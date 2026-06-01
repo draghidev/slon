@@ -1,0 +1,8 @@
+# Public API Analyzers
+
+root = false
+
+[*.cs]
+
+# Consider calling ConfigureAwait on the awaited task
+dotnet_diagnostic.CA2007.severity = error;

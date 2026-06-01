@@ -1,0 +1,8 @@
+{
+   "configProperties": {
+      "System.Threading.ThreadPool.HillClimbing.Disable": true,
+      "System.Threading.ThreadPool.MinThreads": 2,
+      "System.Threading.ThreadPool.MaxThreads": 2,
+      "System.Threading.ThreadPool.DisableStarvationDetection": true
+   }
+}

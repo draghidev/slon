@@ -1,0 +1,518 @@
+using System.Collections.Immutable;
+using System.Data;
+using System.Data.Common;
+using System.Diagnostics;
+using System.Diagnostics.CodeAnalysis;
+using System.Runtime.CompilerServices;
+using Slon.Pg;
+using Slon.Pg.Protocol.Flows;
+
+namespace Slon;
+
+// Shared between DbBatch and DbCommand
+struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
+{
+    FieldRef<AdoBatchCore<TCommand>> _fieldRef;
+    object _dataSourceOrConnection;
+    bool _disposed;
+    bool _explicitlyPrepared;
+    TimeSpan _timeout;
+    bool _enableErrorBarriers;
+    AdoCommandList<TCommand> _commands;
+
+    public AdoBatchCore(SlonConnection connection, FieldRef<AdoBatchCore<TCommand>> fieldRef)
+    {
+        _dataSourceOrConnection = connection;
+        _fieldRef = fieldRef;
+    }
+
+    public AdoBatchCore(SlonDataSource dataSource, FieldRef<AdoBatchCore<TCommand>> fieldRef)
+    {
+        _dataSourceOrConnection = dataSource;
+        _fieldRef = fieldRef;
+    }
+
+    [UnscopedRef]
+    public ref AdoCommandList<TCommand> Commands => ref _commands;
+
+    public TimeSpan Timeout
+    {
+        get => _timeout;
+        set
+        {
+            // No need to throw if read-only, we allow any state unrelated to preparation to be changed.
+            ThrowIfDisposed();
+            _timeout = value;
+        }
+    }
+
+    /// <summary>Whether to place an error barrier between every command in this batch. The default value is <see langword="false" />.</summary>
+    public bool EnableErrorBarriers
+    {
+        get => _enableErrorBarriers;
+        set
+        {
+            ThrowIfDisposed();
+            _enableErrorBarriers = value;
+        }
+    }
+
+    /// Return whether the instance is ready for mutations. It can become read-only, for example, if it has been prepared.
+    public bool IsReadOnly => _explicitlyPrepared;
+
+    internal void InitializeFrom<TOther>(FieldRef<AdoBatchCore<TCommand>> fieldRef, AdoBatchCore<TOther> other, AdoCommandList<TCommand> mappedCommands) where TOther : IAdoCommand
+    {
+        _dataSourceOrConnection = other._dataSourceOrConnection;
+        _fieldRef = fieldRef;
+        _disposed = other._disposed;
+        _explicitlyPrepared = other._explicitlyPrepared;
+        _timeout = other._timeout;
+        _enableErrorBarriers = other._enableErrorBarriers;
+        if (IsReadOnly)
+        {
+            foreach (var commands in mappedCommands)
+                commands.MakeReadOnly();
+        }
+        _commands = mappedCommands;
+    }
+
+    bool HasCloseConnection(CommandBehavior behavior) => (behavior & CommandBehavior.CloseConnection) == CommandBehavior.CloseConnection;
+    void ThrowIfHasCloseConnection(CommandBehavior behavior)
+    {
+        // Only for DbConnection commands, throws for DbDataSource commands (alternatively we can choose to ignore it).
+        if (HasCloseConnection(behavior))
+            ThrowHelper.ThrowArgumentException(nameof(behavior), $"Cannot pass {nameof(CommandBehavior.CloseConnection)} to a DbDataSource command, this is only valid when a command has a connection.");
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void ThrowIfDisposedOrReadOnly()
+    {
+        ThrowIfDisposed();
+        ThrowIfReadOnly();
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void ThrowIfDisposed()
+    {
+        if (_disposed)
+            Throw(_fieldRef.Instance);
+
+        static void Throw(object instance) => throw new ObjectDisposedException(instance.GetType().Name);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    void ThrowIfReadOnly()
+    {
+        if (IsReadOnly)
+            Throw();
+
+        static void Throw() => throw new InvalidOperationException("Command is prepared, no changes can be made until it's unprepared.");
+    }
+
+    public void SetConnection(SlonConnection connection)
+    {
+        ThrowIfDisposedOrReadOnly();
+        // TODO We probably can...
+        if (TryGetDataSource(out _, out _))
+            ThrowHelper.ThrowInvalidOperation("This is a DbDataSource command and cannot be assigned to connections.");
+
+        connection.CloseOwned(_fieldRef.Instance);
+        _dataSourceOrConnection = connection;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public bool TryGetDataSource([NotNullWhen(true)]out SlonDataSource? dataSource, [NotNullWhen(false)]out SlonConnection? connection)
+    {
+        Debug.Assert(_dataSourceOrConnection is not null);
+        if (_dataSourceOrConnection.GetType() == typeof(SlonDataSource))
+        {
+            dataSource = (SlonDataSource)_dataSourceOrConnection;
+            connection = null;
+            return true;
+        }
+
+        dataSource = null;
+        connection = (SlonConnection)_dataSourceOrConnection;
+        return false;
+    }
+
+    CommandFlowOptions CreateCommandFlowOptions(ReadOnlySpan<DbParameterCollection?> parametersSpan, CommandBehavior behavior, SlonConnection? connection = null, CommandTracker? tracker = null)
+    {
+        if (_commands.Count is 0)
+            ThrowHelper.ThrowInvalidOperation("No commands were added to the batch.");
+
+        // We also allow the 1 case for passing all parameters in one collection, mostly for SlonCommand implicit batching.
+        var indexParameters = parametersSpan.Length == _commands.Count;
+        if (!indexParameters && parametersSpan.Length is not (0 or 1))
+            ThrowHelper.ThrowArgumentException(nameof(parametersSpan), "The number of parameter collections must match the number of commands.");
+
+        var commands = _commands.AsSpan();
+        var batchBuilder = commands.Length > 1 ? ImmutableArray.CreateBuilder<Command>(commands.Length) : null;
+        (Command Command, TrackerResult TrackerResult) result = default;
+        Action<CommandResult, object?>? onResultAction = null;
+        object? onResultActionState = null;
+        (Action<CommandResult, TrackedCommand>, TrackedCommand)?[]? completionArray = null;
+        for (var i = 0; i < commands.Length; i++)
+        {
+            ref var adoCommand = ref commands[i];
+            TrackerContext trackerContext = default;
+            if (connection is not null)
+            {
+                trackerContext = _explicitlyPrepared && adoCommand.Tracked is null
+                    ? TrackerContext.Create(connection, _fieldRef.Instance)
+                    : TrackerContext.Create(connection, adoCommand.Tracked);
+            }
+            else if (tracker is not null)
+            {
+                trackerContext = TrackerContext.Create(tracker, adoCommand.Tracked);
+            }
+
+            var parameters = indexParameters ? parametersSpan[i] : !parametersSpan.IsEmpty ? parametersSpan[0] : null;
+            result = adoCommand.CreateCommand(_enableErrorBarriers, behavior, trackerContext, parameters, Timeout);
+            adoCommand.Tracked ??= result.TrackerResult.Tracked;
+
+            if (batchBuilder is null)
+            {
+                if (result.TrackerResult.CompleteTrackedAsObjectAction is not null)
+                {
+                    onResultAction = result.TrackerResult.CompleteTrackedAsObjectAction;
+                    onResultActionState = result.TrackerResult.Tracked;
+                }
+            }
+            else
+            {
+                if (result.TrackerResult.CompleteTrackedAsObjectAction is not null)
+                {
+                    if (completionArray is null)
+                    {
+                        completionArray = new (Action<CommandResult, TrackedCommand>, TrackedCommand)?[_commands.Count];
+                        if (onResultAction is not null)
+                            completionArray[0] = (onResultAction, (TrackedCommand)onResultActionState!);
+
+                        onResultAction = static (result, state) =>
+                        {
+                            var completions = ((Action<CommandResult, TrackedCommand> Action, TrackedCommand State)?[])state!;
+                            if (completions[result.GetMetadata().CommandIndex] is { } completion)
+                                completion.Action(result, completion.State);
+                        };
+                        onResultActionState = completionArray;
+                    }
+                    if (result.TrackerResult.CompleteTrackedAction is not null && result.TrackerResult.Tracked is not null)
+                        completionArray[i] = (result.TrackerResult.CompleteTrackedAction, result.TrackerResult.Tracked);
+                }
+
+                batchBuilder.Add(result.Command);
+            }
+        }
+
+        return new()
+        {
+            OnCommandResultAction = onResultAction,
+            OnCommandResultActionState = onResultActionState,
+            Commands = batchBuilder is null ? new(result.Command) : new(batchBuilder.MoveToImmutable())
+        };
+    }
+
+    CommandFlow Enqueue(DbParameterCollection? parameters, CommandBehavior behavior)
+    {
+        CommandFlow flow;
+        if (TryGetDataSource(out var dataSource, out var connection))
+        {
+            ThrowIfHasCloseConnection(behavior);
+            var tracker = dataSource.GetCommandTracker();
+            var options = CreateCommandFlowOptions([parameters], behavior, tracker: tracker);
+            flow = dataSource.EnqueueCommands(options);
+        }
+        else
+        {
+            var options = CreateCommandFlowOptions([parameters], behavior, connection);
+            flow = connection.EnqueueCommands(options, closeConnection: HasCloseConnection(behavior));
+        }
+        return flow;
+    }
+
+    ValueTask<CommandFlow> EnqueueAsync(DbParameterCollection? parameters, CommandBehavior behavior, CancellationToken cancellationToken)
+    {
+        if (TryGetDataSource(out var dataSource, out var connection))
+            return DataSourceCore(_fieldRef, dataSource, parameters, behavior, cancellationToken);
+
+        var options = CreateCommandFlowOptions([parameters], behavior, connection);
+        return connection.EnqueueCommandsAsync(options, closeConnection: HasCloseConnection(behavior), cancellationToken);
+
+        static async ValueTask<CommandFlow> DataSourceCore(FieldRef<AdoBatchCore<TCommand>> fieldRef, SlonDataSource dataSource, DbParameterCollection? parameters, CommandBehavior behavior, CancellationToken cancellationToken)
+        {
+            fieldRef.Invoke().ThrowIfHasCloseConnection(behavior);
+            var tracker = await dataSource.GetCommandTrackerAsync(cancellationToken).ConfigureAwait(false);
+            var options = fieldRef.Invoke().CreateCommandFlowOptions([parameters], behavior, default, tracker);
+            return await dataSource.EnqueueCommandsAsync(options, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    public void Prepare(DbParameterCollection? parameters)
+    {
+        ThrowIfDisposedOrReadOnly();
+        // TODO begin tracking the protocol on flow Bind, once we have it we can also queue close flows correctly for datasource commands on subsequent command errors.
+        // For now we only support explicit preparation on connections as we don't yet track the protocol from a flow, so we can't recover from errors.
+        if (TryGetDataSource(out _, out var connection))
+            ThrowHelper.ThrowInvalidOperation("Explicit preparation is not supported for DbDataSource commands.");
+
+        _explicitlyPrepared = true;
+        CommandFlow.Enumerator enumerator = default;
+        List<(int, Exception)>? exceptions = null;
+        try
+        {
+            enumerator = Enqueue(parameters, CommandBehavior.SchemaOnly).GetEnumerator();
+            var span = _commands.AsSpan();
+            for (var i = 0; i < span.Length; i++)
+            {
+                if (!enumerator.MoveNext())
+                    ThrowHelper.ThrowUnexpected("Not enough results returned.");
+                var result = enumerator.Current;
+                try
+                {
+                    if (result.HasRows)
+                        ThrowHelper.ThrowUnexpected("Rows were returned?");
+                }
+                catch (Exception ex)
+                {
+                    exceptions ??= new();
+                    exceptions.Add((i, ex));
+                }
+            }
+
+            if (exceptions is not null)
+                throw new AggregateException(SelectException(exceptions));
+        }
+        catch (Exception)
+        {
+            _explicitlyPrepared = false;
+            // TODO execute a Close flow for all indices that are not in the exceptions list.
+            throw;
+        }
+        finally
+        {
+            enumerator.Dispose();
+        }
+
+        IEnumerable<Exception> SelectException(List<(int, Exception)> exceptions)
+        {
+            foreach (var (index, ex) in exceptions)
+                yield return ex;
+        }
+    }
+
+    // Async instance methods on structs make a copy of 'this', we don't want that so we define a static method passing in our field ref.
+    static async ValueTask PrepareAsyncCore(FieldRef<AdoBatchCore<TCommand>> fieldRef, DbParameterCollection? parameters, CancellationToken cancellationToken)
+    {
+        ref var thisRef = ref fieldRef.Invoke();
+        thisRef.ThrowIfDisposedOrReadOnly();
+
+        // TODO begin tracking the protocol on flow Bind, once we have it we can also queue close flows correctly for datasource commands on subsequent command errors.
+        // For now we only support explicit preparation on connections as we don't yet track the protocol from a flow, so we can't recover from errors.
+        if (thisRef.TryGetDataSource(out _, out var connection))
+            ThrowHelper.ThrowInvalidOperation("Explicit preparation is not supported for DbDataSource commands.");
+
+        thisRef._explicitlyPrepared = true;
+        CommandFlow.Enumerator enumerator = default;
+        List<(int, Exception)>? exceptions = null;
+        try
+        {
+            enumerator = (await thisRef.EnqueueAsync(parameters, CommandBehavior.SchemaOnly, cancellationToken).ConfigureAwait(false)).GetAsyncEnumerator(cancellationToken);
+            for (var i = 0; i < fieldRef.Invoke()._commands.AsSpan().Length; i++)
+            {
+                try
+                {
+                    // TODO we should check whether a prepared parse gets rolled back/closed if a subsequent bind or describe fails, if so we don't need to close manually.
+                    if (!await enumerator.MoveNextAsync(cancellationToken).ConfigureAwait(false))
+                        ThrowHelper.ThrowUnexpected("Not enough results returned.");
+                    var result = enumerator.Current;
+                    if (result.HasRows)
+                        ThrowHelper.ThrowUnexpected("Rows were returned?");
+                }
+                catch (Exception ex)
+                {
+                    exceptions ??= new();
+                    exceptions.Add((i, ex));
+                }
+            }
+
+            if (exceptions is not null)
+                throw new AggregateException(SelectException(exceptions));
+        }
+        catch (Exception)
+        {
+            fieldRef.Invoke()._explicitlyPrepared = false;
+            // TODO execute a Close flow as well.
+            throw;
+        }
+        finally
+        {
+            await enumerator.DisposeAsync().ConfigureAwait(false);
+        }
+
+        IEnumerable<Exception> SelectException(List<(int, Exception)> exceptions)
+        {
+            foreach (var (index, ex) in exceptions)
+                yield return ex;
+        }
+    }
+
+    public ValueTask PrepareAsync(DbParameterCollection? parameters, CancellationToken cancellationToken = default)
+        => PrepareAsyncCore(_fieldRef, parameters, cancellationToken);
+
+    public int ExecuteNonQuery(DbParameterCollection? parameters)
+    {
+        ThrowIfDisposed();
+        var recordsAffected = 0L;
+        foreach (var result in Enqueue(parameters, CommandBehavior.Default))
+            recordsAffected = checked(recordsAffected + result.RecordsAffected);
+        return checked((int)recordsAffected);
+    }
+
+    static async ValueTask<int> ExecuteNonQueryAsyncCore(FieldRef<AdoBatchCore<TCommand>> fieldRef, DbParameterCollection? parameters, CancellationToken cancellationToken)
+    {
+        ref var thisRef = ref fieldRef.Invoke();
+        thisRef.ThrowIfDisposed();
+        cancellationToken.ThrowIfCancellationRequested();
+        CommandFlow.Enumerator enumerator = default;
+        try
+        {
+            var recordsAffected = 0L;
+            enumerator = (await thisRef.EnqueueAsync(parameters, CommandBehavior.Default, cancellationToken).ConfigureAwait(false)).GetAsyncEnumerator(cancellationToken);
+            while (await enumerator.MoveNextAsync().ConfigureAwait(false))
+                recordsAffected = checked(recordsAffected + enumerator.Current.RecordsAffected);
+            return checked((int)recordsAffected);
+        }
+        finally
+        {
+            await enumerator.DisposeAsync().ConfigureAwait(false);
+        }
+    }
+
+    public ValueTask<int> ExecuteNonQueryAsync(DbParameterCollection? parameters, CancellationToken cancellationToken = default)
+        => ExecuteNonQueryAsyncCore(_fieldRef, parameters, cancellationToken);
+
+    public object? ExecuteScalar(DbParameterCollection? parameters)
+    {
+        ThrowIfDisposed();
+        foreach (var result in Enqueue(parameters, CommandBehavior.Default))
+        {
+            using var rowEnumerator = result.GetAsyncEnumerator();
+            if (rowEnumerator.MoveNext())
+                return result.FieldCount is not 0 ? rowEnumerator.Current.GetValue<object>(0) : null;
+        }
+        return null;
+    }
+
+    static async ValueTask<object?> ExecuteScalarAsyncCore(FieldRef<AdoBatchCore<TCommand>> fieldRef, DbParameterCollection? parameters, CancellationToken cancellationToken)
+    {
+        ref var thisRef = ref fieldRef.Invoke();
+        thisRef.ThrowIfDisposed();
+        cancellationToken.ThrowIfCancellationRequested();
+        CommandFlow.Enumerator enumerator = default;
+        try
+        {
+            enumerator = (await thisRef.EnqueueAsync(parameters, CommandBehavior.Default, cancellationToken).ConfigureAwait(false)).GetAsyncEnumerator(cancellationToken);
+            while (await enumerator.MoveNextAsync().ConfigureAwait(false))
+            {
+                var rowEnumerator = enumerator.Current.GetAsyncEnumerator(cancellationToken);
+                try
+                {
+                    if (await rowEnumerator.MoveNextAsync(cancellationToken).ConfigureAwait(false))
+                        return enumerator.Current.FieldCount is not 0
+                            ? await rowEnumerator.Current.GetValueAsync<object>(0, cancellationToken).ConfigureAwait(false)
+                            : null;
+                }
+                finally
+                {
+                    await rowEnumerator.DisposeAsync().ConfigureAwait(false);
+                }
+            }
+            return null;
+        }
+        finally
+        {
+            await enumerator.DisposeAsync().ConfigureAwait(false);
+        }
+    }
+
+    public ValueTask<object?> ExecuteScalarAsync(DbParameterCollection? parameters, CancellationToken cancellationToken = default)
+        => ExecuteScalarAsyncCore(_fieldRef, parameters, cancellationToken);
+
+    public SlonDataReader ExecuteReader(DbParameterCollection? parameters, CommandBehavior behavior)
+    {
+        ThrowIfDisposed();
+        return SlonDataReader.Create(behavior, Enqueue(parameters, behavior));
+    }
+
+    public ValueTask<DbDataReader> ExecuteDbReaderAsync(DbParameterCollection? parameters, CommandBehavior behavior, CancellationToken cancellationToken = default)
+    {
+        if (_disposed)
+            return ValueTask.FromException<DbDataReader>(new ObjectDisposedException(_fieldRef.Instance.GetType().Name));
+        if (cancellationToken.IsCancellationRequested)
+            return ValueTask.FromCanceled<DbDataReader>(cancellationToken);
+
+        return SlonDataReader.CreateAsync<DbDataReader>(behavior, EnqueueAsync(parameters, behavior, cancellationToken), cancellationToken);
+    }
+
+    public ValueTask<SlonDataReader> ExecuteReaderAsync(DbParameterCollection? parameters, CommandBehavior behavior, CancellationToken cancellationToken = default)
+    {
+        if (_disposed)
+            return ValueTask.FromException<SlonDataReader>(new ObjectDisposedException(_fieldRef.Instance.GetType().Name));
+        if (cancellationToken.IsCancellationRequested)
+            return ValueTask.FromCanceled<SlonDataReader>(cancellationToken);
+
+        return SlonDataReader.CreateAsync<SlonDataReader>(behavior, EnqueueAsync(parameters, behavior, cancellationToken), cancellationToken);
+    }
+
+    public void Add(TCommand command)
+    {
+        _commands.Add(command);
+    }
+
+    public void Clear()
+    {
+        _commands.Clear();
+    }
+
+    public void Dispose()
+    {
+        if (_disposed || !_explicitlyPrepared)
+            return;
+
+        _disposed = true;
+        if (TryGetDataSource(out var dataSource, out var connection))
+        {
+            // TODO once we support explicit prepare for datasource commands, unprepare here.
+        }
+        else
+        {
+            connection.CloseOwned(_fieldRef.Instance);
+        }
+    }
+
+    public ValueTask DisposeAsync()
+    {
+        if (_disposed || !_explicitlyPrepared)
+            return new();
+
+        _disposed = true;
+        if (TryGetDataSource(out var dataSource, out var connection))
+        {
+            // TODO once we support explicit prepare for datasource commands, unprepare here.
+            return new();
+        }
+
+        return connection.CloseOwnedAsync(_fieldRef.Instance);
+    }
+
+    // TODO what to do with concurrent callers, datasource commands etc.?
+    public void Cancel()
+    {
+        // We can't throw in connectionless scenarios as dapper etc expect this method to work.
+        if (TryGetDataSource(out _, out var connection))
+            return;
+
+        connection.PerformUserCancellation();
+    }
+}

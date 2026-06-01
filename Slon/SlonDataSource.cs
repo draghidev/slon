@@ -1,0 +1,336 @@
+using System.Data.Common;
+using System.Net;
+using Slon.Pg;
+using Slon.Pg.Protocol;
+using Slon.Pg.Protocol.Flows;
+using Slon.Pg.Types;
+using Slon.Pools;
+using Slon.Transport;
+using AddressFamily = System.Net.Sockets.AddressFamily;
+
+namespace Slon;
+
+interface IFrontendTypeCatalog
+{
+    DataTypeName GetDataTypeName(PgTypeId pgTypeId);
+    bool TryGetIdentifiers(SlonDbType slonDbType, out PgTypeId canonicalTypeId, out DataTypeName dataTypeName);
+}
+
+public record SlonDataSourceOptions
+{
+    internal static TimeSpan DefaultCommandTimeout = TimeSpan.FromSeconds(30);
+
+    public required EndPoint EndPoint { get; init; }
+    public required string Username { get; init; }
+    public string? Password { get; init; }
+    public string? Database { get; init; }
+    public TimeSpan ConnectionTimeout { get; init; } = TimeSpan.FromSeconds(10);
+    public TimeSpan CancellationTimeout { get; init; } = TimeSpan.FromSeconds(10);
+    public int MinPoolSize { get; init; } = 1;
+    public int MaxPoolSize { get; init; } = 10;
+    public int PoolSize
+    {
+        init
+        {
+            MinPoolSize = value;
+            MaxPoolSize = value;
+        }
+    }
+
+    public Action<SlonConnection, TimeSpan>? ConnectionInitializer { get; init; }
+    public Func<SlonConnection, CancellationToken, ValueTask>? AsyncConnectionInitializer { get; init; }
+
+    /// <summary>
+    /// CommandTimeout affects the first IO read after writing out a command.
+    /// Default is infinite, where behavior purely relies on read and write timeouts of the underlying protocol.
+    /// </summary>
+    public TimeSpan CommandTimeout { get; init; } = DefaultCommandTimeout;
+    public int AutoPreparationMinimumUses { get; set; } = 5;
+    public int MaxActiveAutoPreparations { get; set; }
+
+    internal PgClientOptions ToPgClientOptions() => new()
+    {
+        EndPoint = EndPoint,
+        Username = Username,
+        Database = Database,
+        Password = Password
+    };
+
+    internal bool Validate()
+    {
+        // etc
+        return true;
+    }
+
+    public static EndPoint ParseIpOrDnsEndPoint(string host) => PgClientOptions.ParseIpOrDnsEndPoint(host);
+}
+
+class PgDatabaseInfo
+{
+    public PgDatabaseInfo(PgTypeCatalog typeCatalog)
+    {
+        TypeCatalog = typeCatalog;
+        ServerVersion = "PG";
+    }
+
+    public string ServerVersion { get; }
+
+    public PgTypeCatalog TypeCatalog { get; }
+}
+
+
+interface ISlonDatabaseInfoProvider
+{
+    PgDatabaseInfo Get(SlonDataSourceOptions options, TimeSpan timeSpan);
+    ValueTask<PgDatabaseInfo> GetAsync(SlonDataSourceOptions options, CancellationToken cancellationToken = default);
+}
+
+sealed class DefaultSlonDatabaseInfoProvider: ISlonDatabaseInfoProvider
+{
+    PgDatabaseInfo Create() => new(PgTypeCatalog.Default);
+    public PgDatabaseInfo Get(SlonDataSourceOptions options, TimeSpan timeSpan) => Create();
+    public ValueTask<PgDatabaseInfo> GetAsync(SlonDataSourceOptions options, CancellationToken cancellationToken = default) => new(Create());
+}
+
+/// <inheritdoc cref="System.Data.Common.DbDataSource" />
+public sealed class SlonDataSource: DbDataSource
+{
+    readonly SlonDataSourceOptions _options;
+    readonly ISlonDatabaseInfoProvider _slonDatabaseInfoProvider;
+    readonly SemaphoreSlim _lifecycleLock;
+
+    // Initialized on the first real use.
+    ConnectionPool<PgClientProtocol> _connectionPool = null!;
+    IPoolConnectionFactory<PgClientProtocol> _clientFactory = null!;
+    PgDbDependencies _dbDependencies = null!;
+    bool _isInitialized;
+
+    public SlonDataSource(SlonDataSourceOptions options) : this(options, null) { }
+    internal SlonDataSource(SlonDataSourceOptions options, ISlonDatabaseInfoProvider? pgDatabaseInfoProvider = null)
+    {
+        options.Validate();
+        _options = options;
+        DisplayEndpoint = options.EndPoint.AddressFamily is AddressFamily.InterNetwork or AddressFamily.InterNetworkV6 ? $"tcp://{options.EndPoint}" : options.EndPoint.ToString()!;
+        _slonDatabaseInfoProvider = pgDatabaseInfoProvider ?? new DefaultSlonDatabaseInfoProvider();
+        _lifecycleLock = new(1);
+    }
+
+    ConnectionPool<PgClientProtocol> ConnectionPool => _connectionPool ?? throw NotInitializedException();
+
+    // Store the result if multiple dependencies are required. The instance may be switched out during reloading.
+    // To prevent any inconsistencies without having to obtain a lock on the data we instead use an immutable instance.
+    // All relevant depedencies are bundled to provide a consistent view, it's either all new or all old data.
+    PgDbDependencies GetDbDependencies() => _dbDependencies ?? throw NotInitializedException();
+
+    // True for datasources that dispatch commands across different backends.
+    // Among other effects this impacts cacheability of state derived from unstable backend type information.
+    // Its value should be static for the lifetime of the instance.
+    internal bool IsVirtualDataSource => false;
+    // This is to get back to the multi-host datasource that owns its host sources.
+    // It also helps commands to keep caches intact when switching sources from the same owner.
+    internal SlonDataSource DataSourceOwner => this;
+
+    internal TimeSpan ConnectionTimeout => _options.ConnectionTimeout;
+    internal TimeSpan DefaultCancellationTimeout => _options.CancellationTimeout;
+    internal TimeSpan DefaultCommandTimeout => _options.CommandTimeout;
+    internal string Database => _options.Database ?? _options.Username;
+    internal string DisplayEndpoint { get; }
+
+    internal string ServerVersion => GetDbDependencies().PgDatabaseInfo.ServerVersion;
+
+    int DbDepsRevision { get; set; }
+
+    AdoConnectionProxy CreateProxy(PgClientProtocol protocol, IAdoConnection connection)
+    {
+        return new(this, protocol, connection);
+    }
+
+     ValueTask Initialize(bool async, TimeSpan timeout, CancellationToken cancellationToken)
+    {
+        if (_isInitialized)
+            return new ValueTask();
+
+        return Core();
+
+        async ValueTask Core()
+        {
+            if (async)
+                await _lifecycleLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+            else
+                _lifecycleLock.Wait(cancellationToken);
+            try
+            {
+                if (_isInitialized)
+                    return;
+
+                // We don't flow cancellationToken past this point, at least one thread has to finish the init.
+                // We do DbDeps first as it may throw, otherwise we'd need to cleanup the other dependencies again.
+                var deps = await CreateDbDeps(async, timeout, CancellationToken.None).ConfigureAwait(false);
+
+                var connectionInit = _options.ConnectionInitializer;
+                var asyncConnectionInit = _options.AsyncConnectionInitializer;
+                var clientOptions = _options.ToPgClientOptions();
+                var transportFactory = SocketStreamConnection.CreateFactory(clientOptions.EndPoint);
+                var factory = new InitializingConnectionFactory<PgClientProtocol>(
+                    factory: new PgClientProtocolFactory(clientOptions, transportFactory),
+                    initializer: connectionInit is not null ? (protocol, timeout) =>
+                        {
+                            using var conn = CreateConnection();
+                            conn.SetProxy(CreateProxy(protocol, conn));
+                            connectionInit(conn, timeout);
+                        } : null,
+                    asyncInitializer:
+                        asyncConnectionInit is not null ? async (protocol, cancellationToken) =>
+                        {
+                            var conn = CreateConnection();
+                            await using var _ = conn.ConfigureAwait(false);
+                            conn.SetProxy(CreateProxy(protocol, conn));
+                            await asyncConnectionInit(conn, cancellationToken).ConfigureAwait(false);
+                        } : null
+                );
+
+                // Finally store all the fields
+                if (_options.MaxPoolSize > 0)
+                    _connectionPool = new ConnectionPool<PgClientProtocol>(factory, new() { MaxConnections = _options.MaxPoolSize });
+                _clientFactory = factory;
+                _dbDependencies = deps;
+
+                _isInitialized = true;
+            }
+            finally
+            {
+                _lifecycleLock.Release();
+            }
+        }
+
+        async ValueTask<PgDbDependencies> CreateDbDeps(bool async, TimeSpan timeout, CancellationToken cancellationToken)
+        {
+            var databaseInfo = async
+                ? _slonDatabaseInfoProvider.Get(_options, timeout)
+                : await _slonDatabaseInfoProvider.GetAsync(_options, cancellationToken).ConfigureAwait(false);
+
+            return new PgDbDependencies(databaseInfo, new CommandTracker(_options.MaxActiveAutoPreparations, _options.AutoPreparationMinimumUses), DbDepsRevision++);
+        }
+    }
+
+    void EnsureInitialized(TimeSpan timeout) => Initialize(false, timeout, CancellationToken.None).GetAwaiter().GetResult();
+    ValueTask EnsureInitializedAsync(TimeSpan timeout, CancellationToken cancellationToken) => Initialize(true, timeout, cancellationToken);
+
+    internal void Enqueue(PgClientFlow flow, TimeSpan connectionTimeout)
+    {
+        throw new NotImplementedException();
+    }
+
+    internal CommandFlow EnqueueCommands(CommandFlowOptions options)
+    {
+        throw new NotImplementedException();
+    }
+    internal ValueTask<CommandFlow> EnqueueCommandsAsync(CommandFlowOptions options, CancellationToken cancellationToken)
+    {
+        throw new NotImplementedException();
+    }
+
+    internal string SensitiveConnectionString => throw new NotImplementedException();
+    public override string ConnectionString => ""; //TODO
+    internal CommandTracker GetCommandTracker(bool initializedOnly = false)
+    {
+        if (initializedOnly && !_isInitialized)
+            throw NotInitializedException();
+
+        EnsureInitialized(TimeSpan.Zero);
+        return GetDbDependencies().CommandsTracker;
+    }
+
+    internal ValueTask<CommandTracker> GetCommandTrackerAsync(CancellationToken cancellationToken)
+    {
+        return _isInitialized ? new(GetDbDependencies().CommandsTracker) : Core(cancellationToken);
+
+        async ValueTask<CommandTracker> Core(CancellationToken cancellationToken)
+        {
+            await EnsureInitializedAsync(TimeSpan.Zero, cancellationToken).ConfigureAwait(false);
+            return GetDbDependencies().CommandsTracker;
+        }
+    }
+
+    protected override DbConnection CreateDbConnection() => CreateConnection();
+    public new SlonConnection CreateConnection() => new(this);
+
+    protected override DbConnection OpenDbConnection() => OpenConnection();
+    public new SlonConnection OpenConnection()
+    {
+        var connection = CreateConnection();
+        connection.SetProxy(GetProxy(connection, ConnectionTimeout));
+        return connection;
+    }
+
+
+    protected override async ValueTask<DbConnection> OpenDbConnectionAsync(CancellationToken cancellationToken = default)
+    {
+        var connection = CreateConnection();
+        connection.SetProxy(await GetProxyAsync(connection, ConnectionTimeout, cancellationToken).ConfigureAwait(false));
+        return connection;
+    }
+    public new async ValueTask<SlonConnection> OpenConnectionAsync(CancellationToken cancellationToken)
+    {
+        var connection = CreateConnection();
+        connection.SetProxy(await GetProxyAsync(connection, ConnectionTimeout, cancellationToken).ConfigureAwait(false));
+        return connection;
+    }
+
+    public new SlonBatch CreateBatch() => new(this);
+    protected override DbBatch CreateDbBatch() => CreateBatch();
+
+    protected override DbCommand CreateDbCommand(string? commandText = null) => CreateCommand(commandText);
+    public new SlonCommand CreateCommand(string? commandText = null) => new(null, this, commandText);
+
+    protected override void Dispose(bool disposing)
+    {
+    }
+
+    // Internal for testing.
+    internal class PgDbDependencies: IFrontendTypeCatalog
+    {
+        public PgDbDependencies(PgDatabaseInfo pgDatabaseInfo, CommandTracker commandTracker, int revision)
+        {
+            PgDatabaseInfo = pgDatabaseInfo;
+            CommandsTracker = commandTracker;
+            Revision = revision;
+        }
+
+        public PgDatabaseInfo PgDatabaseInfo { get; }
+        public CommandTracker CommandsTracker { get; }
+        public int Revision { get; }
+
+        public PgTypeCatalog TypeCatalog => PgDatabaseInfo.TypeCatalog;
+
+        public bool TryGetIdentifiers(SlonDbType slonDbType, out PgTypeId canonicalTypeId, out DataTypeName dataTypeName)
+            => TryGetIdentifiers(TypeCatalog, slonDbType, out canonicalTypeId, out dataTypeName);
+
+        public DataTypeName GetDataTypeName(PgTypeId typeId) => TypeCatalog.GetDataTypeName(typeId);
+
+        internal static bool TryGetIdentifiers(PgTypeCatalog typeCatalog, SlonDbType slonDbType, out PgTypeId canonicalTypeId, out DataTypeName dataTypeName)
+        {
+            if (slonDbType.ResolveArrayType)
+                return typeCatalog.TryGetArrayIdentifiers(slonDbType.DataTypeName, out canonicalTypeId, out dataTypeName);
+
+            if (slonDbType.ResolveMultirangeType)
+                return typeCatalog.TryGetMultiRangeIdentifiers(slonDbType.DataTypeName, out canonicalTypeId, out dataTypeName);
+
+            return typeCatalog.TryGetIdentifiers(slonDbType.DataTypeName, out canonicalTypeId, out dataTypeName);
+        }
+    }
+
+    static Exception NotInitializedException() => new InvalidOperationException("DataSource is not initialized yet, at least one connection needs to be opened first.");
+
+    internal AdoConnectionProxy GetProxy(IAdoConnection connection, TimeSpan timeout)
+    {
+        EnsureInitialized(timeout);
+        return CreateProxy(_connectionPool.Get(timeout), connection);
+    }
+
+    internal async ValueTask<AdoConnectionProxy> GetProxyAsync(IAdoConnection connection, TimeSpan timeout, CancellationToken cancellationToken = default)
+    {
+        await EnsureInitializedAsync(timeout, cancellationToken).ConfigureAwait(false);
+        return CreateProxy(await _connectionPool.GetAsync(timeout, cancellationToken).ConfigureAwait(false), connection);
+    }
+}

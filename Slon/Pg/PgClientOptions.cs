@@ -1,0 +1,48 @@
+using System.Net;
+using System.Text;
+
+namespace Slon.Pg;
+
+sealed class PgClientOptions
+{
+    internal TimeSpan HeartbeatInterval { get; } = TimeSpan.FromSeconds(1);
+
+    public required EndPoint EndPoint { get; init; }
+    public required string Username { get; init; }
+    public string? Password { get; init; }
+    public string? Database { get; init; }
+    public TimeSpan ReadTimeout { get; init; } = Timeout.InfiniteTimeSpan; // TimeSpan.FromSeconds(2);
+    public TimeSpan WriteTimeout { get; init; } = TimeSpan.FromSeconds(10);
+
+    public TimeSpan ConnectionTimeout { get; init; } = Timeout.InfiniteTimeSpan;
+
+    public int PoolSize { get; init; }
+
+    // Hardcoded to UTF8 until a use for another encoding comes up.
+    internal Encoding Encoding => Encoding.UTF8;
+    internal Encoding PasswordEncoding => Encoding.UTF8;
+
+    internal static Encoding PreStartupEncoding => Encoding.ASCII;
+
+    public static EndPoint ParseIpOrDnsEndPoint(string host) => IPOrDnsEndPoint.Parse(host, defaultPort: 5432);
+}
+
+static class IPOrDnsEndPoint
+{
+    public static EndPoint Parse(string host, int defaultPort = 0)
+    {
+        EndPoint endPoint;
+        if (IPEndPoint.TryParse(host, out var ipEndPoint))
+        {
+            endPoint = defaultPort is not 0 && ipEndPoint.Port is 0
+                ? new IPEndPoint(ipEndPoint.Address, defaultPort)
+                : ipEndPoint;
+        }
+        else
+        {
+            var port = host.Substring(host.LastIndexOf(':') + 1);
+            endPoint = new DnsEndPoint(host.Substring(0, host.Length - port.Length - 1), port.Length is 0 ? defaultPort : int.Parse(port));
+        }
+        return endPoint;
+    }
+}
