@@ -13,8 +13,7 @@ enum TrackedCommandKind
 
 sealed class TrackedCommand
 {
-    Status _status;
-    StrongBox<CommandDescriptor> _descriptorBox;
+    State _state;
     long _lastAccessedTicks;
 
     public TrackedCommand(TrackedCommandKind kind, CommandDescriptor descriptor)
@@ -24,60 +23,102 @@ sealed class TrackedCommand
         if (descriptor.IsPrepared)
             ThrowHelper.ThrowArgumentException(nameof(descriptor), "Descriptor is already prepared.");
 
-        // We must preserve the types to prevent rooting parameters.
-        _descriptorBox = new(CommandDescriptor.Create(descriptor.UnpreparedCommandText, descriptor.ParameterTypes.Preserve(), descriptor.CommandName));
+        // Preserve types to avoid rooting parameters.
+        _state = new State(Status.Initialized, CommandDescriptor.Create(descriptor.UnpreparedCommandText, descriptor.ParameterTypes.Preserve(), descriptor.CommandName));
         CommandText = descriptor.UnpreparedCommandText;
         Kind = kind;
     }
 
-    Status GetStatus() => (Status)Volatile.Read(ref Unsafe.As<Status, int>(ref _status));
-
-    public EncodedString CommandName => IsInvalid ? default : _descriptorBox.Value.CommandName;
     public string CommandText { get; }
     public TrackedCommandKind Kind { get; }
+
+    public EncodedString CommandName
+    {
+        get
+        {
+            var state = Volatile.Read(ref _state);
+            return state.Status is Status.Invalid ? default : state.Descriptor.CommandName;
+        }
+    }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal bool TryGetPreparedDescriptor(out CommandDescriptor descriptor)
     {
-        if (!IsCompleted)
+        var state = Volatile.Read(ref _state);
+        if (state.Status is not (Status.CompletedIndeterminate or Status.CompletedSuccesfully))
         {
             descriptor = default;
             return false;
         }
 
-        _lastAccessedTicks = Environment.TickCount64;
-        descriptor = _descriptorBox.Value;
+        // LRU access stamp, statistical only, tearing protection is the only requirement.
+        Volatile.Write(ref _lastAccessedTicks, Environment.TickCount64);
+        descriptor = state.Descriptor;
         return true;
     }
 
     // Whether the command has gone through all the required operations to be used to run matching commands in a prepared fashion.
-    public bool IsCompleted => GetStatus() is Status.CompletedIndeterminate or Status.CompletedSuccesfully;
-    public bool IsCompletedSuccessfully => GetStatus() is Status.CompletedSuccesfully;
-    public bool IsInvalid => GetStatus() is Status.Invalid;
+    public bool IsCompleted => Volatile.Read(ref _state).Status is Status.CompletedIndeterminate or Status.CompletedSuccesfully;
+    public bool IsCompletedSuccessfully => Volatile.Read(ref _state).Status is Status.CompletedSuccesfully;
+    public bool IsInvalid => Volatile.Read(ref _state).Status is Status.Invalid;
 
-    public void Invalidate() => Interlocked.Exchange(ref _status, Status.Invalid);
+    internal long LastAccessedTicks => Volatile.Read(ref _lastAccessedTicks);
+
+    // Returns true if this call transitioned to Invalid. False if already Invalid.
+    public bool Invalidate()
+    {
+        while (true)
+        {
+            var current = Volatile.Read(ref _state);
+            if (current.Status is Status.Invalid)
+                return false;
+            var next = new State(Status.Invalid, current.Descriptor);
+            if (Interlocked.CompareExchange(ref _state, next, current) == current)
+                return true;
+        }
+    }
 
     public bool Complete(CommandDescriptor descriptor)
     {
         if (!descriptor.IsPrepared)
             ThrowHelper.ThrowArgumentException(nameof(descriptor), "Descriptor is not prepared.");
 
-        var comparand = _descriptorBox.Value.IsPrepared && _descriptorBox.Value.PreparedRowDescription is null ? Status.CompletedIndeterminate : Status.Initialized;
-        var value = descriptor.PreparedRowDescription is null ? Status.CompletedIndeterminate : Status.CompletedSuccesfully;
-        _descriptorBox = new(CommandDescriptor.CreatePrepared(descriptor.CommandName, descriptor.ParameterTypes.Preserve(), descriptor.PreparedRowDescription?.Preserve()));
-        return Interlocked.CompareExchange(ref _status, value, comparand) == comparand;
+        var prepared = CommandDescriptor.CreatePrepared(descriptor.CommandName, descriptor.ParameterTypes.Preserve(), descriptor.PreparedRowDescription?.Preserve());
+        var newStatus = descriptor.PreparedRowDescription is null ? Status.CompletedIndeterminate : Status.CompletedSuccesfully;
+        // (status, descriptor) is loop-invariant. Hoist the allocation so contention does not amplify it.
+        var next = new State(newStatus, prepared);
+
+        while (true)
+        {
+            var current = Volatile.Read(ref _state);
+            // Allowed transitions:
+            //   Initialized             -> any prepared status
+            //   CompletedIndeterminate  -> CompletedIndeterminate (refresh) or CompletedSuccesfully (upgrade)
+            //   CompletedSuccesfully / Invalid -> terminal
+            var canTransition = current.Status switch
+            {
+                Status.Initialized => true,
+                Status.CompletedIndeterminate => true,
+                _ => false
+            };
+            if (!canTransition)
+                return false;
+
+            if (Interlocked.CompareExchange(ref _state, next, current) == current)
+                return true;
+        }
     }
 
     public RowDescription? RowDescription
     {
         get
         {
-            var descriptorBox = _descriptorBox;
-            return descriptorBox.Value.IsPrepared ? descriptorBox.Value.PreparedRowDescription : null;
+            var descriptor = Volatile.Read(ref _state).Descriptor;
+            return descriptor.IsPrepared ? descriptor.PreparedRowDescription : null;
         }
     }
 
-    public ParameterTypeList ParameterTypes => _descriptorBox.Value.ParameterTypes;
+    public ParameterTypeList ParameterTypes => Volatile.Read(ref _state).Descriptor.ParameterTypes;
 
     enum Status
     {
@@ -85,5 +126,11 @@ sealed class TrackedCommand
         Invalid,
         CompletedIndeterminate,
         CompletedSuccesfully,
+    }
+
+    sealed class State(Status status, CommandDescriptor descriptor)
+    {
+        public readonly Status Status = status;
+        public readonly CommandDescriptor Descriptor = descriptor;
     }
 }

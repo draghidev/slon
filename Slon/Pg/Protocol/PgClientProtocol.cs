@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Text;
@@ -18,6 +19,18 @@ enum ProtocolStatus
     Ready,
     Draining,
     Completed
+}
+
+// Per-session presence of a workload-known TrackedCommand. Absent (= missing from the presence
+// map) means no Parse has been issued for this name on this session. Preparing means a Parse
+// flow has been enqueued and hasn't completed; pipeline FIFO ordering lets follower flows
+// enqueue their Bind/Execute behind the Parse without re-issuing it. Present means the Parse
+// succeeded and the name is ready to use.
+enum PresenceState
+{
+    Absent,
+    Preparing,
+    Present,
 }
 
 // Lifecycle contract the protocol framework calls into. Explicit-impl on PgClientFlow forces
@@ -88,6 +101,12 @@ sealed class PgClientProtocol : IPoolConnection<PgClientProtocol>
     // Any concurrent CompleteAsync (which also transitions to draining) is respected the same way.
     int _drainingCount;
 
+    // Per-session map of which TrackedCommands have been (or are being) Parsed on this connection.
+    // Synchronization between Preparing and follower use is provided by pipeline FIFO order,
+    // not by an explicit promise — followers see Preparing and enqueue their use behind the
+    // winner's Parse flow.
+    readonly ConcurrentDictionary<TrackedCommand, PresenceState> _presence = new();
+
     PgClientProtocol(PgClientProtocolOptions options)
     {
         _options = options;
@@ -97,6 +116,28 @@ sealed class PgClientProtocol : IPoolConnection<PgClientProtocol>
     }
 
     public string CurrentSearchPath { get; set; } = "public";
+
+    public PresenceState GetPresence(TrackedCommand tracked)
+        => _presence.TryGetValue(tracked, out var state) ? state : PresenceState.Absent;
+
+    // Atomic Absent -> Preparing. Winner enqueues the Parse flow (its own Sync window so a
+    // sibling error can't kill it); losers see Preparing and enqueue only their use flow.
+    public bool TryBeginPreparing(TrackedCommand tracked)
+        => _presence.TryAdd(tracked, PresenceState.Preparing);
+
+    // Called from the Parse flow's completion handler on success.
+    public void MarkPresent(TrackedCommand tracked)
+        => _presence[tracked] = PresenceState.Present;
+
+    // Called on eviction (DEALLOCATE fanout) or to roll back an optimistic Preparing marker
+    // when the Parse flow failed.
+    public void MarkAbsent(TrackedCommand tracked)
+        => _presence.TryRemove(tracked, out _);
+
+    // Session-wide reset (DISCARD ALL, role change, reconnect) destroyed every prepared
+    // statement on this session; drop all presence so subsequent uses re-Parse.
+    public void ClearPresence()
+        => _presence.Clear();
 
     Control FlowControl { get; }
     CancellationToken AbortToken => _abortToken;

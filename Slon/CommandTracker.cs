@@ -113,19 +113,29 @@ sealed class CommandTracker : IDisposable, IAsyncDisposable
         {
             var tracked = (TrackedCommand)state!;
             var metadata = result.GetMetadata();
-            // Here we would make RowDescription portable (once we need it).
-            if (metadata.IsPrepared)
+            try
             {
-                // We were raced, which would be unexpected, or it got invalidated...
-                if (!tracked.Complete(metadata.ToPreparedDescriptor()))
+                // Here we would make RowDescription portable (once we need it).
+                if (metadata.IsPrepared)
                 {
-                    if (!tracked.IsInvalid)
-                        ThrowHelper.ThrowInvalidOperation("Command was completed by another caller, this should not happen.");
-                    // If it's invalid we must add it to leaked commands for cleanup.
-                    // TODO if we were disposed we have to do something else.
-                    Debug.Assert(_leakedCommandNames is not null, "Any owned command complete shouldn't find a null leaked list.");
-                    _leakedCommandNames.Add(tracked.CommandName);
+                    // We were raced, which would be unexpected, or it got invalidated...
+                    if (!tracked.Complete(metadata.ToPreparedDescriptor()))
+                    {
+                        if (!tracked.IsInvalid)
+                            ThrowHelper.ThrowInvalidOperation("Command was completed by another caller, this should not happen.");
+                        // If it's invalid we must add it to leaked commands for cleanup.
+                        // TODO if we were disposed we have to do something else.
+                        Debug.Assert(_leakedCommandNames is not null, "Any owned command complete shouldn't find a null leaked list.");
+                        _leakedCommandNames.Add(tracked.CommandName);
+                    }
                 }
+                // If !metadata.IsPrepared the Parse failed (or was skipped). We leave tracked at
+                // Initialized so a future caller can re-attempt the preparation; the finally below
+                // releases the in-flight marker so they aren't blocked from doing so.
+            }
+            finally
+            {
+                _preparingCommands.TryRemove(tracked, out _);
             }
         }
 
@@ -158,24 +168,24 @@ sealed class CommandTracker : IDisposable, IAsyncDisposable
         if (_owned is not null)
         {
             // TODO aggregate and queue a close flow.
-            foreach (var (_, descriptor) in _owned)
-                descriptor.Dispose();
+            foreach (var (_, ownedTracker) in _owned)
+                ownedTracker.Dispose();
         }
-        _parent?.Dispose();
+        // _parent is the workload-scope tracker owned by SlonDataSource, not ours to dispose.
     }
 
-    public async ValueTask DisposeAsync()
+    public ValueTask DisposeAsync()
     {
         if (Interlocked.Exchange(ref _disposed, true))
-            return;
+            return default;
         if (_owned is not null)
         {
             // TODO aggregate and queue a close flow.
-            foreach (var (_, descriptor) in _owned)
-                descriptor.Dispose();
+            foreach (var (_, ownedTracker) in _owned)
+                ownedTracker.Dispose();
         }
-        if (_parent != null)
-            await _parent.DisposeAsync().ConfigureAwait(false);
+        // _parent is the workload-scope tracker owned by SlonDataSource, not ours to dispose.
+        return default;
     }
 
     // We don't want to pass our AdoConnectionProxy as these instances would then have a path back to the CWT.

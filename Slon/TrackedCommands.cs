@@ -3,15 +3,20 @@ using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
 using Slon.Pg;
+using Slon.Runtime.CompilerServices;
 
 namespace Slon;
 
 sealed class TrackedCommands(int maxAuto, int autoMinimumUses)
 {
     readonly ConcurrentDictionary<string, TrackedCommand?[]> _commands = new(concurrencyLevel: 1, capacity: 1);
-    int _autoCount;
-    ConditionalWeakTable<string, TrackedCandidate>? _weakCandidates;
-    string?[]? _candidates;
+    // Candidate set keyed by SQL text content (so callers aggregate) with weak-key lifetime
+    // (so dropped SQL strings clean themselves up).
+    readonly WeakKeyedTable<string, StrongBox<int>> _candidates = new();
+    // Admission/eviction is serialized. Readers (Find) stay lockless.
+    readonly Lock _admissionLock = new();
+    int _nameCounter; // monotonic, names never collide
+    int _autoCount;   // currently-live auto TrackedCommands, gated against maxAuto
 
     public ICollection<TrackedCommand?[]> Commands => _commands.Values;
 
@@ -35,51 +40,73 @@ sealed class TrackedCommands(int maxAuto, int autoMinimumUses)
         bool Core(CommandDescriptor descriptor, [NotNullWhen(true)]out TrackedCommand? tracked)
         {
             var commandText = descriptor.UnpreparedCommandText;
-            _weakCandidates ??= new();
-            _candidates ??= new string?[maxAuto];
-            TrackedCandidate? candidate;
-            while (!_weakCandidates.TryGetValue(commandText, out candidate))
-            {
-                // TODO maybe we use a hashset + count check instead?
-                // Use IndexOf so we get vectorized search.
-                var auto = _candidates.AsSpan();
-                int i;
-                while ((i = auto.IndexOf((string?)null)) is not -1)
-                {
-                    if (Interlocked.CompareExchange(ref auto[i], commandText, null) is null)
-                        break;
-                    auto = auto[i..];
-                }
+            var box = _candidates.GetOrAdd(commandText, static _ => new StrongBox<int>());
 
-                // No more room for new auto candidates.
-                if (i is -1)
-                {
-                    tracked = null;
-                    return false;
-                }
-
-                if (_weakCandidates.TryAdd(commandText, candidate = new TrackedCandidate(autoMinimumUses)))
-                    break;
-
-                Volatile.Write(ref auto[i], null);
-            }
-
-            if (!candidate.TryPromote())
+            if (Interlocked.Increment(ref box.Value) < autoMinimumUses)
             {
                 tracked = null;
                 return false;
             }
 
-            var autoCount = Interlocked.Increment(ref _autoCount);
-            if (autoCount <= maxAuto)
+            lock (_admissionLock)
             {
-                tracked = GetOrAdd(new TrackedCommand(TrackedCommandKind.Auto, descriptor with { CommandName = $"_ap{autoCount}" }));
+                // Re-check under lock. A peer admission may have just landed for this descriptor.
+                if (Find(TrackedCommandKind.Auto, descriptor) is { } existing)
+                {
+                    tracked = existing;
+                    _candidates.Remove(commandText);
+                    return true;
+                }
+
+                if (_autoCount >= maxAuto && !TryEvictLruLocked())
+                {
+                    tracked = null;
+                    return false;
+                }
+
+                var name = ++_nameCounter;
+                var newTracked = new TrackedCommand(TrackedCommandKind.Auto, descriptor with { CommandName = $"_ap{name}" });
+                var added = TryAdd(newTracked);
+                Debug.Assert(added, "Re-check under lock should have caught a peer admission.");
+                _autoCount++;
+                _candidates.Remove(commandText);
+                tracked = newTracked;
                 return true;
             }
-            Interlocked.Decrement(ref _autoCount);
-            tracked = null;
-            return false;
         }
+    }
+
+    // Must be called with _admissionLock held.
+    bool TryEvictLruLocked()
+    {
+        TrackedCommand? lru = null;
+        long lruTicks = long.MaxValue;
+        foreach (var variants in _commands.Values)
+        {
+            for (var i = 0; i < variants.Length; i++)
+            {
+                var variant = variants[i];
+                if (variant is null || variant.Kind != TrackedCommandKind.Auto || variant.IsInvalid)
+                    continue;
+                var ticks = variant.LastAccessedTicks;
+                if (ticks < lruTicks)
+                {
+                    lruTicks = ticks;
+                    lru = variant;
+                }
+            }
+        }
+
+        if (lru is null)
+            return false;
+
+        // Concurrent Invalidate (e.g. from a connection-side drift path) may have raced us.
+        if (!lru.Invalidate())
+            return false;
+
+        Remove(lru);
+        _autoCount--;
+        return true;
     }
 
     bool Remove(TrackedCommand tracked)
@@ -165,12 +192,5 @@ sealed class TrackedCommands(int maxAuto, int autoMinimumUses)
         }
 
         return null;
-    }
-
-    sealed class TrackedCandidate(int minimumUses)
-    {
-        int _trackedUses;
-        public int TrackedUses => _trackedUses;
-        public bool TryPromote() => Interlocked.Increment(ref _trackedUses) >= minimumUses;
     }
 }
