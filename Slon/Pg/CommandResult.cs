@@ -317,7 +317,14 @@ sealed class CommandResult<TEnumerator>(TEnumerator enumerator) : CommandResult 
     internal new void Initialize(int index, CommandDescriptor descriptor, RowDescription? requestedRowDescription, bool requestedExecution, bool simpleProtocol)
         => base.Initialize(index, descriptor, requestedRowDescription, requestedExecution, simpleProtocol);
 
-    protected override BackendMessage GetCurrentMessage() => ((IEnumerator<BackendMessage>)_messageEnumerator).Current;
+    protected override BackendMessage GetCurrentMessage()
+    {
+        return GetCurrent(_messageEnumerator);
+
+        // Disambiguate Current without having to do a cast.
+        static BackendMessage GetCurrent<T>(T enumerator) where T : IEnumerator<BackendMessage> => enumerator.Current;
+    }
+
     protected override bool MoveNextMessage() => _messageEnumerator.MoveNext();
     protected override ValueTask<bool> MoveNextMessageAsync() => _messageEnumerator.MoveNextAsync();
 
