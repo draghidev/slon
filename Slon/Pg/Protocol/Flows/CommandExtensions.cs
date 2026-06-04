@@ -11,7 +11,12 @@ static class CommandExtensions
     public static bool IsSimple(this in Command command) =>
         command.PreferSimple && command.WithSync && !command.DescribeOnly && !command.Descriptor.IsPrepared && command.Descriptor.ParameterTypes.Count is 0;
 
-    public static async ValueTask WriteAuto(this Command command, PgEncoder encoder, CancellationToken cancellationToken = default)
+    // Sync/async pair at the Command (full composition) level. No *Auto wrapper here.
+    // Callers picking sync vs async make that choice once at this level rather than threading
+    // a mode flag through every encoder helper underneath. WriteAllCommands always picks
+    // WriteAsync for the back-pressure handoff to work. Mode-adaptive callers do
+    // `command.IsAsync ? command.WriteAsync(...) : command.Write(...)` themselves.
+    public static async ValueTask WriteAsync(this Command command, PgEncoder encoder, CancellationToken cancellationToken = default)
     {
         var descriptor = command.Descriptor;
         if (descriptor.IsPrepared)
@@ -25,7 +30,7 @@ static class CommandExtensions
                 parameters = descriptor.ParameterTypes.ToDbNullParameterList();
             }
 
-            await encoder.WriteBindAuto(descriptor.CommandName, parameters: parameters, cancellationToken: cancellationToken).ConfigureAwait(false);
+            await encoder.WriteBindAsync(descriptor.CommandName, parameters: parameters, cancellationToken: cancellationToken).ConfigureAwait(false);
 
             // We always re-request the description for describe only, even for prepared statements.
             if (command.DescribeOnly)
@@ -46,7 +51,7 @@ static class CommandExtensions
         }
         else if (command.IsSimple())
         {
-            await encoder.WriteQueryAuto(descriptor.UnpreparedCommandText).ConfigureAwait(false);
+            await encoder.WriteQueryAsync(descriptor.UnpreparedCommandText).ConfigureAwait(false);
         }
         else
         {
@@ -60,8 +65,64 @@ static class CommandExtensions
             }
 
             // Extended unprepared.
-            await encoder.WriteParseAuto(descriptor.UnpreparedCommandText, descriptor.CommandName, descriptor.ParameterTypes, cancellationToken: cancellationToken).ConfigureAwait(false);
-            await encoder.WriteBindAuto(descriptor.CommandName, parameters: parameters, cancellationToken: cancellationToken).ConfigureAwait(false);
+            await encoder.WriteParseAsync(descriptor.UnpreparedCommandText, descriptor.CommandName, descriptor.ParameterTypes, cancellationToken: cancellationToken).ConfigureAwait(false);
+            await encoder.WriteBindAsync(descriptor.CommandName, parameters: parameters, cancellationToken: cancellationToken).ConfigureAwait(false);
+            encoder.WriteDescribe();
+            if (!command.DescribeOnly)
+                encoder.WriteExecute();
+            if (command.WithSync)
+                encoder.WriteSync();
+        }
+    }
+
+    public static void Write(this Command command, PgEncoder encoder)
+    {
+        var descriptor = command.Descriptor;
+        if (descriptor.IsPrepared)
+        {
+            var parameters = command.Parameters;
+            if (parameters.Length != descriptor.ParameterTypes.Count)
+            {
+                if (!command.DescribeOnly)
+                    ThrowHelper.ThrowInvalidOperation($"Prepared command parameter count mismatch with descriptor, expected: ${descriptor.ParameterTypes.Count}.");
+
+                parameters = descriptor.ParameterTypes.ToDbNullParameterList();
+            }
+
+            encoder.WriteBind(descriptor.CommandName, parameters: parameters);
+
+            if (command.DescribeOnly)
+            {
+                encoder.WriteDescribe();
+            }
+            else
+            {
+                if (descriptor.IsPrepared && descriptor.PreparedRowDescription is null)
+                    encoder.WriteDescribe();
+
+                encoder.WriteExecute();
+            }
+
+            if (command.WithSync)
+                encoder.WriteSync();
+        }
+        else if (command.IsSimple())
+        {
+            encoder.WriteQuery(descriptor.UnpreparedCommandText);
+        }
+        else
+        {
+            var parameters = command.Parameters;
+            if (parameters.Length != descriptor.ParameterTypes.Count)
+            {
+                if (!command.DescribeOnly)
+                    ThrowHelper.ThrowInvalidOperation("Parameter count mismatch between descriptor and command, unprepared parameter sources must match.");
+
+                parameters = descriptor.ParameterTypes.ToDbNullParameterList();
+            }
+
+            encoder.WriteParse(descriptor.UnpreparedCommandText, descriptor.CommandName, descriptor.ParameterTypes);
+            encoder.WriteBind(descriptor.CommandName, parameters: parameters);
             encoder.WriteDescribe();
             if (!command.DescribeOnly)
                 encoder.WriteExecute();

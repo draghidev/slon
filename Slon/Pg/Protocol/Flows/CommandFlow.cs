@@ -104,16 +104,15 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                 }
             }
 
-            var encoder = context.GetEncoder();
-            for (var i = 0; i < CommandCount; i++)
-                await _options.Commands[i].WriteAuto(encoder, _callerCancellationToken).ConfigureAwait(false);
-
-            if (!encoder.LastMessageInducesRfq)
-            {
-                _readFlowRfq = true;
-                encoder.WriteSync();
-            }
-            await encoder.FlushAuto(_callerCancellationToken).ConfigureAwait(false);
+            // All writes captured as a single task. If the writes back-pressure (TCP send
+            // buffer full, large batch saturating local+peer windows), this task is pending
+            // and ExecutePipelined awaits it concurrently with the read phase — reads drain
+            // the wire, the peer ACKs, the trailing writes complete. If writes fit in the
+            // buffer, the task is sync-completed and the later await is a free no-op.
+            // See https://www.postgresql.org/message-id/CADT4RqAH2nuVwM6cEugFL2z6apwXfP3OJb=zxR6jRgWEpx_2Ww@mail.gmail.com
+            // https://github.com/pgjdbc/pgjdbc/issues/194
+            // https://github.com/npgsql/npgsql/issues/641
+            _writeTask = WriteAllCommands();
         }
         catch (Exception ex)
         {
@@ -121,14 +120,31 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
             throw;
         }
 
-        // TODO put writing past some point on a write task handled by the executor so it won't deadlock.
-        // See https://www.postgresql.org/message-id/CADT4RqAH2nuVwM6cEugFL2z6apwXfP3OJb=zxR6jRgWEpx_2Ww@mail.gmail.com
-        // https://www.postgresql.org/message-id/E1YPrLl-0001qZ-5g%40gemulon.postgresql.org
-        // https://github.com/postgres/postgres/commit/2a3f6e368babdac7b586a7d43105af60fc08b1a3#diff-f841acf02862af937cc11c55df1c8ae3e8db81dd16ea0c0e0c7ead5f404e796cR915
-        // https://github.com/pgjdbc/pgjdbc/issues/194
-        // https://github.com/npgsql/npgsql/issues/641
-        _writeTask = new ValueTask();
         return DispatchPipelinedRead(context, context.GetProtocolStatic<ReadState>().ReadPromise);
+
+        // Always async writes and flushes regardless of flow mode. The whole point of capturing
+        // this as a single task is to let it complete inline when the wire is responsive AND
+        // yield when back-pressure hits. Sync flushes (which block the caller's thread on the
+        // syscall) would defeat that and re-introduce the npgsql-style sync-batch deadlock.
+        //
+        // Note: today the inner *Auto methods don't flush internally (parameter sizes are
+        // trivial), so only the final FlushAsync matters. Once the full serializer lands,
+        // WriteBindAuto / WriteParseAuto will flush mid-parameter for large payloads — those
+        // flushes must also be on the async path (via *Async overloads or a force-async-flush
+        // scope on the encoder).
+        async ValueTask WriteAllCommands()
+        {
+            var encoder = context.GetEncoder();
+            for (var i = 0; i < CommandCount; i++)
+                await _options.Commands[i].WriteAsync(encoder, _callerCancellationToken).ConfigureAwait(false);
+
+            if (!encoder.LastMessageInducesRfq)
+            {
+                _readFlowRfq = true;
+                encoder.WriteSync();
+            }
+            await encoder.FlushAsync(_callerCancellationToken).ConfigureAwait(false);
+        }
     }
 
     // The reason this whole mechanism exists rather than just `using var _ = BeginCallScope(...);

@@ -26,15 +26,37 @@ readonly struct PgEncoder
 
     public ValueTask WriteQueryAuto(string commandText)
     {
+        if (_executionControl.IsAsync)
+            return WriteQueryAsync(commandText);
+        WriteQuery(commandText);
+        return new();
+    }
+
+    // Today identical to WriteQuery in body. Once the serializer / large-query path lands,
+    // this takes the async-flush route when the text exceeds buffer capacity.
+    public ValueTask WriteQueryAsync(string commandText)
+    {
+        WriteQuery(commandText);
+        return new();
+    }
+
+    public void WriteQuery(string commandText)
+    {
         var encoding = ClientEncoding;
         var commandTextLength = GetStringWithNullTerminatorByteCount(commandText, encoding);
         StartMessage(FrontendType.Query, bodyLength: commandTextLength);
         _writer.WriteStringWithNullTerminator(commandText, encoding, commandTextLength);
+    }
 
+    public ValueTask WriteParseAuto(string commandText, EncodedString commandName = default, ParameterTypeList parameterTypes = default, CancellationToken cancellationToken = default)
+    {
+        if (_executionControl.IsAsync)
+            return WriteParseAsync(commandText, commandName, parameterTypes, cancellationToken);
+        WriteParse(commandText, commandName, parameterTypes);
         return new();
     }
 
-    public async ValueTask WriteParseAuto(string commandText, EncodedString commandName = default, ParameterTypeList parameterTypes = default, CancellationToken cancellationToken = default)
+    public async ValueTask WriteParseAsync(string commandText, EncodedString commandName = default, ParameterTypeList parameterTypes = default, CancellationToken cancellationToken = default)
     {
         var encoding = ClientEncoding;
         var commandTextLength = GetStringWithNullTerminatorByteCount(commandText, encoding);
@@ -57,7 +79,47 @@ readonly struct PgEncoder
             _writer.WriteUInt(enumerator.Current.Oid.Value);
     }
 
+    public void WriteParse(string commandText, EncodedString commandName = default, ParameterTypeList parameterTypes = default)
+    {
+        var encoding = ClientEncoding;
+        var commandTextLength = GetStringWithNullTerminatorByteCount(commandText, encoding);
+        var commandNameBytes = commandName.AsNullTerminatedSpan(encoding);
+        var parameterCount = parameterTypes.PgCount;
+        StartMessage(FrontendType.Parse, bodyLength:
+            commandNameBytes.Length +
+            commandTextLength +
+            sizeof(ushort) +
+            parameterCount * sizeof(uint)
+        );
+
+        _writer.WriteRaw(commandNameBytes);
+        _writer.WriteStringWithNullTerminator(commandText, encoding, commandTextLength);
+        _writer.WriteUShort(parameterCount);
+
+        using var enumerator = parameterTypes.GetEnumerator(_writer.OidLookup);
+        while (enumerator.MoveNext())
+            _writer.WriteUInt(enumerator.Current.Oid.Value);
+    }
+
     public ValueTask WriteBindAuto(EncodedString commandName = default, EncodedString portalName = default, ImmutableArray<Parameter> parameters = default, CancellationToken cancellationToken = default)
+    {
+        if (_executionControl.IsAsync)
+            return WriteBindAsync(commandName, portalName, parameters, cancellationToken);
+        WriteBind(commandName, portalName, parameters);
+        return new();
+    }
+
+    // Today identical to WriteBind in body. The full serializer hasn't landed yet, so
+    // parameter writes are just buffer fills with no flush points. Once the serializer is in
+    // and large parameter payloads need to flush mid-write, this method takes the async-flush
+    // path (FlushAsync) while WriteBind takes the sync-flush path (Flush).
+    public ValueTask WriteBindAsync(EncodedString commandName = default, EncodedString portalName = default, ImmutableArray<Parameter> parameters = default, CancellationToken cancellationToken = default)
+    {
+        WriteBind(commandName, portalName, parameters);
+        return new();
+    }
+
+    public void WriteBind(EncodedString commandName = default, EncodedString portalName = default, ImmutableArray<Parameter> parameters = default)
     {
         var encoding = ClientEncoding;
         var portalNameBytes = portalName.AsNullTerminatedSpan(encoding);
@@ -122,8 +184,6 @@ readonly struct PgEncoder
 
         _writer.WriteUShort(1); // result format codes
         _writer.WriteUShort(1); // all binary for now
-
-        return new();
     }
 
     public void WriteDescribe(EncodedString name = default, bool portalName = true)
