@@ -5,10 +5,15 @@ public readonly struct SchedulingContext<T>
     public SchedulingContext(T connection, CancellationToken userCancellationToken, bool idle = true)
     {
         Connection = connection;
+        UserCancellationToken = userCancellationToken;
         Idle = idle;
     }
 
     public T Connection { get; }
+
+    /// The cancellation token passed to the original Get call. Schedule predicates can use this
+    /// when their scheduling work needs to honor caller cancellation.
+    public CancellationToken UserCancellationToken { get; }
 
     /// This connection was idle when selected.
     /// <returns>True when idle. False when busy, there may be delays before new work gets processed.</returns>

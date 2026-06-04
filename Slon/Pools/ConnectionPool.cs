@@ -17,13 +17,9 @@ public class ConnectionPoolOptions
 public sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
     where T : class, IPoolConnection<T>
 {
-    const int BeforeIncrement = -1;
-    const int SortActive = -2;
-
     volatile bool _disposed;
     object SyncObj { get; } = new();
 
-    readonly StripedInt _stripedLastIndex;
     readonly StripedRef<object?> _stripedConnections;
 
     readonly ConnectionPoolContext<T> _context;
@@ -47,10 +43,6 @@ public sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
             maxConnections < Environment.ProcessorCount ? maxConnections : Math.Max(1, maxConnections / Environment.ProcessorCount)
             );
 
-        _stripedLastIndex = new(_stripedConnections.LengthPerStripe);
-        for (var i = 0; i < _stripedLastIndex.Length; i++)
-            _stripedLastIndex[i] = BeforeIncrement;
-
         _factory = factory;
         var channel = Channel.CreateUnbounded<T>(new() { AllowSynchronousContinuations = false });
         (_idleWriter, _idleReader) = (channel.Writer, channel.Reader);
@@ -72,12 +64,10 @@ public sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
         if (schedule is not null && schedule(context, state))
             return true;
 
-        // We didn't schedule anything, if it was not busy we put it back onto the idle channel.
-        // If it was an attempt to schedule onto a busy connection it may have gone idle in the meantime.
-        // That would have already pushed it back on the channel, so we check !Busy here and not Connection.IsIdle.
-        if (!newConnection && !context.Idle)
-            _idleWriter.TryWrite(context.Connection);
-
+        // No re-enqueue on stripe-walk failure: those conns are non-idle, putting them on the
+        // idle channel would pollute it (every channel reader would have to defend against
+        // non-idle conns). If the conn actually goes idle, its own idle signal puts it on the
+        // channel. We don't have to anticipate.
         return false;
     }
 
@@ -127,47 +117,13 @@ public sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
             }
         }
 
-        var startIndex = 0;
         var connections = _stripedConnections.Current;
-        // No need to try to increment and sort if there is only one connection.
-        if (connections.Length > 1)
-        {
-            ref var perCoreIndex = ref _stripedLastIndex.Current;
-            var spinner = new SpinWait();
-            start:
-            // Add to 'least busy' pipeline.
-            startIndex = Volatile.Read(ref perCoreIndex);
-            if (startIndex >= BeforeIncrement)
-            {
-                var newIndex = startIndex + 1 <= connections.Length ? startIndex + 1 : 0;
-                if (Interlocked.CompareExchange(ref perCoreIndex, newIndex, startIndex) != startIndex)
-                    goto start;
-                startIndex = newIndex;
-            }
-            else
-            {
-                // Some other thread got preempted while sorting the connections of tihs core, wait for this.
-                spinner.SpinOnce();
-                goto start;
-            }
-
-            if (startIndex == connections.Length)
-            {
-                int currIndex;
-                do
-                {
-                    if ((currIndex = Interlocked.CompareExchange(ref perCoreIndex, SortActive, startIndex)) == startIndex)
-                        break;
-                    if (currIndex == SortActive)
-                        goto start;
-                    startIndex = Volatile.Read(ref perCoreIndex);
-                } while (currIndex != startIndex);
-
-                connections.AsSpan().Sort(Sort);
-                startIndex = 0;
-                Volatile.Write(ref perCoreIndex, startIndex);
-            }
-        }
+        // Thread-local XorShift start: zero atomic ops, just a TLS field and one mix step. Each
+        // thread picks a different offset so concurrent walkers don't pile onto slot 0. Works
+        // correctly under TPC pinning and general-thread schedulers alike.
+        var startIndex = connections.Length > 1
+            ? NextRandomStart(connections.Length)
+            : 0;
 
         future = null;
         for (var i = startIndex; i < startIndex + connections.Length; i++)
@@ -182,11 +138,11 @@ public sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
                     return false;
                 }
 
-                // Checking IsIdle prevents a race where:
-                // 1. thread A doesn't see a connection in the idle channel and starts iterating all connections.
-                // 2. thread B completes remaining work which puts the idle connection onto the channel.
-                // 3. thread A was iterating ends up scheduling work onto this idle connection.
-                // 4. thread C reads from the idle channel and unexpectedly ends up queueing work.
+                // Idle conns belong to the channel reader; skip. Non-idle conns are multiplex
+                // candidates — take the first hit. Power-of-two-choices was measured slower in
+                // synthetic benchmarks and its load-distribution guarantee assumes homogeneous
+                // service cost — for heterogeneous PG workloads PipelineDepth is a noisy proxy.
+                // Revisit when we have real production data showing uneven utilization.
                 if (!conn.IsIdle && DoSchedule(new(conn, cancellationToken, idle: false), schedule, state))
                 {
                     future = null;
@@ -207,43 +163,6 @@ public sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
         connection = default;
         return false;
 
-        static int Sort(object? left, object? right)
-        {
-            // Order by:
-            // 1. open spots (nulls).
-            // 2. successfully completed futures and connections (leftConn.CompareTo(rightConn)).
-            // 3. pending futures.
-
-            T leftConn;
-            switch (left)
-            {
-                case null:
-                    return right is null ? 0 : -1;
-                case ConnectionFuture leftFuture:
-                    if (leftFuture.Result is not null)
-                        leftConn = leftFuture.Result;
-                    else
-                        return right is ConnectionFuture { IsCompleted: false } ? 0 : 1;
-                    break;
-                default:
-                    leftConn = UnsafeCast(left);
-                    break;
-            }
-
-            // Remaining cases after concluding 'left' is a connection.
-            return right switch
-            {
-                null => 1,
-                ConnectionFuture rightFuture => !rightFuture.IsCompleted ? -1 : leftConn.CompareTo(rightFuture.Result),
-                _ => leftConn.CompareTo(UnsafeCast(right)),
-            };
-
-            static T UnsafeCast(object? instance)
-            {
-                Debug.Assert(instance is T);
-                return Unsafe.As<T>(instance);
-            }
-        }
     }
 
     // Must complete the future before exiting.
@@ -347,8 +266,10 @@ public sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
 
         bool GetInternal(long id, out ConnectionFuture? future, [NotNullWhen(true)]out T? result)
         {
-            var index = (int)Math.Abs(id % _stripedConnections.LengthPerStripe);
-            var connections = _stripedConnections[(int)Math.Abs(id % _stripedConnections.Length)].AsSpan();
+            // Cast to ulong to avoid Math.Abs(int.MinValue) returning int.MinValue (overflow). The
+            // sign bit gets dropped cleanly. Modulo on the unsigned space wraps correctly.
+            var index = (int)((ulong)id % (ulong)_stripedConnections.LengthPerStripe);
+            var connections = _stripedConnections[(int)((ulong)id % (ulong)_stripedConnections.Length)].AsSpan();
             T? connection = null;
             for (var i = index; i < index + connections.Length; i++)
             {
@@ -405,9 +326,11 @@ public sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
     }
 
     public T Get(TimeSpan timeout)
-        => GetCore<object?>(null, null, timeout);
+        => GetCore(AlwaysTrue, (object?)null, timeout);
     public T Get<TState>(Func<SchedulingContext<T>, TState, bool> schedule, TState state, TimeSpan timeout)
         => GetCore(schedule, state, timeout);
+
+    static readonly Func<SchedulingContext<T>, object?, bool> AlwaysTrue = static (_, _) => true;
 
     ValueTask<T> GetCoreAsync<TState>(Func<SchedulingContext<T>, TState, bool>? schedule, TState state, TimeSpan timeout, CancellationToken cancellationToken = default)
     {
@@ -422,7 +345,7 @@ public sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
     }
 
     public ValueTask<T> GetAsync(TimeSpan timeout, CancellationToken cancellationToken = default)
-        => GetCoreAsync<object?>(null, null, timeout, cancellationToken);
+        => GetCoreAsync(AlwaysTrue, (object?)null, timeout, cancellationToken);
     public ValueTask<T> GetAsync<TState>(Func<SchedulingContext<T>, TState, bool>? schedule, TState state, TimeSpan timeout, CancellationToken cancellationToken = default)
         => GetCoreAsync(schedule, state, timeout, cancellationToken);
 
@@ -453,7 +376,7 @@ public sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
 
             _disposed = true;
             _idleWriter.Complete();
-            var tasks = new Task[_stripedConnections.Length * _stripedConnections.LengthPerStripe];
+            var pending = new List<Task>();
             for (var i = 0; i < _stripedConnections.Length; i++)
             {
                 var array = _stripedConnections[i];
@@ -465,7 +388,7 @@ public sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
                     ref var connSlot = ref array[j];
                     if (TryGetConnection(ref connSlot, out var conn))
                     {
-                        tasks[i * j] = Task.Run(async () =>
+                        pending.Add(Task.Run(async () =>
                         {
                             try
                             {
@@ -475,12 +398,12 @@ public sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
                             {
                                 // TODO This 'should' log something.
                             }
-                        });
+                        }));
                     }
                 }
             }
 
-            return tasks;
+            return pending.Count is 0 ? null : pending.ToArray();
         }
     }
 
@@ -504,6 +427,21 @@ public sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
         return connection is not null;
     }
 
+    [ThreadStatic]
+    static uint _xorShiftState;
+
+    static int NextRandomStart(int bound)
+    {
+        var s = _xorShiftState;
+        if (s is 0)
+            s = (uint)Environment.CurrentManagedThreadId | 1u;
+        s ^= s << 13;
+        s ^= s >> 17;
+        s ^= s << 5;
+        _xorShiftState = s;
+        return (int)(s % (uint)bound);
+    }
+
     void ThrowIfDisposed()
     {
         if (_disposed)
@@ -515,19 +453,23 @@ public sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
     sealed class ConnectionFuture
     {
         T? _conn;
-        bool _isCompleted;
+        bool _reserved;
+        bool _published;
 
         public void Complete(T? conn)
         {
-            if (!_isCompleted)
-            {
-                _isCompleted = true;
-                _conn = conn;
-            }
+            // Reserve via CAS so only one writer proceeds. Then store _conn before publishing,
+            // so any reader observing _published=true is guaranteed to see the conn store. Two
+            // flags (reserve + publish) keep the writer ordering clear: reserve gates entry,
+            // publish gates visibility.
+            if (Interlocked.CompareExchange(ref _reserved, true, false))
+                return;
+            Volatile.Write(ref _conn, conn);
+            Volatile.Write(ref _published, true);
         }
 
-        public T? Result => _conn;
-        public bool IsCompleted => _isCompleted;
+        public T? Result => Volatile.Read(ref _conn);
+        public bool IsCompleted => Volatile.Read(ref _published);
     }
 }
 

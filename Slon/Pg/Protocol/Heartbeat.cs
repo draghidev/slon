@@ -27,7 +27,7 @@ public sealed class Heartbeat : IDisposable
                     var period = _timer.Period;
                     try
                     {
-                        var next = _actionHead?.Next;
+                        var next = _actionHead;
                         while (next is not null)
                         {
                             // TODO this smells, for flexibility the signature should be ValueTask, but there is no ValueTask.WhenAll.
@@ -59,12 +59,12 @@ public sealed class Heartbeat : IDisposable
     {
         lock (_lock)
         {
-            var next = new ActionNode(action);
+            var node = new ActionNode(action);
             if (_actionTail is not null)
-                _actionTail.Next = next;
-            if (_actionHead is not null)
-                _actionHead = next;
-            _actionTail = next;
+                _actionTail.Next = node;
+            if (_actionHead is null)
+                _actionHead = node;
+            _actionTail = node;
         }
     }
 

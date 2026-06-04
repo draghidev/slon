@@ -1,4 +1,3 @@
-using Slon.Pg.Protocol;
 namespace Slon.Pools;
 
 public sealed class ConnectionPoolContext<T>(Action<T> signalIdle, Action<T, Func<T, TimeSpan, ValueTask>> onHeartbeat)
