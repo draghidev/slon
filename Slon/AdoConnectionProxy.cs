@@ -16,29 +16,33 @@ sealed class AdoConnectionProxy : IDisposable, IAsyncDisposable
 {
     readonly SlonDataSource? _dataSource;
     readonly CommandTracker _tracker;
-    readonly PgClientProtocol _client;
+    readonly PgConnection _pgConnection;
     readonly IAdoConnection _connection;
 
     CommandFlow? _cachedFlow;
     int _pipelineDepth;
     bool _inExclusiveScope;
 
-    internal AdoConnectionProxy(SlonDataSource dataSource, PgClientProtocol client, IAdoConnection connection)
+    internal AdoConnectionProxy(SlonDataSource dataSource, PgConnection pgConnection, IAdoConnection connection)
     {
         _dataSource = dataSource;
-        _tracker = _dataSource.GetCommandTracker(initializedOnly: true);
-        _client = client;
         _connection = connection;
+        _pgConnection = pgConnection;
+        // Auto-prepare uses the workload-scope tracker directly. Explicit-prepare bookkeeping
+        // lives on SlonConnection (per Policy A, survives Close-Open). PgConnection ↔ tracker
+        // registration happens at PgConnection construction (in the factory), not here. Proxy
+        // is per-lease, PgConnection-tracker binding is per-session.
+        _tracker = dataSource.GetCommandTracker(initializedOnly: true);
     }
 
-    internal AdoConnectionProxy(PgClientProtocol client, IAdoConnection connection, bool autoPrepare, CommandTracker? tracker = null)
+    internal AdoConnectionProxy(PgConnection pgConnection, IAdoConnection connection, bool autoPrepare, CommandTracker? tracker = null)
     {
         const int MaxAuto = 100;
         const int AutoMinimumUses = 5;
 
-        _client = client;
         _connection = connection;
         _tracker = new(autoPrepare ? MaxAuto : 0, AutoMinimumUses, parent: tracker);
+        _pgConnection = pgConnection;
     }
 
     public string ConnectionString => ""; // TODO pull from client or pass it in somehow.
@@ -47,6 +51,9 @@ sealed class AdoConnectionProxy : IDisposable, IAsyncDisposable
 
     internal PgClientFlow? CurrentReadingFlow { get; set; }
     internal PgClientFlow? CurrentWritingFlow { get; set; }
+
+    internal CommandTracker Tracker => _tracker;
+    internal PgConnection PgConnection => _pgConnection;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public TrackerResult TrackCommand(in CommandDescriptor descriptor, TrackedCommand? tracked = null, object? owningInstance = null)
@@ -71,6 +78,20 @@ sealed class AdoConnectionProxy : IDisposable, IAsyncDisposable
             ThrowHelper.ThrowInvalidOperation("Could not enqueue flow.");
     }
 
+    // Sync delegate-based enqueue, sibling to the async variant: snapshots the current PgConnection
+    // so the flowFactory callback's decisions (presence consultation, descriptor baking) and the queue
+    // operation share a single atomic reference.
+    public TFlow Enqueue<TArg, TFlow>(Func<PgConnection, TArg, TFlow> flowFactory, TArg arg)
+        where TFlow : PgClientFlow
+        where TArg : allows ref struct
+    {
+        var connection = _pgConnection;
+        var flow = flowFactory(connection, arg);
+        if (!TryQueueOn(connection, flow))
+            ThrowHelper.ThrowInvalidOperation("Could not enqueue flow.");
+        return flow;
+    }
+
     // Returns the given flow to allow an async caller to directly return this task.
     public ValueTask<TFlow> EnqueueAsync<TFlow>(TFlow flow, CancellationToken cancellationToken) where TFlow : PgClientFlow
     {
@@ -80,7 +101,27 @@ sealed class AdoConnectionProxy : IDisposable, IAsyncDisposable
         return new(flow);
     }
 
-    bool TryQueue(PgClientFlow flow)
+    // Delegate-based enqueue: snapshots the current PgConnection into a local for the duration of
+    // the flowFactory callback so the flow's wire-shape decisions (presence consultation, TryBeginPreparing,
+    // descriptor baking) happen atomically against the connection the flow will run on. Caller passes
+    // state through `arg` to avoid closure allocation.
+    public ValueTask<TFlow> EnqueueAsync<TArg, TFlow>(
+        Func<PgConnection, TArg, TFlow> flowFactory,
+        TArg arg,
+        CancellationToken cancellationToken)
+        where TFlow : PgClientFlow
+        where TArg : allows ref struct
+    {
+        var connection = _pgConnection;
+        var flow = flowFactory(connection, arg);
+        if (!TryQueueOn(connection, flow))
+            ThrowHelper.ThrowInvalidOperation("Could not enqueue flow.");
+        return new(flow);
+    }
+
+    bool TryQueue(PgClientFlow flow) => TryQueueOn(_pgConnection, flow);
+
+    bool TryQueueOn(PgConnection connection, PgClientFlow flow)
     {
         Interlocked.Increment(ref _pipelineDepth);
         flow.SetCompletionAction(static (flow, exception, state) =>
@@ -91,7 +132,7 @@ sealed class AdoConnectionProxy : IDisposable, IAsyncDisposable
             if (exception is not null && instance._inExclusiveScope)
                 instance._connection.Break(exception);
         }, this);
-        if (!_client.TryQueue(flow))
+        if (!connection.TryQueue(flow))
         {
             Interlocked.Decrement(ref _pipelineDepth);
             return false;
@@ -129,12 +170,12 @@ sealed class AdoConnectionProxy : IDisposable, IAsyncDisposable
 
     public void Dispose()
     {
-
+        // PgConnection survives the lease, it's the pool unit. Tracker deregister happens on
+        // PgConnection.CompleteAsync (true session end).
     }
 
     public ValueTask DisposeAsync()
     {
-        // TODO release managed resources here
         return new();
     }
 }

@@ -68,20 +68,20 @@ public class ClientBenchmark
 
     static readonly PgClientProtocolOptions ProtocolOptions = DispatchingSyncOptions;
 
-    internal static PgClientProtocolFactory CreateProtocolFactory()
+    internal static PgConnectionFactory CreateProtocolFactory()
     {
         var transportFactory = SocketStreamConnection.CreateFactory(Options.EndPoint);
-        return new PgClientProtocolFactory(Options, transportFactory, o =>
+        return new PgConnectionFactory(Options, transportFactory, configureOptions: o =>
         {
             o.RunEnqueueAsynchronously = ProtocolOptions.RunEnqueueAsynchronously;
         });
     }
 
-    private protected static ConnectionPool<PgClientProtocol> InitSlonPool(Func<PgClientProtocol, CancellationToken, ValueTask>? initializer, int? poolSize = null)
+    private protected static ConnectionPool<PgConnection> InitSlonPool(Func<PgConnection, CancellationToken, ValueTask>? initializer, int? poolSize = null)
     {
-        IPoolConnectionFactory<PgClientProtocol> factory = CreateProtocolFactory();
+        IPoolConnectionFactory<PgConnection> factory = CreateProtocolFactory();
         if (initializer is not null)
-            factory = new InitializingConnectionFactory<PgClientProtocol>(factory, asyncInitializer: initializer);
+            factory = new InitializingConnectionFactory<PgConnection>(factory, asyncInitializer: initializer);
 
         return new(factory, new() { MaxConnections = poolSize ?? Options.PoolSize });
     }

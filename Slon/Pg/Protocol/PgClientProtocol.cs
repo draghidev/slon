@@ -1,5 +1,4 @@
 using System.Buffers;
-using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Text;
@@ -8,7 +7,6 @@ using Slon.Runtime.CompilerServices;
 using Draghi.Pipelining;
 using Slon.Buffers;
 using Slon.Pg.Protocol.Flows;
-using Slon.Pools;
 using Slon.Transport;
 
 namespace Slon.Pg.Protocol;
@@ -19,18 +17,6 @@ enum ProtocolStatus
     Ready,
     Draining,
     Completed
-}
-
-// Per-session presence of a workload-known TrackedCommand. Absent (= missing from the presence
-// map) means no Parse has been issued for this name on this session. Preparing means a Parse
-// flow has been enqueued and hasn't completed; pipeline FIFO ordering lets follower flows
-// enqueue their Bind/Execute behind the Parse without re-issuing it. Present means the Parse
-// succeeded and the name is ready to use.
-enum PresenceState
-{
-    Absent,
-    Preparing,
-    Present,
 }
 
 // Lifecycle contract the protocol framework calls into. Explicit-impl on PgClientFlow forces
@@ -79,7 +65,7 @@ sealed class PgClientProtocolOptions
     public TimeSpan ReadTimeout { get; set; } = Timeout.InfiniteTimeSpan;
 }
 
-sealed class PgClientProtocol : IPoolConnection<PgClientProtocol>
+sealed class PgClientProtocol
 {
     readonly PgClientProtocolOptions _options;
     IOutputWriter<byte> _pipeWriter = null!;
@@ -101,12 +87,6 @@ sealed class PgClientProtocol : IPoolConnection<PgClientProtocol>
     // Any concurrent CompleteAsync (which also transitions to draining) is respected the same way.
     int _drainingCount;
 
-    // Per-session map of which TrackedCommands have been (or are being) Parsed on this connection.
-    // Synchronization between Preparing and follower use is provided by pipeline FIFO order,
-    // not by an explicit promise — followers see Preparing and enqueue their use behind the
-    // winner's Parse flow.
-    readonly ConcurrentDictionary<TrackedCommand, PresenceState> _presence = new();
-
     PgClientProtocol(PgClientProtocolOptions options)
     {
         _options = options;
@@ -117,70 +97,68 @@ sealed class PgClientProtocol : IPoolConnection<PgClientProtocol>
 
     public string CurrentSearchPath { get; set; } = "public";
 
-    public PresenceState GetPresence(TrackedCommand tracked)
-        => _presence.TryGetValue(tracked, out var state) ? state : PresenceState.Absent;
-
-    // Atomic Absent -> Preparing. Winner enqueues the Parse flow (its own Sync window so a
-    // sibling error can't kill it); losers see Preparing and enqueue only their use flow.
-    public bool TryBeginPreparing(TrackedCommand tracked)
-        => _presence.TryAdd(tracked, PresenceState.Preparing);
-
-    // Called from the Parse flow's completion handler on success.
-    public void MarkPresent(TrackedCommand tracked)
-        => _presence[tracked] = PresenceState.Present;
-
-    // Called on eviction (DEALLOCATE fanout) or to roll back an optimistic Preparing marker
-    // when the Parse flow failed.
-    public void MarkAbsent(TrackedCommand tracked)
-        => _presence.TryRemove(tracked, out _);
-
-    // Session-wide reset (DISCARD ALL, role change, reconnect) destroyed every prepared
-    // statement on this session; drop all presence so subsequent uses re-Parse.
-    public void ClearPresence()
-        => _presence.Clear();
-
     Control FlowControl { get; }
     CancellationToken AbortToken => _abortToken;
     public int PipelineDepth => _pipeline.Depth;
     ProtocolStatus Status => _status;
 
+    // Pool-unit accessors. PgConnection forwards its IPoolConnection<PgConnection> implementation
+    // to these. Keeps the protocol package decoupled from Slon.Pools' typed context.
+    internal bool IsIdle => PipelineDepth is 0;
+    internal bool IsCompleted => Status is ProtocolStatus.Completed;
+    internal int CompareTo(PgClientProtocol? other)
+    {
+        // null instances are always better, they represent empty connection slots.
+        if (other is null)
+            return 1;
+
+        // Arbitrary factor for stalls :)
+        var score = PipelineDepth + (_pipelineStalls * 4);
+        var otherScore = other.PipelineDepth + (other._pipelineStalls * 4);
+
+        return score < otherScore ? -1 : score == otherScore ? 0 : 1;
+    }
+
     public static PgClientProtocol Create(PgClientProtocolOptions protocolOptions)
         => new(protocolOptions);
 
-    void Initialize(TransportConnection connection, ConnectionPoolContext<PgClientProtocol>? poolContext)
+    void Initialize(TransportConnection connection, Action? onIdle)
     {
         _pipeWriter = connection.Writer as IOutputWriter<byte> ?? new PipeStreamingWriter(connection.Writer);
         _protocolDataWriter = new(_pipeWriter, PgClientOptions.PreStartupEncoding);
         _pipeSegmentEnumerator = new(connection.Reader, new(), ownsReader: true);
         _pgDecoder = new(_pipeSegmentEnumerator, AbortToken, _options.ReadTimeout);
-        // We haven't been registered to a pool, set up our own heartbeat.
-        if (poolContext is null)
+
+        // onIdle being non-null is the signal that an external orchestrator (pool, PgConnection)
+        // is driving us, including the heartbeat tick. When null, we run our own heartbeat so
+        // standalone consumers of the protocol package get working flow activation timeouts out
+        // of the box.
+        if (onIdle is null)
         {
             _heartbeat = new(_options.HeartbeatInterval, _options.TimeProvider);
             _heartbeat.Register(period => Heartbeat(period));
         }
         else
         {
-            _poolConnectionIdleSignal = poolContext.CreateConnectionIdleSignal(this);
-            poolContext.OnHeartbeat(static (instance, interval) => instance.Heartbeat(interval), this);
+            _poolConnectionIdleSignal = onIdle;
         }
     }
 
-    public void Start(PgClientOptions options, TransportConnection connection, ConnectionPoolContext<PgClientProtocol>? poolContext = null, TimeSpan timeout = default)
+    public void Start(PgClientOptions options, TransportConnection connection, Action? onIdle = null, TimeSpan timeout = default)
     {
         if (connection.Reader is not StreamPipeReader || connection.Writer is not StreamPipeWriter)
             ThrowHelper.ThrowInvalidOperation("Transport does not support synchronous I/O.");
 
-        Initialize(connection, poolContext);
+        Initialize(connection, onIdle);
         var flow = new StartupFlow(async: false, options, timeout == default ? options.ConnectionTimeout : timeout);
         var task = StartAsync(flow, flow.WaitForComplete());
         Debug.Assert(task.IsCompleted);
         task.GetAwaiter().GetResult();
     }
 
-    public async ValueTask StartAsync(PgClientOptions options, TransportConnection connection, ConnectionPoolContext<PgClientProtocol>? poolContext = null, CancellationToken cancellationToken = default)
+    public async ValueTask StartAsync(PgClientOptions options, TransportConnection connection, Action? onIdle = null, CancellationToken cancellationToken = default)
     {
-        Initialize(connection, poolContext);
+        Initialize(connection, onIdle);
         var flow = new StartupFlow(async: true, options, options.ConnectionTimeout);
         await StartAsync(flow, flow.WaitForComplete(cancellationToken), cancellationToken).ConfigureAwait(false);
     }
@@ -343,14 +321,12 @@ sealed class PgClientProtocol : IPoolConnection<PgClientProtocol>
         finally
         {
             _abortCts.CancelAfter(TimeSpan.Zero);
+            _heartbeat?.Dispose();
             SignalCompleted();
         }
     }
 
-    bool IPoolConnection<PgClientProtocol>.IsIdle => PipelineDepth is 0;
-    bool IPoolConnection<PgClientProtocol>.IsCompleted => Status is ProtocolStatus.Completed;
-
-    ValueTask Heartbeat(TimeSpan period)
+    internal ValueTask Heartbeat(TimeSpan period)
     {
         var control = FlowControl;
         foreach (var flow in GetFlows())
@@ -367,18 +343,6 @@ sealed class PgClientProtocol : IPoolConnection<PgClientProtocol>
         return new();
     }
 
-    int IPoolConnection<PgClientProtocol>.CompareTo(PgClientProtocol? other)
-    {
-        // null instances are always better, they represent empty connection slots.
-        if (other is null)
-            return 1;
-
-        // Arbitrary factor for stalls :)
-        var score = PipelineDepth + (_pipelineStalls * 4);
-        var otherScore = other.PipelineDepth + (other._pipelineStalls * 4);
-
-        return score < otherScore ? -1 : score == otherScore ? 0 : 1;
-    }
 
     public struct Enumerator
     {

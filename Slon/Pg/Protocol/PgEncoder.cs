@@ -156,6 +156,20 @@ readonly struct PgEncoder
         StartMessage(FrontendType.Sync, bodyLength: 0);
     }
 
+    public void WriteClose(EncodedString name = default, bool portalName = false)
+    {
+        const byte portal = (byte)'P';
+        const byte statement = (byte)'S';
+
+        var nameBytes = name.AsNullTerminatedSpan(ClientEncoding);
+        StartMessage(FrontendType.Close, bodyLength:
+            sizeof(byte) + // 'portal' or 'statement'
+            nameBytes.Length // command/portal name
+        );
+        _writer.WriteByte(portalName ? portal : statement);
+        _writer.WriteRaw(nameBytes);
+    }
+
     static int GetStringWithNullTerminatorByteCount(string value, Encoding encoding)
         => encoding.GetByteCount(value) + sizeof(byte);
 

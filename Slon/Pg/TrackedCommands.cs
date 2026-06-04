@@ -7,7 +7,7 @@ using Slon.Runtime.CompilerServices;
 
 namespace Slon;
 
-sealed class TrackedCommands(int maxAuto, int autoMinimumUses)
+sealed class TrackedCommands(int maxAuto, int autoMinimumUses, Action<TrackedCommand>? onEvict = null)
 {
     readonly ConcurrentDictionary<string, TrackedCommand?[]> _commands = new(concurrencyLevel: 1, capacity: 1);
     // Candidate set keyed by SQL text content (so callers aggregate) with weak-key lifetime
@@ -19,6 +19,20 @@ sealed class TrackedCommands(int maxAuto, int autoMinimumUses)
     int _autoCount;   // currently-live auto TrackedCommands, gated against maxAuto
 
     public ICollection<TrackedCommand?[]> Commands => _commands.Values;
+
+    // Test/diagnostic. Count of currently-live (non-evicted, non-invalidated) Auto entries.
+    internal int LiveAutoCount
+    {
+        get
+        {
+            var count = 0;
+            foreach (var variants in _commands.Values)
+                foreach (var v in variants)
+                    if (v is { Kind: TrackedCommandKind.Auto, IsInvalid: false })
+                        count++;
+            return count;
+        }
+    }
 
     public bool TryGet(in CommandDescriptor descriptor, [NotNullWhen(true)]out TrackedCommand? tracked)
     {
@@ -106,6 +120,10 @@ sealed class TrackedCommands(int maxAuto, int autoMinimumUses)
 
         Remove(lru);
         _autoCount--;
+        // Fan out a maintenance signal to the registry so each PgConnection that holds this
+        // name can DEALLOCATE it. Runs while we hold _admissionLock, keep the callback cheap
+        // (push-to-queue + arm flag, the real wire work happens off-thread on each connection).
+        onEvict?.Invoke(lru);
         return true;
     }
 

@@ -4,7 +4,6 @@
 using System.Buffers;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
-using Slon.Buffers;
 
 namespace Slon.Buffers;
 

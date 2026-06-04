@@ -1,14 +1,11 @@
-using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using Slon.Pg;
 
 namespace Slon;
 
-readonly struct TrackerResult(TrackedCommand? tracked, Action<CommandResult, object?>? completeTrackedAction = null)
+readonly struct TrackerResult(TrackedCommand? tracked)
 {
-    public Action<CommandResult, object?>? CompleteTrackedAsObjectAction => completeTrackedAction;
-    public Action<CommandResult, TrackedCommand>? CompleteTrackedAction => completeTrackedAction;
     public TrackedCommand? Tracked => tracked;
     public CommandDescriptor GetDescriptor(string commandText, ParameterTypeList parameterTypes)
     {
@@ -20,145 +17,162 @@ readonly struct TrackerResult(TrackedCommand? tracked, Action<CommandResult, obj
 
 sealed class CommandTracker : IDisposable, IAsyncDisposable
 {
-    readonly ConcurrentDictionary<TrackedCommand, bool> _preparingCommands = new(concurrencyLevel: 1, capacity: 0);
     readonly TrackedCommands? _tracked;
     List<EncodedString>? _leakedCommandNames;
     ConditionalWeakTable<object, OwnedCommands>? _owned;
-    Action<CommandResult, object?>? _completeTrackedAction;
+    // Registered PgConnections whose presence map may hold entries from _tracked. Used to fan out
+    // eviction-driven DEALLOCATE pushes. Walked under _registryLock so concurrent register/deregister
+    // doesn't race the eviction callback.
+    List<PgConnection>? _registeredConnections;
+    readonly Lock _registryLock = new();
     bool _disposed;
 
-    int _counter;
     readonly CommandTracker? _parent;
 
     public CommandTracker(int maxAuto, int autoMinimumUses, CommandTracker? parent = null)
     {
         _parent = parent;
         if (maxAuto > 0)
-            _tracked = new(maxAuto, autoMinimumUses);
+            _tracked = new(maxAuto, autoMinimumUses, onEvict: OnEvict);
     }
 
-    // TODO have to make sure our explicit names won't clash across trackes (need some shared sequence).
+    void OnEvict(TrackedCommand tracked)
+    {
+        // Snapshot under lock then push outside, PushMaintenance is cheap but we don't want to
+        // hold the registry lock across queue+arm logic in case it expands later.
+        PgConnection[] snapshot;
+        lock (_registryLock)
+        {
+            if (_registeredConnections is null || _registeredConnections.Count is 0)
+                return;
+            snapshot = _registeredConnections.ToArray();
+        }
+        foreach (var connection in snapshot)
+        {
+            // Only fan out to connections where the name is actually Tracked. Preparing entries
+            // have a Parse in flight. DEALLOCATE-ing now either races the Parse or wastes work
+            // (we'd just re-Parse on next use). The next eviction round picks them up if still due.
+            if (connection.GetTrackedStatus(tracked) is TrackedStatus.Tracked)
+                connection.PushMaintenance(new EvictDeallocate(tracked));
+        }
+    }
 
-    string GetNextExplicitlyPreparedName() => $"_ep{Interlocked.Increment(ref _counter)}";
+    public void Register(PgConnection connection)
+    {
+        lock (_registryLock)
+            (_registeredConnections ??= new()).Add(connection);
+    }
+
+    public void Deregister(PgConnection connection)
+    {
+        lock (_registryLock)
+            _registeredConnections?.Remove(connection);
+    }
 
     public bool HasParent => _parent is not null;
 
-    // public TrackerResult TrackParentOwned(object owningInstance, in CommandDescriptor descriptor, TrackedCommand? tracked = null)
-    // {
-    //     if (parent is null)
-    //         ThrowHelper.ThrowInvalidOperation("Parent tracker is not set.");
-    //     return parent.Track(descriptor, tracked, owningInstance);
-    // }
+    // Test/diagnostic. Exposed via InternalsVisibleTo so tests can verify admission/eviction
+    // semantics directly without round-tripping through the protocol.
+    internal int RegisteredConnectionCount
+    {
+        get
+        {
+            lock (_registryLock)
+                return _registeredConnections?.Count ?? 0;
+        }
+    }
+    internal int LiveAutoCount => _tracked?.LiveAutoCount ?? 0;
 
-    public TrackerResult Track(in CommandDescriptor descriptor, TrackedCommand? tracked = null, object? owningInstance = null)
+    // Track is admission/identity only. Completion (transitioning Tracked status, presence updates,
+    // etc.) is the caller's concern. The proxy's delegate-baked path attaches a winner closure
+    // that calls tracked.Complete + protocol.SetTracked when Parse lands. For the explicit-prepare
+    // path, `nameSource` mints `_ep{N}` names, per-session so successive SlonConnections sharing
+    // the same PgConnection through the pool can't collide on names.
+    public TrackerResult Track(in CommandDescriptor descriptor, TrackedCommand? tracked = null, object? owningInstance = null, PgConnection? nameSource = null)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (descriptor.IsPrepared)
             ThrowHelper.ThrowArgumentException(nameof(descriptor), "Descriptor is a prepared descriptor.");
 
         if (tracked?.IsCompleted == true)
-            return new(tracked, tracked.RowDescription is null ? _completeTrackedAction ??= CompleteTracked : null);
+            return new(tracked);
 
-        // This is an auto prepare.
         if (owningInstance is null)
         {
+            // Auto-prepare path.
             if (_tracked is null)
                 return _parent?.Track(descriptor, tracked) ?? default;
-
-            if (_tracked.TryGet(descriptor, out tracked))
-            {
-                if (tracked.IsCompleted)
-                    return new(tracked, tracked.RowDescription is null ? _completeTrackedAction ??= CompleteTracked : null);
-
-                return !tracked.IsInvalid && _preparingCommands.TryAdd(tracked, true)
-                    ? new(tracked, _completeTrackedAction ??= CompleteTracked)
-                    // TODO if we wanted to return in progress preparations to tag along on
-                    // we must know in which way this new command is connected to the tracked one.
-                    // If it's in its own sync batch we can't share the preparation as the original preparation might error.
-                    // If it's in the same batch we can, as the previous error will make sure we won't end up executing it.
-                    : default;
-            }
-
+            if (_tracked.TryGet(descriptor, out tracked) && !tracked.IsInvalid)
+                return new(tracked);
             return default;
         }
 
-        return Core(owningInstance, descriptor, tracked);
+        if (nameSource is null)
+            ThrowHelper.ThrowArgumentException(nameof(nameSource), "Explicit-prepare path requires a name source.");
+        return Core(owningInstance, descriptor, nameSource);
 
         [MethodImpl(MethodImplOptions.NoInlining)]
-        TrackerResult Core(object owningInstance, in CommandDescriptor descriptor, TrackedCommand? tracked = null)
+        TrackerResult Core(object owningInstance, in CommandDescriptor descriptor, PgConnection nameSource)
         {
-            // This is an explicit prepare.
+            // Explicit-prepare path.
             _owned ??= new();
             if (!_owned.TryGetValue(owningInstance, out var ownedTracker))
-                ownedTracker = CreateOwnedTracker(owningInstance, descriptor, tracked);
+                ownedTracker = CreateOwnedTracker(owningInstance, descriptor, nameSource);
 
-            while ((tracked = ownedTracker.Find(descriptor)) is null)
+            TrackedCommand? tc;
+            while ((tc = ownedTracker.Find(descriptor)) is null)
             {
-                tracked = new(TrackedCommandKind.Command, descriptor with { CommandName = GetNextExplicitlyPreparedName() });
-                if (ownedTracker.TryAdd(tracked))
+                tc = new(TrackedCommandKind.Command, descriptor with { CommandName = nameSource.MintExplicitPrepareName() });
+                if (ownedTracker.TryAdd(tc))
                     break;
             }
 
-            // TODO there's probably a race here where the tracked command turns invalid just after we have added it.
-            // If no flow is already preparing it, return the command name.
-            if (tracked.IsCompleted)
-                return new(tracked);
-
-            return !tracked.IsInvalid && _preparingCommands.TryAdd(tracked, true)
-                ? new(tracked, _completeTrackedAction ??= CompleteTracked)
-                : new(tracked);
+            return tc.IsInvalid ? default : new(tc);
         }
 
-        void CompleteTracked(CommandResult result, object? state)
+        OwnedCommands CreateOwnedTracker(object owningInstance, in CommandDescriptor descriptor, PgConnection nameSource)
         {
-            var tracked = (TrackedCommand)state!;
-            var metadata = result.GetMetadata();
-            try
-            {
-                // Here we would make RowDescription portable (once we need it).
-                if (metadata.IsPrepared)
-                {
-                    // We were raced, which would be unexpected, or it got invalidated...
-                    if (!tracked.Complete(metadata.ToPreparedDescriptor()))
-                    {
-                        if (!tracked.IsInvalid)
-                            ThrowHelper.ThrowInvalidOperation("Command was completed by another caller, this should not happen.");
-                        // If it's invalid we must add it to leaked commands for cleanup.
-                        // TODO if we were disposed we have to do something else.
-                        Debug.Assert(_leakedCommandNames is not null, "Any owned command complete shouldn't find a null leaked list.");
-                        _leakedCommandNames.Add(tracked.CommandName);
-                    }
-                }
-                // If !metadata.IsPrepared the Parse failed (or was skipped). We leave tracked at
-                // Initialized so a future caller can re-attempt the preparation; the finally below
-                // releases the in-flight marker so they aren't blocked from doing so.
-            }
-            finally
-            {
-                _preparingCommands.TryRemove(tracked, out _);
-            }
-        }
-
-        OwnedCommands CreateOwnedTracker(object owningInstance, in CommandDescriptor descriptor, TrackedCommand? tracked)
-        {
-            if (tracked is not null)
-                ThrowHelper.ThrowArgumentException(nameof(tracked), "Instance was not found but prepared name was given?");
-
-            tracked = new TrackedCommand(TrackedCommandKind.Command, descriptor with { CommandName = GetNextExplicitlyPreparedName() });
+            var tc = new TrackedCommand(TrackedCommandKind.Command, descriptor with { CommandName = nameSource.MintExplicitPrepareName() });
             var tracker = new OwnedCommands(_leakedCommandNames ??= new());
-            var success = tracker.TryAdd(tracked);
+            var success = tracker.TryAdd(tc);
             Debug.Assert(success);
 
             // We were raced by a concurrent explicit prepare, that shouldn't normally happen but it's easy to handle.
-            while (!_owned.TryAdd(owningInstance, tracker!))
+            while (!_owned!.TryAdd(owningInstance, tracker))
             {
-                if (_owned.TryGetValue(owningInstance, out tracker))
+                if (_owned.TryGetValue(owningInstance, out var existing))
+                {
+                    tracker = existing;
                     break;
+                }
             }
-
-            Debug.Assert(tracker is not null);
             return tracker;
         }
+    }
+
+    // Atomically take + clear the accumulated leaked-names list. Used by SlonConnection.Dispose
+    // (and similar lifecycle hooks) to push CloseStatement maintenance items onto the current
+    // PgConnection. Leaked names come from OwnedCommands finalizers that fired while this tracker
+    // was alive. By the time we drain, the owning user object is gone and we just need the wire
+    // DEALLOCATE.
+    public List<EncodedString>? DrainLeakedNames()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        return Interlocked.Exchange(ref _leakedCommandNames, null);
+    }
+
+    // Walk every owned tracker and collect the live TrackedCommands.
+    // Used by SlonConnection.UnprepareAll to build the DEALLOCATE batch before disposing.
+    public TrackedCommand[] CollectOwned()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (_owned is null)
+            return [];
+
+        var sink = new List<TrackedCommand>();
+        foreach (var (_, ownedTracker) in _owned)
+            ownedTracker.CollectInto(sink);
+        return sink.Count is 0 ? [] : sink.ToArray();
     }
 
     public void Dispose()
@@ -212,6 +226,17 @@ sealed class CommandTracker : IDisposable, IAsyncDisposable
         {
             ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed), this);
             return _tracked.Complete(TrackedCommandKind.Command, descriptor);
+        }
+
+        public void CollectInto(List<TrackedCommand> sink)
+        {
+            ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed), this);
+            foreach (var variants in _tracked.Commands)
+            {
+                foreach (var command in variants)
+                    if (command is not null && !command.IsInvalid)
+                        sink.Add(command);
+            }
         }
 
         public void Dispose() => Dispose(disposing: true);

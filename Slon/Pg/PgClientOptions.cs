@@ -5,7 +5,11 @@ namespace Slon.Pg;
 
 sealed class PgClientOptions
 {
-    internal TimeSpan HeartbeatInterval { get; } = TimeSpan.FromSeconds(1);
+    internal TimeSpan HeartbeatInterval { get; init; } = TimeSpan.FromSeconds(1);
+    // Time-based subsampling on top of the heartbeat. Pushes batch up to this interval before a
+    // maintenance flow is scheduled. Setting this larger than HeartbeatInterval grows batches at
+    // the cost of cleanup latency.
+    internal TimeSpan MaintenanceInterval { get; init; } = TimeSpan.FromSeconds(1);
 
     public required EndPoint EndPoint { get; init; }
     public required string Username { get; init; }

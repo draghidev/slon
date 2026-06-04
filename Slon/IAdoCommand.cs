@@ -109,6 +109,12 @@ readonly ref struct TrackerContext
                     tracked: _tracked,
                     owningInstance: _owningInstance
                 );
+            case CommandTracker tracker:
+                return tracker.Track(
+                    descriptor: CommandDescriptor.Create(commandText, parameterTypes, CommandName),
+                    tracked: _tracked,
+                    owningInstance: _owningInstance
+                );
         }
         return default;
     }

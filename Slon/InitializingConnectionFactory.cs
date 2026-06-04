@@ -1,5 +1,3 @@
-using Slon;
-
 namespace Slon.Pools;
 
 sealed class InitializingConnectionFactory<T>(

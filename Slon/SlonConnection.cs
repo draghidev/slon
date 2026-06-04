@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
 using Slon.Pg;
+using Slon.Pg.Protocol;
 using Slon.Pg.Protocol.Flows;
 using IsolationLevel = System.Data.IsolationLevel;
 #pragma warning disable CS0197 // Using a field of a marshal-by-reference class as a ref or out value or taking its address may cause a runtime exception
@@ -24,6 +25,11 @@ public sealed partial class SlonConnection : IAdoConnection
     AdoConnectionProxy? _proxy;
     bool _closingConnection;
     bool _stateChangeEventHandlerAdded;
+
+    // Test/diagnostic access to the underlying substrate. Exposed via InternalsVisibleTo so tests
+    // can verify auto-prepare / presence behavior without round-tripping through pg_prepared_statements.
+    internal AdoConnectionProxy? UnderlyingProxy => _proxy;
+    internal PgConnection? UnderlyingPgConnection => _proxy?.PgConnection;
 
     SlonConnection(string? connectionString, SlonDataSource? dataSource)
     {
@@ -172,6 +178,7 @@ public sealed partial class SlonConnection : IAdoConnection
         _disposed = true;
         try
         {
+            ReleaseOwnedAndLeakedToMaintenance();
             CloseCore();
         }
         finally
@@ -188,6 +195,7 @@ public sealed partial class SlonConnection : IAdoConnection
         _disposed = true;
         try
         {
+            ReleaseOwnedAndLeakedToMaintenance();
             await CloseAsyncCore().ConfigureAwait(false);
         }
         finally
@@ -195,6 +203,29 @@ public sealed partial class SlonConnection : IAdoConnection
             if (_proxy is not null)
                 await _proxy.DisposeAsync().ConfigureAwait(false);
             base.Dispose();
+        }
+    }
+
+    // Push owned tracked commands + drained leaked names onto the current PgConnection's
+    // maintenance queue. Fire-and-forget: dispose returns without waiting for the wire
+    // DEALLOCATEs to complete. The PgConnection survives the lease (pooled), so its
+    // MaintenanceFlow will process the queue on the next pipeline turn.
+    void ReleaseOwnedAndLeakedToMaintenance()
+    {
+        if (_proxy is null)
+            return;
+        var pgConnection = _proxy.PgConnection;
+        if (_ownedTracker is not null)
+        {
+            foreach (var t in _ownedTracker.CollectOwned())
+                pgConnection.PushMaintenance(new EvictDeallocate(t));
+            _ownedTracker.Dispose();
+            _ownedTracker = null;
+        }
+        if (_proxy.Tracker.DrainLeakedNames() is { Count: > 0 } leakedNames)
+        {
+            foreach (var name in leakedNames)
+                pgConnection.PushMaintenance(new CloseStatement(name));
         }
     }
 
@@ -285,6 +316,20 @@ public sealed partial class SlonConnection : IAdoConnection
         return commandFlow;
     }
 
+    // Sync delegate-based enqueue, mirror of the async variant.
+    internal TFlow Enqueue<TArg, TFlow>(
+        Func<PgConnection, TArg, TFlow> flowFactory,
+        TArg arg,
+        bool closeConnection)
+        where TFlow : PgClientFlow
+        where TArg : allows ref struct
+    {
+        var proxy = EnsureConnected();
+        if (closeConnection && Interlocked.CompareExchange(ref _closingConnection, true, false))
+            ThrowHelper.ThrowInvalidOperation($"A command has already been committed with the {nameof(CommandBehavior.CloseConnection)} behavior.");
+        return proxy.Enqueue(flowFactory, arg);
+    }
+
     internal ValueTask<CommandFlow> EnqueueCommandsAsync(in CommandFlowOptions options, bool closeConnection, CancellationToken cancellationToken)
     {
         var proxy = EnsureConnected();
@@ -294,9 +339,79 @@ public sealed partial class SlonConnection : IAdoConnection
         return proxy.EnqueueAsync(commandFlow, cancellationToken);
     }
 
+    // Delegate-based enqueue: the flowFactory callback runs inside the proxy's atomic PgConnection scope,
+    // so flow construction (presence consultation, descriptor baking) sees the connection the flow
+    // will run on. State flows through `arg` to avoid closure allocation.
+    internal ValueTask<TFlow> EnqueueAsync<TArg, TFlow>(
+        Func<PgConnection, TArg, TFlow> flowFactory,
+        TArg arg,
+        bool closeConnection,
+        CancellationToken cancellationToken)
+        where TFlow : PgClientFlow
+        where TArg : allows ref struct
+    {
+        var proxy = EnsureConnected();
+        if (closeConnection && Interlocked.CompareExchange(ref _closingConnection, true, false))
+            ThrowHelper.ThrowInvalidOperation($"A command has already been committed with the {nameof(CommandBehavior.CloseConnection)} behavior.");
+        return proxy.EnqueueAsync(flowFactory, arg, cancellationToken);
+    }
+
     // We should only get here when we are enqueuing and have confirmed we are connected.
+    // Dispatch: explicit-prepare (owningInstance non-null) → connection-local OwnedTracker.
+    // Auto-prepare → workload tracker via the proxy.
     internal TrackerResult TrackCommand(in CommandDescriptor descriptor, TrackedCommand? tracked = null, object? owningInstance = null)
-        => _proxy!.TrackCommand(descriptor, tracked, owningInstance);
+        => owningInstance is null
+            ? AutoTracker.Track(descriptor, tracked)
+            : OwnedTracker.Track(descriptor, tracked, owningInstance, nameSource: _proxy?.PgConnection);
+
+    // Auto-prepare goes through the workload tracker via the proxy.
+    CommandTracker AutoTracker => _proxy!.Tracker;
+
+    // Explicit-prepare bookkeeping. Lazy because most connections never call Prepare(). The
+    // tracker stays unallocated until first use. Survives Close-Open with the SlonConnection
+    // (Policy A, object-identity continuity for prepared commands).
+    CommandTracker? _ownedTracker;
+    CommandTracker OwnedTracker => _ownedTracker ??= new CommandTracker(maxAuto: 0, autoMinimumUses: 0);
+
+    void UnprepareAllCore() => UnprepareAllImpl(awaitable: false).GetAwaiter().GetResult();
+
+    ValueTask UnprepareAllAsyncCore() => UnprepareAllImpl(awaitable: true);
+
+    // Invalidate the TrackedCommands and clear presence locally so the caller sees immediate
+    // effect, then push a single CloseStatements (plural) maintenance item carrying all names
+    // for the wire-side DEALLOCATE. One node for the whole batch, single allocation, single
+    // optional completion TCS. If awaitable, the TCS fires once MaintenanceFlow commits the
+    // batch. Awaiting it confirms the server-side DEALLOCATEs landed.
+    ValueTask UnprepareAllImpl(bool awaitable)
+    {
+        if (_ownedTracker is null)
+            return default;
+        var tracked = _ownedTracker.CollectOwned();
+        if (tracked.Length is 0 || _proxy is null)
+        {
+            _ownedTracker.Dispose();
+            _ownedTracker = null;
+            return default;
+        }
+
+        var pgConnection = _proxy.PgConnection;
+        var names = new EncodedString[tracked.Length];
+        for (var i = 0; i < tracked.Length; i++)
+        {
+            var t = tracked[i];
+            t.Invalidate();
+            pgConnection.RemoveTracked(t);
+            names[i] = t.CommandName;
+        }
+
+        var tcs = awaitable ? new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously) : null;
+        pgConnection.PushMaintenance(new CloseStatements(names) { Completion = tcs });
+
+        _ownedTracker.Dispose();
+        _ownedTracker = null;
+
+        return tcs is null ? default : new ValueTask(tcs.Task);
+    }
 
     void UnprepareOwned(object owningInstance)
     {
@@ -482,6 +597,19 @@ public sealed partial class SlonConnection : DbConnection
     /// <summary>Returns a new instance of the provider's class that implements the <see cref="T:System.Data.Common.DbBatch" /> class.</summary>
     /// <returns>A new instance of <see cref="Slon.SlonBatch" />.</returns>
     public new SlonBatch CreateBatch() => new(this);
+
+    /// <summary>
+    /// Releases all explicit-prepared commands held by this connection. The server-side
+    /// prepared statements are deallocated and the per-command bookkeeping is cleared.
+    /// Commands that were previously prepared via <see cref="DbCommand.Prepare"/> will be
+    /// re-prepared transparently on next use.
+    /// </summary>
+    public void UnprepareAll() => UnprepareAllCore();
+
+    /// <summary>
+    /// Asynchronously releases all explicit-prepared commands held by this connection.
+    /// </summary>
+    public ValueTask UnprepareAllAsync() => UnprepareAllAsyncCore();
 
     /// <inheritdoc />
     protected override DbCommand CreateDbCommand() => CreateCommand();

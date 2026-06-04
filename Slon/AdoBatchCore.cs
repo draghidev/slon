@@ -9,6 +9,22 @@ using Slon.Pg.Protocol.Flows;
 
 namespace Slon;
 
+readonly struct EnqueueArgs<TCommand> where TCommand : IAdoCommand
+{
+    public readonly FieldRef<AdoBatchCore<TCommand>> FieldRef;
+    public readonly DbParameterCollection? Parameters;
+    public readonly CommandBehavior Behavior;
+    public readonly SlonConnection Connection;
+
+    public EnqueueArgs(FieldRef<AdoBatchCore<TCommand>> fieldRef, DbParameterCollection? parameters, CommandBehavior behavior, SlonConnection connection)
+    {
+        FieldRef = fieldRef;
+        Parameters = parameters;
+        Behavior = behavior;
+        Connection = connection;
+    }
+}
+
 // Shared between DbBatch and DbCommand
 struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
 {
@@ -113,11 +129,36 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
     {
         ThrowIfDisposedOrReadOnly();
         // TODO We probably can...
-        if (TryGetDataSource(out _, out _))
+        if (TryGetDataSource(out _, out var oldConnection))
             ThrowHelper.ThrowInvalidOperation("This is a DbDataSource command and cannot be assigned to connections.");
 
-        connection.CloseOwned(_fieldRef.Instance);
+        // Conceptually a Dispose against the old connection (release owned state, clear stale
+        // tracking refs) followed by a re-bind to the new one.
+        ReleaseOwned(oldConnection);
+        ClearTrackedRefs();
+
         _dataSourceOrConnection = connection;
+    }
+
+    void ReleaseOwned(SlonConnection connection)
+    {
+        if (_explicitlyPrepared)
+            connection.CloseOwned(_fieldRef.Instance);
+    }
+
+    ValueTask ReleaseOwnedAsync(SlonConnection connection)
+        => _explicitlyPrepared ? connection.CloseOwnedAsync(_fieldRef.Instance) : new();
+
+    void ClearTrackedRefs()
+    {
+        // Only the explicit (Command) kind is stale on connection move. Auto refs point at
+        // workload-shared TCs that stay valid across SlonConnections in the same datasource.
+        foreach (var command in _commands.AsSpan())
+        {
+            var ado = (IAdoCommand)command;
+            if (ado.Tracked is { Kind: TrackedCommandKind.Command })
+                ado.Tracked = null;
+        }
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -136,7 +177,7 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
         return false;
     }
 
-    CommandFlowOptions CreateCommandFlowOptions(ReadOnlySpan<DbParameterCollection?> parametersSpan, CommandBehavior behavior, SlonConnection? connection = null, CommandTracker? tracker = null)
+    CommandFlowOptions CreateCommandFlowOptions(ReadOnlySpan<DbParameterCollection?> parametersSpan, CommandBehavior behavior, SlonConnection? connection = null, CommandTracker? tracker = null, PgConnection? pgConnection = null)
     {
         if (_commands.Count is 0)
             ThrowHelper.ThrowInvalidOperation("No commands were added to the batch.");
@@ -151,7 +192,11 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
         (Command Command, TrackerResult TrackerResult) result = default;
         Action<CommandResult, object?>? onResultAction = null;
         object? onResultActionState = null;
-        (Action<CommandResult, TrackedCommand>, TrackedCommand)?[]? completionArray = null;
+        (Action<CommandResult, object?>, object?)?[]? completionArray = null;
+        // Tracks TrackedCommands that this batch's earlier commands have already issued Parse for
+        // as the Winner. Subsequent same-TC commands in the same batch get the Present shape
+        // (rely on the earlier in-batch Parse in the same Sync window).
+        HashSet<TrackedCommand>? intraBatchWinners = null;
         for (var i = 0; i < commands.Length; i++)
         {
             ref var adoCommand = ref commands[i];
@@ -169,36 +214,127 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
 
             var parameters = indexParameters ? parametersSpan[i] : !parametersSpan.IsEmpty ? parametersSpan[0] : null;
             result = adoCommand.CreateCommand(_enableErrorBarriers, behavior, trackerContext, parameters, Timeout);
-            adoCommand.Tracked ??= result.TrackerResult.Tracked;
+            // Refresh the cache when the tracker resolved to a different TC than the one we
+            // passed in (catches workload-tracker recreation via DbDepsRevision++ and similar).
+            if (result.TrackerResult.Tracked is not null && !ReferenceEquals(adoCommand.Tracked, result.TrackerResult.Tracked))
+                adoCommand.Tracked = result.TrackerResult.Tracked;
 
-            if (batchBuilder is null)
+            // Per-command completion (presence-aware on the connection-bound path with a protocol
+            // in scope, falls through to the legacy TrackerResult-driven completion otherwise).
+            Action<CommandResult, object?>? thisCompletion;
+            object? thisCompletionState;
+
+            if (pgConnection is not null && result.TrackerResult.Tracked is { } tracked)
             {
-                if (result.TrackerResult.CompleteTrackedAsObjectAction is not null)
+                // Same-SQL earlier in this batch already Winner'd → safe to ride its in-batch Parse.
+                var isIntraBatchWinner = intraBatchWinners?.Contains(tracked) ?? false;
+                var status = isIntraBatchWinner ? TrackedStatus.Tracked : pgConnection.GetTrackedStatus(tracked);
+
+                if (status is TrackedStatus.Tracked)
                 {
-                    onResultAction = result.TrackerResult.CompleteTrackedAsObjectAction;
-                    onResultActionState = result.TrackerResult.Tracked;
+                    // Tracked shape: keep prepared descriptor (Bind/Execute only), no completion.
+                    thisCompletion = null;
+                    thisCompletionState = null;
+                }
+                else if (status is TrackedStatus.Preparing)
+                {
+                    // Anonymous tag-along: another flow is preparing this name on this session.
+                    // run our own anonymous Parse so we don't depend on its success.
+                    var commandText = adoCommand.CommandText;
+                    var paramTypes = result.Command.Descriptor.ParameterTypes;
+                    result = (result.Command with { Descriptor = CommandDescriptor.Create(commandText, paramTypes, default) }, result.TrackerResult);
+                    thisCompletion = null;
+                    thisCompletionState = null;
+                }
+                else // None
+                {
+                    if (pgConnection.TryBeginPreparing(tracked))
+                    {
+                        // Winner: descriptor becomes unprepared-with-name so WriteAuto emits
+                        // Parse+Bind+Execute. Completion updates tracked status on the protocol.
+                        var commandText = adoCommand.CommandText;
+                        var paramTypes = result.Command.Descriptor.ParameterTypes;
+                        result = (result.Command with { Descriptor = CommandDescriptor.Create(commandText, paramTypes, tracked.CommandName) }, result.TrackerResult);
+                        thisCompletion = static (cmdResult, state) =>
+                        {
+                            var (p, t) = ((PgConnection, TrackedCommand))state!;
+                            var metadata = cmdResult.GetMetadata();
+                            // Here we would make RowDescription portable (once we need it).
+                            if (metadata.IsPrepared)
+                            {
+                                // CAS-fails only if another caller already completed (shouldn't
+                                // happen under TryBeginPreparing ownership) or the TC got
+                                // invalidated mid-flight. In the invalidated case the prepared
+                                // name on the server is orphaned and should be added to the
+                                // protocol's leaked-names salvage list (per-protocol, since
+                                // server-side names are session-scoped) for later DEALLOCATE.
+                                if (!t.Complete(metadata.ToPreparedDescriptor()))
+                                {
+                                    // TODO if invalid, push t.CommandName into the protocol's
+                                    // salvage list. If !IsInvalid, throw (would mean someone
+                                    // bypassed TryBeginPreparing's exclusivity).
+                                }
+                                p.SetTracked(t);
+                            }
+                            else
+                            {
+                                // Parse failed (or was skipped because a sibling command in this
+                                // Sync window errored earlier). Leave tracked at Initialized so
+                                // a future caller can re-attempt. Remove the Preparing marker so
+                                // they aren't blocked.
+                                p.RemoveTracked(t);
+                            }
+                        };
+                        thisCompletionState = (pgConnection, tracked);
+                        (intraBatchWinners ??= new()).Add(tracked);
+                    }
+                    else
+                    {
+                        // Lost the None → Preparing race: anonymous tag-along.
+                        var commandText = adoCommand.CommandText;
+                        var paramTypes = result.Command.Descriptor.ParameterTypes;
+                        result = (result.Command with { Descriptor = CommandDescriptor.Create(commandText, paramTypes, default) }, result.TrackerResult);
+                        thisCompletion = null;
+                        thisCompletionState = null;
+                    }
                 }
             }
             else
             {
-                if (result.TrackerResult.CompleteTrackedAsObjectAction is not null)
+                // Data-source path placeholder, or no admission: no per-command completion.
+                // (The data-source orchestrator, when implemented, will use the same delegate-
+                // baked path as the connection-bound case here.)
+                thisCompletion = null;
+                thisCompletionState = null;
+            }
+
+            if (batchBuilder is null)
+            {
+                if (thisCompletion is not null)
+                {
+                    onResultAction = thisCompletion;
+                    onResultActionState = thisCompletionState;
+                }
+            }
+            else
+            {
+                if (thisCompletion is not null)
                 {
                     if (completionArray is null)
                     {
-                        completionArray = new (Action<CommandResult, TrackedCommand>, TrackedCommand)?[_commands.Count];
+                        completionArray = new (Action<CommandResult, object?>, object?)?[_commands.Count];
                         if (onResultAction is not null)
-                            completionArray[0] = (onResultAction, (TrackedCommand)onResultActionState!);
+                            completionArray[0] = (onResultAction, onResultActionState);
 
                         onResultAction = static (result, state) =>
                         {
-                            var completions = ((Action<CommandResult, TrackedCommand> Action, TrackedCommand State)?[])state!;
+                            var completions = ((Action<CommandResult, object?> Action, object? State)?[])state!;
                             if (completions[result.GetMetadata().CommandIndex] is { } completion)
                                 completion.Action(result, completion.State);
                         };
                         onResultActionState = completionArray;
                     }
-                    if (result.TrackerResult.CompleteTrackedAction is not null && result.TrackerResult.Tracked is not null)
-                        completionArray[i] = (result.TrackerResult.CompleteTrackedAction, result.TrackerResult.Tracked);
+                    completionArray[i] = (thisCompletion, thisCompletionState);
                 }
 
                 batchBuilder.Add(result.Command);
@@ -215,20 +351,23 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
 
     CommandFlow Enqueue(DbParameterCollection? parameters, CommandBehavior behavior)
     {
-        CommandFlow flow;
         if (TryGetDataSource(out var dataSource, out var connection))
         {
             ThrowIfHasCloseConnection(behavior);
             var tracker = dataSource.GetCommandTracker();
             var options = CreateCommandFlowOptions([parameters], behavior, tracker: tracker);
-            flow = dataSource.EnqueueCommands(options);
+            return dataSource.EnqueueCommands(options);
         }
-        else
-        {
-            var options = CreateCommandFlowOptions([parameters], behavior, connection);
-            flow = connection.EnqueueCommands(options, closeConnection: HasCloseConnection(behavior));
-        }
-        return flow;
+
+        return connection.Enqueue(
+            static (pgConnection, args) =>
+            {
+                ref var core = ref args.FieldRef.Invoke();
+                var options = core.CreateCommandFlowOptions([args.Parameters], args.Behavior, args.Connection, tracker: null, pgConnection);
+                return new CommandFlow(async: false, options);
+            },
+            new EnqueueArgs<TCommand>(_fieldRef, parameters, behavior, connection),
+            closeConnection: HasCloseConnection(behavior));
     }
 
     ValueTask<CommandFlow> EnqueueAsync(DbParameterCollection? parameters, CommandBehavior behavior, CancellationToken cancellationToken)
@@ -236,8 +375,19 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
         if (TryGetDataSource(out var dataSource, out var connection))
             return DataSourceCore(_fieldRef, dataSource, parameters, behavior, cancellationToken);
 
-        var options = CreateCommandFlowOptions([parameters], behavior, connection);
-        return connection.EnqueueCommandsAsync(options, closeConnection: HasCloseConnection(behavior), cancellationToken);
+        return connection.EnqueueAsync(
+            static (pgConnection, args) =>
+            {
+                // pgConnection is the snapshot of the current PgConnection. Presence consultation
+                // and three-shape baking happens here so the wire-shape decisions are atomic against
+                // the connection the flow will run on.
+                ref var core = ref args.FieldRef.Invoke();
+                var options = core.CreateCommandFlowOptions([args.Parameters], args.Behavior, args.Connection, tracker: null, pgConnection);
+                return new CommandFlow(async: true, options);
+            },
+            new EnqueueArgs<TCommand>(_fieldRef, parameters, behavior, connection),
+            closeConnection: HasCloseConnection(behavior),
+            cancellationToken);
 
         static async ValueTask<CommandFlow> DataSourceCore(FieldRef<AdoBatchCore<TCommand>> fieldRef, SlonDataSource dataSource, DbParameterCollection? parameters, CommandBehavior behavior, CancellationToken cancellationToken)
         {
@@ -481,14 +631,13 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
             return;
 
         _disposed = true;
-        if (TryGetDataSource(out var dataSource, out var connection))
+        if (TryGetDataSource(out _, out var connection))
         {
             // TODO once we support explicit prepare for datasource commands, unprepare here.
+            return;
         }
-        else
-        {
-            connection.CloseOwned(_fieldRef.Instance);
-        }
+
+        ReleaseOwned(connection);
     }
 
     public ValueTask DisposeAsync()
@@ -497,13 +646,13 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
             return new();
 
         _disposed = true;
-        if (TryGetDataSource(out var dataSource, out var connection))
+        if (TryGetDataSource(out _, out var connection))
         {
             // TODO once we support explicit prepare for datasource commands, unprepare here.
             return new();
         }
 
-        return connection.CloseOwnedAsync(_fieldRef.Instance);
+        return ReleaseOwnedAsync(connection);
     }
 
     // TODO what to do with concurrent callers, datasource commands etc.?

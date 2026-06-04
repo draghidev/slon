@@ -1,6 +1,5 @@
 using System.IO.Pipelines;
 using System.Runtime.CompilerServices;
-using Slon.Pipelines;
 using Slon.Buffers;
 
 namespace Slon.Pipelines;

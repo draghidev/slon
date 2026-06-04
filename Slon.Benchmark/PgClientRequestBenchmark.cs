@@ -245,15 +245,15 @@ public class PgClientRequestBenchmark : ClientBenchmark
             CtsHolder = holder,
         };
 
-        static async Task QueueLoop(ChannelReader<CommandFlow> reader, ConnectionPool<PgClientProtocol> pool)
+        static async Task QueueLoop(ChannelReader<CommandFlow> reader, ConnectionPool<PgConnection> pool)
         {
-            PgClientProtocol? conn = null;
+            PgConnection? conn = null;
             while (await reader.WaitToReadAsync().ConfigureAwait(false))
             {
                 var count = 0;
                 while (reader.TryRead(out var flow))
                 {
-                    if (conn is not null && conn.TryQueue(flow, mustPipeline: true))
+                    if (conn is not null && conn.Protocol.TryQueue(flow, mustPipeline: true))
                     {
                         count = ++count % 8;
                         if (count is 0)
@@ -261,7 +261,7 @@ public class PgClientRequestBenchmark : ClientBenchmark
                         continue;
                     }
                     conn = await pool.GetAsync(
-                        static (ctx, flow) => ctx.Connection.TryQueue(flow, mustPipeline: !ctx.Idle),
+                        static (ctx, flow) => ctx.Connection.Protocol.TryQueue(flow, mustPipeline: !ctx.Idle),
                         flow, TimeSpan.FromSeconds(30), CancellationToken.None).ConfigureAwait(false);
                     count = 1;
                 }

@@ -1,19 +1,23 @@
+using Slon.Pg;
+using Slon.Pg.Protocol;
 using Slon.Pools;
 using Slon.Transport;
 
-namespace Slon.Pg.Protocol;
+namespace Slon;
 
-sealed class PgClientProtocolFactory : IPoolConnectionFactory<PgClientProtocol>
+sealed class PgConnectionFactory : IPoolConnectionFactory<PgConnection>
 {
     readonly PgClientOptions _clientOptions;
     readonly TransportConnection.Factory _transportConnectionFactory;
+    readonly CommandTracker? _tracker;
     readonly Action<PgClientProtocolOptions>? _configureOptions;
     readonly PgClientProtocolOptions? _sharedOptions;
 
-    public PgClientProtocolFactory(PgClientOptions clientOptions, TransportConnection.Factory transportConnectionFactory, Action<PgClientProtocolOptions>? configureOptions = null)
+    public PgConnectionFactory(PgClientOptions clientOptions, TransportConnection.Factory transportConnectionFactory, CommandTracker? tracker = null, Action<PgClientProtocolOptions>? configureOptions = null)
     {
         _clientOptions = clientOptions;
         _transportConnectionFactory = transportConnectionFactory;
+        _tracker = tracker;
         _configureOptions = configureOptions;
         if (configureOptions is null)
             _sharedOptions = new PgClientProtocolOptions(clientOptions);
@@ -28,36 +32,38 @@ sealed class PgClientProtocolFactory : IPoolConnectionFactory<PgClientProtocol>
         return options;
     }
 
-    PgClientProtocol Create(ConnectionPoolContext<PgClientProtocol>? poolContext, TimeSpan timeout = default)
+    PgConnection Create(ConnectionPoolContext<PgConnection>? poolContext, TimeSpan timeout = default)
     {
         var protocol = PgClientProtocol.Create(CreateOptions());
+        var pgConnection = new PgConnection(protocol, _tracker, _clientOptions.MaintenanceInterval);
         var connection = _transportConnectionFactory.Connect(timeout);
-        protocol.Start(_clientOptions, connection, poolContext, timeout);
-        return protocol;
+        pgConnection.Start(_clientOptions, connection, poolContext, timeout);
+        return pgConnection;
     }
 
-    async ValueTask<PgClientProtocol> CreateAsync(ConnectionPoolContext<PgClientProtocol>? poolContext, CancellationToken cancellationToken = default)
+    async ValueTask<PgConnection> CreateAsync(ConnectionPoolContext<PgConnection>? poolContext, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
         var protocol = PgClientProtocol.Create(CreateOptions());
+        var pgConnection = new PgConnection(protocol, _tracker, _clientOptions.MaintenanceInterval);
         var connection = await _transportConnectionFactory.ConnectAsync(cancellationToken).ConfigureAwait(false);
-        await protocol.StartAsync(_clientOptions, connection, poolContext, cancellationToken).ConfigureAwait(false);
-        return protocol;
+        await pgConnection.StartAsync(_clientOptions, connection, poolContext, cancellationToken).ConfigureAwait(false);
+        return pgConnection;
     }
 
-    public PgClientProtocol Create(TimeSpan timeout = default)
+    public PgConnection Create(TimeSpan timeout = default)
         => Create(null, timeout);
 
-    public ValueTask<PgClientProtocol> CreateAsync(CancellationToken cancellationToken = default)
+    public ValueTask<PgConnection> CreateAsync(CancellationToken cancellationToken = default)
         => CreateAsync(null, cancellationToken);
 
-    PgClientProtocol IPoolConnectionFactory<PgClientProtocol>.Create(ConnectionPoolContext<PgClientProtocol> poolContext, TimeSpan timeout)
+    PgConnection IPoolConnectionFactory<PgConnection>.Create(ConnectionPoolContext<PgConnection> poolContext, TimeSpan timeout)
     {
         ArgumentNullException.ThrowIfNull(poolContext);
         return Create(poolContext, timeout);
     }
 
-    ValueTask<PgClientProtocol> IPoolConnectionFactory<PgClientProtocol>.CreateAsync(ConnectionPoolContext<PgClientProtocol> poolContext, CancellationToken cancellationToken)
+    ValueTask<PgConnection> IPoolConnectionFactory<PgConnection>.CreateAsync(ConnectionPoolContext<PgConnection> poolContext, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(poolContext);
         return CreateAsync(poolContext, cancellationToken);

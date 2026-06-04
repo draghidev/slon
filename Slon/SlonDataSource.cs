@@ -48,12 +48,19 @@ public record SlonDataSourceOptions
     public int AutoPreparationMinimumUses { get; set; } = 5;
     public int MaxActiveAutoPreparations { get; set; }
 
+    // Internal, tests need to override these to drive maintenance flows on a tight loop. Public
+    // surface would require thinking through "what's a sensible knob for end users."
+    internal TimeSpan HeartbeatInterval { get; init; } = TimeSpan.FromSeconds(1);
+    internal TimeSpan MaintenanceInterval { get; init; } = TimeSpan.FromSeconds(1);
+
     internal PgClientOptions ToPgClientOptions() => new()
     {
         EndPoint = EndPoint,
         Username = Username,
         Database = Database,
-        Password = Password
+        Password = Password,
+        HeartbeatInterval = HeartbeatInterval,
+        MaintenanceInterval = MaintenanceInterval,
     };
 
     internal bool Validate()
@@ -100,8 +107,8 @@ public sealed class SlonDataSource: DbDataSource
     readonly SemaphoreSlim _lifecycleLock;
 
     // Initialized on the first real use.
-    ConnectionPool<PgClientProtocol> _connectionPool = null!;
-    IPoolConnectionFactory<PgClientProtocol> _clientFactory = null!;
+    ConnectionPool<PgConnection> _connectionPool = null!;
+    IPoolConnectionFactory<PgConnection> _clientFactory = null!;
     PgDbDependencies _dbDependencies = null!;
     bool _isInitialized;
 
@@ -115,7 +122,7 @@ public sealed class SlonDataSource: DbDataSource
         _lifecycleLock = new(1);
     }
 
-    ConnectionPool<PgClientProtocol> ConnectionPool => _connectionPool ?? throw NotInitializedException();
+    ConnectionPool<PgConnection> ConnectionPool => _connectionPool ?? throw NotInitializedException();
 
     // Store the result if multiple dependencies are required. The instance may be switched out during reloading.
     // To prevent any inconsistencies without having to obtain a lock on the data we instead use an immutable instance.
@@ -140,9 +147,9 @@ public sealed class SlonDataSource: DbDataSource
 
     int DbDepsRevision { get; set; }
 
-    AdoConnectionProxy CreateProxy(PgClientProtocol protocol, IAdoConnection connection)
+    AdoConnectionProxy CreateProxy(PgConnection pgConnection, IAdoConnection connection)
     {
-        return new(this, protocol, connection);
+        return new(this, pgConnection, connection);
     }
 
      ValueTask Initialize(bool async, TimeSpan timeout, CancellationToken cancellationToken)
@@ -171,27 +178,32 @@ public sealed class SlonDataSource: DbDataSource
                 var asyncConnectionInit = _options.AsyncConnectionInitializer;
                 var clientOptions = _options.ToPgClientOptions();
                 var transportFactory = SocketStreamConnection.CreateFactory(clientOptions.EndPoint);
-                var factory = new InitializingConnectionFactory<PgClientProtocol>(
-                    factory: new PgClientProtocolFactory(clientOptions, transportFactory),
-                    initializer: connectionInit is not null ? (protocol, timeout) =>
+
+                var factory = new InitializingConnectionFactory<PgConnection>(
+                    factory: new PgConnectionFactory(clientOptions, transportFactory, tracker: deps.CommandsTracker),
+                    initializer: connectionInit is not null ? (pgConnection, timeout) =>
                         {
                             using var conn = CreateConnection();
-                            conn.SetProxy(CreateProxy(protocol, conn));
+                            conn.SetProxy(CreateProxy(pgConnection, conn));
                             connectionInit(conn, timeout);
                         } : null,
                     asyncInitializer:
-                        asyncConnectionInit is not null ? async (protocol, cancellationToken) =>
+                        asyncConnectionInit is not null ? async (pgConnection, cancellationToken) =>
                         {
                             var conn = CreateConnection();
                             await using var _ = conn.ConfigureAwait(false);
-                            conn.SetProxy(CreateProxy(protocol, conn));
+                            conn.SetProxy(CreateProxy(pgConnection, conn));
                             await asyncConnectionInit(conn, cancellationToken).ConfigureAwait(false);
                         } : null
                 );
 
                 // Finally store all the fields
                 if (_options.MaxPoolSize > 0)
-                    _connectionPool = new ConnectionPool<PgClientProtocol>(factory, new() { MaxConnections = _options.MaxPoolSize });
+                    _connectionPool = new ConnectionPool<PgConnection>(factory, new()
+                    {
+                        MaxConnections = _options.MaxPoolSize,
+                        HeartbeatInterval = _options.HeartbeatInterval,
+                    });
                 _clientFactory = factory;
                 _dbDependencies = deps;
 
