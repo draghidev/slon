@@ -1,11 +1,10 @@
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Threading.Tasks.Sources;
-using Slon.Runtime.CompilerServices;
 
 namespace Slon.Pg.Protocol;
 
-abstract class PgClientFlow : IProtocolFlow, IValueTaskSource<PgDecoder>, IValueTaskSource
+abstract class PgClientFlow : IProtocolFlow, IValueTaskSource<PgDecoder>
 {
     readonly bool _supportsPipelining;
     CancellationToken? _abortToken;
@@ -28,20 +27,18 @@ abstract class PgClientFlow : IProtocolFlow, IValueTaskSource<PgDecoder>, IValue
     CancellationTokenRegistration _activationCancellationTokenRegistration;
     TimeSpan _remainingActivationTimeout;
 
-    // Pipeline state.
-    Slon.Threading.Tasks.Sources.ManualResetValueTaskSourceCore<bool> _executePipelinedCore;
-    ValueTaskSourcePromise<bool>? _pipelinePromise;
-    Context _context;
-    ValueTask _task;
-
     // Completion state.
     Action<PgClientFlow, Exception?, object?>? _completionAction;
     object? _completionState;
 
-    protected abstract ValueTask<FlowTasks> Execute(Context context);
-
-    protected virtual ValueTask ExecutePipelined(Context context)
-        => ValueTask.FromException(new NotSupportedException("Flow has no implementation of ExecutePipelined."));
+    /// The flow's body. The "Auto" suffix is the protocol package's convention for "this method's
+    /// contract adapts to the bound flow mode (sync or async)" — the same convention applies to
+    /// the helper APIs the body calls (FlushAuto, WriteAuto, ReadUntilExecuteAuto, ...).
+    ///
+    /// Prefer async/await in both modes. Sync mode affects scheduling, not body syntax. A fully
+    /// sync body that needs the decoder calls <c>GetDecoderAuto</c> for a blocking get. Don't
+    /// mix sync I/O calls inside an <c>async</c> body or vice versa.
+    protected abstract ValueTask<FlowTasks> ExecuteAuto(Context context);
 
     protected bool IsAsync
     {
@@ -67,7 +64,6 @@ abstract class PgClientFlow : IProtocolFlow, IValueTaskSource<PgDecoder>, IValue
     {
         throw new NotImplementedException();
     }
-
 
     protected PgClientFlow(bool supportsPipelining)
     {
@@ -136,12 +132,6 @@ abstract class PgClientFlow : IProtocolFlow, IValueTaskSource<PgDecoder>, IValue
     void IValueTaskSource<PgDecoder>.OnCompleted(Action<object?> continuation, object? state, short token, ValueTaskSourceOnCompletedFlags flags)
         => _activationTaskSource.OnCompleted(continuation, state, token, flags);
 
-    ValueTaskSourceStatus IValueTaskSource.GetStatus(short token) => _executePipelinedCore.GetStatus(token);
-    void IValueTaskSource.OnCompleted(Action<object?> continuation, object? state, short token, ValueTaskSourceOnCompletedFlags flags)
-        => _executePipelinedCore.OnCompleted(continuation, state, token, flags);
-
-    void IValueTaskSource.GetResult(short token)
-        => _executePipelinedCore.GetResult(token);
 
     protected readonly struct Context
     {
@@ -155,25 +145,150 @@ abstract class PgClientFlow : IProtocolFlow, IValueTaskSource<PgDecoder>, IValue
         public PgEncoder GetEncoder()
             => _executionControl.GetEncoder();
 
-        public PgDecoder GetDecoder()
-        {
-            var task = _executionControl.GetActivationResultAsync();
-            if (task.IsCompletedSuccessfully)
-                return task.Result;
+        /// Returns an awaitable for the decoder. The <c>Async</c> suffix marks this as
+        /// intrinsically asynchronous. Activation is a cross-flow rendezvous, completed by
+        /// another flow's thread. The awaiter's <c>GetResult</c> throws if not yet completed.
+        /// async bodies use <c>await</c>. Sync bodies that want a blocking call should use
+        /// <see cref="GetDecoderAuto"/>. Direct-dispatch callers (e.g. CommandFlow's
+        /// shared-promise pattern) use IsCompleted + (Unsafe)OnCompleted to register
+        /// continuations without going through await machinery.
+        ///
+        /// The optional cancellation token lets the flow unwind itself rather than holding a
+        /// continuation that may never complete. Wire bytes the flow already emitted are owned
+        /// by the protocol and drained on the flow's behalf when it unwinds.
+        public DecoderAwaitable GetDecoderAsync(CancellationToken cancellationToken = default)
+            => new(_executionControl, cancellationToken);
 
-            // This will stall the pipeline and informs the runtime we have a thread blocking on a task completion.
-            // https://learn.microsoft.com/en-us/dotnet/core/runtime-config/threading#thread-injection-in-response-to-blocking-work-items
-            return task.AsTask().GetAwaiter().GetResult();
+        /// Blocks the caller's thread until the decoder is available, then returns it. The
+        /// <c>Auto</c> suffix marks this as the per-flow-mode adaptive helper: sync flow bodies
+        /// call this directly for a blocking get; async flow bodies should prefer
+        /// <see cref="GetDecoderAsync"/> with <c>await</c>. If activation has already happened
+        /// when this is called the fast path returns the decoder without ever blocking; otherwise
+        /// the call bridges via <c>AsTask().GetAwaiter().GetResult()</c>.
+        public PgDecoder GetDecoderAuto(CancellationToken cancellationToken = default)
+        {
+            var awaitable = GetDecoderAsync(cancellationToken);
+            return awaitable.IsCompleted
+                ? awaitable.GetResult()
+                : awaitable.AsTask().GetAwaiter().GetResult();
+        }
+    }
+
+    // Self-awaitable for `await context.GetDecoderAsync()` plus direct-dispatch interaction:
+    //
+    // - `await` syntax: the C# compiler checks IsCompleted and calls GetResult only when true.
+    //   If not yet ready it schedules the continuation via OnCompleted(Action) /
+    //   UnsafeOnCompleted(Action).
+    //
+    // - Direct dispatchers (CommandFlow's shared-promise pattern): use IsCompleted +
+    //   OnCompleted(Action<object?>, object?) / UnsafeOnCompleted(Action<object?>, object?) to
+    //   register continuations without closure allocation. GetResult is only valid after
+    //   IsCompleted is true (standard awaiter contract).
+    protected readonly struct DecoderAwaitable(ExecutionControl control, CancellationToken cancellationToken) : ICriticalNotifyCompletion
+    {
+        public DecoderAwaitable GetAwaiter() => this;
+        public bool IsCompleted => control.IsDecoderReady;
+
+        // Only valid after IsCompleted is true — MVTSC has no blocking GetResult, so a Pending
+        // status throws InvalidOperationException. The C# compiler guarantees the IsCompleted
+        // check for `await` syntax; direct callers must check it themselves.
+        // Also throws OCE if the token raced ahead of activation completing.
+        public PgDecoder GetResult()
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            return control.GetDecoderResult();
         }
 
-        public ValueTask<PgDecoder> GetDecoderAsync(CancellationToken cancellationToken = default)
-            => _executionControl.GetActivationResultAsync(cancellationToken);
+        // Returns a configured variant that controls whether the continuation resumes on the
+        // captured SynchronizationContext. Mirrors Task/ValueTask's ConfigureAwait shape.
+        public ConfiguredDecoderAwaitable ConfigureAwait(bool continueOnCapturedContext)
+            => new(control, cancellationToken, continueOnCapturedContext);
 
-        public ValueTask<PgDecoder> GetDecoderAuto(CancellationToken cancellationToken = default)
-            => _executionControl.IsAsync ? GetDecoderAsync(cancellationToken) : new(GetDecoder());
+        // Bridge to Task for sync-wait or Task-combinator composition. Sync flow bodies that
+        // want to block call <c>AsTask().GetAwaiter().GetResult()</c>.
+        public Task<PgDecoder> AsTask() => control.GetDecoderTask(cancellationToken);
 
-        public ValueTask ExecutePipelinedWithPromise(ValueTaskSourcePromise<bool> promise)
-            => _executionControl.ExecutePipelinedWithPromise(promise);
+        // Action-only overloads: the C# compiler calls these for `await` syntax. Mirrors
+        // ValueTaskAwaiter's defaults, capture both SynchronizationContext and ExecutionContext
+        // so an awaiting body resumes on the context it suspended on. Unsafe* skips EC capture
+        // (the state machine builder handles it) but still honors scheduling context.
+        public void OnCompleted(Action continuation)
+        {
+            control.RegisterActivationCancellation(cancellationToken);
+            control.OnDecoder(static state => ((Action)state!)(), continuation,
+                ValueTaskSourceOnCompletedFlags.UseSchedulingContext | ValueTaskSourceOnCompletedFlags.FlowExecutionContext);
+        }
+        public void UnsafeOnCompleted(Action continuation)
+        {
+            control.RegisterActivationCancellation(cancellationToken);
+            control.OnDecoder(static state => ((Action)state!)(), continuation,
+                ValueTaskSourceOnCompletedFlags.UseSchedulingContext);
+        }
+
+        // State-taking overloads: direct-dispatch escape hatch (e.g. CommandFlow's shared-promise
+        // pattern). Capture defaults mirror the Action overloads, callers that want to skip
+        // scheduling-context capture go through ConfigureAwait(false) first.
+        public void OnCompleted(Action<object?> continuation, object? state)
+        {
+            control.RegisterActivationCancellation(cancellationToken);
+            control.OnDecoder(continuation, state,
+                ValueTaskSourceOnCompletedFlags.UseSchedulingContext | ValueTaskSourceOnCompletedFlags.FlowExecutionContext);
+        }
+        public void UnsafeOnCompleted(Action<object?> continuation, object? state)
+        {
+            control.RegisterActivationCancellation(cancellationToken);
+            control.OnDecoder(continuation, state, ValueTaskSourceOnCompletedFlags.UseSchedulingContext);
+        }
+    }
+
+    // The ConfigureAwait(false) variant: skips scheduling-context capture. Action overloads are
+    // for the C# `await` syntax (compiler calls UnsafeOnCompleted on ICriticalNotifyCompletion).
+    protected readonly struct ConfiguredDecoderAwaitable(ExecutionControl control, CancellationToken cancellationToken, bool continueOnCapturedContext) : ICriticalNotifyCompletion
+    {
+        public ConfiguredDecoderAwaitable GetAwaiter() => this;
+        public bool IsCompleted => control.IsDecoderReady;
+
+        public PgDecoder GetResult()
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            return control.GetDecoderResult();
+        }
+
+        public void OnCompleted(Action continuation)
+        {
+            control.RegisterActivationCancellation(cancellationToken);
+            var flags = ValueTaskSourceOnCompletedFlags.FlowExecutionContext;
+            if (continueOnCapturedContext)
+                flags |= ValueTaskSourceOnCompletedFlags.UseSchedulingContext;
+            control.OnDecoder(static state => ((Action)state!)(), continuation, flags);
+        }
+        public void UnsafeOnCompleted(Action continuation)
+        {
+            control.RegisterActivationCancellation(cancellationToken);
+            var flags = ValueTaskSourceOnCompletedFlags.None;
+            if (continueOnCapturedContext)
+                flags |= ValueTaskSourceOnCompletedFlags.UseSchedulingContext;
+            control.OnDecoder(static state => ((Action)state!)(), continuation, flags);
+        }
+
+        // State-taking overloads. Mirror DecoderAwaitable's pair so direct-dispatch callers can
+        // also opt out of scheduling-context capture via ConfigureAwait(false).
+        public void OnCompleted(Action<object?> continuation, object? state)
+        {
+            control.RegisterActivationCancellation(cancellationToken);
+            var flags = ValueTaskSourceOnCompletedFlags.FlowExecutionContext;
+            if (continueOnCapturedContext)
+                flags |= ValueTaskSourceOnCompletedFlags.UseSchedulingContext;
+            control.OnDecoder(continuation, state, flags);
+        }
+        public void UnsafeOnCompleted(Action<object?> continuation, object? state)
+        {
+            control.RegisterActivationCancellation(cancellationToken);
+            var flags = ValueTaskSourceOnCompletedFlags.None;
+            if (continueOnCapturedContext)
+                flags |= ValueTaskSourceOnCompletedFlags.UseSchedulingContext;
+            control.OnDecoder(continuation, state, flags);
+        }
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -258,12 +373,12 @@ abstract class PgClientFlow : IProtocolFlow, IValueTaskSource<PgDecoder>, IValue
             flow._remainingActivationTimeout = activationTimeout;
         }
 
-        public ValueTask<FlowTasks> Execute()
-            => IsAsync ? flow.Execute(new(this)) : ExecuteSynchronously();
+        public ValueTask<FlowTasks> ExecuteAuto()
+            => IsAsync ? flow.ExecuteAuto(new(this)) : ExecuteSynchronously();
 
         // For ease of debugging we add a stackframe that tells us whether we're a sync flow.
         [MethodImpl(MethodImplOptions.NoInlining)]
-        ValueTask<FlowTasks> ExecuteSynchronously() => flow.Execute(new(this));
+        ValueTask<FlowTasks> ExecuteSynchronously() => flow.ExecuteAuto(new(this));
 
         public void Activate(PgDecoder decoder)
         {
@@ -291,28 +406,6 @@ abstract class PgClientFlow : IProtocolFlow, IValueTaskSource<PgDecoder>, IValue
             flow.OnHeartbeat(interval);
         }
 
-        public ValueTask<PgDecoder> GetActivationResultAsync(CancellationToken cancellationToken = default)
-        {
-            if (flow._activationTaskSource.GetStatus(flow._activationTaskSource.Version) is not ValueTaskSourceStatus.Pending)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                return new(flow._activationTaskSource.GetResult(flow._activationTaskSource.Version));
-            }
-
-            if (cancellationToken.CanBeCanceled)
-            {
-                if (flow._activationCancellationTokenRegistration != default)
-                    ThrowHelper.ThrowInvalidOperation("Concurrent activation result awaits are not supported.");
-
-                flow._activationCancellationTokenRegistration = cancellationToken.UnsafeRegister(
-                    static (state, token) =>
-                        ((PgClientFlow)state!)._activationTaskSource.TrySetException(new OperationCanceledException(token), runContinuationsAsynchronously: true),
-                    flow);
-            }
-
-            return new ValueTask<PgDecoder>(flow, flow._activationTaskSource.Version);
-        }
-
         public ref readonly TState GetProtocolStatic<TState>()
             => ref ((IProtocolStatic<TState>)(object)control).Value;
 
@@ -330,70 +423,38 @@ abstract class PgClientFlow : IProtocolFlow, IValueTaskSource<PgDecoder>, IValue
                     "which ends after the Execute method returns the inner task.");
         }
 
-        public ValueTask ExecutePipelinedWithPromise(ValueTaskSourcePromise<bool> promise)
+        // Activation-task-source primitives surfaced as "decoder ready / on decoder" because that's
+        // what consumers care about. Keeps the version token internal. Exposed publicly through
+        // Context as the DecoderAwaitable.
+        public bool IsDecoderReady
+            => flow._activationTaskSource.GetStatus(flow._activationTaskSource.Version) is ValueTaskSourceStatus.Succeeded;
+        public PgDecoder GetDecoderResult()
+            => flow._activationTaskSource.GetResult(flow._activationTaskSource.Version);
+        public void OnDecoder(Action<object?> continuation, object? state, ValueTaskSourceOnCompletedFlags flags)
+            => flow._activationTaskSource.OnCompleted(continuation, state, flow._activationTaskSource.Version, flags);
+
+        // Bridge to Task for callers that need to block (sync flow body using
+        // .GetAwaiter().GetResult()) or to compose with Task-based combinators. MVTSC has no
+        // blocking GetResult of its own, so this is the only safe sync-wait path.
+        public Task<PgDecoder> GetDecoderTask(CancellationToken cancellationToken)
         {
-            var version = flow._activationTaskSource.Version;
-            if (flow._activationTaskSource.GetStatus(version) is ValueTaskSourceStatus.Succeeded)
-            {
-                PromiseAsyncValueTaskMethodBuilder.Promise = promise;
-                try
-                {
-                    return flow.ExecutePipelined(new(this));
-                }
-                finally
-                {
-                    PromiseAsyncValueTaskMethodBuilder.Promise = null;
-                }
-            }
+            RegisterActivationCancellation(cancellationToken);
+            return new ValueTask<PgDecoder>(flow, flow._activationTaskSource.Version).AsTask();
+        }
 
-            flow._context = new(this);
-            flow._pipelinePromise = promise;
-            ((IValueTaskSource<PgDecoder>)flow).OnCompleted(static state =>
-            {
-                var flow = (PgClientFlow)state!;
-                var promise = flow._pipelinePromise;
-                var context = flow._context;
-                PromiseAsyncValueTaskMethodBuilder.Promise = promise;
-                try
-                {
-                    var task = flow.ExecutePipelined(context);
-                    if (!task.IsCompleted)
-                    {
-                        flow._task = task;
-                        ((IValueTaskSource)promise!).OnCompleted(static state =>
-                        {
-                            var flow = (PgClientFlow)state!;
-                            try
-                            {
-                                flow._task.GetAwaiter().GetResult();
-                                flow._executePipelinedCore.SetResult(true);
-                            }
-                            catch (Exception ex)
-                            {
-                                flow._executePipelinedCore.SetException(ex);
-                            }
-                        }, flow, promise.Token, ValueTaskSourceOnCompletedFlags.FlowExecutionContext);
-                    }
-                    else
-                    {
-                        try
-                        {
-                            task.GetAwaiter().GetResult();
-                            flow._executePipelinedCore.SetResult(true);
-                        }
-                        catch (Exception ex)
-                        {
-                            flow._executePipelinedCore.SetException(ex);
-                        }
-                    }
-                }
-                finally
-                {
-                    PromiseAsyncValueTaskMethodBuilder.Promise = null;
-                }
-            }, flow, version, ValueTaskSourceOnCompletedFlags.FlowExecutionContext);
-
-            return new(flow, flow._executePipelinedCore.Version);
+        // Registers caller cancellation against the activation source so a flow can unwind
+        // itself rather than hold a continuation that may never complete. No-op for default
+        // tokens. Only one registration is supported per activation cycle.
+        public void RegisterActivationCancellation(CancellationToken cancellationToken)
+        {
+            if (!cancellationToken.CanBeCanceled)
+                return;
+            if (flow._activationCancellationTokenRegistration != default)
+                ThrowHelper.ThrowInvalidOperation("Concurrent activation result awaits are not supported.");
+            flow._activationCancellationTokenRegistration = cancellationToken.UnsafeRegister(
+                static (state, token) =>
+                    ((PgClientFlow)state!)._activationTaskSource.TrySetException(new OperationCanceledException(token), runContinuationsAsynchronously: true),
+                flow);
         }
     }
 }

@@ -554,7 +554,7 @@ sealed class PgClientProtocol
             var writer = protocol._protocolDataWriter;
             if (writer.UnflushedBytes > 1000)
                 await writer.FlushAsync(abortToken).ConfigureAwait(false);
-            var flowTasks = await flow.GetExecutionControl(this).Execute().ConfigureAwait(false);
+            var flowTasks = await flow.GetExecutionControl(this).ExecuteAuto().ConfigureAwait(false);
             // TODO only null after flowTasks.TrailingExecutionTask is completed.
             ExecutorFlow = null;
             return new(flowTasks.TrailingExecutionTask, flowTasks.PipelineTask);

@@ -24,7 +24,7 @@ sealed class StartupFlow : PgClientFlow
         IsAsync = async;
     }
 
-    protected override async ValueTask<FlowTasks> Execute(Context context)
+    protected override async ValueTask<FlowTasks> ExecuteAuto(Context context)
     {
         var spanWriter = new SpanWriter<MemoryBufferWriter, byte>(new MemoryBufferWriter());
         var encoder = context.GetEncoder();
@@ -48,7 +48,7 @@ sealed class StartupFlow : PgClientFlow
         encoder.CopyStartupBuffer(spanWriter.InnerWriter);
         await encoder.FlushAuto().ConfigureAwait(false);
 
-        var decoder = await context.GetDecoderAuto().ConfigureAwait(false);
+        var decoder = await context.GetDecoderAsync().ConfigureAwait(false);
         decoder.ReadTimeout = _startupTimeout;
         var message = await decoder.GetNextAsync().ConfigureAwait(false);
         var authType = ParseAuthMessage(message, out var reader);

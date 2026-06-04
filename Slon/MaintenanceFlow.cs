@@ -1,17 +1,25 @@
+using System.Runtime.CompilerServices;
 using Slon.Pg.Protocol;
+using Slon.Runtime.CompilerServices;
 using static Slon.Pg.Protocol.PgTypes;
 
 namespace Slon;
 
 // ADO-layer flow that drains a PgConnection's maintenance queue. Groups work items by kind into
-// a single wire batch where possible (currently: EvictDeallocate items aggregated into one
-// Close+Sync window). Lives in the Slon namespace because it knows about TrackedCommand and
-// PgConnection; the protocol layer just sees a PgClientFlow.
+// a single wire batch where possible (currently: Close per item all under one Sync window).
+// Lives in the Slon namespace because it knows about TrackedCommand and PgConnection. The
+// protocol layer just sees a PgClientFlow.
+//
+// Pipelineable: the write phase (Execute) emits Close+Sync and hands off to the framework via
+// ExecutePipelinedWithPromise. The read phase (ExecutePipelined) drains to RFQ and runs the
+// cleanup walk. While we're in the read phase, the executor can start the next flow's write
+// phase, maintenance doesn't stall the pipeline behind it.
 sealed class MaintenanceFlow : PgClientFlow
 {
     PgConnection? _connection;
+    readonly ValueTaskSourcePromise<bool> _readPromise = new();
 
-    public MaintenanceFlow() : base(supportsPipelining: false)
+    public MaintenanceFlow() : base(supportsPipelining: true)
     {
         IsAsync = true;
     }
@@ -39,7 +47,7 @@ sealed class MaintenanceFlow : PgClientFlow
         _connection = null;
     }
 
-    protected override async ValueTask<FlowTasks> Execute(Context context)
+    protected override async ValueTask<FlowTasks> ExecuteAuto(Context context)
     {
         var connection = _connection ?? throw new InvalidOperationException("MaintenanceFlow has not been bound to a PgConnection.");
         // Snapshot the range to process. (Head, Tail) define an immutable window in the intrusive
@@ -50,10 +58,10 @@ sealed class MaintenanceFlow : PgClientFlow
         if (head is null)
             return ValueTask.CompletedTask;
 
-        // One Sync window for the whole batch. Per protocol spec, Close against a nonexistent
-        // statement is NOT an error — it returns CloseComplete — so racy cleanup and leak salvage
-        // don't trip the after-error-skip semantics. ErrorResponse on Close is reserved for
-        // genuine server-side difficulty (OOM etc.); accepted as best-effort for the batch.
+        // Write phase: one Sync window for the whole batch. Per protocol spec, Close against a
+        // nonexistent statement is NOT an error (it returns CloseComplete) so racy cleanup and
+        // leak salvage don't trip the after-error-skip semantics. ErrorResponse on Close is
+        // reserved for genuine server-side difficulty (OOM etc.), accepted as best-effort.
         var encoder = context.GetEncoder();
         var node = head;
         while (true)
@@ -78,36 +86,47 @@ sealed class MaintenanceFlow : PgClientFlow
         encoder.WriteSync();
         await encoder.FlushAuto().ConfigureAwait(false);
 
-        // Drain to RFQ — tolerant of any mid-window outcome so a single odd ErrorResponse doesn't
-        // poison the decoder state. The protocol resyncs at RFQ either way. If this throws (e.g.
-        // unrecoverable wire error), the policy will eject the PgConnection and the unconsumed
-        // items go with it; no requeue needed because no future flow on this session will run.
-        var decoder = await context.GetDecoderAuto().ConfigureAwait(false);
-        while (true)
+        // Hand off to the pipelined read phase as a local async function. BeginCallScope sets the
+        // promise TLS so the local function's builder picks it up at Create time. The using clears
+        // it once we've returned. head/tail/connection/context are closed over from outer scope.
+        // The framework's await on the returned ValueTask handles activation deferral naturally
+        // via GetDecoderAsync's own await suspension, no special framework deferral needed.
+        using (PromiseAsyncValueTaskMethodBuilder.BeginCallScope(_readPromise))
         {
-            var message = await decoder.GetNextAsync().ConfigureAwait(false);
-            if (message.Header.Type is BackendType.ReadyForQuery)
-                break;
+            return ReadPhase();
         }
 
-        // Cleanup walk: RemoveTracked for EvictDeallocate entries, fire completion TCSs. Must
-        // happen BEFORE commit since commit clears Next pointers so the GC can reclaim nodes.
-        node = head;
-        while (true)
+        [AsyncMethodBuilder(typeof(PromiseAsyncValueTaskMethodBuilder))]
+        async ValueTask ReadPhase()
         {
-            if (node is EvictDeallocate evict)
-                connection.RemoveTracked(evict.Tracked);
-            node.Completion?.TrySetResult();
-            if (ReferenceEquals(node, tail))
-                break;
-            node = node.Next!;
+            // Drain to RFQ, tolerant of any mid-window outcome so a single odd ErrorResponse
+            // doesn't poison the decoder state. The protocol resyncs at RFQ either way. If this
+            // throws (e.g. unrecoverable wire error), the policy will eject the PgConnection and
+            // the unconsumed items go with it. No requeue needed.
+            var decoder = await context.GetDecoderAsync().ConfigureAwait(false);
+            while (true)
+            {
+                var message = await decoder.GetNextAsync().ConfigureAwait(false);
+                if (message.Header.Type is BackendType.ReadyForQuery)
+                    break;
+            }
+
+            // Cleanup walk: RemoveTracked for EvictDeallocate entries, fire completion TCSs. Must
+            // happen BEFORE commit since commit clears Next pointers so the GC can reclaim nodes.
+            var n = head;
+            while (true)
+            {
+                if (n is EvictDeallocate evict)
+                    connection.RemoveTracked(evict.Tracked);
+                n.Completion?.TrySetResult();
+                if (ReferenceEquals(n, tail))
+                    break;
+                n = n.Next!;
+            }
+
+            // Commit: unlink the processed range. Nodes become GC-eligible. Producers that
+            // appended beyond `tail` during our run stay linked.
+            connection.CommitMaintenanceRange(tail);
         }
-
-        // Commit: unlink the processed range from the list. Nodes are now unreferenced from the
-        // connection's queue and become GC-eligible. Producers that appended beyond `tail` during
-        // our run stay linked — the completion action's HasMaintenance check picks them up.
-        connection.CommitMaintenanceRange(tail);
-
-        return ValueTask.CompletedTask;
     }
 }

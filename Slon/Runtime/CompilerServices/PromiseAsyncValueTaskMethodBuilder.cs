@@ -12,6 +12,20 @@ struct PromiseAsyncValueTaskMethodBuilder<TResult>
     [field: ThreadStatic]
     public static ValueTaskSourcePromise<TResult>? Promise { get; set; }
 
+    /// Sets Promise to `promise` and returns a disposable that clears it on exit. Intended for
+    /// `using (PromiseAsyncValueTaskMethodBuilder{T}.BeginCallScope(_readPromise)) { return LocalFn(); }`
+    /// so the builder's Create() picks up the promise during LocalFn's state machine construction.
+    public static CallScope BeginCallScope(ValueTaskSourcePromise<TResult> promise)
+    {
+        Promise = promise;
+        return default;
+    }
+
+    public ref struct CallScope
+    {
+        public void Dispose() => Promise = null;
+    }
+
     readonly ValueTaskSourcePromise<TResult> _promise;
     ValueTask<TResult> _task;
     bool _promiseTask;
@@ -105,6 +119,20 @@ struct PromiseAsyncValueTaskMethodBuilder
     // As we cannot pass arguments to builders today we use a thread-static to pass the promise instance.
     [field: ThreadStatic]
     public static ValueTaskSourcePromise<bool>? Promise { get; set; }
+
+    /// Sets Promise to `promise` and returns a disposable that clears it on exit. Intended for
+    /// `using (PromiseAsyncValueTaskMethodBuilder.BeginCallScope(_readPromise)) { return LocalFn(); }`
+    /// so the builder's Create() picks up the promise during LocalFn's state machine construction.
+    public static CallScope BeginCallScope(ValueTaskSourcePromise<bool> promise)
+    {
+        Promise = promise;
+        return default;
+    }
+
+    public ref struct CallScope
+    {
+        public void Dispose() => Promise = null;
+    }
 
     readonly ValueTaskSourcePromise<bool> _promise;
     ValueTask _task;

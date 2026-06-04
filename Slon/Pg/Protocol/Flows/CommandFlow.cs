@@ -16,7 +16,7 @@ readonly struct CommandFlowOptions
     public CommandList Commands { get; init; }
 }
 
-sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSource<FlowCallerInteractionCoreResult>
+sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSource<FlowCallerInteractionCoreResult>, IValueTaskSource
 {
     // Flow state
     CommandFlowOptions _options;
@@ -34,6 +34,15 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
     bool _isResultReady;
     PgDecoder? _decoder;
     bool _readFlowRfq;
+
+    // Pipelined dispatch state. Lives here (not on PgClientFlow base) because the shared-promise
+    // optimization that needs these fields is CommandFlow-specific. See DispatchPipelinedRead
+    // for why. Other flows that pipeline use the local-function form with their own per-instance
+    // promise via PromiseAsyncValueTaskMethodBuilder.BeginCallScope.
+    Slon.Threading.Tasks.Sources.ManualResetValueTaskSourceCore<bool> _executePipelinedCore;
+    ValueTaskSourcePromise<bool>? _pipelinePromise;
+    Context _context;
+    ValueTask _task;
 
     ValueTask<bool> EnumeratorMoveNextTask => new(this, _enumeratorMoveNextTaskSource.Version);
 
@@ -74,7 +83,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
     }
 
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
-    protected override async ValueTask<FlowTasks> Execute(Context context)
+    protected override async ValueTask<FlowTasks> ExecuteAuto(Context context)
     {
         try
         {
@@ -119,11 +128,95 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
         // https://github.com/pgjdbc/pgjdbc/issues/194
         // https://github.com/npgsql/npgsql/issues/641
         _writeTask = new ValueTask();
-        return context.ExecutePipelinedWithPromise(context.GetProtocolStatic<ReadState>().ReadPromise);
+        return DispatchPipelinedRead(context, context.GetProtocolStatic<ReadState>().ReadPromise);
+    }
+
+    // The reason this whole mechanism exists rather than just `using var _ = BeginCallScope(...);
+    // return ReadPhase();` like other pipelined flows:
+    //
+    // CommandFlow uses a per-protocol SHARED ValueTaskSourcePromise (via ReadState.ReadPromise).
+    // One promise instance serves every CommandFlow queued on this protocol. The natural local-
+    // function form would eagerly Create the state machine in each flow, each capturing the
+    // promise. Two state machines pointing at the same promise is a state conflict, so the
+    // sharing breaks.
+    //
+    // The deferred dispatch here doesn't Create the state machine until activation fires, so only
+    // ONE flow at a time pulls the promise from TLS and constructs. Multiple flows can queue up
+    // referencing the same promise. Each one Creates only at its turn. N-1 promise allocations
+    // saved per protocol under pipelined load.
+    //
+    // External flow authors can't easily replicate this (would need a CWT or similar hosting slot
+    // and pay the lookup cost on every dispatch), so the optimization is structurally protocol-
+    // package-internal. Hence "live here" rather than as a framework helper on Context.
+    ValueTask DispatchPipelinedRead(Context context, ValueTaskSourcePromise<bool> promise)
+    {
+        var waiter = context.GetDecoderAsync().ConfigureAwait(false);
+        if (waiter.IsCompleted)
+        {
+            PromiseAsyncValueTaskMethodBuilder.Promise = promise;
+            try
+            {
+                return ExecutePipelined(context);
+            }
+            finally
+            {
+                PromiseAsyncValueTaskMethodBuilder.Promise = null;
+            }
+        }
+
+        _context = context;
+        _pipelinePromise = promise;
+        waiter.OnCompleted(static state =>  // ConfigureAwait(false): the continuation is a static bridge into framework state, no scheduling context needed
+
+        {
+            var flow = (CommandFlow)state!;
+            var promise = flow._pipelinePromise!;
+            var ctx = flow._context;
+            PromiseAsyncValueTaskMethodBuilder.Promise = promise;
+            try
+            {
+                var task = flow.ExecutePipelined(ctx);
+                if (!task.IsCompleted)
+                {
+                    flow._task = task;
+                    ((IValueTaskSource)promise).OnCompleted(static state =>
+                    {
+                        var flow = (CommandFlow)state!;
+                        try
+                        {
+                            flow._task.GetAwaiter().GetResult();
+                            flow._executePipelinedCore.SetResult(true);
+                        }
+                        catch (Exception ex)
+                        {
+                            flow._executePipelinedCore.SetException(ex);
+                        }
+                    }, flow, promise.Token, ValueTaskSourceOnCompletedFlags.FlowExecutionContext);
+                }
+                else
+                {
+                    try
+                    {
+                        task.GetAwaiter().GetResult();
+                        flow._executePipelinedCore.SetResult(true);
+                    }
+                    catch (Exception ex)
+                    {
+                        flow._executePipelinedCore.SetException(ex);
+                    }
+                }
+            }
+            finally
+            {
+                PromiseAsyncValueTaskMethodBuilder.Promise = null;
+            }
+        }, this);
+
+        return new ValueTask(this, _executePipelinedCore.Version);
     }
 
     [AsyncMethodBuilder(typeof(PromiseAsyncValueTaskMethodBuilder))]
-    protected override async ValueTask ExecutePipelined(Context context)
+    async ValueTask ExecutePipelined(Context context)
     {
         // If we have a continuation stored we must already be on the caller thread,
         // otherwise we must make sure to unblock the executor (see comment in the write phase).
@@ -132,7 +225,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
 
         try
         {
-            _decoder = await context.GetDecoderAuto(_callerCancellationToken).ConfigureAwait(false);
+            _decoder = await context.GetDecoderAsync(_callerCancellationToken).ConfigureAwait(false);
             while (++_commandIndex < CommandCount)
             {
                 _isResultReady = false;
@@ -374,6 +467,13 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
     ValueTaskSourceStatus IValueTaskSource<bool>.GetStatus(short token) => _enumeratorMoveNextTaskSource.GetStatus(token);
     void IValueTaskSource<bool>.OnCompleted(Action<object?> continuation, object? state, short token, ValueTaskSourceOnCompletedFlags flags)
         => _enumeratorMoveNextTaskSource.OnCompleted(continuation, state, token, flags);
+
+    // Backing for the pipelined-dispatch ValueTask. Returned to the framework when activation
+    // hasn't fired yet. Nested callback completes it when ExecutePipelined finishes.
+    void IValueTaskSource.GetResult(short token) => _executePipelinedCore.GetResult(token);
+    ValueTaskSourceStatus IValueTaskSource.GetStatus(short token) => _executePipelinedCore.GetStatus(token);
+    void IValueTaskSource.OnCompleted(Action<object?> continuation, object? state, short token, ValueTaskSourceOnCompletedFlags flags)
+        => _executePipelinedCore.OnCompleted(continuation, state, token, flags);
 
     public readonly struct Enumerator(CommandFlow flow) : IEnumerator<CommandResult>, IAsyncEnumerator<CommandResult>
     {
