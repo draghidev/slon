@@ -205,14 +205,21 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
         return default;
     }
 
+    // Interim sync entrypoints: sync-over-async via GetAwaiter().GetResult(). Acceptable
+    // because the sync command flow shunts writes onto a LongRunning thread first, so the
+    // caller thread is free to block here while async I/O drives the response. Will be
+    // replaced by a real sync read pump that calls SealedNetworkStream.Read directly.
     public bool MoveNext()
     {
-        throw new NotImplementedException();
+        var task = MoveNextAsync();
+        return task.IsCompleted ? task.Result : task.AsTask().GetAwaiter().GetResult();
     }
 
     public BackendMessage GetNext()
     {
-        throw new NotImplementedException();
+        if (!MoveNext())
+            ThrowHelper.ThrowInvalidOperation("No more messages");
+        return Current;
     }
 
     void IDisposable.Dispose() => _messageBatchEnumerator.Dispose();

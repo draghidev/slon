@@ -447,11 +447,13 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
 
             _enumeratorCompleted = completed;
             _enumeratorMoveNextTaskSource.SetResult(!completed, runContinuationsAsynchronously: completed);
-            // Wake any sync MoveNext that's parked in WaitForContinuation without a continuation
-            // registered. Happens when the body's progress came from async I/O on TP rather than
-            // a SetContinuationAndUnblockWaiter handoff, including the post-last-result cleanup
-            // path that ends in SetResult(null) without a preceding continuation registration.
-            if (!IsAsync)
+            // For completion (completed=true) the body is done and will not register a follow-up
+            // continuation, so we must wake any parked sync MoveNext directly. For result
+            // delivery (completed=false) the body's next statement is
+            // await SetContinuationAndUnblockWaiter, which stores the next continuation and
+            // signals the mres. Signaling here would race ahead of that and the caller's MoveNext
+            // would observe a "no continuation" wake even though one is about to be stored.
+            if (!IsAsync && completed)
                 _callerInteractionCore.SignalProgress();
         }
 
@@ -465,6 +467,9 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
 
     void HandleException(Exception ex)
     {
+        // Mark the flow terminally completed so the caller's next MoveNext returns the cached
+        // task result (which throws the exception) instead of resetting the source and parking.
+        _enumeratorCompleted = true;
         // We have to make sure to unblock the caller if the flow failed to (could be a cancellation, io error, etc).
         _enumeratorMoveNextTaskSource.SetException(ex);
         // Wake any sync MoveNext parked in WaitForContinuation. The body just faulted, so no
@@ -616,6 +621,12 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
         {
             // Default value.
             if (flow is null)
+                return;
+
+            // If the flow already terminally completed, there's nothing to drain. Skipping
+            // also avoids re-throwing a previously-observed fault from EnumeratorMoveNextTask.Result
+            // during foreach's exception unwind.
+            if (flow._enumeratorCompleted)
                 return;
 
             while (MoveNext())

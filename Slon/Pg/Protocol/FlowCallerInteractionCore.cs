@@ -13,6 +13,7 @@ struct FlowCallerInteractionCore<TResult>
 {
     ManualResetEventSlim? _mres;
     Action? _continuation;
+    bool _progressSignaled;
 
     public Slon.Threading.Tasks.Sources.ManualResetValueTaskSourceCore<TResult> GateTaskSource;
 
@@ -47,8 +48,13 @@ struct FlowCallerInteractionCore<TResult>
     // Park the caller until the body either registers a continuation for us to drive forward,
     // or signals progress via SignalProgress (because the body resumed on its own via async I/O
     // completion and produced a result or completion on the move-next task source). The two
-    // wake conditions share one MRES. Returns the continuation to invoke, or null if we were
-    // woken only by the progress signal.
+    // wake conditions share one MRES. Returns the continuation to invoke, or null if the wake
+    // came from a progress signal alone (the task source completed without a new continuation
+    // being registered, e.g. body completion via SetResult(null)). Importantly, _continuation
+    // is not cleared on wake. The body's SetContinuationAndUnblockWaiter overwrites it next
+    // time, and HasContinuation acts as a "handoff already done" marker that ExecutePipelined
+    // reads to skip a redundant handoff when it runs on TP while the caller is still inside
+    // its first MoveNext.
     public Action? WaitForContinuation()
     {
         var mres = GetMres();
@@ -58,9 +64,12 @@ struct FlowCallerInteractionCore<TResult>
         {
             mres.Wait();
             mres.Reset();
-            var continuation = _continuation;
-            _continuation = null;
-            return continuation;
+            if (_progressSignaled)
+            {
+                _progressSignaled = false;
+                return null;
+            }
+            return _continuation!;
         }
         finally
         {
@@ -72,7 +81,11 @@ struct FlowCallerInteractionCore<TResult>
     // the body's result-delivery and completion paths so a sync caller can wake even when the
     // body's progress came from an async-I/O continuation that ran on a TP thread without
     // routing through SetContinuationAndUnblockWaiter.
-    public void SignalProgress() => _mres?.Set();
+    public void SignalProgress()
+    {
+        _progressSignaled = true;
+        _mres?.Set();
+    }
 
     public ContinuationCapturingAwaitable SetContinuationAndUnblockWaiter(FieldRef<FlowCallerInteractionCore<TResult>> fieldRef)
         => new(fieldRef);
@@ -81,6 +94,7 @@ struct FlowCallerInteractionCore<TResult>
     {
         _mres?.Reset();
         _continuation = null;
+        _progressSignaled = false;
         GateTaskSource.Reset();
     }
 
@@ -94,9 +108,12 @@ struct FlowCallerInteractionCore<TResult>
 
             public void GetResult()
             {
-                // Make sure cancellations get picked up by synchronous flows as well.
+                // Surface a pending cancellation set by CancelPendingWait. The gate source is
+                // only completed when cancellation fires. In the normal sync-flow handoff path
+                // it stays Pending and we just return.
                 var gateTaskSource = fieldRef.Invoke().GateTaskSource;
-                gateTaskSource.GetResult(gateTaskSource.Version);
+                if (gateTaskSource.GetStatus(gateTaskSource.Version) != System.Threading.Tasks.Sources.ValueTaskSourceStatus.Pending)
+                    gateTaskSource.GetResult(gateTaskSource.Version);
             }
 
             public void OnCompleted(Action continuation)
