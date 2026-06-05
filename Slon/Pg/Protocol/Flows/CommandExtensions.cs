@@ -135,18 +135,21 @@ static class CommandExtensions
         }
     }
 
-    // TODO make actually auto (e.g. sync compat)
-    public static ValueTask<(PgError?, RowDescription?)> ReadUntilExecuteAuto(this in Command command, PgDecoder decoder)
+    /// Reads the response messages up to (but not including) the actual row stream / CommandComplete.
+    /// Async variant. Yields on missing bytes. Caller picks this vs <see cref="ReadUntilExecute"/>
+    /// based on per-call <c>IsAsync</c>. No wrapper method, dispatch inlined at the call site.
+    public static ValueTask<(PgError?, RowDescription?)> ReadUntilExecuteAsync(this in Command command, PgDecoder decoder)
     {
-        return command.IsSimple()
-            ? ReadSimple(decoder)
-            : ReadExtended(decoder,
-                readParse: !command.Descriptor.IsPrepared,
-                readDescribe: command.DescribeOnly || !command.Descriptor.IsPrepared || command.Descriptor.PreparedRowDescription is null,
-                readExecute: !command.DescribeOnly);
+        if (command.IsSimple())
+            return ReadSimpleAsync(decoder);
+
+        return ReadExtendedAsync(decoder,
+            readParse: !command.Descriptor.IsPrepared,
+            readDescribe: command.DescribeOnly || !command.Descriptor.IsPrepared || command.Descriptor.PreparedRowDescription is null,
+            readExecute: !command.DescribeOnly);
 
         [AsyncMethodBuilder(typeof(NonContextRestoringPoolingValueTaskMethodBuilder<>))]
-        static async ValueTask<(PgError?, RowDescription?)> ReadSimple(PgDecoder decoder)
+        static async ValueTask<(PgError?, RowDescription?)> ReadSimpleAsync(PgDecoder decoder)
         {
             if (!decoder.TryGetNext(out var message))
                 message = await decoder.GetNextAsync().ConfigureAwait(false);
@@ -178,7 +181,7 @@ static class CommandExtensions
         }
 
         [AsyncMethodBuilder(typeof(NonContextRestoringPoolingValueTaskMethodBuilder<>))]
-        static async ValueTask<(PgError?, RowDescription?)> ReadExtended(PgDecoder decoder, bool readParse, bool readDescribe, bool readExecute)
+        static async ValueTask<(PgError?, RowDescription?)> ReadExtendedAsync(PgDecoder decoder, bool readParse, bool readDescribe, bool readExecute)
         {
             BackendMessage message;
             if (readParse)
@@ -230,6 +233,100 @@ static class CommandExtensions
             {
                 if (!decoder.TryGetNext(out message))
                     message = await decoder.GetNextAsync().ConfigureAwait(false);
+                message.DebugEnsureExpected(PgTypes.BackendType.DataRow, PgTypes.BackendType.CommandComplete);
+            }
+
+            Debug.Assert(!readDescribe || requestedRowDescription is not null);
+            return (null, requestedRowDescription);
+        }
+    }
+
+    /// Sync counterpart to <see cref="ReadUntilExecuteAsync"/>. Blocks via <see cref="PgDecoder.GetNext"/>
+    /// when bytes aren't already buffered. Safe on the executor's thread when that thread is dedicated
+    /// to this flow's processing (handoff mode sync, or dedicated mode + <c>MoveNext()</c> per-call).
+    public static (PgError?, RowDescription?) ReadUntilExecute(this in Command command, PgDecoder decoder)
+    {
+        if (command.IsSimple())
+            return ReadSimpleSync(decoder);
+
+        return ReadExtendedSync(decoder,
+            readParse: !command.Descriptor.IsPrepared,
+            readDescribe: command.DescribeOnly || !command.Descriptor.IsPrepared || command.Descriptor.PreparedRowDescription is null,
+            readExecute: !command.DescribeOnly);
+
+        static (PgError?, RowDescription?) ReadSimpleSync(PgDecoder decoder)
+        {
+            var message = decoder.TryGetNext(out var m) ? m : decoder.GetNext();
+            if (message.EnsureExpectedOrError(PgTypes.BackendType.RowDescription, PgTypes.BackendType.NoData)
+                    is var result && result.Error is { } describeError)
+                return (describeError, null);
+
+            RowDescription? requestedRowDescription;
+            switch (result.Type)
+            {
+                case PgTypes.BackendType.RowDescription:
+                    requestedRowDescription = new RowDescription();
+                    requestedRowDescription.Initialize(message.BodyReader);
+                    break;
+                case PgTypes.BackendType.NoData:
+                    Debug.Assert(message.Header.BodyLength is 0);
+                    requestedRowDescription = RowDescription.NoData;
+                    break;
+                default:
+                    ThrowHelper.ThrowUnhandledCase(result.Type);
+                    return default!;
+            }
+
+            message = decoder.TryGetNext(out m) ? m : decoder.GetNext();
+            message.DebugEnsureExpected(PgTypes.BackendType.DataRow, PgTypes.BackendType.CommandComplete);
+            return (null, requestedRowDescription);
+        }
+
+        static (PgError?, RowDescription?) ReadExtendedSync(PgDecoder decoder, bool readParse, bool readDescribe, bool readExecute)
+        {
+            BackendMessage message;
+            if (readParse)
+            {
+                message = decoder.TryGetNext(out var m) ? m : decoder.GetNext();
+                if (message.EnsureExpectedOrError(PgTypes.BackendType.ParseComplete) is { } parseError)
+                    return (parseError, null);
+
+                Debug.Assert(message.Header.BodyLength is 0);
+            }
+
+            message = decoder.TryGetNext(out var bm) ? bm : decoder.GetNext();
+            if (message.EnsureExpectedOrError(PgTypes.BackendType.BindComplete) is { } bindError)
+                return (bindError, null);
+
+            Debug.Assert(message.Header.BodyLength is 0);
+
+            RowDescription? requestedRowDescription = null;
+            if (readDescribe)
+            {
+                message = decoder.TryGetNext(out var dm) ? dm : decoder.GetNext();
+                if (message.EnsureExpectedOrError(PgTypes.BackendType.RowDescription, PgTypes.BackendType.NoData)
+                        is var result && result.Error is { } describeError)
+                    return (describeError, null);
+
+                switch (result.Type)
+                {
+                    case PgTypes.BackendType.RowDescription:
+                        requestedRowDescription = new RowDescription();
+                        requestedRowDescription.Initialize(message.BodyReader);
+                        break;
+                    case PgTypes.BackendType.NoData:
+                        Debug.Assert(message.Header.BodyLength is 0);
+                        requestedRowDescription = RowDescription.NoData;
+                        break;
+                    default:
+                        ThrowHelper.ThrowUnhandledCase(result.Type);
+                        return default!;
+                }
+            }
+
+            if (readExecute)
+            {
+                message = decoder.TryGetNext(out var em) ? em : decoder.GetNext();
                 message.DebugEnsureExpected(PgTypes.BackendType.DataRow, PgTypes.BackendType.CommandComplete);
             }
 

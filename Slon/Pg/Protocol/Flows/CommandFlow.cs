@@ -302,9 +302,10 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                 }
 
                 command = ref _options.Commands.ItemRef(_commandIndex);
-                var task = command.ReadUntilExecuteAuto(_decoder);
-                Debug.Assert(task.IsCompleted || IsAsync);
-                (_pgError, _requestedRowDescription) = await task.ConfigureAwait(false);
+                if (IsAsync)
+                    (_pgError, _requestedRowDescription) = await command.ReadUntilExecuteAsync(_decoder).ConfigureAwait(false);
+                else
+                    (_pgError, _requestedRowDescription) = command.ReadUntilExecute(_decoder);
 
                 if (_callerCancellationToken.CanBeCanceled)
                 {
