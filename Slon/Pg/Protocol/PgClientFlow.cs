@@ -66,6 +66,22 @@ abstract class PgClientFlow : IProtocolFlow, IValueTaskSource<PgDecoder>
     // so they must go through TP to avoid pinning the advancer latch.
     internal bool IsAsyncAtBind => _isAsyncAtBind;
 
+    // Pre-bind read of IsAsync for the enqueue path: the protocol routes sync flows through an
+    // inline wake-signal dispatch so the producer's thread takes over the executor for that flow.
+    // Asserts the flow set its mode before queueing (same precondition Bind enforces).
+    internal bool IsAsyncForEnqueue
+    {
+        get
+        {
+            if (_isAsync is not { } async)
+            {
+                ThrowHelper.ThrowInvalidOperation("IsAsync was not set by flow before it was queued.");
+                return default;
+            }
+            return async;
+        }
+    }
+
     // Probably should use a cts here.
     public void Cancel()
     {

@@ -48,7 +48,6 @@ sealed class PgClientProtocolOptions
         FlowActivationTimeout = options.ConnectionTimeout;
     }
 
-    public bool RunEnqueueAsynchronously { get; set; } = true;
     public TimeProvider TimeProvider { get; set; } = TimeProvider.System;
     // How much time to give CompleteAsync before forcefully aborting flows.
     public TimeSpan CompletionTimeout { get; set; } = TimeSpan.FromSeconds(10);
@@ -80,7 +79,8 @@ sealed class PgClientProtocol
     // Framework state, formerly inherited from Protocol<TFlow>.
     readonly CancellationTokenSource _abortCts;
     readonly CancellationToken _abortToken;
-    QueuedPipeline<PgClientFlow, Policy> _pipeline = null!;
+    Pipeline<PgClientFlow, Policy, PgClientFlowSource, PgClientFlowSource.Enumerator> _pipeline = null!;
+    PgClientFlowSource _source;
     readonly Lock _syncRoot = new();
     ProtocolStatus _status = ProtocolStatus.Created;
     // Track draining count so overlapping recovery starts/ends don't signal ready too early.
@@ -101,6 +101,11 @@ sealed class PgClientProtocol
     CancellationToken AbortToken => _abortToken;
     public int PipelineDepth => _pipeline.Depth;
     ProtocolStatus Status => _status;
+
+    // Source-side accessors. The PgClientFlowSource's pre-park hook reads these to decide whether
+    // it must flush before the executor goes idle.
+    internal long UnflushedBytes => _protocolDataWriter.UnflushedBytes;
+    internal ValueTask FlushAsync(CancellationToken cancellationToken) => _protocolDataWriter.FlushAsync(cancellationToken);
 
     // Pool-unit accessors. PgConnection forwards its IPoolConnection<PgConnection> implementation
     // to these. Keeps the protocol package decoupled from Slon.Pools' typed context.
@@ -165,7 +170,8 @@ sealed class PgClientProtocol
 
     async ValueTask StartAsync(PgClientFlow? flow, ValueTask flowCompletion, CancellationToken cancellationToken = default)
     {
-        _pipeline = Pipeline.Create<PgClientFlow, Policy>(new Policy(this));
+        _source = PgClientFlowSource.Create(this, _options.ExecutionScheduler);
+        _pipeline = Pipeline.Create<PgClientFlow, Policy, PgClientFlowSource, PgClientFlowSource.Enumerator>(new Policy(this), _source);
         if (flow is not null && !TryQueueFlow(flow, ProtocolStatus.Created))
             throw new InvalidOperationException("Could not enqueue starting flow, protocol is not in a valid state to start.");
         try
@@ -248,7 +254,8 @@ sealed class PgClientProtocol
     bool TryQueueFlow(PgClientFlow flow, ProtocolStatus requiredStatus) => TryQueueFlow<bool>(flow, requiredStatus);
     bool TryQueueFlow<TState>(PgClientFlow flow, ProtocolStatus requiredStatus, Func<TState, bool>? predicate = null, TState state = default!)
     {
-        UnboundedQueueSource<PgClientFlow>.EnqueueResult enqueue;
+        var isAsync = flow.IsAsyncForEnqueue;
+        PgClientFlowSource.EnqueueResult enqueue = default;
         lock (_syncRoot)
         {
             if (_status != requiredStatus)
@@ -257,15 +264,18 @@ sealed class PgClientProtocol
             if (predicate?.Invoke(state) == false)
                 return false;
 
-            enqueue = _pipeline.Enqueue(flow);
+            if (isAsync)
+                enqueue = _source.Enqueue(flow);
         }
-        enqueue.Execute();
+        if (isAsync)
+        {
+            enqueue.Execute(runContinuationsAsynchronously: true);
+        }
+        else
+        {
+            _source.EnqueueSyncWithHandoff(flow);
+        }
         return true;
-    }
-
-    ValueTask OnExecutionIdleAsync(CancellationToken cancellationToken = default)
-    {
-        return _protocolDataWriter.UnflushedBytes is not 0 ? _protocolDataWriter.FlushAsync(cancellationToken) : new();
     }
 
     // TODO remove and create a drain primitive.
@@ -346,9 +356,9 @@ sealed class PgClientProtocol
 
     public struct Enumerator
     {
-        Pipeline<PgClientFlow, Policy, UnboundedQueueSource<PgClientFlow>, UnboundedQueueSource<PgClientFlow>.Enumerator>.Enumerator _inner;
+        Pipeline<PgClientFlow, Policy, PgClientFlowSource, PgClientFlowSource.Enumerator>.Enumerator _inner;
 
-        internal Enumerator(Pipeline<PgClientFlow, Policy, UnboundedQueueSource<PgClientFlow>, UnboundedQueueSource<PgClientFlow>.Enumerator>.Enumerator inner) => _inner = inner;
+        internal Enumerator(Pipeline<PgClientFlow, Policy, PgClientFlowSource, PgClientFlowSource.Enumerator>.Enumerator inner) => _inner = inner;
 
         public PgClientFlow Current => _inner.Current;
         public Enumerator GetEnumerator() => this;
@@ -368,12 +378,10 @@ sealed class PgClientProtocol
             _abortToken = protocol._abortToken;
             _promise = new();
             _activationWorkItem = new(protocol.FlowControl);
-            RunEnqueueAsynchronously = protocol._options.RunEnqueueAsynchronously;
             ExecutionScheduler = protocol._options.ExecutionScheduler;
             ActivationScheduler = protocol._options.ActivationScheduler;
         }
 
-        public bool RunEnqueueAsynchronously { get; }
         public PipelineScheduler? ExecutionScheduler { get; }
         PipelineScheduler? ActivationScheduler { get; }
 
@@ -434,8 +442,6 @@ sealed class PgClientProtocol
             recoveryItem = null;
             return false;
         }
-
-        public ValueTask OnExecutionIdleAsync(CancellationToken cancellationToken) => _protocol.OnExecutionIdleAsync(cancellationToken);
 
         sealed class ActivationWorkItem(Control flowControl) : IThreadPoolWorkItem
         {
