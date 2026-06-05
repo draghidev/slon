@@ -1,14 +1,41 @@
+using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Text;
 using Slon.Buffers;
 using Slon.Buffers.Binary;
 using Slon.Pg.Types;
+using Slon.Transport;
 
 namespace Slon.Pg.Protocol;
 
-sealed class PgProtocolDataWriter(IOutputWriter<byte> writer, Encoding clientEncoding)
+sealed class PgProtocolDataWriter(IOutputWriter<byte> writer, Encoding clientEncoding, Action waitWritable)
 {
     BufferingWriter _bufferingWriter = new(writer);
+
+    // Per-connection cached signal. The flow parks this in
+    // TransportConnection.SyncNonBlockingSignal around each Resumable call, the transport
+    // returns it on WouldBlock as the pending source, the flow's driver fires it via
+    // SignalWritable. Reused across operations thanks to auto-reset on consumption.
+    public WritableSignal WritableSignal { get; } = new();
+
+    // Maps a thrown exception to a SocketError, or null when the exception isn't recognizable
+    // as a transport-level socket error. Handles the .NET socket-stack path. NetworkStream and
+    // SslStream wrap SocketException in IOException, raw Socket throws it directly.
+    public SocketError? GetSocketError(Exception ex)
+    {
+        if (ex is SocketException se)
+            return se.SocketErrorCode;
+        if (ex is IOException && ex.InnerException is SocketException ise)
+            return ise.SocketErrorCode;
+        return null;
+    }
+
+    // Driver hooks for the sync wrappers and higher-composition sync drivers. SignalWritable
+    // fires the cached writable signal, releasing any coroutine awaiter that captured it on
+    // WouldBlock. WaitWritable forwards to the transport's wait callback (typically
+    // Socket.Poll on a SelectMode.SelectWrite), parking the calling thread until writable.
+    public void SignalWritable() => WritableSignal.Signal();
+    public void WaitWritable() => waitWritable();
 
     internal void CopyFrom<TBuffer>(TBuffer buffer) where TBuffer : ICopyableBuffer<byte>
         => buffer.CopyTo(writer);

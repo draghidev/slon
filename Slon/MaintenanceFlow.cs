@@ -47,7 +47,7 @@ sealed class MaintenanceFlow : PgClientFlow
         _connection = null;
     }
 
-    protected override async ValueTask<FlowTasks> ExecuteAuto(Context context)
+    protected override ValueTask<FlowTasks> ExecuteAuto(Context context)
     {
         var connection = _connection ?? throw new InvalidOperationException("MaintenanceFlow has not been bound to a PgConnection.");
         // Snapshot the range to process. (Head, Tail) define an immutable window in the intrusive
@@ -56,12 +56,15 @@ sealed class MaintenanceFlow : PgClientFlow
         // the range visible for the next flow (at-least-once default, Close is idempotent).
         var (head, tail) = connection.SnapshotMaintenanceRange();
         if (head is null)
-            return ValueTask.CompletedTask;
+            return new(ValueTask.CompletedTask);
 
         // Write phase: one Sync window for the whole batch. Per protocol spec, Close against a
         // nonexistent statement is NOT an error (it returns CloseComplete) so racy cleanup and
         // leak salvage don't trip the after-error-skip semantics. ErrorResponse on Close is
         // reserved for genuine server-side difficulty (OOM etc.), accepted as best-effort.
+        // All writes are sync buffer-fills (WriteClose, WriteSync are void). The only point that
+        // can yield is the flush, which we hand to FlowTasks as trailing so the read phase can
+        // start concurrently with the wire I/O draining.
         var encoder = context.GetEncoder();
         var node = head;
         while (true)
@@ -84,7 +87,7 @@ sealed class MaintenanceFlow : PgClientFlow
             node = node.Next!;
         }
         encoder.WriteSync();
-        await encoder.FlushAuto().ConfigureAwait(false);
+        var flushTask = encoder.FlushAsync();
 
         // Hand off to the pipelined read phase as a local async function. BeginCallScope sets the
         // promise TLS so the local function's builder picks it up at Create time. The using clears
@@ -93,7 +96,7 @@ sealed class MaintenanceFlow : PgClientFlow
         // via GetDecoderAsync's own await suspension, no special framework deferral needed.
         using (PromiseAsyncValueTaskMethodBuilder.BeginCallScope(_readPromise))
         {
-            return ReadPhase();
+            return new(new FlowTasks(trailingExecutionTask: flushTask, pipelineTask: ReadPhase()));
         }
 
         [AsyncMethodBuilder(typeof(PromiseAsyncValueTaskMethodBuilder))]

@@ -4,6 +4,7 @@ using System.Collections.Immutable;
 using System.Security.Cryptography;
 using System.Text;
 using Slon.Buffers;
+using Slon.Transport;
 using static Slon.Pg.Protocol.PgTypes;
 
 namespace Slon.Pg.Protocol;
@@ -24,6 +25,45 @@ readonly struct PgEncoder
 
     public bool LastMessageInducesRfq => _executionControl.LastMessageInducesRfq;
 
+    // Cached writable signal the flow parks in the transport TLS slot around a Resumable
+    // call. Cached on the writer (per-connection) so each call reuses one instance, no
+    // per-op allocation. Auto-reset on consumption keeps it ready for the next WouldBlock
+    // cycle.
+    public WritableSignal WritableSignal => _writer.WritableSignal;
+
+    // Opens a scope that places the writer's cached signal in the transport's TLS slot for
+    // the scope's lifetime, restoring on Dispose. Use this from a Resumable-driving caller
+    // (flow body or sync wrapper) so the transport sees the signal underneath. Lets the
+    // caller stay agnostic to the TLS plumbing.
+    public ResumableScope BeginResumableScope() => new(_writer.WritableSignal);
+
+    // Forwards to the underlying writer so the sync encoder variants and higher-composition
+    // sync drivers can park and signal without reaching into the transport directly.
+    void WaitWritable() => _writer.WaitWritable();
+    void SignalWritable() => _writer.SignalWritable();
+
+    // Dispatches a pending Resumable's driver loop to a LongRunning thread. Caller is
+    // expected to have already observed that the resumable isn't completed (so the shunt is
+    // needed). The LongRunning delegate opens its own ResumableScope so the transport's TLS
+    // slot stays populated through the resumption thread's lifetime, then runs the same
+    // driver body the sync wrappers use inline
+    // (while (!t.IsCompleted) { WaitWritable, SignalWritable }, then GetResult).
+    public ValueTask RunResumableTask(ValueTask resumable)
+    {
+        var encoder = this;
+        return new ValueTask(Task.Factory.StartNew(static state =>
+        {
+            var (e, t) = ((PgEncoder, ValueTask))state!;
+            using var _ = e.BeginResumableScope();
+            while (!t.IsCompleted)
+            {
+                e.WaitWritable();
+                e.SignalWritable();
+            }
+            t.GetAwaiter().GetResult();
+        }, (encoder, resumable), CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default));
+    }
+
     public ValueTask WriteQueryAuto(string commandText)
     {
         if (_executionControl.IsAsync)
@@ -40,6 +80,15 @@ readonly struct PgEncoder
         return new();
     }
 
+    // Names the caller's intent: "I have a ResumableScope open, drive my returned task."
+    // Body is just the Async variant. Transport reads the TLS signal and translates WouldBlock
+    // into a pending ValueTask backed by it. Kept as a separate method so call sites stay
+    // self-documenting and the Async / Resumable bodies can diverge later if serializer
+    // auto-flush needs different scheduling.
+    public ValueTask WriteQueryResumable(string commandText) => WriteQueryAsync(commandText);
+
+    // Sync core. Back-pressure is handled at the transport layer via the TLS-armed Resumable
+    // path, not at the encoder level, so this is just the buffer fill.
     public void WriteQuery(string commandText)
     {
         var encoding = ClientEncoding;
@@ -78,6 +127,10 @@ readonly struct PgEncoder
         while (enumerator.MoveNext())
             _writer.WriteUInt(enumerator.Current.Oid.Value);
     }
+
+    // See WriteQueryResumable for the contract.
+    public ValueTask WriteParseResumable(string commandText, EncodedString commandName = default, ParameterTypeList parameterTypes = default)
+        => WriteParseAsync(commandText, commandName, parameterTypes);
 
     public void WriteParse(string commandText, EncodedString commandName = default, ParameterTypeList parameterTypes = default)
     {
@@ -118,6 +171,10 @@ readonly struct PgEncoder
         WriteBind(commandName, portalName, parameters);
         return new();
     }
+
+    // See WriteQueryResumable for the contract.
+    public ValueTask WriteBindResumable(EncodedString commandName = default, EncodedString portalName = default, ImmutableArray<Parameter> parameters = default)
+        => WriteBindAsync(commandName, portalName, parameters);
 
     public void WriteBind(EncodedString commandName = default, EncodedString portalName = default, ImmutableArray<Parameter> parameters = default)
     {
@@ -290,9 +347,32 @@ readonly struct PgEncoder
         _executionControl.OnMessageWrite(type);
     }
 
+    // Calls FlushAsync expecting the caller (flow level) to have opened an
+    // EncoderResumableScope so the writer's signal is in the transport TLS slot. The
+    // transport picks up the TLS signal, does sync non-blocking syscalls, and translates
+    // WouldBlock into a pending ValueTask backed by that signal. No exception, just a
+    // pending shape that propagates faithfully through SslStream, NetworkStream, and any
+    // other async wrapper in between. The flow's driver (inline or shunted to LongRunning)
+    // holds the signal reference and drives it externally via WaitWritable plus
+    // signal.Signal. No try/catch at this layer, the transport is the coroutine, the flow
+    // is the driver.
+    public ValueTask FlushResumable()
+    {
+        _executionControl.ThrowIfCannotWrite();
+        // When a flow pipelines a flush never gets followed by a read - in the first phase - so we can always delay flushes.
+        if (_executionControl.IsPipelined)
+            return default;
+
+        return _writer.FlushAsync(default);
+    }
+
     public void Flush()
     {
         _executionControl.ThrowIfCannotWrite();
+        // When a flow pipelines a flush never gets followed by a read - in the first phase - so we can always delay flushes.
+        if (_executionControl.IsPipelined)
+            return;
+
         _writer.Flush();
     }
 

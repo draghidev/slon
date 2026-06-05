@@ -59,6 +59,13 @@ abstract class PgClientFlow : IProtocolFlow, IValueTaskSource<PgDecoder>
         }
     }
 
+    // The bind-time async snapshot. Stable across the flow's tenure (unlike IsAsync, which a
+    // flow body may mutate for sync/async mixing). Used by the policy to decide whether
+    // activation can run inline: sync flows park their caller via Task wait-handle (bounded
+    // signal cost), so inline-Activate is safe. Async flows can attach arbitrary continuations,
+    // so they must go through TP to avoid pinning the advancer latch.
+    internal bool IsAsyncAtBind => _isAsyncAtBind;
+
     // Probably should use a cts here.
     public void Cancel()
     {

@@ -14,8 +14,20 @@ abstract class TransportConnection
     internal const int DefaultReaderSegmentSize = 65536;
     internal const int DefaultWriterSegmentSize = DefaultReaderSegmentSize;
 
+    // Set by ResumableScope to request synchronous non-blocking writes. On WouldBlock, the
+    // transport returns a pending task backed by this caller-owned signal; only the caller resumes it.
+    [ThreadStatic]
+    public static WriteResumeSignal? SyncNonBlockingSignal;
+
+    // Optional deadline for synchronous polling under the same scope. Null means infinite.
+    [ThreadStatic]
+    public static Deadline? SyncNonBlockingDeadline;
+
     public abstract PipeReader Reader { get; }
     public abstract PipeWriter Writer { get; }
+
+    // Parks the calling thread until the transport is writable.
+    public abstract void WaitWritable();
 
     public abstract class Factory(TransportConnectionOptions? options = null)
     {

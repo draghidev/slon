@@ -43,23 +43,36 @@ struct FlowCallerInteractionCore<TResult>
 
     public bool IsWaiting { get; private set; }
     public bool HasContinuation => _continuation is not null;
-    public Action WaitForContinuation()
+
+    // Park the caller until the body either registers a continuation for us to drive forward,
+    // or signals progress via SignalProgress (because the body resumed on its own via async I/O
+    // completion and produced a result or completion on the move-next task source). The two
+    // wake conditions share one MRES. Returns the continuation to invoke, or null if we were
+    // woken only by the progress signal.
+    public Action? WaitForContinuation()
     {
         var mres = GetMres();
 
-        // This should get unblocked by the flow on every await.
         IsWaiting = true;
         try
         {
             mres.Wait();
             mres.Reset();
-            return _continuation!;
+            var continuation = _continuation;
+            _continuation = null;
+            return continuation;
         }
         finally
         {
             IsWaiting = false;
         }
     }
+
+    // Wake any WaitForContinuation that's parked without registering a continuation. Used by
+    // the body's result-delivery and completion paths so a sync caller can wake even when the
+    // body's progress came from an async-I/O continuation that ran on a TP thread without
+    // routing through SetContinuationAndUnblockWaiter.
+    public void SignalProgress() => _mres?.Set();
 
     public ContinuationCapturingAwaitable SetContinuationAndUnblockWaiter(FieldRef<FlowCallerInteractionCore<TResult>> fieldRef)
         => new(fieldRef);

@@ -75,7 +75,11 @@ static class CommandExtensions
         }
     }
 
-    public static void Write(this Command command, PgEncoder encoder)
+    // Sync coroutine variant, composes the encoder's *Resumable primitives into a single
+    // async state machine for the whole command. Any WouldBlock from a mid-message auto-flush
+    // (post-serializer) suspends here. The resumption picks up at the exact same composition
+    // point with all state intact. Cf. encoder.WriteQueryResumable for the per-message contract.
+    public static async ValueTask WriteResumable(this Command command, PgEncoder encoder)
     {
         var descriptor = command.Descriptor;
         if (descriptor.IsPrepared)
@@ -89,7 +93,7 @@ static class CommandExtensions
                 parameters = descriptor.ParameterTypes.ToDbNullParameterList();
             }
 
-            encoder.WriteBind(descriptor.CommandName, parameters: parameters);
+            await encoder.WriteBindResumable(descriptor.CommandName, parameters: parameters).ConfigureAwait(false);
 
             if (command.DescribeOnly)
             {
@@ -108,7 +112,7 @@ static class CommandExtensions
         }
         else if (command.IsSimple())
         {
-            encoder.WriteQuery(descriptor.UnpreparedCommandText);
+            await encoder.WriteQueryResumable(descriptor.UnpreparedCommandText).ConfigureAwait(false);
         }
         else
         {
@@ -121,8 +125,8 @@ static class CommandExtensions
                 parameters = descriptor.ParameterTypes.ToDbNullParameterList();
             }
 
-            encoder.WriteParse(descriptor.UnpreparedCommandText, descriptor.CommandName, descriptor.ParameterTypes);
-            encoder.WriteBind(descriptor.CommandName, parameters: parameters);
+            await encoder.WriteParseResumable(descriptor.UnpreparedCommandText, descriptor.CommandName, descriptor.ParameterTypes).ConfigureAwait(false);
+            await encoder.WriteBindResumable(descriptor.CommandName, parameters: parameters).ConfigureAwait(false);
             encoder.WriteDescribe();
             if (!command.DescribeOnly)
                 encoder.WriteExecute();

@@ -34,6 +34,7 @@ sealed class SocketStreamConnection : TransportConnection, IDisposable, IAsyncDi
 
     public override PipeReader Reader { get; }
     public override PipeWriter Writer { get; }
+    public override void WaitWritable() => _stream.WaitWritable();
 
     public static Factory CreateFactory(EndPoint endPoint, TransportConnectionOptions? options = null) => new(endPoint, options);
 
@@ -136,5 +137,152 @@ sealed class SocketStreamConnection : TransportConnection, IDisposable, IAsyncDi
             => SocketStreamConnection.ConnectAsync<TransportConnection>(_endPoint, Options, cancellationToken);
     }
 
-    sealed class SealedNetworkStream(Socket socket, bool ownsSocket) : NetworkStream(socket, ownsSocket);
+    // Reads TransportConnection.SyncNonBlockingSignal to decide whether WriteAsync does sync
+    // non-blocking syscalls. With a signal set it returns a pending ValueTask backed by that
+    // signal on WouldBlock, never throwing. Without one it falls through to base
+    // NetworkStream's normal async I/O. The "lie" lets SslStream and any other async wrappers
+    // above pass our ValueTasks through faithfully. The signal is owned by the flow that set
+    // it. The transport never signals it.
+    internal sealed class SealedNetworkStream : NetworkStream
+    {
+        public SealedNetworkStream(Socket socket, bool ownsSocket) : base(socket, ownsSocket)
+        {
+            // NetworkStream's constructor validates that socket.Blocking is true and refuses
+            // non-blocking sockets. Flip it AFTER base construction so our WriteAsync override
+            // gets non-blocking semantics. The read path needs the same treatment before this
+            // is safe for full integration use, but it works for the write-only tests below.
+            socket.Blocking = false;
+        }
+
+        public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            // No TLS signal == normal async I/O path (TP completion via SocketAsyncEngine).
+            // This is the async-flow path, unaffected by the coroutine pattern.
+            var signal = SyncNonBlockingSignal;
+            if (signal is null)
+                return base.WriteAsync(buffer, cancellationToken);
+
+            // Hot path: try sync non-blocking send inline. If the whole buffer goes out
+            // without WouldBlock, return sync-completed, no state machine, no allocation.
+            while (buffer.Length > 0)
+            {
+                var sent = Socket.Send(buffer.Span, SocketFlags.None, out var errorCode);
+                if (errorCode == SocketError.WouldBlock)
+                {
+                    // Cold path: rest of the buffer needs to suspend. Hand off to the coroutine
+                    // capturing the signal (so the flow's driver can clear TLS after this
+                    // initial call returns without affecting the in-flight coroutine).
+                    return WriteAsyncCoroutine(buffer, signal, cancellationToken);
+                }
+                if (errorCode != SocketError.Success)
+                    return ValueTask.FromException(new SocketException((int)errorCode));
+                buffer = buffer.Slice(sent);
+            }
+            return ValueTask.CompletedTask;
+        }
+
+        async ValueTask WriteAsyncCoroutine(ReadOnlyMemory<byte> buffer, WriteResumeSignal signal, CancellationToken cancellationToken)
+        {
+            while (buffer.Length > 0)
+            {
+                var sent = Socket.Send(buffer.Span, SocketFlags.None, out var errorCode);
+                if (errorCode == SocketError.WouldBlock)
+                {
+                    await signal.Pending().ConfigureAwait(false);
+                    continue;
+                }
+                if (errorCode != SocketError.Success)
+                    throw new SocketException((int)errorCode);
+                buffer = buffer.Slice(sent);
+            }
+        }
+
+        // Exposed so the flow-level driver can park its thread until the kernel reports
+        // writability. Honors the TLS-carried SyncNonBlockingDeadline set by ResumableScope
+        // so per-command timeouts work end-to-end without a separate signature. Throws
+        // TimeoutException on expiry so a dead peer doesn't park the driver thread forever.
+        public void WaitWritable() => PollWritableOrThrow(SyncNonBlockingDeadline);
+
+        // Sync Write. The socket is non-blocking (set at construction), so we own the local
+        // reactor loop here. Sources the deadline from the Stream's WriteTimeout property
+        // (the standard sync-stream timeout knob) rather than the TLS slot, since sync Write
+        // callers aren't going through ResumableScope. One Deadline per Write call so the
+        // whole operation must complete within WriteTimeout, matching the NetworkStream
+        // contract.
+        public override void Write(ReadOnlySpan<byte> buffer)
+        {
+            var deadline = WriteTimeout <= 0
+                ? (Deadline?)null
+                : new Deadline(TimeSpan.FromMilliseconds(WriteTimeout));
+            while (buffer.Length > 0)
+            {
+                var sent = Socket.Send(buffer, SocketFlags.None, out var errorCode);
+                if (errorCode == SocketError.Success)
+                {
+                    buffer = buffer.Slice(sent);
+                    continue;
+                }
+                if (errorCode == SocketError.WouldBlock)
+                {
+                    PollWritableOrThrow(deadline);
+                    continue;
+                }
+                throw new SocketException((int)errorCode);
+            }
+        }
+
+        public override void Write(byte[] buffer, int offset, int count)
+            => Write(buffer.AsSpan(offset, count));
+
+        // Sync Read. Mirrors the sync Write reactor loop. Once writes shunt off to a
+        // LongRunning thread the caller thread is free to block here in Poll waiting for
+        // data, so we don't need TLS-driven async-read coroutines for sync flows. Sources
+        // the deadline from Stream.ReadTimeout, fresh Deadline per Read call to match the
+        // NetworkStream contract.
+        public override int Read(Span<byte> buffer)
+        {
+            var deadline = ReadTimeout <= 0
+                ? (Deadline?)null
+                : new Deadline(TimeSpan.FromMilliseconds(ReadTimeout));
+            while (true)
+            {
+                var received = Socket.Receive(buffer, SocketFlags.None, out var errorCode);
+                if (errorCode == SocketError.Success)
+                    return received;
+                if (errorCode == SocketError.WouldBlock)
+                {
+                    PollOrThrow(deadline, SelectMode.SelectRead, "Read");
+                    continue;
+                }
+                throw new SocketException((int)errorCode);
+            }
+        }
+
+        public override int Read(byte[] buffer, int offset, int count)
+            => Read(buffer.AsSpan(offset, count));
+
+        void PollWritableOrThrow(Deadline? deadline) => PollOrThrow(deadline, SelectMode.SelectWrite, "Write");
+
+        void PollOrThrow(Deadline? deadline, SelectMode mode, string opName)
+        {
+            // Null deadline means infinite. Otherwise compute remaining (which itself throws
+            // TimeoutException if already elapsed). Socket.Poll uses -1 for infinite and
+            // positive value as microseconds. Clamp ms-to-us conversion at int.MaxValue for
+            // very large remaining intervals.
+            int pollUs;
+            if (deadline is { } d)
+            {
+                var remaining = d.GetRemaining();
+                pollUs = remaining == Timeout.InfiniteTimeSpan
+                    ? -1
+                    : (int)Math.Min((long)remaining.TotalMilliseconds * 1000, int.MaxValue);
+            }
+            else
+            {
+                pollUs = -1;
+            }
+            if (!Socket.Poll(pollUs, mode))
+                throw new IOException($"{opName} timed out waiting for socket readiness.", new SocketException((int)SocketError.TimedOut));
+        }
+    }
 }

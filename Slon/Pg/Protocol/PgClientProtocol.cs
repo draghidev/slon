@@ -125,7 +125,7 @@ sealed class PgClientProtocol
     void Initialize(TransportConnection connection, Action? onIdle)
     {
         _pipeWriter = connection.Writer as IOutputWriter<byte> ?? new PipeStreamingWriter(connection.Writer);
-        _protocolDataWriter = new(_pipeWriter, PgClientOptions.PreStartupEncoding);
+        _protocolDataWriter = new(_pipeWriter, PgClientOptions.PreStartupEncoding, connection.WaitWritable);
         _pipeSegmentEnumerator = new(connection.Reader, new(), ownsReader: true);
         _pgDecoder = new(_pipeSegmentEnumerator, AbortToken, _options.ReadTimeout);
 
@@ -410,7 +410,12 @@ sealed class PgClientProtocol
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public void ActivateHeadItem(PgClientFlow item, bool preferAsync = true)
         {
-            if (preferAsync)
+            // Inline-activate when the framework allows it (preferAsync=false) OR when the flow
+            // is sync. Sync flows park their caller via Task.AsTask().GetAwaiter().GetResult(),
+            // so the activation continuation is just a kernel wait-handle signal, bounded cost,
+            // safe to run under the advancer latch. Async flows can attach arbitrary continuation
+            // work via await, so they MUST go through TP to keep the latch hold bounded.
+            if (preferAsync && item.IsAsyncAtBind)
             {
                 _activationWorkItem.Initialize(item);
                 if (ActivationScheduler is { } scheduler)

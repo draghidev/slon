@@ -106,13 +106,44 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
 
             // All writes captured as a single task. If the writes back-pressure (TCP send
             // buffer full, large batch saturating local+peer windows), this task is pending
-            // and ExecutePipelined awaits it concurrently with the read phase — reads drain
+            // and ExecutePipelined awaits it concurrently with the read phase. Reads drain
             // the wire, the peer ACKs, the trailing writes complete. If writes fit in the
             // buffer, the task is sync-completed and the later await is a free no-op.
+            //
+            // Async flows take the *Async path (TP completion via SocketAsyncEngine plus the
+            // adaptive batching scheduler). Sync flows take the *Resumable path (sync
+            // syscalls on a non-blocking socket, WouldBlock suspends the coroutine, the
+            // readiness driver fires the writable signal to resume). The SignalScope places
+            // the encoder's cached writable signal in the transport's TLS slot for the
+            // duration of the call. The transport captures the signal into its coroutine on
+            // WouldBlock, so the scope can close after the initial call returns without
+            // disturbing the suspended state machine.
             // See https://www.postgresql.org/message-id/CADT4RqAH2nuVwM6cEugFL2z6apwXfP3OJb=zxR6jRgWEpx_2Ww@mail.gmail.com
             // https://github.com/pgjdbc/pgjdbc/issues/194
             // https://github.com/npgsql/npgsql/issues/641
-            _writeTask = WriteAllCommands();
+            ValueTask writeTask;
+            var encoder = context.GetEncoder();
+            if (IsAsync)
+            {
+                writeTask = WriteAllCommandsAsync();
+            }
+            else
+            {
+                using (encoder.BeginResumableScope())
+                    writeTask = WriteAllCommandsResumable();
+            }
+
+            // If the writes already completed observe them here so a synchronously-faulted
+            // task throws inside this try block and goes through HandleException. Without
+            // this, a sync-thrown error would be stashed into _writeTask and only observed
+            // later in ExecutePipelined's await, missing this scope's error handling. Same
+            // concern in both async and sync paths.
+            if (writeTask.IsCompleted)
+                writeTask.GetAwaiter().GetResult();
+            else if (!IsAsync)
+                writeTask = encoder.RunResumableTask(writeTask);
+
+            _writeTask = writeTask;
         }
         catch (Exception ex)
         {
@@ -122,17 +153,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
 
         return DispatchPipelinedRead(context, context.GetProtocolStatic<ReadState>().ReadPromise);
 
-        // Always async writes and flushes regardless of flow mode. The whole point of capturing
-        // this as a single task is to let it complete inline when the wire is responsive AND
-        // yield when back-pressure hits. Sync flushes (which block the caller's thread on the
-        // syscall) would defeat that and re-introduce the npgsql-style sync-batch deadlock.
-        //
-        // Note: today the inner *Auto methods don't flush internally (parameter sizes are
-        // trivial), so only the final FlushAsync matters. Once the full serializer lands,
-        // WriteBindAuto / WriteParseAuto will flush mid-parameter for large payloads — those
-        // flushes must also be on the async path (via *Async overloads or a force-async-flush
-        // scope on the encoder).
-        async ValueTask WriteAllCommands()
+        async ValueTask WriteAllCommandsAsync()
         {
             var encoder = context.GetEncoder();
             for (var i = 0; i < CommandCount; i++)
@@ -144,6 +165,20 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                 encoder.WriteSync();
             }
             await encoder.FlushAsync(_callerCancellationToken).ConfigureAwait(false);
+        }
+
+        async ValueTask WriteAllCommandsResumable()
+        {
+            var encoder = context.GetEncoder();
+            for (var i = 0; i < CommandCount; i++)
+                await _options.Commands[i].WriteResumable(encoder).ConfigureAwait(false);
+
+            if (!encoder.LastMessageInducesRfq)
+            {
+                _readFlowRfq = true;
+                encoder.WriteSync();
+            }
+            await encoder.FlushResumable().ConfigureAwait(false);
         }
     }
 
@@ -375,14 +410,12 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
         }
         catch (TimeoutException)
         {
-            Console.WriteLine("Timeout exception?");
             throw;
             // Issue backend cancel(s), this is a timeout on I/O, luckily this means we have a fairly high certainty we cancel our own commands.
             // We have to issue as many cancels as there are syncs in this flow.
         }
         catch (Exception ex)
         {
-            Console.WriteLine("Exception?: " + ex);
             HandleException(ex);
             throw;
         }
@@ -406,15 +439,20 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                 {
                     _options.OnCommandResultAction?.Invoke(next!, _options.OnCommandResultActionState);
                 }
-                catch (Exception ex)
+                catch
                 {
-                    Console.WriteLine("Exception from command result action: " + ex);
                     // TODO log.
                 }
             }
 
             _enumeratorCompleted = completed;
             _enumeratorMoveNextTaskSource.SetResult(!completed, runContinuationsAsynchronously: completed);
+            // Wake any sync MoveNext that's parked in WaitForContinuation without a continuation
+            // registered. Happens when the body's progress came from async I/O on TP rather than
+            // a SetContinuationAndUnblockWaiter handoff, including the post-last-result cleanup
+            // path that ends in SetResult(null) without a preceding continuation registration.
+            if (!IsAsync)
+                _callerInteractionCore.SignalProgress();
         }
 
         async ValueTask ReadRfq(PgDecoder decoder)
@@ -429,6 +467,11 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
     {
         // We have to make sure to unblock the caller if the flow failed to (could be a cancellation, io error, etc).
         _enumeratorMoveNextTaskSource.SetException(ex);
+        // Wake any sync MoveNext parked in WaitForContinuation. The body just faulted, so no
+        // continuation will be registered. The caller needs to observe the exception via the
+        // move-next task source.
+        if (!IsAsync)
+            _callerInteractionCore.SignalProgress();
         // TODO use tryrecover to consume as many rfqs as we have left at the time of throwing.
         // TODO This essentially replaces manually having to consume the flow remainder on unexpected errors (e.g. unhandled protocol errors).
     }
@@ -519,7 +562,12 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
 
             // We reset the source here to mirror the async side.
             flow._enumeratorMoveNextTaskSource.Reset();
-            flow._callerInteractionCore.WaitForContinuation().Invoke();
+            // Two wake reasons: a continuation was registered (drive the body forward inline)
+            // or the body signaled progress (a result, completion, or fault landed on the
+            // move-next task source while we were parked). In the progress-only case there is
+            // no continuation to invoke. The task is already complete.
+            var continuation = flow._callerInteractionCore.WaitForContinuation();
+            continuation?.Invoke();
             var task = flow.EnumeratorMoveNextTask;
             return task.IsCompleted ? task.Result : task.AsTask().GetAwaiter().GetResult();
         }
