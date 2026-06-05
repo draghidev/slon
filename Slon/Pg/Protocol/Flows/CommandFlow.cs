@@ -85,6 +85,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
     protected override async ValueTask<FlowTasks> ExecuteAuto(Context context)
     {
+        ValueTask writeTask;
         try
         {
             if (IsAsync)
@@ -106,9 +107,9 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
 
             // All writes captured as a single task. If the writes back-pressure (TCP send
             // buffer full, large batch saturating local+peer windows), this task is pending
-            // and ExecutePipelined awaits it concurrently with the read phase. Reads drain
-            // the wire, the peer ACKs, the trailing writes complete. If writes fit in the
-            // buffer, the task is sync-completed and the later await is a free no-op.
+            // and the framework awaits it inline between iterations to prevent the next
+            // item's writes from racing past. If writes fit in the buffer, the task is
+            // sync-completed and the framework's await is a free no-op.
             //
             // Async flows take the *Async path (TP completion via SocketAsyncEngine plus the
             // adaptive batching scheduler). Sync flows take the *Resumable path (sync
@@ -121,7 +122,6 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
             // See https://www.postgresql.org/message-id/CADT4RqAH2nuVwM6cEugFL2z6apwXfP3OJb=zxR6jRgWEpx_2Ww@mail.gmail.com
             // https://github.com/pgjdbc/pgjdbc/issues/194
             // https://github.com/npgsql/npgsql/issues/641
-            ValueTask writeTask;
             var encoder = context.GetEncoder();
             if (IsAsync)
             {
@@ -135,15 +135,13 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
 
             // If the writes already completed observe them here so a synchronously-faulted
             // task throws inside this try block and goes through HandleException. Without
-            // this, a sync-thrown error would be stashed into _writeTask and only observed
-            // later in ExecutePipelined's await, missing this scope's error handling. Same
-            // concern in both async and sync paths.
+            // this, a sync-thrown error would only be observed later via the framework's
+            // trailing-task await, missing this scope's error handling. Same concern in both
+            // async and sync paths.
             if (writeTask.IsCompleted)
                 writeTask.GetAwaiter().GetResult();
             else if (!IsAsync)
                 writeTask = encoder.RunResumableTask(writeTask);
-
-            _writeTask = writeTask;
         }
         catch (Exception ex)
         {
@@ -151,7 +149,16 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
             throw;
         }
 
-        return DispatchPipelinedRead(context, context.GetProtocolStatic<ReadState>().ReadPromise);
+        // Return writeTask as the trailing slot so the framework awaits it inline between
+        // iterations for transport-level backpressure (TCP-window-deadlock prevention).
+        // Ordering between pipeline-task completion and trailing observation is enforced by
+        // the framework's tail-waiter routing. CompleteItem fires only after trailing has
+        // been observed regardless of when the pipeline task completes. Write failures are
+        // treated as transport death (ASP.NET-style). The next operation discovers a broken
+        // connection, no per-flow error bubbling needed.
+        return new FlowTasks(
+            trailingExecutionTask: writeTask,
+            pipelineTask: DispatchPipelinedRead(context, context.GetProtocolStatic<ReadState>().ReadPromise));
 
         async ValueTask WriteAllCommandsAsync()
         {
@@ -365,9 +372,12 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                 }
             }
 
-            // Make sure any asynchronous writes are also completed and any exceptions are observed.
-            await _writeTask.ConfigureAwait(false);
-
+            // Write failures are framework-observed via the trailing-task slot. The framework
+            // catches the exception, the structural routing ensures CompleteItem only fires
+            // after trailing is observed, and the no-recovery path lets the pipeline-task
+            // outcome stand. ASP.NET treats transport writes the same way. A failing write is
+            // connection death, the next operation discovers it. We don't bubble it up as a
+            // per-flow error here.
             if (_readFlowRfq)
             {
                 if (_decoder.TryGetNext(out var message))
@@ -518,8 +528,6 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
         _callerInteractionCore.GateTaskSource.Reset();
         return result;
     }
-
-    ValueTask _writeTask;
 
     ValueTaskSourceStatus IValueTaskSource<FlowCallerInteractionCoreResult>.GetStatus(short token)
         => _callerInteractionCore.GateTaskSource.GetStatus(token);

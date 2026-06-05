@@ -32,8 +32,11 @@ abstract class PgClientFlow : IProtocolFlow, IValueTaskSource<PgDecoder>
     object? _completionState;
 
     /// The flow's body. The "Auto" suffix is the protocol package's convention for "this method's
-    /// contract adapts to the bound flow mode (sync or async)" — the same convention applies to
-    /// the helper APIs the body calls (FlushAuto, WriteAuto, ReadUntilExecuteAuto, ...).
+    /// contract adapts to the bound flow mode (sync or async)". The body internally
+    /// dispatches between sync and async I/O based on <see cref="IsAsync"/> for each per-call read.
+    /// Helper APIs the body calls come as explicit sync/async pairs (e.g.
+    /// <c>ReadUntilExecute</c> / <c>ReadUntilExecuteAsync</c>, <c>Write</c> / <c>WriteAsync</c>).
+    /// The body picks one at each call site rather than threading a mode flag through a wrapper.
     ///
     /// Prefer async/await in both modes. Sync mode affects scheduling, not body syntax. A fully
     /// sync body that needs the decoder calls <c>GetDecoderAuto</c> for a blocking get. Don't
