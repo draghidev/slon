@@ -80,7 +80,7 @@ sealed class PgClientProtocol
     // Framework state, formerly inherited from Protocol<TFlow>.
     readonly CancellationTokenSource _abortCts;
     readonly CancellationToken _abortToken;
-    Pipeline<PgClientFlow, Policy> _pipeline = null!;
+    QueuedPipeline<PgClientFlow, Policy> _pipeline = null!;
     readonly Lock _syncRoot = new();
     ProtocolStatus _status = ProtocolStatus.Created;
     // Track draining count so overlapping recovery starts/ends don't signal ready too early.
@@ -248,7 +248,7 @@ sealed class PgClientProtocol
     bool TryQueueFlow(PgClientFlow flow, ProtocolStatus requiredStatus) => TryQueueFlow<bool>(flow, requiredStatus);
     bool TryQueueFlow<TState>(PgClientFlow flow, ProtocolStatus requiredStatus, Func<TState, bool>? predicate = null, TState state = default!)
     {
-        Pipeline.EnqueueResult enqueue;
+        UnboundedQueueSource<PgClientFlow>.EnqueueResult enqueue;
         lock (_syncRoot)
         {
             if (_status != requiredStatus)
@@ -346,9 +346,9 @@ sealed class PgClientProtocol
 
     public struct Enumerator
     {
-        Pipeline<PgClientFlow, Policy>.Enumerator _inner;
+        Pipeline<PgClientFlow, Policy, UnboundedQueueSource<PgClientFlow>, UnboundedQueueSource<PgClientFlow>.Enumerator>.Enumerator _inner;
 
-        internal Enumerator(Pipeline<PgClientFlow, Policy>.Enumerator inner) => _inner = inner;
+        internal Enumerator(Pipeline<PgClientFlow, Policy, UnboundedQueueSource<PgClientFlow>, UnboundedQueueSource<PgClientFlow>.Enumerator>.Enumerator inner) => _inner = inner;
 
         public PgClientFlow Current => _inner.Current;
         public Enumerator GetEnumerator() => this;
