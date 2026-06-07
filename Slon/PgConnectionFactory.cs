@@ -34,21 +34,15 @@ sealed class PgConnectionFactory : IPoolConnectionFactory<PgConnection>
 
     PgConnection Create(ConnectionPoolContext<PgConnection>? poolContext, TimeSpan timeout = default)
     {
-        var protocol = PgClientProtocol.Create(CreateOptions());
-        var pgConnection = new PgConnection(protocol, _tracker, _clientOptions.MaintenanceInterval);
-        var connection = _transportConnectionFactory.Connect(timeout);
-        pgConnection.Start(_clientOptions, connection, poolContext, timeout);
-        return pgConnection;
+        var transport = _transportConnectionFactory.Connect(timeout);
+        return PgConnection.Create(CreateOptions(), _clientOptions, transport, _tracker, poolContext, timeout);
     }
 
     async ValueTask<PgConnection> CreateAsync(ConnectionPoolContext<PgConnection>? poolContext, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        var protocol = PgClientProtocol.Create(CreateOptions());
-        var pgConnection = new PgConnection(protocol, _tracker, _clientOptions.MaintenanceInterval);
-        var connection = await _transportConnectionFactory.ConnectAsync(cancellationToken).ConfigureAwait(false);
-        await pgConnection.StartAsync(_clientOptions, connection, poolContext, cancellationToken).ConfigureAwait(false);
-        return pgConnection;
+        var transport = await _transportConnectionFactory.ConnectAsync(cancellationToken).ConfigureAwait(false);
+        return await PgConnection.CreateAsync(CreateOptions(), _clientOptions, transport, _tracker, poolContext, cancellationToken).ConfigureAwait(false);
     }
 
     public PgConnection Create(TimeSpan timeout = default)

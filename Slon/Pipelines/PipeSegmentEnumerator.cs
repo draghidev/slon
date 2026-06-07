@@ -164,11 +164,91 @@ sealed class PipeSegmentEnumerator<TSegmenter, TSegment>(PipeReader reader, TSeg
     bool IEnumerator.MoveNext() => MoveNext(default(TimeSpan));
     public bool MoveNext(TimeSpan timeout = default)
     {
-        throw new NotImplementedException();
-        // if (reader is not ISyncPipeReader syncPipeReader)
-        //     throw new NotSupportedException("Underlying pipe reader does not support synchronous reads.");
-        //
-        // syncPipeReader.ReadAtLeast(_minimumSize);
+        if (reader is not StreamPipeReader syncReader)
+            throw new NotSupportedException("Underlying pipe reader does not support synchronous reads.");
+
+        ReadResult result;
+        var consume = false;
+        var needMoreData = false;
+
+        // Advance past current segment.
+        if (_currentLength is not -1)
+        {
+            if (_consumePosition is null)
+            {
+                result = syncReader.ReadAtLeast(int.Max((int)_currentLength, int.MaxValue), timeout);
+                if (result.IsCompleted)
+                    return false;
+                if (result.IsCanceled)
+                    ThrowHelper.ThrowOperationCanceled(CancellationToken.None);
+
+                if (result.Buffer.Length > _currentLength)
+                {
+                    consume = true;
+                    goto loop;
+                }
+                reader.AdvanceTo(result.Buffer.GetPosition(_currentLength));
+            }
+            else
+            {
+                reader.AdvanceTo(_consumePosition.GetValueOrDefault(), _examinedPosition);
+            }
+        }
+
+        result = syncReader.ReadAtLeast(_segmenter.MinimumSize, timeout);
+
+        loop:
+        while (true)
+        {
+            if (result.IsCompleted)
+                return false;
+            if (result.IsCanceled)
+                ThrowHelper.ThrowOperationCanceled(CancellationToken.None);
+
+            if (consume)
+            {
+                if (result.Buffer.Length < _currentLength)
+                {
+                    reader.AdvanceTo(result.Buffer.Start, result.Buffer.End);
+                    result = syncReader.Read(timeout);
+                    continue;
+                }
+                reader.AdvanceTo(result.Buffer.GetPosition(_currentLength));
+                result = syncReader.ReadAtLeast(_segmenter.MinimumSize, timeout);
+                consume = false;
+                continue;
+            }
+            if (needMoreData)
+            {
+                reader.AdvanceTo(result.Buffer.Start, result.Buffer.End);
+                result = syncReader.ReadAtLeast(_segmenter.MinimumSize, timeout);
+                needMoreData = false;
+                continue;
+            }
+
+            var status = _segmenter.CreateSegment(result.Buffer, out _currentLength, out _current);
+            switch (status)
+            {
+                case OperationStatus.NeedMoreData when _currentLength > 0:
+                case OperationStatus.Done:
+                    ArgumentOutOfRangeException.ThrowIfNegativeOrZero(_currentLength, "segmentLength");
+                    _consumePosition = _currentLength <= result.Buffer.Length ? result.Buffer.GetPosition(_currentLength) : null;
+                    _examinedPosition = result.Buffer.End;
+                    return true;
+                case OperationStatus.DestinationTooSmall:
+                    ThrowHelper.ThrowInvalidOperation();
+                    return default;
+                case OperationStatus.NeedMoreData:
+                    needMoreData = true;
+                    break;
+                case OperationStatus.InvalidData:
+                    reader.Complete(new Exception("Segmenter encountered invalid data."));
+                    return false;
+                case var value:
+                    ThrowHelper.ThrowUnhandledCase(value);
+                    return default;
+            }
+        }
     }
 
     public TSegment Current

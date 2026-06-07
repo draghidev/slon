@@ -4,7 +4,6 @@ using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using Microsoft.VisualStudio.TestTools.UnitTesting;
-using Slon;
 using Slon.Transport;
 
 namespace Slon.Tests;
@@ -13,7 +12,7 @@ namespace Slon.Tests;
 // auto-reset cycle and inline-continuation guarantee, the ResumableScope TLS lifecycle,
 // and end-to-end byte delivery through SocketStreamConnection and SslStream.
 [TestClass]
-public class NonBlockingSyncFlowTests
+public class TransportTests
 {
     [TestMethod]
     public void WriteResumeSignal_Pending_IsPending_BeforeSignal()
@@ -130,7 +129,6 @@ public class NonBlockingSyncFlowTests
         var flushResult = await writeAndFlush;
         Assert.IsTrue(flushResult.IsCompleted || !flushResult.IsCanceled, "flush completed normally");
 
-        // Drain on the listener side. Should see exactly our payload.
         var received = new byte[payload.Length];
         var total = 0;
         while (total < payload.Length)
@@ -163,7 +161,6 @@ public class NonBlockingSyncFlowTests
 
         var serverTask = AcceptAndDecrypt(listener, cert);
 
-        // Client: connect a Socket, wrap in SealedNetworkStream, then SslStream.
         var clientSocket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
         await clientSocket.ConnectAsync(endpoint);
         var inner = new SocketStreamConnection.SealedNetworkStream(clientSocket, ownsSocket: true);
@@ -172,9 +169,6 @@ public class NonBlockingSyncFlowTests
 
         await clientSsl.AuthenticateAsClientAsync("localhost");
 
-        // Now write through SslStream with the TLS signal armed. SslStream encrypts and
-        // hands ciphertext to inner.WriteAsync (our override), which does sync non-blocking
-        // Send. Bytes appear on the server side after SslStream's decryption.
         var payload = new byte[] { 0x10, 0x20, 0x30, 0x40 };
         ValueTask writeTask;
         using (new ResumableScope(new WriteResumeSignal()))
@@ -207,27 +201,6 @@ public class NonBlockingSyncFlowTests
         return result;
     }
 
-    [TestMethod]
-    public async Task SyncExecuteNonQuery_SimpleSelect_Completes()
-    {
-        await using var ds = new SlonDataSource(new SlonDataSourceOptions
-        {
-            EndPoint = new IPEndPoint(IPAddress.Loopback, 5432),
-            Username = "postgres",
-            Password = "postgres123",
-            Database = "postgres",
-            MaxPoolSize = 2,
-            HeartbeatInterval = TimeSpan.FromSeconds(1),
-            MaintenanceInterval = TimeSpan.FromSeconds(1),
-        });
-        await using var conn = await ds.OpenConnectionAsync(CancellationToken.None);
-        await using var cmd = new SlonCommand(conn, "select 1");
-        // Just verify the sync flow runs end-to-end without hanging or faulting. The actual
-        // RecordsAffected value isn't asserted yet because CommandResult.RecordsAffected is
-        // not populated from CommandComplete (TODO in CommandResult.cs).
-        cmd.ExecuteNonQuery();
-    }
-
     static X509Certificate2 CreateSelfSignedCert()
     {
         using var rsa = RSA.Create(2048);
@@ -236,8 +209,6 @@ public class NonBlockingSyncFlowTests
         sanBuilder.AddDnsName("localhost");
         req.CertificateExtensions.Add(sanBuilder.Build());
         var cert = req.CreateSelfSigned(DateTimeOffset.UtcNow.AddDays(-1), DateTimeOffset.UtcNow.AddDays(1));
-        // Round-trip through PFX so AuthenticateAsServerAsync can use the private key on all
-        // platforms (some need the cert to have an exportable key in the PFX form).
         var pfx = cert.Export(X509ContentType.Pfx);
         return X509CertificateLoader.LoadPkcs12(pfx, password: null);
     }

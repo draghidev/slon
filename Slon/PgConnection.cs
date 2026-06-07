@@ -92,7 +92,14 @@ sealed class PgConnection : IPoolConnection<PgConnection>
 
     public string MintExplicitPrepareName() => $"_ep{Interlocked.Increment(ref _explicitPrepareCounter)}";
 
-    public PgConnection(PgClientProtocol protocol, CommandTracker? tracker = null, TimeSpan maintenanceInterval = default)
+    // Pool's idle-signal closure, captured during Start. Invoked via SignalIdleIfStarted, which
+    // gates on _isStarted so the connection's startup-time idle transition doesn't publish to
+    // the idle channel before the create-path has committed the lease (otherwise a concurrent
+    // OpenConnectionAsync would grab the channel-published conn and end up sharing the wire).
+    Action? _underlyingPoolIdleSignal;
+    int _isStarted;
+
+    PgConnection(PgClientProtocol protocol, CommandTracker? tracker, TimeSpan maintenanceInterval)
     {
         _protocol = protocol;
         _tracker = tracker;
@@ -102,21 +109,49 @@ sealed class PgConnection : IPoolConnection<PgConnection>
 
     public PgClientProtocol Protocol => _protocol;
 
-    // Pool-aware startup: wires the pool's idle signal + heartbeat onto the protocol, then drives
-    // protocol startup. PgClientProtocol stays Slon.Pools-oblivious — the typed callbacks land
-    // here. The heartbeat goes through OnHeartbeat (not protocol.Heartbeat directly) so we get a
-    // periodic tick to check pending maintenance; in non-pool mode we own the tick ourselves.
-    public void Start(PgClientOptions options, TransportConnection connection, ConnectionPoolContext<PgConnection>? poolContext = null, TimeSpan timeout = default)
+    // Static factories: combine constructor + protocol-startup + idle-signal wiring into one
+    // atomic creation step. Callers can't get a half-initialized PgConnection.
+    //
+    // Wires the pool's idle signal + heartbeat onto the protocol, then drives protocol startup.
+    // PgClientProtocol stays Slon.Pools-oblivious. The typed callbacks land here. The
+    // heartbeat goes through OnHeartbeat (not protocol.Heartbeat directly) so we get a periodic
+    // tick to check pending maintenance. In non-pool mode we own the tick ourselves.
+    //
+    // The returned connection is fully open but NOT yet started. That's <see cref="Start"/>'s
+    // job, called by the pool after the create-path commits the lease (or by the caller
+    // directly in the no-pool case). Until Start fires, idle-channel publication is suppressed
+    // so the connection's startup-time depth-to-zero transition can't race itself into the
+    // channel before its first lease is assigned.
+    public static PgConnection Create(PgClientProtocolOptions protocolOptions, PgClientOptions clientOptions, TransportConnection transport, CommandTracker? tracker = null, ConnectionPoolContext<PgConnection>? poolContext = null, TimeSpan timeout = default)
     {
-        _protocol.Start(options, connection, poolContext?.CreateConnectionIdleSignal(this) ?? NoopOnIdle, timeout);
-        WireHeartbeat(options, poolContext);
+        var protocol = PgClientProtocol.Create(protocolOptions);
+        var conn = new PgConnection(protocol, tracker, clientOptions.MaintenanceInterval);
+        conn._underlyingPoolIdleSignal = poolContext?.CreateConnectionIdleSignal(conn);
+        protocol.Start(clientOptions, transport, conn._underlyingPoolIdleSignal is null ? NoopOnIdle : conn.SignalIdleIfStarted, timeout);
+        conn.WireHeartbeat(clientOptions, poolContext);
+        return conn;
     }
 
-    public async ValueTask StartAsync(PgClientOptions options, TransportConnection connection, ConnectionPoolContext<PgConnection>? poolContext = null, CancellationToken cancellationToken = default)
+    public static async ValueTask<PgConnection> CreateAsync(PgClientProtocolOptions protocolOptions, PgClientOptions clientOptions, TransportConnection transport, CommandTracker? tracker = null, ConnectionPoolContext<PgConnection>? poolContext = null, CancellationToken cancellationToken = default)
     {
-        await _protocol.StartAsync(options, connection, poolContext?.CreateConnectionIdleSignal(this) ?? NoopOnIdle, cancellationToken).ConfigureAwait(false);
-        WireHeartbeat(options, poolContext);
+        var protocol = PgClientProtocol.Create(protocolOptions);
+        var conn = new PgConnection(protocol, tracker, clientOptions.MaintenanceInterval);
+        conn._underlyingPoolIdleSignal = poolContext?.CreateConnectionIdleSignal(conn);
+        await protocol.StartAsync(clientOptions, transport, conn._underlyingPoolIdleSignal is null ? NoopOnIdle : conn.SignalIdleIfStarted, cancellationToken).ConfigureAwait(false);
+        conn.WireHeartbeat(clientOptions, poolContext);
+        return conn;
     }
+
+    void SignalIdleIfStarted()
+    {
+        if (Volatile.Read(ref _isStarted) != 0)
+            _underlyingPoolIdleSignal!();
+    }
+
+    // Lifecycle gate: called once, after Open + lease-commit, to put the connection in service.
+    // From this point on, depth-to-zero transitions publish to the pool's idle channel.
+    // Before this, they're suppressed.
+    public void Start() => Volatile.Write(ref _isStarted, 1);
 
     // Passed to protocol.Start when not pooled, the protocol uses "onIdle is non-null" as the
     // "external orchestrator present, stay passive about heartbeat" signal. There's nothing for

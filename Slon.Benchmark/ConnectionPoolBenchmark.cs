@@ -144,6 +144,10 @@ sealed class FakeConnection : IPoolConnection<FakeConnection>
     }
 
     public ValueTask CompleteAsync(Exception? exception = null) => default;
+
+    // The fake drives idle publication explicitly via MarkIdleAndSignal, so the startup
+    // suppression gate Start() exists for has nothing to unblock here.
+    public void Start() { }
 }
 
 sealed class FakeFactory : IPoolConnectionFactory<FakeConnection>

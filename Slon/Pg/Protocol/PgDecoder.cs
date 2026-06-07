@@ -205,14 +205,44 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
         return default;
     }
 
-    // Interim sync entrypoints: sync-over-async via GetAwaiter().GetResult(). Acceptable
-    // because the sync command flow shunts writes onto a LongRunning thread first, so the
-    // caller thread is free to block here while async I/O drives the response. Will be
-    // replaced by a real sync read pump that calls SealedNetworkStream.Read directly.
     public bool MoveNext()
     {
-        var task = MoveNextAsync();
-        return task.IsCompleted ? task.Result : task.AsTask().GetAwaiter().GetResult();
+        var timeoutSet = false;
+        try
+        {
+            while (true)
+            {
+                var context = _messageContext;
+                if (!context.TryMoveNext())
+                {
+                    if (!timeoutSet)
+                    {
+                        SetRemainingTimeout(ReadTimeout);
+                        timeoutSet = true;
+                    }
+
+                    var success = _messageBatchEnumerator.MoveNext(_remainingTimeout);
+                    context.SetBatch(_messageBatchEnumerator.Current);
+                    if (!success)
+                        return false;
+
+                    if (!context.TryMoveNext())
+                        ThrowHelper.ThrowInvalidOperation("No message in a new batch");
+                }
+
+                // HandleMessageAuto is always sync-completing (every branch returns a
+                // synchronously-constructed ValueTask). Reading .Result inline is safe.
+                if (CurrentExecutionControl.HandleMessageAuto(context.Current).Result)
+                    continue;
+
+                return true;
+            }
+        }
+        finally
+        {
+            if (timeoutSet)
+                SetRemainingTimeout(Timeout.InfiniteTimeSpan);
+        }
     }
 
     public BackendMessage GetNext()

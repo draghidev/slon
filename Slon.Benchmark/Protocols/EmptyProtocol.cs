@@ -201,7 +201,7 @@ sealed class EmptyProtocol<TMode> : IPoolConnection<EmptyProtocol<TMode>>
     readonly EmptyProtocolOptions _options;
     readonly Action? _poolConnectionIdleSignal;
     readonly CancellationTokenSource _abortCts;
-    Pipeline<EmptyFlow<TMode>, Policy> _pipeline = null!;
+    QueuedPipeline<EmptyFlow<TMode>, Policy> _pipeline = null!;
     readonly Lock _syncRoot = new();
     ProtocolStatus _status = ProtocolStatus.Created;
     int _drainingCount;
@@ -228,7 +228,7 @@ sealed class EmptyProtocol<TMode> : IPoolConnection<EmptyProtocol<TMode>>
 
     bool TryQueueFlow<TState>(EmptyFlow<TMode> flow, Func<TState, bool>? predicate, TState state)
     {
-        Pipeline.EnqueueResult enqueue;
+        UnboundedQueueSource<EmptyFlow<TMode>>.EnqueueResult enqueue;
         lock (_syncRoot)
         {
             if (_status != ProtocolStatus.Ready)
@@ -266,6 +266,10 @@ sealed class EmptyProtocol<TMode> : IPoolConnection<EmptyProtocol<TMode>>
 
     bool IPoolConnection<EmptyProtocol<TMode>>.IsIdle => PipelineDepth is 0;
     bool IPoolConnection<EmptyProtocol<TMode>>.IsCompleted => _status is ProtocolStatus.Completed;
+
+    // The benchmark protocol has no startup flow (it constructs immediately Ready), so there is
+    // no suppressed idle publication for the pool's post-lease Start to unblock.
+    void IPoolConnection<EmptyProtocol<TMode>>.Start() { }
 
     int IPoolConnection<EmptyProtocol<TMode>>.CompareTo(EmptyProtocol<TMode>? other)
     {

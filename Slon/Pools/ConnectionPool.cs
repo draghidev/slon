@@ -107,12 +107,16 @@ public sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
 
     bool TrySchedule<TState>(Func<SchedulingContext<T>, TState, bool>? schedule, TState state, CancellationToken cancellationToken, out ConnectionFuture? future, [NotNullWhen(true)]out T? connection)
     {
-        while (_idleReader.TryRead(out var conn))
+        // Preference order: idle channel > empty slot (open new) > multiplex onto busy conn.
+        // Idle-channel reuse is the cheapest path. Opening a new conn is preferred over
+        // multiplexing onto a non-idle one so capacity is used before pipelining starts.
+
+        while (_idleReader.TryRead(out var idle))
         {
-            if (conn.IsIdle && DoSchedule(new(conn, cancellationToken), schedule, state))
+            if (idle.IsIdle && DoSchedule(new(idle, cancellationToken), schedule, state))
             {
                 future = null;
-                connection = conn;
+                connection = idle;
                 return true;
             }
         }
@@ -126,43 +130,45 @@ public sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
             : 0;
 
         future = null;
+        // Single pass through stripes. Empty / completed slots claim immediately (open new).
+        // Non-idle conns are remembered as the multiplex fallback. Only taken after the walk
+        // confirms no growth path is available.
+        T? multiplexCandidate = null;
         for (var i = startIndex; i < startIndex + connections.Length; i++)
         {
             ref var item = ref connections[i < connections.Length ? i : i - connections.Length];
             if (TryGetConnection(ref item, out var conn))
             {
-                // This is a completed connection which we can replace with a new one.
+                // Completed slot, reclaim and open new in its place.
                 if (conn.IsCompleted && Interlocked.CompareExchange(ref item, future ??= new ConnectionFuture(), conn) == conn)
                 {
                     connection = default;
                     return false;
                 }
 
-                // Idle conns belong to the channel reader; skip. Non-idle conns are multiplex
-                // candidates — take the first hit. Power-of-two-choices was measured slower in
-                // synthetic benchmarks and its load-distribution guarantee assumes homogeneous
-                // service cost — for heterogeneous PG workloads PipelineDepth is a noisy proxy.
-                // Revisit when we have real production data showing uneven utilization.
-                if (!conn.IsIdle && DoSchedule(new(conn, cancellationToken, idle: false), schedule, state))
-                {
-                    future = null;
-                    connection = conn;
-                    return true;
-                }
+                // Remember first non-idle as the multiplex fallback. Don't take yet.
+                if (multiplexCandidate is null && !conn.IsIdle)
+                    multiplexCandidate = conn;
             }
             else if (Interlocked.CompareExchange(ref item, future ??= new ConnectionFuture(), conn) == conn)
             {
+                // Empty slot, open new.
                 connection = default;
                 return false;
             }
         }
 
-        // TODO Visit all core caches thread-safely if we are not at full capacity, might find an empty spot/completed protocol.
+        // No growth path. Multiplex onto a busy conn we saw during the walk.
+        if (multiplexCandidate is not null && DoSchedule(new(multiplexCandidate, cancellationToken, idle: false), schedule, state))
+        {
+            future = null;
+            connection = multiplexCandidate;
+            return true;
+        }
 
         future = null;
         connection = default;
         return false;
-
     }
 
     // Must complete the future before exiting.
@@ -187,6 +193,10 @@ public sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
                     _idleWriter.TryWrite(conn);
                 future.Complete(conn);
             }
+            // Start after the lease commit so the connection's idle channel publication is
+            // unblocked from here on. Suppressed during startup so a depth-to-zero transition
+            // can't publish to the channel before this conn has been assigned to its lessee.
+            conn.Start();
         }
         catch (Exception ex)
         {
@@ -228,6 +238,8 @@ public sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
                     _idleWriter.TryWrite(conn);
                 future.Complete(conn);
             }
+            // See OpenConnection for the rationale on Start placement.
+            conn.Start();
         }
         catch (Exception ex)
         {

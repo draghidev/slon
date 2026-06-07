@@ -56,25 +56,13 @@ public class ClientBenchmark
         PoolSize = Connections
     };
 
-    static readonly PgClientProtocolOptions DispatchingSyncOptions = new()
-    {
-        RunEnqueueAsynchronously = true
-    };
-
-    static readonly PgClientProtocolOptions MultiplexingOptions = new()
-    {
-        RunEnqueueAsynchronously = false
-    };
-
-    static readonly PgClientProtocolOptions ProtocolOptions = DispatchingSyncOptions;
-
     internal static PgConnectionFactory CreateProtocolFactory()
     {
+        // Enqueue dispatch mode is no longer an option: the protocol decides per call site
+        // (async enqueues Execute(runContinuationsAsynchronously: true), sync flows ride the
+        // handoff rendezvous), so the old DispatchingSync/Multiplexing option pair is gone.
         var transportFactory = SocketStreamConnection.CreateFactory(Options.EndPoint);
-        return new PgConnectionFactory(Options, transportFactory, configureOptions: o =>
-        {
-            o.RunEnqueueAsynchronously = ProtocolOptions.RunEnqueueAsynchronously;
-        });
+        return new PgConnectionFactory(Options, transportFactory, configureOptions: null);
     }
 
     private protected static ConnectionPool<PgConnection> InitSlonPool(Func<PgConnection, CancellationToken, ValueTask>? initializer, int? poolSize = null)

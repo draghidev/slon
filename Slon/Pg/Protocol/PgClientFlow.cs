@@ -183,21 +183,15 @@ abstract class PgClientFlow : IProtocolFlow, IValueTaskSource<PgDecoder>
         /// continuation that may never complete. Wire bytes the flow already emitted are owned
         /// by the protocol and drained on the flow's behalf when it unwinds.
         public DecoderAwaitable GetDecoderAsync(CancellationToken cancellationToken = default)
-            => new(_executionControl, cancellationToken);
+            => new(_executionControl, cancellationToken, auto: false);
 
-        /// Blocks the caller's thread until the decoder is available, then returns it. The
-        /// <c>Auto</c> suffix marks this as the per-flow-mode adaptive helper: sync flow bodies
-        /// call this directly for a blocking get; async flow bodies should prefer
-        /// <see cref="GetDecoderAsync"/> with <c>await</c>. If activation has already happened
-        /// when this is called the fast path returns the decoder without ever blocking; otherwise
-        /// the call bridges via <c>AsTask().GetAwaiter().GetResult()</c>.
-        public PgDecoder GetDecoderAuto(CancellationToken cancellationToken = default)
-        {
-            var awaitable = GetDecoderAsync(cancellationToken);
-            return awaitable.IsCompleted
-                ? awaitable.GetResult()
-                : awaitable.AsTask().GetAwaiter().GetResult();
-        }
+        /// Mode-adaptive wrapper. Returns a <see cref="DecoderAwaitable"/> that, when awaited
+        /// by a sync flow body and activation hasn't fired yet, blocks via the AsTask bridge
+        /// inside <c>OnCompleted</c> and runs the continuation inline. Async flow bodies get the
+        /// standard async-continuation behavior. Call sites <c>await</c> uniformly without
+        /// branching on <c>IsAsync</c> themselves.
+        public DecoderAwaitable GetDecoderAuto(CancellationToken cancellationToken = default)
+            => new(_executionControl, cancellationToken, auto: true);
     }
 
     // Self-awaitable for `await context.GetDecoderAsync()` plus direct-dispatch interaction:
@@ -210,19 +204,26 @@ abstract class PgClientFlow : IProtocolFlow, IValueTaskSource<PgDecoder>
     //   OnCompleted(Action<object?>, object?) / UnsafeOnCompleted(Action<object?>, object?) to
     //   register continuations without closure allocation. GetResult is only valid after
     //   IsCompleted is true (standard awaiter contract).
-    protected readonly struct DecoderAwaitable(ExecutionControl control, CancellationToken cancellationToken) : ICriticalNotifyCompletion
+    protected readonly struct DecoderAwaitable(ExecutionControl control, CancellationToken cancellationToken, bool auto) : ICriticalNotifyCompletion
     {
         public DecoderAwaitable GetAwaiter() => this;
-        public bool IsCompleted => control.IsDecoderReady;
 
-        // Only valid after IsCompleted is true — MVTSC has no blocking GetResult, so a Pending
-        // status throws InvalidOperationException. The C# compiler guarantees the IsCompleted
-        // check for `await` syntax; direct callers must check it themselves.
-        // Also throws OCE if the token raced ahead of activation completing.
+        // Sync-flow auto path claims completed up front so the await machinery takes the sync
+        // shortcut (no state machine box allocated, no continuation registered) and falls
+        // straight to GetResult, which blocks via AsTask if activation hasn't fired yet.
+        // Async flows always reflect actual readiness.
+        public bool IsCompleted => control.IsDecoderReady || (auto && !control.IsAsync);
+
+        // Only valid after IsCompleted is true. For the sync-flow auto path, IsCompleted is
+        // true unconditionally, so this may run while the decoder isn't actually ready. In
+        // that case we block via the AsTask bridge. Async flows follow the standard awaiter
+        // contract and the compiler guarantees IsCompleted has fired before this.
         public PgDecoder GetResult()
         {
             cancellationToken.ThrowIfCancellationRequested();
-            return control.GetDecoderResult();
+            if (control.IsDecoderReady)
+                return control.GetDecoderResult();
+            return control.GetDecoderTask(cancellationToken).GetAwaiter().GetResult();
         }
 
         // Returns a configured variant that controls whether the continuation resumes on the
@@ -277,7 +278,11 @@ abstract class PgClientFlow : IProtocolFlow, IValueTaskSource<PgDecoder>
         public PgDecoder GetResult()
         {
             cancellationToken.ThrowIfCancellationRequested();
-            return control.GetDecoderResult();
+            if (control.IsDecoderReady)
+                return control.GetDecoderResult();
+            if (control.IsAsync)
+                ThrowHelper.ThrowInvalidOperation("Decoder is not ready and the flow is async. GetResult violates the awaiter contract.");
+            return control.GetDecoderTask(cancellationToken).GetAwaiter().GetResult();
         }
 
         public void OnCompleted(Action continuation)

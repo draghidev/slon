@@ -208,7 +208,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
     // package-internal. Hence "live here" rather than as a framework helper on Context.
     ValueTask DispatchPipelinedRead(Context context, ValueTaskSourcePromise<bool> promise)
     {
-        var waiter = context.GetDecoderAsync().ConfigureAwait(false);
+        var waiter = context.GetDecoderAuto().ConfigureAwait(false);
         if (waiter.IsCompleted)
         {
             PromiseAsyncValueTaskMethodBuilder.Promise = promise;
@@ -283,7 +283,10 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
 
         try
         {
-            _decoder = await context.GetDecoderAsync(_callerCancellationToken).ConfigureAwait(false);
+            // GetDecoderAuto adapts to flow mode internally. Activation has already been gated
+            // by DispatchPipelinedRead's waiter.IsCompleted check, so the fast path returns
+            // sync-immediately in both modes. The await is free when sync-completed.
+            _decoder = await context.GetDecoderAuto(_callerCancellationToken).ConfigureAwait(false);
             while (++_commandIndex < CommandCount)
             {
                 _isResultReady = false;
@@ -386,9 +389,13 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                     if (message.EnsureExpectedOrError(PgTypes.BackendType.ReadyForQuery) is { } rfqError)
                         PostgresException.Throw(rfqError);
                 }
+                else if (IsAsync)
+                {
+                    await ReadRfqAsync(_decoder).ConfigureAwait(false);
+                }
                 else
                 {
-                    await ReadRfq(_decoder).ConfigureAwait(false);
+                    ReadRfq(_decoder);
                 }
             }
 
@@ -468,9 +475,16 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                 _callerInteractionCore.SignalProgress();
         }
 
-        async ValueTask ReadRfq(PgDecoder decoder)
+        async ValueTask ReadRfqAsync(PgDecoder decoder)
         {
             var message = await decoder.GetNextAsync().ConfigureAwait(false);
+            if (message.EnsureExpectedOrError(PgTypes.BackendType.ReadyForQuery) is { } rfqError)
+                PostgresException.Throw(rfqError);
+        }
+
+        static void ReadRfq(PgDecoder decoder)
+        {
+            var message = decoder.GetNext();
             if (message.EnsureExpectedOrError(PgTypes.BackendType.ReadyForQuery) is { } rfqError)
                 PostgresException.Throw(rfqError);
         }
