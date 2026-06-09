@@ -147,14 +147,11 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
         public SyncHandoffEntry? Next;
     }
 
-    public Enumerator GetAsyncEnumerator(CancellationToken cancellationToken)
+    public Enumerator GetAsyncEnumerator(Action? onEnqueue = null, CancellationToken cancellationToken = default)
     {
-        if (cancellationToken.CanBeCanceled)
-            cancellationToken.UnsafeRegister(static state => ((State)state!).Complete(), _state);
+        _state.OnEnqueue = onEnqueue;
         return new(_state, cancellationToken);
     }
-
-    public void AttachDepthHook(Action onEnqueue) => _state.OnEnqueue = onEnqueue;
 
     static void ThrowCompleted() => throw new InvalidOperationException("The source has been completed.");
 
@@ -241,18 +238,28 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
         }
     }
 
-    public struct Enumerator : IAsyncEnumerator<PgClientFlow>
+    public struct Enumerator : IPipelineEnumerator<PgClientFlow>
     {
         readonly State _state;
-        readonly CancellationToken _cancellationToken;
+        readonly CancellationTokenSource _cts;
+        // Captured at construction so reads survive Dispose. See UnboundedQueueSource.Enumerator
+        // for the rationale.
+        readonly CancellationToken _completionToken;
 
-        internal Enumerator(State state, CancellationToken cancellationToken)
+        internal Enumerator(State state, CancellationToken externalCt)
         {
             _state = state;
-            _cancellationToken = cancellationToken;
+            _cts = externalCt.CanBeCanceled
+                ? CancellationTokenSource.CreateLinkedTokenSource(externalCt)
+                : new CancellationTokenSource();
+            _completionToken = _cts.Token;
+            _completionToken.UnsafeRegister(static state => ((State)state!).Complete(), _state);
         }
 
         public PgClientFlow Current => _state.Current;
+        public CancellationToken CompletionToken => _completionToken;
+
+        public void Complete() => _cts.Cancel();
 
         public ValueTask<bool> MoveNextAsync()
         {
@@ -270,7 +277,7 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
                 result = true;
                 return true;
             }
-            if (Volatile.Read(ref _state.IsCompleted) || _cancellationToken.IsCancellationRequested)
+            if (Volatile.Read(ref _state.IsCompleted) || _completionToken.IsCancellationRequested)
             {
                 result = false;
                 return true;
@@ -290,13 +297,14 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
 
         async ValueTask<bool> FlushThenPark()
         {
-            await _state.Protocol.FlushAsync(_cancellationToken).ConfigureAwait(false);
+            await _state.Protocol.FlushAsync(_completionToken).ConfigureAwait(false);
             return await Park().ConfigureAwait(false);
         }
 
         public ValueTask DisposeAsync()
         {
-            _state.Complete();
+            _cts.Cancel();   // idempotent; in case caller skipped Complete()
+            _cts.Dispose();  // releases linked-CTS registration on the external token's source
             return default;
         }
     }
