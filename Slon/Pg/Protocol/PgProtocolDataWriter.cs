@@ -8,9 +8,12 @@ using Slon.Transport;
 
 namespace Slon.Pg.Protocol;
 
-sealed class PgProtocolDataWriter(IOutputWriter<byte> writer, Encoding clientEncoding, Action waitWritable)
+sealed class PgProtocolDataWriter(IOutputWriter<byte> writer, Encoding clientEncoding, Action waitWritable, CancellationToken abortToken, PgClientProtocol.Control control)
 {
     BufferingWriter _bufferingWriter = new(writer);
+    readonly CancellationToken _abortToken = abortToken;
+    readonly PgClientProtocol.Control _control = control;
+    CancellationTokenSource _cts = CancellationTokenSource.CreateLinkedTokenSource(abortToken);
 
     // Per-connection cached signal. The flow parks this in
     // TransportConnection.SyncNonBlockingSignal around each Resumable call, the transport
@@ -61,7 +64,42 @@ sealed class PgProtocolDataWriter(IOutputWriter<byte> writer, Encoding clientEnc
     public void WriteInt(int value) => _bufferingWriter.WriteInt32BigEndian<BufferingWriter>(value);
 
     public void Flush(TimeSpan timeout = default) => _bufferingWriter.Flush(timeout);
-    public ValueTask FlushAsync(CancellationToken cancellationToken) => _bufferingWriter.FlushAsync(cancellationToken);
+
+    /// Flow-owned escape hatch from a parked flush. Without it the only break-out is protocol
+    /// abort. An uncaught firing triggers the protocol's recovery path, so prefer a
+    /// coordination-boundary check in connection-preserving flows.
+    public ValueTask FlushAsync(CancellationToken cancellationToken)
+    {
+        var task = _bufferingWriter.FlushAsync(_cts.Token);
+        if (task.IsCompletedSuccessfully)
+            return task;
+        return Core(task, cancellationToken);
+
+        async ValueTask Core(ValueTask task, CancellationToken cancellationToken)
+        {
+            var registration = cancellationToken.UnsafeRegister(static (state, _) => ((CancellationTokenSource)state!).Cancel(), _cts);
+            try
+            {
+                await task.ConfigureAwait(false);
+            }
+            catch (OperationCanceledException oce) when (oce.CancellationToken == _cts.Token)
+            {
+                if (_abortToken.IsCancellationRequested)
+                    _control.ThrowIfClosed();
+                if (cancellationToken.IsCancellationRequested)
+                    throw new OperationCanceledException(cancellationToken);
+                throw;
+            }
+            finally
+            {
+                registration.Dispose();
+                // Recycle after a user-CT cancel so the next call has a fresh CTS. Abort is
+                // terminal, leave the CTS cancelled.
+                if (_cts.IsCancellationRequested && !_abortToken.IsCancellationRequested)
+                    _cts = CancellationTokenSource.CreateLinkedTokenSource(_abortToken);
+            }
+        }
+    }
 
     // Wrapper to shield callers from slow writers (e.g. PipeWriter).
     struct BufferingWriter(IOutputWriter<byte> writer) : IOutputWriter<byte>

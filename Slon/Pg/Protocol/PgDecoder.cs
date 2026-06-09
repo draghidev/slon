@@ -58,17 +58,29 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
     void OnHeartbeat(TimeSpan elapsed)
     {
         if (_remainingTimeout != Timeout.InfiniteTimeSpan && (_remainingTimeout -= elapsed) <= TimeSpan.Zero)
-        {
             _cancellationTokenSource.Cancel();
-            _cancellationTokenSource = CancellationTokenSource.CreateLinkedTokenSource(_abortToken);
-        }
     }
 
     /// Applies not just to {Get,Move}Next but also {Get,Move}NextAsync, fully cancels I/O.
     public TimeSpan ReadTimeout { get; set; }
 
-    public ValueTask<bool> MoveNextAsync()
+    ValueTask<bool> IAsyncEnumerator<BackendMessage>.MoveNextAsync() => MoveNextAsync(CancellationToken.None);
+
+    // Recycle a CTS cancelled by timeout or user-CT from the previous call. Abort is terminal,
+    // never recycle past it. Single recycle site (here, not OnHeartbeat / Core's finally) so
+    // there's no race between heartbeat thread and the flow's own teardown.
+    void EnsureUsableCts()
     {
+        if (_cancellationTokenSource.IsCancellationRequested && !_abortToken.IsCancellationRequested)
+            _cancellationTokenSource = CancellationTokenSource.CreateLinkedTokenSource(_abortToken);
+    }
+
+    /// Flow-owned escape hatch from a parked read. Without it the only break-out is protocol
+    /// abort. An uncaught firing triggers the protocol's recovery path, so prefer a
+    /// coordination-boundary check in connection-preserving flows.
+    public ValueTask<bool> MoveNextAsync(CancellationToken cancellationToken = default)
+    {
+        EnsureUsableCts();
         while (true)
         {
             var context = _messageContext;
@@ -76,7 +88,7 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
             {
                 var task = _messageBatchEnumerator.MoveNextAsync(_cancellationTokenSource.Token);
                 if (!task.IsCompletedSuccessfully)
-                    return MoveNextAsyncCore(task, null);
+                    return MoveNextAsyncCore(task, null, cancellationToken);
 
                 var success = task.Result;
                 context.SetBatch(_messageBatchEnumerator.Current);
@@ -89,7 +101,7 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
 
             var handleTask = CurrentExecutionControl.HandleMessageAuto(context.Current);
             if (!handleTask.IsCompletedSuccessfully)
-                return MoveNextAsyncCore(default, handleTask);
+                return MoveNextAsyncCore(default, handleTask, cancellationToken);
 
             // We have to try to fetch another message if this one was handled by the protocol.
             if (handleTask.Result)
@@ -101,10 +113,11 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
         // Implemented in an somewhat convoluted fashion to handle either task without needing another async frame.
         [MethodImpl(MethodImplOptions.NoInlining)]
         [AsyncMethodBuilder(typeof(NonContextRestoringPoolingValueTaskMethodBuilder<>))]
-        async ValueTask<bool> MoveNextAsyncCore(ValueTask<bool> task, ValueTask<bool>? messageHandledTask)
+        async ValueTask<bool> MoveNextAsyncCore(ValueTask<bool> task, ValueTask<bool>? messageHandledTask, CancellationToken cancellationToken)
         {
             var firstMessageHandled = messageHandledTask.HasValue;
             var timeoutSet = false;
+            var registration = cancellationToken.UnsafeRegister(static (state, _) => ((CancellationTokenSource)state!).Cancel(), _cancellationTokenSource);
             try
             {
                 while (true)
@@ -148,6 +161,13 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
                     catch (OperationCanceledException oce) when
                         (oce.CancellationToken == _cancellationTokenSource.Token && _cancellationTokenSource.IsCancellationRequested)
                     {
+                        // Gate on this protocol's own abort token so a different protocol's
+                        // closure can't be mistaken for ours; the CTS would otherwise also
+                        // observe cancellation via the read-timeout heartbeat path.
+                        if (_abortToken.IsCancellationRequested)
+                            _control.ThrowIfClosed();
+                        if (cancellationToken.IsCancellationRequested)
+                            throw new OperationCanceledException(cancellationToken);
                         throw new TimeoutException("Read timed out.", oce);
                     }
 
@@ -156,6 +176,7 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
             }
             finally
             {
+                registration.Dispose();
                 if (timeoutSet)
                     SetRemainingTimeout(Timeout.InfiniteTimeSpan);
             }

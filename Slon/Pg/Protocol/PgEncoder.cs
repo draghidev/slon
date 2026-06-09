@@ -9,7 +9,6 @@ using static Slon.Pg.Protocol.PgTypes;
 
 namespace Slon.Pg.Protocol;
 
-// TODO wire in protocol abort cancellation.
 readonly struct PgEncoder
 {
     readonly PgClientFlow.ExecutionControl _executionControl;

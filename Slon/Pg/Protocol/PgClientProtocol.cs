@@ -80,6 +80,10 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
     readonly CancellationToken _abortToken;
     readonly CancellationTokenSource _stoppingCts;
     readonly CancellationToken _stoppingToken;
+    // Canonical closed exception, materialized once on Shutdown entry. Cached so observers
+    // (heartbeat checking parked-flow propagation, future I/O surfaces converting OCE to the
+    // typed closed exception) all see the same instance with the same closeReason wrapped.
+    PgClientClosedException? _closedException;
     Pipeline<PgClientFlow, Policy, PgClientFlowSource, PgClientFlowSource.Enumerator> _pipeline = null!;
     PgClientFlowSource _source;
     readonly Lock _syncRoot = new();
@@ -134,7 +138,7 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
     void Initialize(TransportConnection connection, Action? onIdle)
     {
         _pipeWriter = connection.Writer as IOutputWriter<byte> ?? new PipeStreamingWriter(connection.Writer);
-        _protocolDataWriter = new(_pipeWriter, PgClientOptions.PreStartupEncoding, connection.WaitWritable);
+        _protocolDataWriter = new(_pipeWriter, PgClientOptions.PreStartupEncoding, connection.WaitWritable, AbortToken, FlowControl);
         _pipeSegmentEnumerator = new(connection.Reader, new(), ownsReader: true);
         _pgDecoder = new(_pipeSegmentEnumerator, AbortToken, _options.ReadTimeout);
 
@@ -282,52 +286,66 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
         return true;
     }
 
-    // Pipeline-delivered abort exception. Items still in flight when the protocol tears down
-    // get this delivered via Pipeline.CompleteAsync's exception parameter, surfaced through the
-    // policy's CompleteItem call. OCE-with-token is the standard idiom so flow-side catch
-    // clauses can attribute via ex.CancellationToken == AbortToken (see CommandFlow).
-    Exception CreateAbortException(Exception? abortReason)
-        => abortReason is null
-            ? new OperationCanceledException(_abortToken)
-            : new OperationCanceledException("Protocol aborted.", abortReason, _abortToken);
-
     /// Graceful shutdown. Gives flows up to CompletionTimeout to drain, then escalates to
     /// forceful by firing AbortToken. Awaitable: returns when the pipeline has fully drained
     /// and all in-flight flows have completed. This is the only entry point that observes the
     /// drain - <see cref="DisposeAsync"/> / <see cref="Dispose"/> fire-and-forget. If you need
     /// to observe drain completion, call this first, then Dispose afterwards.
-    public ValueTask CompleteAsync(Exception? exception = null)
-        => Shutdown(exception, forceful: false, observeDrain: true);
+    public ValueTask CompleteAsync(Exception? closeReason = null)
+        => Shutdown(closeReason, forceful: false);
 
     /// Async forceful tear-down. Fires AbortToken immediately, fails activations for pipelined
-    /// flows, releases sync-disposable resources (heartbeat) before returning. The pipeline
-    /// drain unwinds in the background; this method does NOT await it. Callers that need to
-    /// observe drain completion should call <see cref="CompleteAsync"/> first.
+    /// flows. The pipeline drain unwinds in the background; this method does NOT await it (the
+    /// returned task is the entry-point handle, not the drain). Callers that need to observe
+    /// drain completion should call <see cref="CompleteAsync"/> first.
     public ValueTask DisposeAsync()
     {
-        _ = Shutdown(CreateAbortException(null), forceful: true, observeDrain: false);
+        FireAndForget(Shutdown(closeReason: null, forceful: true));
         return default;
     }
 
     /// Synchronous tear-down for callers that can't go async (the canonical case is
     /// <see cref="System.Data.Common.DbDataSource.Dispose"/>'s sync contract bubbling down to
     /// connection/protocol cleanup). Same fire-and-forget semantics as <see cref="DisposeAsync"/>:
-    /// AbortToken fires immediately, sync resources released up-front, pipeline drain happens
-    /// in the background. Idempotent.
+    /// AbortToken fires immediately, pipeline drain happens in the background. Idempotent.
     public void Dispose()
-        => _ = Shutdown(CreateAbortException(null), forceful: true, observeDrain: false);
+        => FireAndForget(Shutdown(closeReason: null, forceful: true));
 
     /// Internal emergency self-evict for the two framework-internal "we cannot continue" sites
     /// (startup catch, OnParameterStatus encoding failure). Fire-and-forget shape so it can run
     /// from the message-processing thread. Pool eviction picks up via the status flag.
     internal void FailProtocol(Exception? reason)
-        => _ = Shutdown(CreateAbortException(reason), forceful: true, observeDrain: false);
+        => FireAndForget(Shutdown(reason, forceful: true));
 
-    async ValueTask Shutdown(Exception? exception, bool forceful, bool observeDrain)
+    /// Discarding a ValueTask silently swallows any exception thrown by the background drain.
+    /// async void with a top-level try/catch ensures exceptions are observed (caught here) rather
+    /// than lost to a bare discard. For now they're swallowed at this site too - once we have a
+    /// logging path or an unobserved-exception hook plumbed through, this is where they get
+    /// routed.
+    static async void FireAndForget(ValueTask task)
+    {
+        try
+        {
+            await task.ConfigureAwait(false);
+        }
+        catch
+        {
+            // TODO route to logging/unobserved-exception hook
+        }
+    }
+
+    async ValueTask Shutdown(Exception? closeReason, bool forceful)
     {
         // First-writer-wins. SignalDraining returns false when status is already Completed.
         if (!SignalDraining())
             return;
+
+        // Materialize the canonical closed exception BEFORE firing any cancellation so any
+        // observer that wakes on AbortToken / StoppingToken and reaches for Control.ClosedException
+        // sees the same instance. PgClientClosedException wraps closeReason as InnerException so
+        // callers can introspect the original cause.
+        var closedException = new PgClientClosedException(closeReason);
+        _closedException = closedException;
 
         // Anything below the first await is background work from a fire-and-forget caller's
         // perspective. Parked-flow propagation is heartbeat-driven for both paths:
@@ -349,8 +367,8 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
 
         try
         {
-            // Drain remaining items. exception is delivered to each via policy.CompleteItem.
-            await _pipeline.CompleteAsync(exception).ConfigureAwait(false);
+            // Drain remaining items. closedException is delivered to each via policy.CompleteItem.
+            await _pipeline.CompleteAsync(closedException).ConfigureAwait(false);
         }
         finally
         {
@@ -395,7 +413,6 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
 
     internal readonly struct Policy : IPipelinePolicy<PgClientFlow>
     {
-        readonly CancellationToken _abortToken;
         readonly PgClientProtocol _protocol;
         readonly ValueTaskSourcePromise<PipelineItemResult> _promise;
         readonly ActivationWorkItem _activationWorkItem;
@@ -403,7 +420,6 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
         public Policy(PgClientProtocol protocol)
         {
             _protocol = protocol;
-            _abortToken = protocol._abortToken;
             _promise = new();
             _activationWorkItem = new(protocol.FlowControl);
             ExecutionScheduler = protocol._options.ExecutionScheduler;
@@ -492,6 +508,25 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
         // framework) can read without each flow paying the storage.
         public CancellationToken AbortToken => protocol._abortToken;
         public CancellationToken StoppingToken => protocol._stoppingToken;
+
+        /// The canonical <see cref="PgClientClosedException"/> for this protocol if Shutdown has
+        /// been entered, null otherwise. Single instance per protocol lifetime, materialized
+        /// before any cancellation fires so any observer that wakes on AbortToken/StoppingToken
+        /// and reads ClosedException sees a non-null value. Use this anywhere the framework
+        /// needs to "the protocol is closed" + the canonical exception, rather than re-deriving
+        /// it at each callsite.
+        public PgClientClosedException? ClosedException => protocol._closedException;
+
+        /// Sync throw helper. Throws <see cref="PgClientClosedException"/> if the protocol is
+        /// closed, no-op otherwise. Intended for use inside existing async I/O frames
+        /// (PgDecoder, PgProtocolDataWriter) on the OCE catch path - converting OCE-from-our-
+        /// abort-token to the typed closed exception without paying for an extra wrapping
+        /// frame.
+        public void ThrowIfClosed()
+        {
+            if (protocol._closedException is { } ex)
+                throw ex;
+        }
 
         public void OnParameterStatus(BackendMessage message)
         {

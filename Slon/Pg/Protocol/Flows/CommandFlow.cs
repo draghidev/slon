@@ -401,13 +401,15 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
 
             SetResult(null);
         }
-        catch (OperationCanceledException ex) when (ex.CancellationToken == context.AbortToken || ex.CancellationToken == _callerCancellationToken)
+        catch (PgClientClosedException) when (context.IsProtocolClosed)
         {
-            if (ex.CancellationToken == context.AbortToken)
-            {
-                // Protocol will terminate the backend connection, nothing more for us to do.
-                throw;
-            }
+            // Scope the catch to our own closure so a nested protocol's closed exception
+            // bubbling through doesn't get treated as ours. Protocol will terminate the
+            // backend connection.
+            throw;
+        }
+        catch (OperationCanceledException ex) when (ex.CancellationToken == _callerCancellationToken)
+        {
 
             // All of what happens below is complicated by the fact PG cancellation is not deterministic.
             // Ideally we want a mechanism to state "cancel if you are at this message and continue until you see this other one"
@@ -521,7 +523,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
     static ref FlowCallerInteractionCore<FlowCallerInteractionCoreResult> GetCallerInteractionCore(CommandFlow instance)
         => ref instance._callerInteractionCore;
 
-    protected override void OnAbort(OperationCanceledException exception)
+    protected override void OnAbort(PgClientClosedException exception)
         => _callerInteractionCore.CancelPendingWait(exception);
 
     protected override void OnReset()

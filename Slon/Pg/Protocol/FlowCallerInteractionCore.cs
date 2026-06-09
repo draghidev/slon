@@ -24,7 +24,7 @@ struct FlowCallerInteractionCore<TResult>
 
     public ValueTask<TResult> GetGateTask(IValueTaskSource<TResult> source) => new(source, GateTaskSource.Version);
 
-    public void CancelPendingWait(OperationCanceledException exception)
+    public void CancelPendingWait(Exception exception)
     {
         GateTaskSource.TrySetException(exception, runContinuationsAsynchronously: true);
         _mres?.Set();

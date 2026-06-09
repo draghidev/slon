@@ -115,7 +115,7 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>
 
 
     protected virtual void OnHeartbeat(TimeSpan interval) {}
-    protected virtual void OnAbort(OperationCanceledException exception) {}
+    protected virtual void OnAbort(PgClientClosedException exception) {}
     protected virtual void OnReset() {}
 
     PgDecoder IValueTaskSource<PgDecoder>.GetResult(short token) => _activationTaskSource.GetResult(token);
@@ -130,17 +130,17 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>
         internal Context(ExecutionControl executionControl)
             => _executionControl = executionControl;
 
-        /// Forceful "wire dead" signal. I/O ops observe via construction-time wiring at protocol
-        /// init - do NOT thread this into per-call CT params on I/O methods. Body's role is
-        /// passive: catch OCE from I/O, attribute via ex.CancellationToken == AbortToken,
-        /// propagate.
-        public CancellationToken AbortToken => _executionControl.AbortToken;
-
         /// Graceful drain signal. Poll at handoff/coordination boundaries (per-CommandResult for
         /// CommandFlow) to switch to drain mode. I/O keeps running so the wire reaches a clean
         /// state. Do NOT thread this into I/O methods - the analyzer will suggest it but that
         /// converts graceful semantics into forceful cancellation on the next I/O op.
         public CancellationToken StoppingToken => _executionControl.StoppingToken;
+
+        /// True when this protocol has entered <c>Shutdown</c>. Use as the <c>when</c> filter on
+        /// a <c>PgClientClosedException</c> catch so a closed exception bubbling up from a
+        /// nested protocol isn't mistaken for ours; the check naturally scopes to the current
+        /// nesting layer.
+        public bool IsProtocolClosed => _executionControl.IsProtocolClosed;
 
         public ref readonly TState GetProtocolStatic<TState>()
             => ref _executionControl.GetProtocolStatic<TState>();
@@ -383,6 +383,7 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>
         // Tokens are routed from Control (protocol-owned). No per-flow storage.
         public CancellationToken AbortToken => control.AbortToken;
         public CancellationToken StoppingToken => control.StoppingToken;
+        public bool IsProtocolClosed => control.ClosedException is not null;
 
         public ValueTask<FlowTasks> ExecuteAuto()
             => IsAsync ? flow.ExecuteAuto(new(this)) : ExecuteSynchronously();
@@ -416,9 +417,8 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>
             // wiring (PgDecoder, PgProtocolDataWriter) - this path is only load-bearing for
             // pipelined flows that haven't been activated yet. TrySetException on an already-
             // completed activation source is a no-op, so iterating the head flow is harmless.
-            if (control.AbortToken.IsCancellationRequested && !flow._completed)
+            if (control.ClosedException is { } ex && !flow._completed)
             {
-                var ex = new OperationCanceledException(control.AbortToken);
                 flow._activationTaskSource.TrySetException(ex, runContinuationsAsynchronously: true);
                 flow.OnAbort(ex);
                 return;
