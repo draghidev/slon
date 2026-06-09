@@ -401,9 +401,9 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
 
             SetResult(null);
         }
-        catch (OperationCanceledException ex) when (ex.CancellationToken == AbortToken || ex.CancellationToken == _callerCancellationToken)
+        catch (OperationCanceledException ex) when (ex.CancellationToken == context.AbortToken || ex.CancellationToken == _callerCancellationToken)
         {
-            if (ex.CancellationToken == AbortToken)
+            if (ex.CancellationToken == context.AbortToken)
             {
                 // Protocol will terminate the backend connection, nothing more for us to do.
                 throw;

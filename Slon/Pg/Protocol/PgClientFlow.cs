@@ -4,10 +4,9 @@ using System.Threading.Tasks.Sources;
 
 namespace Slon.Pg.Protocol;
 
-abstract class PgClientFlow : IProtocolFlow, IValueTaskSource<PgDecoder>
+abstract class PgClientFlow : IValueTaskSource<PgDecoder>
 {
     readonly bool _supportsPipelining;
-    CancellationToken? _abortToken;
     Action<TimeSpan>? _decoderOnHeartbeatAction; // TODO should we have this here?
     int _rfqCount;
     bool _lastMessageInducesRfq;
@@ -49,18 +48,6 @@ abstract class PgClientFlow : IProtocolFlow, IValueTaskSource<PgDecoder>
         set => _isAsync = value;
     }
 
-    protected CancellationToken AbortToken
-    {
-        get
-        {
-            if (_abortToken is not { } token)
-            {
-                ThrowHelper.ThrowInvalidOperation("Flow is not yet enqueued on a protocol.");
-                return default;
-            }
-            return token;
-        }
-    }
 
     // The bind-time async snapshot. Stable across the flow's tenure (unlike IsAsync, which a
     // flow body may mutate for sync/async mixing). Used by the policy to decide whether
@@ -125,29 +112,7 @@ abstract class PgClientFlow : IProtocolFlow, IValueTaskSource<PgDecoder>
         OnReset();
     }
 
-    // IProtocolFlow lifecycle. Explicit impls so direct callers can't bypass the framework
-    // without making the bypass visible in code (via a cast).
-    void IProtocolFlow.Start() => _started = true;
 
-    void IProtocolFlow.Complete(Exception? exception)
-    {
-        if (_completed)
-            return;
-        _completed = true;
-        _activationCancellationTokenRegistration.Dispose();
-        if (exception is not null)
-            _completionTcs.TrySetException(exception);
-        else
-            _completionTcs.TrySetResult();
-        _completionAction?.Invoke(this, exception, _completionState);
-    }
-
-    void IProtocolFlow.Abort()
-    {
-        var exception = new OperationCanceledException(_abortToken.GetValueOrDefault());
-        _activationTaskSource.TrySetException(exception, runContinuationsAsynchronously: true);
-        OnAbort(exception);
-    }
 
     protected virtual void OnHeartbeat(TimeSpan interval) {}
     protected virtual void OnAbort(OperationCanceledException exception) {}
@@ -164,6 +129,18 @@ abstract class PgClientFlow : IProtocolFlow, IValueTaskSource<PgDecoder>
         readonly ExecutionControl _executionControl;
         internal Context(ExecutionControl executionControl)
             => _executionControl = executionControl;
+
+        /// Forceful "wire dead" signal. I/O ops observe via construction-time wiring at protocol
+        /// init - do NOT thread this into per-call CT params on I/O methods. Body's role is
+        /// passive: catch OCE from I/O, attribute via ex.CancellationToken == AbortToken,
+        /// propagate.
+        public CancellationToken AbortToken => _executionControl.AbortToken;
+
+        /// Graceful drain signal. Poll at handoff/coordination boundaries (per-CommandResult for
+        /// CommandFlow) to switch to drain mode. I/O keeps running so the wire reaches a clean
+        /// state. Do NOT thread this into I/O methods - the analyzer will suggest it but that
+        /// converts graceful semantics into forceful cancellation on the next I/O op.
+        public CancellationToken StoppingToken => _executionControl.StoppingToken;
 
         public ref readonly TState GetProtocolStatic<TState>()
             => ref _executionControl.GetProtocolStatic<TState>();
@@ -391,7 +368,7 @@ abstract class PgClientFlow : IProtocolFlow, IValueTaskSource<PgDecoder>
             }
         }
 
-        public void Bind(CancellationToken abortToken, TimeSpan activationTimeout)
+        public void Bind(TimeSpan activationTimeout)
         {
             if (flow._isAsync is not { } async)
             {
@@ -399,10 +376,13 @@ abstract class PgClientFlow : IProtocolFlow, IValueTaskSource<PgDecoder>
                 return;
             }
 
-            flow._abortToken = abortToken;
             flow._isAsyncAtBind = async;
             flow._remainingActivationTimeout = activationTimeout;
         }
+
+        // Tokens are routed from Control (protocol-owned). No per-flow storage.
+        public CancellationToken AbortToken => control.AbortToken;
+        public CancellationToken StoppingToken => control.StoppingToken;
 
         public ValueTask<FlowTasks> ExecuteAuto()
             => IsAsync ? flow.ExecuteAuto(new(this)) : ExecuteSynchronously();
@@ -417,7 +397,7 @@ abstract class PgClientFlow : IProtocolFlow, IValueTaskSource<PgDecoder>
             // If none of the cancellations triggered, we have a problem, throw.
             if (!flow._activationTaskSource.TrySetResult(decoder, runContinuationsAsynchronously: false)
                 && !(flow._remainingActivationTimeout <= TimeSpan.Zero)
-                && flow._abortToken?.IsCancellationRequested == false
+                && !control.AbortToken.IsCancellationRequested
                 && !flow._activationCancellationTokenRegistration.Token.IsCancellationRequested)
                 ThrowHelper.ThrowInvalidOperation("Flow was already activated unexpectedly.");
         }
@@ -429,12 +409,47 @@ abstract class PgClientFlow : IProtocolFlow, IValueTaskSource<PgDecoder>
 
         public void OnHeartbeat(TimeSpan interval)
         {
+            // Abort propagation: if AbortToken fired (protocol shutting down forcefully, or
+            // CompleteAsync's CompletionTimeout elapsed and escalated), fail this flow's
+            // activation source so anything parked on GetDecoderAsync gets unblocked. Flow
+            // bodies currently doing I/O observe AbortToken directly via construction-time
+            // wiring (PgDecoder, PgProtocolDataWriter) - this path is only load-bearing for
+            // pipelined flows that haven't been activated yet. TrySetException on an already-
+            // completed activation source is a no-op, so iterating the head flow is harmless.
+            if (control.AbortToken.IsCancellationRequested && !flow._completed)
+            {
+                var ex = new OperationCanceledException(control.AbortToken);
+                flow._activationTaskSource.TrySetException(ex, runContinuationsAsynchronously: true);
+                flow.OnAbort(ex);
+                return;
+            }
+
             if (flow._activationTaskSource.GetStatus(flow._activationTaskSource.Version) is ValueTaskSourceStatus.Pending
                 && (flow._remainingActivationTimeout -= interval) <= TimeSpan.Zero)
                 flow._activationTaskSource.TrySetException(new TimeoutException("Operation timed out waiting for activation."), runContinuationsAsynchronously: true);
 
             flow._decoderOnHeartbeatAction?.Invoke(interval);
             flow.OnHeartbeat(interval);
+        }
+
+        /// Framework lifecycle: marks the flow started. Called from the pipeline policy's
+        /// ExecuteItemAsync before the flow body runs.
+        public void Start() => flow._started = true;
+
+        /// Framework lifecycle: marks the flow completed, signals the per-flow completion TCS,
+        /// disposes any per-await activation-cancellation registration, fires the registered
+        /// completion action. Called from the pipeline policy's CompleteItem.
+        public void Complete(Exception? exception = null)
+        {
+            if (flow._completed)
+                return;
+            flow._completed = true;
+            flow._activationCancellationTokenRegistration.Dispose();
+            if (exception is not null)
+                flow._completionTcs.TrySetException(exception);
+            else
+                flow._completionTcs.TrySetResult();
+            flow._completionAction?.Invoke(flow, exception, flow._completionState);
         }
 
         public ref readonly TState GetProtocolStatic<TState>()

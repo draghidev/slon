@@ -19,15 +19,6 @@ enum ProtocolStatus
     Completed
 }
 
-// Lifecycle contract the protocol framework calls into. Explicit-impl on PgClientFlow forces
-// any direct caller to cast (which makes the bypass visible in code).
-internal interface IProtocolFlow
-{
-    void Start();
-    void Complete(Exception? exception = null);
-    void Abort();
-}
-
 interface IProtocolStatic<T>
 {
     ref readonly T Value { get; }
@@ -64,7 +55,7 @@ sealed class PgClientProtocolOptions
     public TimeSpan ReadTimeout { get; set; } = Timeout.InfiniteTimeSpan;
 }
 
-sealed class PgClientProtocol
+sealed class PgClientProtocol : IDisposable, IAsyncDisposable
 {
     readonly PgClientProtocolOptions _options;
     IOutputWriter<byte> _pipeWriter = null!;
@@ -77,8 +68,18 @@ sealed class PgClientProtocol
     Action? _poolConnectionIdleSignal;
 
     // Framework state, formerly inherited from Protocol<TFlow>.
+    // Two-token cancellation cascade:
+    // StoppingToken = graceful drain signal. Body polls at handoff/coordination boundaries (per-
+    // CommandResult for CommandFlow) and switches to drain mode. I/O keeps running so the wire
+    // reaches a clean state. Fired by Shutdown on the graceful path (CompleteAsync entry).
+    // AbortToken = forceful "wire dead" signal. I/O ops observe via construction-time wiring
+    // (PgDecoder, PgProtocolDataWriter). Body is passive: catches OCE, attributes via
+    // ex.CancellationToken == AbortToken, propagates. Fired immediately by Shutdown on the
+    // forceful path, or after CompletionTimeout on the graceful path's escalation.
     readonly CancellationTokenSource _abortCts;
     readonly CancellationToken _abortToken;
+    readonly CancellationTokenSource _stoppingCts;
+    readonly CancellationToken _stoppingToken;
     Pipeline<PgClientFlow, Policy, PgClientFlowSource, PgClientFlowSource.Enumerator> _pipeline = null!;
     PgClientFlowSource _source;
     readonly Lock _syncRoot = new();
@@ -92,6 +93,8 @@ sealed class PgClientProtocol
         _options = options;
         _abortCts = new(Timeout.InfiniteTimeSpan, options.TimeProvider);
         _abortToken = _abortCts.Token;
+        _stoppingCts = new();
+        _stoppingToken = _stoppingCts.Token;
         FlowControl = new Control(this);
     }
 
@@ -99,6 +102,7 @@ sealed class PgClientProtocol
 
     Control FlowControl { get; }
     CancellationToken AbortToken => _abortToken;
+    CancellationToken StoppingToken => _stoppingToken;
     public int PipelineDepth => _pipeline.Depth;
     ProtocolStatus Status => _status;
 
@@ -182,7 +186,7 @@ sealed class PgClientProtocol
         }
         catch (Exception ex)
         {
-            Abort(ex, waitForIdle: true);
+            FailProtocol(ex);
             throw;
         }
     }
@@ -241,7 +245,7 @@ sealed class PgClientProtocol
 
         // Bind
         var control = flow.GetExecutionControl(FlowControl);
-        control.Bind(AbortToken, _options.FlowActivationTimeout);
+        control.Bind(_options.FlowActivationTimeout);
         if (!control.IsPipelined)
             Interlocked.Increment(ref _pipelineStalls);
 
@@ -278,59 +282,83 @@ sealed class PgClientProtocol
         return true;
     }
 
-    // TODO remove and create a drain primitive.
+    // Pipeline-delivered abort exception. Items still in flight when the protocol tears down
+    // get this delivered via Pipeline.CompleteAsync's exception parameter, surfaced through the
+    // policy's CompleteItem call. OCE-with-token is the standard idiom so flow-side catch
+    // clauses can attribute via ex.CancellationToken == AbortToken (see CommandFlow).
     Exception CreateAbortException(Exception? abortReason)
+        => abortReason is null
+            ? new OperationCanceledException(_abortToken)
+            : new OperationCanceledException("Protocol aborted.", abortReason, _abortToken);
+
+    /// Graceful shutdown. Gives flows up to CompletionTimeout to drain, then escalates to
+    /// forceful by firing AbortToken. Awaitable: returns when the pipeline has fully drained
+    /// and all in-flight flows have completed. This is the only entry point that observes the
+    /// drain - <see cref="DisposeAsync"/> / <see cref="Dispose"/> fire-and-forget. If you need
+    /// to observe drain completion, call this first, then Dispose afterwards.
+    public ValueTask CompleteAsync(Exception? exception = null)
+        => Shutdown(exception, forceful: false, observeDrain: true);
+
+    /// Async forceful tear-down. Fires AbortToken immediately, fails activations for pipelined
+    /// flows, releases sync-disposable resources (heartbeat) before returning. The pipeline
+    /// drain unwinds in the background; this method does NOT await it. Callers that need to
+    /// observe drain completion should call <see cref="CompleteAsync"/> first.
+    public ValueTask DisposeAsync()
     {
-        Console.WriteLine("Aborting");
-        Console.WriteLine(abortReason);
-        while (!Debugger.IsAttached)
-            Thread.Sleep(1000);
-        Debugger.Break();
-        return null!;
+        _ = Shutdown(CreateAbortException(null), forceful: true, observeDrain: false);
+        return default;
     }
 
-    public void Abort(Exception? exception = null) => Abort(exception, waitForIdle: true);
+    /// Synchronous tear-down for callers that can't go async (the canonical case is
+    /// <see cref="System.Data.Common.DbDataSource.Dispose"/>'s sync contract bubbling down to
+    /// connection/protocol cleanup). Same fire-and-forget semantics as <see cref="DisposeAsync"/>:
+    /// AbortToken fires immediately, sync resources released up-front, pipeline drain happens
+    /// in the background. Idempotent.
+    public void Dispose()
+        => _ = Shutdown(CreateAbortException(null), forceful: true, observeDrain: false);
 
-    void Abort(Exception? abortReason, bool waitForIdle)
+    /// Internal emergency self-evict for the two framework-internal "we cannot continue" sites
+    /// (startup catch, OnParameterStatus encoding failure). Fire-and-forget shape so it can run
+    /// from the message-processing thread. Pool eviction picks up via the status flag.
+    internal void FailProtocol(Exception? reason)
+        => _ = Shutdown(CreateAbortException(reason), forceful: true, observeDrain: false);
+
+    async ValueTask Shutdown(Exception? exception, bool forceful, bool observeDrain)
     {
-        // Already aborting.
-        if (_abortCts.IsCancellationRequested)
-            return;
-
-        _abortCts.Cancel();
-
-        SignalDraining();
-        try
-        {
-            _ = _pipeline.CompleteAsync(CreateAbortException(abortReason));
-        }
-        finally
-        {
-            SignalCompleted();
-        }
-    }
-
-    public async ValueTask CompleteAsync(Exception? exception = null)
-    {
-        // We're already done if this returns false.
+        // First-writer-wins. SignalDraining returns false when status is already Completed.
         if (!SignalDraining())
             return;
+
+        // Anything below the first await is background work from a fire-and-forget caller's
+        // perspective. Parked-flow propagation is heartbeat-driven for both paths:
+        // ExecutionControl.OnHeartbeat observes AbortToken and fails the activation source within
+        // HeartbeatInterval. Forceful disposal accepts that latency too - "abort is forceful, if
+        // flows are observing StoppingToken activation comes soon for pending ones anyway."
+        if (forceful)
+        {
+            _abortCts.Cancel();
+        }
+        else
+        {
+            // Graceful path: fire StoppingToken first so well-behaved flow bodies observe at
+            // coordination boundaries and drain themselves cooperatively. Schedule AbortToken
+            // as the escalation backstop in case they don't drain in time.
+            _stoppingCts.Cancel();
+            _abortCts.CancelAfter(_options.CompletionTimeout);
+        }
+
         try
         {
-            // Traverse remaining flows ourselves once the token fires so flows don't register/unregister on each execution.
-            using var reg = _abortCts.Token.UnsafeRegister(_ =>
-            {
-                foreach (var flow in GetFlows())
-                    ((IProtocolFlow)flow).Abort();
-            }, null);
-
-            _abortCts.CancelAfter(_options.CompletionTimeout);
-            // Wait for the pipeline to complete and drain remaining items.
+            // Drain remaining items. exception is delivered to each via policy.CompleteItem.
             await _pipeline.CompleteAsync(exception).ConfigureAwait(false);
         }
         finally
         {
             _abortCts.CancelAfter(TimeSpan.Zero);
+            // Heartbeat disposed AFTER drain in all paths: it needs to keep ticking during the
+            // drain to propagate AbortToken to parked flows via OnHeartbeat. Disposing up-front
+            // would strand them. Same principle should apply at the DbDataSource pool level for
+            // the pool-shared heartbeat: don't dispose until the pool's drain finishes.
             _heartbeat?.Dispose();
             SignalCompleted();
         }
@@ -388,14 +416,14 @@ sealed class PgClientProtocol
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public void CompleteItem(PgClientFlow item, int remainingDepth, Exception? exception)
         {
-            ((IProtocolFlow)item).Complete(exception);
+            item.GetExecutionControl(_protocol.FlowControl).Complete(exception);
             _protocol.FlowControl.OnCompleted(item, remainingDepth);
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public ValueTask<PipelineItemResult> ExecuteItemAsync(PgClientFlow item, CancellationToken cancellationToken)
         {
-            ((IProtocolFlow)item).Start();
+            item.GetExecutionControl(_protocol.FlowControl).Start();
             PromiseAsyncValueTaskMethodBuilder<PipelineItemResult>.Promise = _promise;
             try
             {
@@ -457,6 +485,13 @@ sealed class PgClientProtocol
         public PgClientFlow? ActivatedFlow { get; private set; }
 
         public PgProtocolDataWriter Writer => protocol._protocolDataWriter;
+
+        // Tokens live on the protocol; per-flow storage is unnecessary since the protocol's
+        // tokens are stable across the flow's tenure. Surface them through Control so
+        // ExecutionControl (and through it, Context for the body and OnHeartbeat for the
+        // framework) can read without each flow paying the storage.
+        public CancellationToken AbortToken => protocol._abortToken;
+        public CancellationToken StoppingToken => protocol._stoppingToken;
 
         public void OnParameterStatus(BackendMessage message)
         {
@@ -533,7 +568,7 @@ sealed class PgClientProtocol
                     }
                     catch (ArgumentException ex)
                     {
-                        protocol.Abort(ex);
+                        protocol.FailProtocol(ex);
                         throw;
                     }
                 }
