@@ -336,8 +336,6 @@ sealed class EmptyProtocol<TMode> : IPoolConnection<EmptyProtocol<TMode>>
             return false;
         }
 
-        public ValueTask OnExecutionIdleAsync(CancellationToken cancellationToken) => default;
-
         sealed class ActivationWorkItem(Control flowControl) : IThreadPoolWorkItem
         {
             EmptyFlow<TMode> _item = null!;

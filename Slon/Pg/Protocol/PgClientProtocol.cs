@@ -446,11 +446,9 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
         {
             _protocol = protocol;
             _promise = new();
-            ExecutionScheduler = protocol._options.ExecutionScheduler;
             ActivationScheduler = protocol._options.ActivationScheduler;
         }
 
-        public PipelineScheduler? ExecutionScheduler { get; }
         PipelineScheduler? ActivationScheduler { get; }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
