@@ -55,13 +55,12 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
 
         _state.OnEnqueue?.Invoke();
         _state.Queue.Enqueue(flow);
-        // Full-fence store (not Volatile.Write): this is the producer half of a Dekker pair
-        // with the handoff close-out's clear-then-read. The dispatch's HandoffActive read
-        // (EnqueueResult.Execute) must not pass this store - with a release-only store both
-        // sides' stores can sit in their store buffers past the other's load (store->load is
-        // legal even on x86 TSO): we defer against a stale window, the close-out reads a
-        // stale empty flag, and the wake is lost with the item queued (audit C2).
-        Interlocked.Exchange(ref _state.QueueNotEmpty, true);
+        // Release store suffices: the flag's only cross-thread reader is the handoff
+        // close-out's compensation, and the dispatch's under-lock gate (EnqueueResult.Execute)
+        // is the full fence that publishes this store in time for it - see Execute. (The
+        // wait re-check peeks the QUEUE, not this flag, so a stale TRUE costs at most a
+        // spurious compensation wake; audit C6.)
+        Volatile.Write(ref _state.QueueNotEmpty, true);
 
         return new(_state);
     }
@@ -216,21 +215,23 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
 
         public void Complete()
         {
-            // Full-fence store (not Volatile.Write): the completion half of the same Dekker
-            // pairing as Enqueue's flag store - the HandoffActive gate read below must not
-            // pass this store, or a close-out racing in the window reads a stale false here
-            // while we defer against its stale-open window, stranding the completion and
-            // hanging drain (audit C2).
-            Interlocked.Exchange(ref IsCompleted, true);
+            Volatile.Write(ref IsCompleted, true);
             // Deferred during a sync-handoff window: an ungated completion wake here steals the
             // rendezvous - the executor wakes on a TP thread, takes the Acked handoff slot, and
             // runs the sync flow on the WRONG thread while EnqueueSyncWithHandoff returns
-            // mid-flight (WaitProtocol.tla exhibited the steal; this gate is its verified fix).
-            // No liveness is lost: the handoff's inline claim wakes the executor, and its next
+            // mid-flight. The gate read and the claim execute under ONE wake-lock hold, same
+            // as EnqueueResult.Execute and for the same reason: read-then-claim let a stale
+            // closed-window verdict pair with a post-ack claim. The acquire also publishes the IsCompleted store to
+            // the close-out's compensation read, so it needs no fence of its own. No liveness
+            // is lost on deferral: the handoff's inline claim wakes the executor, and its next
             // wait observes IsCompleted (completed-resolution also defers while HandoffActive,
-            // see WaitCore, so a window opening right after this read still resolves correctly).
-            if (!Volatile.Read(ref HandoffActive))
-                WakeSignal.Signal(runContinuationsAsynchronously: true);
+            // see WaitCore; the close-out re-delivers a completion that raced the window).
+            var wakeSignal = WakeSignal;
+            wakeSignal.AcquireWakeLock();
+            var claimed = !Volatile.Read(ref HandoffActive) && wakeSignal.TryClaimLocked();
+            wakeSignal.ReleaseWakeLock();
+            if (claimed)
+                wakeSignal.DispatchClaimed(runContinuationsAsynchronously: true);
         }
 
         // Two narrow take helpers. The HandoffActive skip-queue rule belongs at the call site
@@ -275,8 +276,25 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
         public void Execute(bool runContinuationsAsynchronously)
         {
             if (_state is null) return;
-            if (Volatile.Read(ref _state.HandoffActive)) return;
-            _state.WakeSignal.Signal(runContinuationsAsynchronously);
+            // Gate UNDER the wake lock: the HandoffActive read and the claim must be one
+            // atomic step against the sync-handoff rendezvous. The old read-then-claim shape
+            // let a gate verdict taken just before the window opened pair with a claim landing
+            // after the sync producer had observed the suspension and acked - the claim stole
+            // the rendezvous, the executor woke on a scheduler thread, and its TryGetNext ran
+            // the sync flow on the WRONG thread while EnqueueSyncWithHandoff returned
+            // mid-flight. The acquire is also
+            // the full fence that publishes this thread's QueueNotEmpty store to the
+            // close-out's compensation read: either this claim runs before that read (the
+            // commit makes the flag visible to it) or after the window clear (the gate sees
+            // it closed and claims directly) - which is why Enqueue's flag store needs no
+            // fence of its own.
+            var wakeSignal = _state.WakeSignal;
+            wakeSignal.AcquireWakeLock();
+            var claimed = !Volatile.Read(ref _state.HandoffActive) && wakeSignal.TryClaimLocked();
+            wakeSignal.ReleaseWakeLock();
+            // Deferred (window open): dropped on purpose - the handoff close-out re-delivers.
+            if (claimed)
+                wakeSignal.DispatchClaimed(runContinuationsAsynchronously);
         }
     }
 
@@ -336,8 +354,15 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
             wakeSignal.AcquireWakeLock();
 
             // Availability re-check under the lock, peek-style: consumption stays in TryGetNext.
+            // The queue test PEEKS (consumer-side, SPSC-legal) instead of reading QueueNotEmpty:
+            // under publish-then-flag a TRUE flag implies the item is already peekable, so the
+            // peek subsumes it - and the flag can go STALE-TRUE (the producer's flag store
+            // landing after TryDequeue's dequeue-to-empty clear), which made a flag-based
+            // re-check retry forever against an empty queue: the executor hot-spun instead of
+            // arming and completed-resolution starved behind it, hanging drain
+            // (WaitProtocolPg.tla FlagRecheckWitness; audit C6).
             if (Volatile.Read(ref _state.HandoffAcked)
-                || (!Volatile.Read(ref _state.HandoffActive) && Volatile.Read(ref _state.QueueNotEmpty)))
+                || (!Volatile.Read(ref _state.HandoffActive) && _state.Queue.TryPeek(out _)))
             {
                 wakeSignal.ReleaseWakeLock();
                 return WaitForNextAwaitable.Retry();
