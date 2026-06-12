@@ -1,4 +1,4 @@
-using System.Threading.Tasks.Sources;
+using System.Diagnostics;
 using Draghi.Pipelining;
 using Draghi.Pipelining.Internal;
 
@@ -9,26 +9,28 @@ using Draghi.Pipelining.Internal;
 namespace Slon.Pg.Protocol;
 
 /// <summary>
-/// Pipeline source for <see cref="PgClientFlow"/>. SPSC primary queue with a custom
-/// <see cref="IValueTaskSource{TResult}"/> at the rendezvous point, plus a sync-flow handoff slot
-/// that lets a synchronous producer's thread drive the executor for its own item without any TP
-/// dispatch in the rendezvous path.
+/// Pipeline source for <see cref="PgClientFlow"/>. SPSC primary queue on the thin
+/// TryGetNext/WaitForNextAsync pull seam (a <see cref="WakeSignal"/> wait, no value-task source),
+/// plus a sync-flow handoff slot that lets a synchronous producer's thread drive the executor for
+/// its own item without any TP dispatch in the rendezvous path.
 /// </summary>
 /// <remarks>
 /// <para>
 /// <b>Idle handoff</b>. The sync producer publishes its flow into <c>HandoffSlot</c> and sets
-/// <c>HandoffActive</c>, which gates async producers from racing the VTS. The producer then waits
-/// on an MRES that the VTS's <see cref="IValueTaskSource{TResult}.OnCompleted"/> handler sets when
-/// the executor parks. Once parked, the producer's <see cref="ResettableValueTaskSource.SetResult"/>
-/// dispatches the executor's continuation inline on the producer's thread. The executor's resume
-/// pulls <c>HandoffSlot</c> via <see cref="ResettableValueTaskSource.GetResult"/>, returns it, and
-/// the pipeline processes the flow synchronously on the caller's thread. No TP work item is enqueued
-/// at any point in the rendezvous.
+/// <c>HandoffActive</c>, which gates async producers' signals AND completion wakes (see
+/// <see cref="State.Complete"/>) from racing the rendezvous. The producer then blocks in
+/// <see cref="WakeSignal.WaitForSuspended"/> until the executor's wait is armed and registered,
+/// acks the slot, and claims the wait inline (<see cref="WakeSignal.Signal(bool)"/> with inline
+/// dispatch): the executor's continuation runs on the producer's thread, its TryGetNext retry
+/// takes the Acked slot, and the pipeline processes the flow synchronously before
+/// <see cref="EnqueueSyncWithHandoff"/> returns. No TP work item is enqueued at any point in the
+/// rendezvous. Protocol verified in Draghi.Pipelining/verification/WaitProtocol.tla (incl. the
+/// completion-steal hazard its gate fixes and witness configs for each mechanism).
 /// </para>
 /// <para>
 /// Async producers that arrive during <c>HandoffActive</c> enqueue to the SPSC queue without
 /// signalling. After the sync handoff completes, the sync caller wakes the executor on TP only if
-/// items were deferred during the window, zero TP otherwise.
+/// items (or a deferred completion) accrued during the window, zero TP otherwise.
 /// </para>
 /// </remarks>
 readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowSource.Enumerator>
@@ -105,18 +107,22 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
 
         _state.OnEnqueue?.Invoke();
 
-        // Publish to the handoff slot. The previous head (if any) re-parked the executor and the
-        // ParkedMres is already set. If we're the original head and the executor was busy we still
-        // wait for the natural park.
+        // Publish to the handoff slot. The previous head (if any) re-suspended the executor and
+        // the suspension observation is already set. If we're the original head and the executor
+        // was busy we still wait for the natural suspension.
         Volatile.Write(ref _state.HandoffSlot, entry.Flow);
-        _state.Vts.WaitForParked();
-        // Ack only AFTER WaitForParked returns. MoveNextAsync gates on this so the executor
-        // can't snipe HandoffSlot during a between-items MoveNextAsync call that doesn't park.
+        _state.WakeSignal.WaitForSuspended();
+        // Ack only AFTER WaitForSuspended returns. TryGetNext gates on this so the executor
+        // can't snipe HandoffSlot during a between-items pull that doesn't suspend.
         Volatile.Write(ref _state.HandoffAcked, true);
-        _state.Vts.SetResult(runContinuationsAsynchronously: false);
-        // SetResult invoked the executor's continuation on this thread. The executor's GetResult
-        // pulled HandoffSlot, returned the flow, the pipeline processed it inline, and called
-        // MoveNextAsync again, which re-parked.
+        // Inline claim: guaranteed to win - async signals defer during HandoffActive
+        // (EnqueueResult.Execute) and Complete's wake defers too (State.Complete), so nothing
+        // else can consume the suspended wait between our observation and this claim
+        // (WaitProtocol.tla, HandoffInline). The executor's continuation runs on this thread:
+        // it retries TryGetNext, takes the Acked handoff slot, and the pipeline processes the
+        // flow inline before this call returns.
+        var claimed = _state.WakeSignal.Signal(runContinuationsAsynchronously: false);
+        Debug.Assert(claimed, "Sync handoff lost its rendezvous: the suspended wait was claimed elsewhere.");
 
         // Baton hand-off: pop self from head, peek next. If a next waiter exists, signal it.
         // Otherwise close out the chain.
@@ -129,7 +135,13 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
             {
                 _state.SyncTail = null;
                 Volatile.Write(ref _state.HandoffActive, false);
-                postHandoffWakeNeeded = Volatile.Read(ref _state.QueueNotEmpty);
+                // Deliver wakes deferred during the window: async enqueues (Execute no-ops while
+                // HandoffActive) AND a deferred completion (State.Complete's gate). The latter
+                // matters because the executor's inline run can re-arm BEFORE this close-out
+                // clears HandoffActive (its completed-resolution defers while the window is
+                // active), so without this wake a completion arriving mid-window strands it.
+                postHandoffWakeNeeded = Volatile.Read(ref _state.QueueNotEmpty)
+                    || Volatile.Read(ref _state.IsCompleted);
             }
             next = _state.SyncHead;
         }
@@ -137,7 +149,7 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
         if (next is not null)
             next.WakeMres.Set();
         else if (postHandoffWakeNeeded)
-            _state.Vts.SetResult(runContinuationsAsynchronously: true);
+            _state.WakeSignal.Signal(runContinuationsAsynchronously: true);
     }
 
     internal sealed class SyncHandoffEntry(PgClientFlow flow)
@@ -159,16 +171,16 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
     {
         public readonly PgClientProtocol Protocol;
         public readonly SingleProducerSingleConsumerQueue<PgClientFlow> Queue = new();
-        public readonly ResettableValueTaskSource Vts;
+        // The wait-protocol WakeSignal with suspension observation enabled: the executor's waits
+        // arm against it (thin path, no value-task source), and EnqueueSyncWithHandoff
+        // rendezvouses on WaitForSuspended. Scheduler-routed async wakes come with it.
+        public readonly WakeSignal WakeSignal;
         public bool QueueNotEmpty;
         public PgClientFlow Current = null!;
         public Action? OnEnqueue;
 
         public PgClientFlow? HandoffSlot;
         public bool HandoffActive;
-        // Set when the async wait path (WaitForNextAsync -> MoveNextAsync) consumed an item into
-        // Current; TryGetNext drains it before probing the handoff slot / queue. Single-consumer.
-        public bool Staged;
         // Acked is what gates MoveNextAsync from taking the handoff slot before the sync caller
         // has actually issued SetResult. Without this, the executor (busy processing a prior
         // item) can finish, loop back, observe HandoffSlot, and take the flow on its own
@@ -185,13 +197,21 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
         public State(PgClientProtocol protocol, PipelineScheduler scheduler)
         {
             Protocol = protocol;
-            Vts = new(this);
+            WakeSignal = new(runContinuationsAsynchronously: true, scheduler, enableWaitForSuspended: true);
         }
 
         public void Complete()
         {
             Volatile.Write(ref IsCompleted, true);
-            Vts.SetResult(runContinuationsAsynchronously: true);
+            // Deferred during a sync-handoff window: an ungated completion wake here steals the
+            // rendezvous - the executor wakes on a TP thread, takes the Acked handoff slot, and
+            // runs the sync flow on the WRONG thread while EnqueueSyncWithHandoff returns
+            // mid-flight (WaitProtocol.tla exhibited the steal; this gate is its verified fix).
+            // No liveness is lost: the handoff's inline claim wakes the executor, and its next
+            // wait observes IsCompleted (completed-resolution also defers while HandoffActive,
+            // see WaitCore, so a window opening right after this read still resolves correctly).
+            if (!Volatile.Read(ref HandoffActive))
+                WakeSignal.Signal(runContinuationsAsynchronously: true);
         }
 
         // Two narrow take helpers. The HandoffActive skip-queue rule belongs at the call site
@@ -237,7 +257,7 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
         {
             if (_state is null) return;
             if (Volatile.Read(ref _state.HandoffActive)) return;
-            _state.Vts.SetResult(runContinuationsAsynchronously);
+            _state.WakeSignal.Signal(runContinuationsAsynchronously);
         }
     }
 
@@ -259,23 +279,17 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
             _completionToken.UnsafeRegister(static state => ((State)state!).Complete(), _state);
         }
 
-        public PgClientFlow Current => _state.Current;
         public CancellationToken CompletionToken => _completionToken;
 
         public void Complete() => _cts.Cancel();
 
-        /// <summary>Synchronous pull. Drains a staged item from the async wait path first, then
-        /// probes the handoff slot and the primary queue (HandoffActive-gated, same as the
-        /// MoveNextAsync ready-check). Items route through <see cref="State.Current"/> here
-        /// because the existing take helpers deliver there.</summary>
+        /// <summary>Synchronous pull: handoff slot first (HandoffAcked-gated, so a between-items
+        /// pull can't snipe a slot whose sync producer hasn't issued its inline claim yet), then
+        /// the primary queue when no handoff window is active (don't hijack the sync caller's
+        /// thread). Items route through <see cref="State.Current"/> because the take helpers
+        /// deliver there.</summary>
         public bool TryGetNext([System.Diagnostics.CodeAnalysis.MaybeNullWhen(false)] out PgClientFlow item)
         {
-            if (_state.Staged)
-            {
-                _state.Staged = false;
-                item = _state.Current;
-                return true;
-            }
             if (_state.TryTakeHandoff() || (!Volatile.Read(ref _state.HandoffActive) && _state.TryDequeue()))
             {
                 item = _state.Current;
@@ -285,76 +299,53 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
             return false;
         }
 
-        /// <summary>Async-fallback wait: this source's park is intrinsically async (it must flush
-        /// unflushed protocol bytes before suspending and its rendezvous doubles as the sync-flow
-        /// handoff point), so it rides the Task shape of <see cref="WaitForNextAwaitable"/>. A
-        /// produced item is staged for the TryGetNext retry.</summary>
-        public WaitForNextAwaitable WaitForNextAsync() => WaitForNextAwaitable.FromTask(WaitCore());
-
-        async ValueTask<bool> WaitCore()
+        /// <summary>Miss path. The common no-flush wait takes the thin signal shape (lock,
+        /// peek-style re-check, arm with the lock held through registration). Flush-before-wait
+        /// is intrinsically async - in-flight flows have written queries the server hasn't
+        /// received yet; without the flush their read phase waits forever and drain hangs - so
+        /// that case rides the Task shape (it implies IO anyway).</summary>
+        public WaitForNextAwaitable WaitForNextAsync()
         {
-            if (!await MoveNextAsync().ConfigureAwait(false))
-                return false;
-            _state.Staged = true;
-            return true;
-        }
-
-        public ValueTask<bool> MoveNextAsync()
-        {
-            if (TryGetReady(out var result))
-            {
-                // On the completion path with pipelined bytes still buffered we must push them
-                // before returning. In-flight flows have written queries the server hasn't
-                // received yet; without this flush their read phase parks forever and drain
-                // hangs.
-                if (!result && _state.Protocol.UnflushedBytes is not 0)
-                    return FlushThenComplete();
-                return new(result);
-            }
             if (_state.Protocol.UnflushedBytes is not 0)
-                return FlushThenPark();
-            return Park();
+                return WaitForNextAwaitable.FromTask(FlushThenWaitAsync());
+            return WaitCore();
         }
 
-        async ValueTask<bool> FlushThenComplete()
+        WaitForNextAwaitable WaitCore()
+        {
+            var wakeSignal = _state.WakeSignal;
+            wakeSignal.AcquireWakeLock();
+
+            // Availability re-check under the lock, peek-style: consumption stays in TryGetNext.
+            if (Volatile.Read(ref _state.HandoffAcked)
+                || (!Volatile.Read(ref _state.HandoffActive) && Volatile.Read(ref _state.QueueNotEmpty)))
+            {
+                wakeSignal.ReleaseWakeLock();
+                return WaitForNextAwaitable.Retry();
+            }
+
+            // Completed-resolution DEFERS during a handoff window: resolving out from under a
+            // waiting sync producer would strand its rendezvous (WaitProtocol.tla,
+            // WaitRecheckCompleted's guard). Arm instead - the producer's inline claim drives
+            // its flow, and the next wait observes completion (re-delivered by the handoff
+            // chain close-out when it raced the window).
+            if ((Volatile.Read(ref _state.IsCompleted) || _completionToken.IsCancellationRequested)
+                && !Volatile.Read(ref _state.HandoffActive))
+            {
+                wakeSignal.ReleaseWakeLock();
+                return WaitForNextAwaitable.Completed();
+            }
+
+            return wakeSignal.Arm();
+        }
+
+        async ValueTask<bool> FlushThenWaitAsync()
         {
             // CancellationToken.None on purpose: in-flight flows have written bytes that must
             // reach the wire so their read phase can drain. The writer's own _cts (linked to
             // AbortToken) is the correct cancellation gate for transport-level abort.
             await _state.Protocol.FlushAsync(CancellationToken.None).ConfigureAwait(false);
-            return false;
-        }
-
-        bool TryGetReady(out bool result)
-        {
-            if (_state.TryTakeHandoff() || (!Volatile.Read(ref _state.HandoffActive) && _state.TryDequeue()))
-            {
-                result = true;
-                return true;
-            }
-            if (Volatile.Read(ref _state.IsCompleted) || _completionToken.IsCancellationRequested)
-            {
-                result = false;
-                return true;
-            }
-            result = default;
-            return false;
-        }
-
-        ValueTask<bool> Park()
-        {
-            _state.Vts.Reset();
-            // Race re-check after reset, before publishing the awaiter.
-            if (TryGetReady(out var result))
-                return new(result);
-            return new(_state.Vts, _state.Vts.Version);
-        }
-
-        async ValueTask<bool> FlushThenPark()
-        {
-            // CancellationToken.None on purpose, same reasoning as FlushThenComplete.
-            await _state.Protocol.FlushAsync(CancellationToken.None).ConfigureAwait(false);
-            return await Park().ConfigureAwait(false);
+            return await WaitCore();
         }
 
         public ValueTask DisposeAsync()
@@ -365,63 +356,4 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
         }
     }
 
-    /// <summary>
-    /// Resettable <see cref="IValueTaskSource{TResult}"/> that doubles as the parking primitive
-    /// for the executor and the rendezvous primitive for sync handoff producers.
-    /// </summary>
-    /// <remarks>
-    /// <see cref="OnCompleted"/> sets <see cref="_parkedMres"/>. Sync producers
-    /// <see cref="WaitForParked"/> for it. <see cref="SetResult"/> clears the MRES before
-    /// dispatching the continuation so the parked state stays accurate across resume.
-    /// <see cref="GetResult"/> resolves <see cref="State.Current"/> by pulling
-    /// <see cref="State.HandoffSlot"/> or dequeueing from the primary queue.
-    /// </remarks>
-    internal sealed class ResettableValueTaskSource : IValueTaskSource<bool>
-    {
-        readonly State _state;
-        readonly ManualResetEventSlim _parkedMres = new(false);
-        ManualResetValueTaskSourceCore<bool> _core;
-
-        public ResettableValueTaskSource(State state) => _state = state;
-
-        public short Version => _core.Version;
-
-        public ValueTaskSourceStatus GetStatus(short token) => _core.GetStatus(token);
-
-        public bool GetResult(short token)
-        {
-            _core.GetResult(token);
-            // GetResult fires from a SetResult that promised either an item or completion. Don't
-            // apply MoveNextAsync's HandoffActive skip-queue rule here. At wake time the executor
-            // must take whatever the producer made visible, on whichever thread is dispatching.
-            if (_state.TryTakeHandoff() || _state.TryDequeue())
-                return true;
-            return !Volatile.Read(ref _state.IsCompleted);
-        }
-
-        public void OnCompleted(Action<object?> continuation, object? state, short token, ValueTaskSourceOnCompletedFlags flags)
-        {
-            _core.OnCompleted(continuation, state, token, flags);
-            _parkedMres.Set();
-        }
-
-        public void Reset()
-        {
-            _parkedMres.Reset();
-            _core.Reset();
-        }
-
-        public void SetResult(bool runContinuationsAsynchronously)
-        {
-            // Continuation is about to run, executor is no longer parked.
-            _parkedMres.Reset();
-            _core.RunContinuationsAsynchronously = runContinuationsAsynchronously;
-            // SetResult is idempotent at our use site: the parked executor may have raced an
-            // earlier SetResult (e.g. completion). Guard via GetStatus.
-            if (_core.GetStatus(_core.Version) == ValueTaskSourceStatus.Pending)
-                _core.SetResult(true);
-        }
-
-        public void WaitForParked() => _parkedMres.Wait();
-    }
 }
