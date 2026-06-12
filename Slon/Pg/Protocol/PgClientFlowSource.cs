@@ -166,6 +166,9 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
 
         public PgClientFlow? HandoffSlot;
         public bool HandoffActive;
+        // Set when the async wait path (WaitForNextAsync -> MoveNextAsync) consumed an item into
+        // Current; TryGetNext drains it before probing the handoff slot / queue. Single-consumer.
+        public bool Staged;
         // Acked is what gates MoveNextAsync from taking the handoff slot before the sync caller
         // has actually issued SetResult. Without this, the executor (busy processing a prior
         // item) can finish, loop back, observe HandoffSlot, and take the flow on its own
@@ -260,6 +263,41 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
         public CancellationToken CompletionToken => _completionToken;
 
         public void Complete() => _cts.Cancel();
+
+        /// <summary>Synchronous pull. Drains a staged item from the async wait path first, then
+        /// probes the handoff slot and the primary queue (HandoffActive-gated, same as the
+        /// MoveNextAsync ready-check). Items route through <see cref="State.Current"/> here
+        /// because the existing take helpers deliver there.</summary>
+        public bool TryGetNext([System.Diagnostics.CodeAnalysis.MaybeNullWhen(false)] out PgClientFlow item)
+        {
+            if (_state.Staged)
+            {
+                _state.Staged = false;
+                item = _state.Current;
+                return true;
+            }
+            if (_state.TryTakeHandoff() || (!Volatile.Read(ref _state.HandoffActive) && _state.TryDequeue()))
+            {
+                item = _state.Current;
+                return true;
+            }
+            item = null;
+            return false;
+        }
+
+        /// <summary>Async-fallback wait: this source's park is intrinsically async (it must flush
+        /// unflushed protocol bytes before suspending and its rendezvous doubles as the sync-flow
+        /// handoff point), so it rides the Task shape of <see cref="WaitForNextAwaitable"/>. A
+        /// produced item is staged for the TryGetNext retry.</summary>
+        public WaitForNextAwaitable WaitForNextAsync() => WaitForNextAwaitable.FromTask(WaitCore());
+
+        async ValueTask<bool> WaitCore()
+        {
+            if (!await MoveNextAsync().ConfigureAwait(false))
+                return false;
+            _state.Staged = true;
+            return true;
+        }
 
         public ValueTask<bool> MoveNextAsync()
         {
