@@ -55,7 +55,13 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
 
         _state.OnEnqueue?.Invoke();
         _state.Queue.Enqueue(flow);
-        Volatile.Write(ref _state.QueueNotEmpty, true);
+        // Full-fence store (not Volatile.Write): this is the producer half of a Dekker pair
+        // with the handoff close-out's clear-then-read. The dispatch's HandoffActive read
+        // (EnqueueResult.Execute) must not pass this store - with a release-only store both
+        // sides' stores can sit in their store buffers past the other's load (store->load is
+        // legal even on x86 TSO): we defer against a stale window, the close-out reads a
+        // stale empty flag, and the wake is lost with the item queued (audit C2).
+        Interlocked.Exchange(ref _state.QueueNotEmpty, true);
 
         return new(_state);
     }
@@ -134,7 +140,15 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
             if (_state.SyncHead is null)
             {
                 _state.SyncTail = null;
-                Volatile.Write(ref _state.HandoffActive, false);
+                // Full-fence clear (not Volatile.Write): the close-out half of the Dekker pairs
+                // with Enqueue's flag store and Complete's IsCompleted store. The compensation
+                // reads below must not pass this clear - a release-only clear let both sides
+                // observe stale values simultaneously (producer defers against the stale-open
+                // window AND this close-out reads the stale-false flag), losing the deferred
+                // wake: queued item never drained, or - the IsCompleted face - a deferred
+                // completion never re-delivered, hanging drain (audit C2). The producers'
+                // stores are Interlocked for the same reason (their halves of the pairs).
+                Interlocked.Exchange(ref _state.HandoffActive, false);
                 // Deliver wakes deferred during the window: async enqueues (Execute no-ops while
                 // HandoffActive) AND a deferred completion (State.Complete's gate). The latter
                 // matters because the executor's inline run can re-arm BEFORE this close-out
@@ -202,7 +216,12 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
 
         public void Complete()
         {
-            Volatile.Write(ref IsCompleted, true);
+            // Full-fence store (not Volatile.Write): the completion half of the same Dekker
+            // pairing as Enqueue's flag store - the HandoffActive gate read below must not
+            // pass this store, or a close-out racing in the window reads a stale false here
+            // while we defer against its stale-open window, stranding the completion and
+            // hanging drain (audit C2).
+            Interlocked.Exchange(ref IsCompleted, true);
             // Deferred during a sync-handoff window: an ungated completion wake here steals the
             // rendezvous - the executor wakes on a TP thread, takes the Acked handoff slot, and
             // runs the sync flow on the WRONG thread while EnqueueSyncWithHandoff returns
