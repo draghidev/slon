@@ -340,11 +340,14 @@ readonly struct PgEncoder
 
     void StartMessage(FrontendType type, int bodyLength)
     {
+        // Arm message-length tracking BEFORE writing the header so the prior message's
+        // declared-vs-written check fires at this boundary (it reads UnflushedBytes, which the
+        // header bytes about to be written would otherwise contaminate). totalLength is on-wire
+        // size: 1 (type) + sizeof(uint) (length field including itself) + bodyLength.
+        _writer.StartMessage(checked(sizeof(byte) + sizeof(uint) + bodyLength));
+
         Span<byte> header = stackalloc byte[sizeof(byte) + sizeof(int)];
         header[0] = type.ToByte();
-        // TODO actually prevent overflows like in npgsql, that approach wouldn't actually cost us any perf though.
-        // Small sanity check, though we don't depend on it, we instead throw during flush or here if messages were started smaller than what is being sent.
-        // It's the safest way to do streaming writes without needing to correctly find and handle every integer addition accumulating into message length.
         BinaryPrimitives.WriteUInt32BigEndian(header.Slice(1), checked(sizeof(uint) + (uint)bodyLength));
         _writer.WriteRaw(header);
 

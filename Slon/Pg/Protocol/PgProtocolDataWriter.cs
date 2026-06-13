@@ -15,6 +15,15 @@ sealed class PgProtocolDataWriter(IOutputWriter<byte> writer, Encoding clientEnc
     readonly PgClientProtocol.Control _control = control;
     CancellationTokenSource _cts = CancellationTokenSource.CreateLinkedTokenSource(abortToken);
 
+    // Current message state (npgsql NpgsqlWriteBuffer.StartMessage / AdvanceMessageBytesFlushed
+    // pattern, GHSA-x9vc-6hfv-hg8c). Validation is structural: per-write Write* methods are
+    // unchecked, the check rolls up at Flush and at the next StartMessage. `_messageBytesFlushed`
+    // is anchored at -unflushedAtStart so `unflushed + _messageBytesFlushed = bytesWrittenForCurrentMessage`
+    // across mid-message flushes too - lets multiple messages stack in the buffer and still get
+    // validated at message boundaries without forcing a flush per message.
+    int? _messageLength;
+    int _messageBytesFlushed;
+
     // Per-connection cached signal. The flow parks this in
     // TransportConnection.SyncNonBlockingSignal around each Resumable call, the transport
     // returns it on WouldBlock as the pending source, the flow's driver fires it via
@@ -48,6 +57,46 @@ sealed class PgProtocolDataWriter(IOutputWriter<byte> writer, Encoding clientEnc
 
     public long UnflushedBytes => _bufferingWriter.UnflushedBytes;
 
+    // Arms message-length tracking for a new message. `totalLength` is the on-wire size of the
+    // full message (type byte + length field + body, e.g. 5 + bodyLength for normal frontend
+    // messages). Validates the previous message wrote exactly its declared length before
+    // accepting the new one - the check fires at the next StartMessage boundary so per-write
+    // calls stay free. Mid-message flushes are handled by AdvanceMessageBytesFlushed maintaining
+    // _messageBytesFlushed as the "bytes already pushed past the buffer" counter for the current
+    // message, so the cross-message algebra holds without a flush per message.
+    internal void StartMessage(int totalLength)
+    {
+        var unflushed = checked((int)_bufferingWriter.UnflushedBytes);
+        // bytesWrittenForPrevious = unflushed + _messageBytesFlushed; the cross-flush case adds
+        // _messageBytesFlushed (negative at start, positive after advances). The previous message
+        // is fully written iff that equals _messageLength.
+        if (_messageLength is { } prev && unflushed + _messageBytesFlushed != prev)
+            ThrowUnderwritten(prev, unflushed + _messageBytesFlushed);
+        _messageBytesFlushed = -unflushed;
+        _messageLength = totalLength;
+    }
+
+    // Advances the message-bytes counter as buffered bytes leave the buffer (Flush). Catches
+    // over-writes: a busted converter that emitted more bytes than its message declared trips
+    // here before the bytes reach the wire. The buffer-level check is the CVE-2024-32655
+    // defense-in-depth for converters that size incorrectly and silently write through.
+    void AdvanceMessageBytesFlushed(int count)
+    {
+        if (_messageLength is null)
+            return; // Pre-startup raw writes (e.g. StartupMessage's CopyStartupBuffer).
+        if (count < 0)
+            throw new ArgumentOutOfRangeException(nameof(count));
+        if ((long)_messageBytesFlushed + count > _messageLength)
+            ThrowOverwritten(_messageLength.Value, _messageBytesFlushed + (long)count);
+        _messageBytesFlushed += count;
+    }
+
+    static void ThrowUnderwritten(int declared, int actual)
+        => throw new InvalidOperationException($"Message wrote {actual} bytes, declared length was {declared}.");
+
+    static void ThrowOverwritten(int declared, long projected)
+        => throw new InvalidOperationException($"Message write would exceed declared length {declared} (projected {projected}).");
+
     // TODO make a cut-off from where we start streaming the string.
     public ValueTask WriteStringWithNullTerminatorAsync(string value, Encoding encoding, int? encodedLength = null, CancellationToken cancellationToken = default)
     {
@@ -63,13 +112,18 @@ sealed class PgProtocolDataWriter(IOutputWriter<byte> writer, Encoding clientEnc
     public void WriteUInt(uint value) => _bufferingWriter.WriteUInt32BigEndian<BufferingWriter>(value);
     public void WriteInt(int value) => _bufferingWriter.WriteInt32BigEndian<BufferingWriter>(value);
 
-    public void Flush(TimeSpan timeout = default) => _bufferingWriter.Flush(timeout);
+    public void Flush(TimeSpan timeout = default)
+    {
+        AdvanceMessageBytesFlushed(checked((int)_bufferingWriter.UnflushedBytes));
+        _bufferingWriter.Flush(timeout);
+    }
 
     /// Flow-owned escape hatch from a parked flush. Without it the only break-out is protocol
     /// abort. An uncaught firing triggers the protocol's recovery path, so prefer a
     /// coordination-boundary check in connection-preserving flows.
     public ValueTask FlushAsync(CancellationToken cancellationToken)
     {
+        AdvanceMessageBytesFlushed(checked((int)_bufferingWriter.UnflushedBytes));
         var task = _bufferingWriter.FlushAsync(_cts.Token);
         if (task.IsCompletedSuccessfully)
             return task;
