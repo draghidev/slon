@@ -67,10 +67,13 @@ sealed class RecoveryDrainFlow : PgClientFlow
         // outstanding RFQs. No discrimination on the failed flow's termination state - worst
         // case is one extra, harmless RFQ on an idle wire (a redundant resync).
         //
-        // TODO(writer-gate): a TORN frame (a partial message whose declared length the server
-        // would read past) is NOT resynced by this Sync - the server consumes the Sync's bytes
-        // as the torn frame's body. Truncate-if-buffered / pad-to-length-if-flushed lands with
-        // PgEncoder message-tracking; until then recovery is correct only for non-torn writes.
+        // Torn-frame defense: if the failed flow faulted mid-message (declared length not
+        // reached), pad with zero bytes so the server reads exactly the declared body and exits
+        // the message at the framing boundary - the Sync that follows lands on a clean RFQ
+        // state. Padded body raises ERROR (Bind with corrupted parameter) not FATAL; the
+        // unexecuted portal dies at Sync (the failed flow's Execute, if any, is never sent by
+        // recovery). PgProtocolDataWriter.CompleteCurrentMessageWithPadding documents the
+        // invariant.
         //
         // TODO(copy): when COPY lands, branch on copy-mode here - a bare Sync is IGNORED during
         // copy-in (the backend waits for CopyData/CopyDone/CopyFail), so copy-in recovery must
@@ -102,6 +105,7 @@ sealed class RecoveryDrainFlow : PgClientFlow
         if (_outstandingTrailing.IsCompletedSuccessfully)
         {
             var encoder = context.GetEncoder();
+            encoder.PadCurrentMessage();
             encoder.WriteSync();
             var flushTask = encoder.FlushAsync();
             return new(new FlowTasks(trailingExecutionTask: flushTask, pipelineTask: DrainPhase()));
@@ -121,6 +125,7 @@ sealed class RecoveryDrainFlow : PgClientFlow
             // accepts our writes here. WriteSync + FlushAsync run sequentially with the
             // failed flow's (now-completed) trailing, single producer preserved.
             var encoder = context.GetEncoder();
+            encoder.PadCurrentMessage();
             encoder.WriteSync();
             await encoder.FlushAsync().ConfigureAwait(false);
         }

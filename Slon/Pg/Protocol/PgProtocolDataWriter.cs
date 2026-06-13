@@ -97,6 +97,37 @@ sealed class PgProtocolDataWriter(IOutputWriter<byte> writer, Encoding clientEnc
     static void ThrowOverwritten(int declared, long projected)
         => throw new InvalidOperationException($"Message write would exceed declared length {declared} (projected {projected}).");
 
+    // Recovery: pad the current torn message to its declared length with zero bytes so the
+    // server's framing reader exits the message at the declared boundary and resyncs on the
+    // subsequent Sync. Returns the byte count written (0 if no message in flight, or the
+    // declared length was already reached). After padding, the next StartMessage's validation
+    // sees a complete message and the buffer is safe to continue / flush.
+    //
+    // INVARIANT (flow-level, not enforced here): a padded message is NEVER followed by its
+    // own Execute - the zero-padded body can parse as a valid Bind whose corrupted parameter
+    // would silently corrupt data. Recovery's job is to inject Sync and drain RFQs, not to
+    // continue any pipelined work; the unexecuted portal dies at Sync.
+    internal int CompleteCurrentMessageWithPadding()
+    {
+        if (_messageLength is null)
+            return 0;
+        var unflushed = checked((int)_bufferingWriter.UnflushedBytes);
+        var remaining = _messageLength.Value - (unflushed + _messageBytesFlushed);
+        if (remaining <= 0)
+            return 0;
+        var padded = remaining;
+
+        Span<byte> zeros = stackalloc byte[256];
+        zeros.Clear();
+        while (remaining > 0)
+        {
+            var chunk = Math.Min(remaining, zeros.Length);
+            _bufferingWriter.Write(zeros.Slice(0, chunk));
+            remaining -= chunk;
+        }
+        return padded;
+    }
+
     // TODO make a cut-off from where we start streaming the string.
     public ValueTask WriteStringWithNullTerminatorAsync(string value, Encoding encoding, int? encodedLength = null, CancellationToken cancellationToken = default)
     {
