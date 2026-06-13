@@ -513,7 +513,7 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
             PromiseAsyncValueTaskMethodBuilder<PipelineItemResult>.Promise = _promise;
             try
             {
-                return ExecuteCore(_protocol.FlowControl, item, cancellationToken);
+                return ExecuteCore(_protocol, item, cancellationToken);
             }
             finally
             {
@@ -522,9 +522,22 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
 
             [AsyncMethodBuilder(typeof(PromiseAsyncValueTaskMethodBuilder<>))]
             static async ValueTask<PipelineItemResult> ExecuteCore(
-                Control flowControl, PgClientFlow item, CancellationToken cancellationToken)
+                PgClientProtocol protocol, PgClientFlow item, CancellationToken cancellationToken)
             {
-                var tasks = await flowControl.Execute(item, cancellationToken).ConfigureAwait(false);
+                // Substitution-substrate sequencing: a RecoveryDrainFlow whose failed flow's
+                // trailing is still in-flight awaits it inside its own ExecuteAuto (no work
+                // needed here; the recovery flow owns the dependency).
+                //
+                // Pre-flush of cross-item buffered bytes, lifted up from Control.Execute. Lives
+                // at this layer because it's policy-level writer hygiene between items, not
+                // part of any specific flow's ExecuteAuto. Pre-flush race with a still-in-flight
+                // failed-flow trailing on the recovery path is intentionally NOT handled here
+                // (the writer is single-producer and PipeWriter fail-fasts on overlapping flush
+                // - cold-path fail-fast, surfaces a real bug rather than hides it).
+                var writer = protocol._protocolDataWriter;
+                if (writer.UnflushedBytes > 1000)
+                    await writer.FlushAsync(protocol._abortToken).ConfigureAwait(false);
+                var tasks = await protocol.FlowControl.Execute(item).ConfigureAwait(false);
                 return new PipelineItemResult(tasks.TrailingExecutionTask, tasks.PipelineTask);
             }
         }
@@ -579,20 +592,18 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
             var control = _protocol.FlowControl;
             var failedControl = failedItem.GetExecutionControl(control);
             var inheritedRfqCount = failedControl.RfqCount;
-            var unflushedBytes = _protocol.UnflushedBytes;
 
-            // Inject Sync when the failed flow's last buffered message didn't induce RFQ - wire
-            // is mid-sequence and the server is waiting for a terminator. Skip if last was already
-            // self-terminating (Sync/Query), or if nothing is buffered (no bytes to send).
-            var injectSync = !failedControl.LastMessageInducesRfq && unflushedBytes > 0;
-            var flushPendingBytes = unflushedBytes > 0;
-            var drainCount = inheritedRfqCount + (injectSync ? 1 : 0);
+            // Recovery resyncs unconditionally: always inject a terminating Sync and drain to the
+            // RFQ it produces, on top of the failed flow's inherited outstanding RFQs. The wire
+            // states converge: an unterminated sequence needs the Sync, an already-terminated
+            // flow gets one extra harmless RFQ (a redundant resync on an idle wire), a torn write
+            // also needs the Sync (modulo the writer-gate repair tracked in RecoveryDrainFlow's
+            // TODO). One wasted round-trip worst-case on a cold path.
+            var drainCount = inheritedRfqCount + 1;
 
             var recovery = new RecoveryDrainFlow(
                 async: failedItem.IsAsyncAtBind,
-                drainCount: drainCount,
-                injectSync: injectSync,
-                flushPendingBytes: flushPendingBytes);
+                drainCount: drainCount);
             recovery.GetExecutionControl(control).TransferInheritedRfqCount(inheritedRfqCount);
 
             // Per the policy contract, the framework will NOT complete a supplanted item -
@@ -603,7 +614,19 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
             // tenure it holds. That unwind resolves inline against the faulted source; a
             // queued sibling dispatching against the same promise in that instant hits the
             // already-started canary and recovers - a visible transient failure, not a hang.
-            recovery.BindFailedFlow(failedItem, context.Exception);
+            //
+            // For PipelineTask kind, the framework passes the failed flow's still-in-flight
+            // TRAILING task through context.OutstandingPhaseTask; the recovery awaits it
+            // inside its own ExecuteAuto before touching the encoder so the substitute's
+            // resync writes don't collide with the trailing flush on the single-producer
+            // writer. For TrailingExecutionTask kind, context.OutstandingPhaseTask carries
+            // the still-pending PIPELINE task instead - irrelevant to this recovery's writes
+            // (the pipeline task is the failed flow's read phase, no writer interaction).
+            // For other kinds it's null.
+            var outstandingTrailing = context.Kind is PipelineItemFailureKind.PipelineTask
+                ? context.OutstandingPhaseTask
+                : default;
+            recovery.BindFailedFlow(failedItem, context.Exception, outstandingTrailing);
 
             recoveryItem = recovery;
             return true;
@@ -613,13 +636,14 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
 
     internal sealed class Control(PgClientProtocol protocol) : IProtocolStatic<CommandFlow.ReadState>
     {
-        public PgClientFlow? ExecutorFlow { get; private set; }
-        PgClientFlow? _activatedFlow;
-        public PgClientFlow? ActivatedFlow
-        {
-            get => Volatile.Read(ref _activatedFlow);
-            private set => Volatile.Write(ref _activatedFlow, value);
-        }
+        // ExecutorFlow / ActivatedFlow source directly from the pipeline's slots - the executor's
+        // single-pump invariant + the in-order Activate-before-Complete discipline together make
+        // these the single source of truth, so the protocol layer doesn't need its own copies.
+        // ExecutorFlow is the write-phase identity (used by ThrowIfCannotWrite); ActivatedFlow is
+        // the read-channel current-reader handle (used by PgDecoder to route messages to the
+        // currently-activated flow's body).
+        public PgClientFlow? ExecutorFlow => protocol._pipeline.ExecutingItem;
+        public PgClientFlow? ActivatedFlow => protocol._pipeline.ActivatedItem;
 
         public PgProtocolDataWriter Writer => protocol._protocolDataWriter;
 
@@ -750,21 +774,22 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
         }
 
         [AsyncMethodBuilder(typeof(NonContextRestoringPoolingValueTaskMethodBuilder<>))]
-        internal async ValueTask<FlowTasks> Execute(PgClientFlow flow, CancellationToken abortToken)
+        internal ValueTask<FlowTasks> Execute(PgClientFlow flow)
         {
-            ExecutorFlow = flow;
-            var writer = protocol._protocolDataWriter;
-            if (writer.UnflushedBytes > 1000)
-                await writer.FlushAsync(abortToken).ConfigureAwait(false);
-            var flowTasks = await flow.GetExecutionControl(this).ExecuteAuto().ConfigureAwait(false);
-            // TODO only null after flowTasks.TrailingExecutionTask is completed.
-            ExecutorFlow = null;
-            return new(flowTasks.TrailingExecutionTask, flowTasks.PipelineTask);
+            // No ExecutorFlow assignment, no pre-flush: this method is reduced to ExecuteAuto's
+            // dispatch. ExecutorFlow now reads from pipeline.ExecutingItem (set by the framework
+            // before our caller's ExecuteItemAsync); the pre-flush of accumulated buffered bytes
+            // has been lifted to Policy.ExecuteItemAsync's wrapper so cross-item writer hygiene
+            // and any recovery-specific sequencing (awaiting the failed flow's still-in-flight
+            // trailing on PipelineTask kind, etc.) live at the same layer.
+            return flow.GetExecutionControl(this).ExecuteAuto();
         }
 
         internal void Activate(PgClientFlow flow)
         {
-            ActivatedFlow = flow;
+            // No ActivatedFlow assignment: the pipeline already published ActivatedItem before
+            // dispatching to _policy.ActivateHeadItem (which routed here either synchronously or
+            // via the activation scheduler). The slot tracks Activate-before-Complete in-order.
             var control = flow.GetExecutionControl(this);
             if (!control.IsPipelined)
                 Interlocked.Decrement(ref protocol._pipelineStalls);
@@ -775,40 +800,18 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
 
         internal void OnCompleted(PgClientFlow flow, int remainingDepth)
         {
-            // ActivatedFlow is the decoder's current-reader handle. The framework dispatches
-            // Activate(next) and Complete(prev) across threads (Policy.ActivateHeadItem TP-
-            // queues; OnCommittedTaskCompleted/DrainSlotInline run on whichever thread
-            // completed the prior waiter task - typically the socket-completion thread). A
-            // brief null window between Complete(A) and Activate(B) means a continuation
-            // resuming on the socket thread can deref a null binding. Holding the stale
-            // reference between completions is safe: in-flight reads only happen during an
-            // activated flow's drain and the framework's per-item Activate-before-Complete
-            // invariant ensures the binding has been republished by the time those reads
-            // execute. The next Activate overwrites the stale slot.
-            //
-            // At pipeline park (remainingDepth == 0) we want to release the flow reference
-            // so GC can collect command parameters / descriptors / buffers it roots. Use CAS
-            // so a concurrent Enqueue's Activate(B) that landed first stays untouched: the
-            // depth==0 read could be stale relative to a user-thread Enqueue that the
-            // framework already processed into an Activate. Same-instance re-activation
-            // (which the CAS cannot distinguish - ABA) is excluded by ordering instead:
-            // Policy.CompleteItem runs this before Complete(), and instance reuse is only
-            // legal from the completion action onward.
-            //
-            // Recycle the read state and signal idle only when the slot is actually clear
-            // (we cleared it, or it already was). A failed CAS against a live successor
-            // means that flow may be mid-drain on this state right now - swapping it then
-            // would yank the shared read promise out from under its pending dispatch, and
-            // the connection is not idle either.
+            // At pipeline park (remainingDepth == 0) release the rooted read-state buffers and
+            // signal the pool connection's idle hook. The pipeline's ActivatedItem slot is
+            // managed by the framework (cleared in CompleteWaiterDeferred immediately after
+            // this returns), so there's no CAS race to handle here: the in-order Activate-
+            // before-Complete invariant means no successor Activate(B) can run concurrently
+            // with this completion, and same-instance re-activation is excluded by the policy
+            // ordering (CompleteItem runs OnCompleted -> Complete; instance reuse via the
+            // completion action runs only after).
             if (remainingDepth is 0)
             {
-                var observed = Interlocked.CompareExchange(ref _activatedFlow, null, flow);
-                if (observed is null || ReferenceEquals(observed, flow))
-                {
-                    // Get rid of any rooted buffers, refs and so on.
-                    _commandFlowReadState = new();
-                    protocol._poolConnectionIdleSignal?.Invoke();
-                }
+                _commandFlowReadState = new();
+                protocol._poolConnectionIdleSignal?.Invoke();
             }
         }
 

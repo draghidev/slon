@@ -98,6 +98,12 @@ public class RecoveryTests
         /// recovery's wire I/O will fail (see RecoveryItselfFails_*).
         public Action? AfterWrites { get; init; }
 
+        /// When set, the flow's trailing task is backed by this TCS instead of a sync
+        /// default/fault. Lets a test control when (and whether) the still-in-flight
+        /// trailing completes, exercising the recovery's substitution-substrate contract
+        /// of capturing-and-awaiting `OutstandingPhaseTask` (move-to-trailing path).
+        public TaskCompletionSource? ControllableTrailing { get; init; }
+
         public FaultingFlow(bool async, FaultPhase phase, WriteShape shape)
             : base(supportsPipelining: true)
         {
@@ -136,9 +142,22 @@ public class RecoveryTests
             ValueTask pipelineTask = _phase is FaultPhase.PipelineTask
                 ? FailedTask()
                 : ValueTask.CompletedTask;
-            ValueTask trailingTask = _phase is FaultPhase.TrailingTask
-                ? FailedTask()
-                : default;
+            ValueTask trailingTask;
+            if (ControllableTrailing is { } controllable)
+            {
+                // Controllable trailing: the framework captures this as OutstandingPhaseTask
+                // when PipelineTask sync-faults. The recovery's TrailingPhase awaits it before
+                // its WriteSync, observe-and-discard regardless of outcome.
+                trailingTask = new ValueTask(controllable.Task);
+            }
+            else if (_phase is FaultPhase.TrailingTask)
+            {
+                trailingTask = FailedTask();
+            }
+            else
+            {
+                trailingTask = default;
+            }
 
             return new(new FlowTasks(trailingExecutionTask: trailingTask, pipelineTask: pipelineTask));
 
@@ -440,5 +459,110 @@ public class RecoveryTests
         StringAssert.Contains(aggregate.InnerExceptions[0].Message, "synthetic");
         Assert.AreNotSame(aggregate.InnerExceptions[0], aggregate.InnerExceptions[1],
             "The recovery's own read fault rides behind the original.");
+    }
+
+    // Substitution-substrate contract: PipelineTask kind with a still-in-flight trailing.
+    // The framework captures the failed flow's TrailingExecutionTask into the context's
+    // OutstandingPhaseTask and the policy hands it to RecoveryDrainFlow.BindFailedFlow.
+    // RecoveryDrainFlow's ExecuteAuto sees the trailing as not-completed-successfully and
+    // takes the move-to-trailing path: returns FlowTasks fast (no inline-await wedge of the
+    // executor pump), and the actual await of outstanding + WriteSync happens in the
+    // recovery's trailing phase running concurrently with its DrainPhase. Pending outstanding
+    // that EVENTUALLY succeeds: recovery awaits it cleanly, then writes its Sync, then drains.
+    [TestMethod]
+    public async Task PipelineTask_PendingTrailingThatEventuallySucceeds_RecoveryCompletesAndSiblingRuns()
+    {
+        var protocol = await ConnectAsync();
+        var trailingTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        var faulting = new FaultingFlow(async: true, FaultPhase.PipelineTask, WriteShape.ParseBindExecuteNoSync)
+        {
+            ControllableTrailing = trailingTcs,
+        };
+        Assert.IsTrue(protocol.TryQueue(faulting));
+
+        // Complete the trailing on a small delay so the recovery genuinely takes the
+        // move-to-trailing await path (outstanding is pending at ExecuteAuto's IsCompletedSuccessfully
+        // check). Inline-await of outstanding in ExecuteAuto would wedge the executor pump
+        // until this completes (test still passes timing-wise, but the architecture is wrong);
+        // the move-to-trailing path lets DrainPhase progress concurrently.
+        _ = Task.Run(async () =>
+        {
+            await Task.Delay(50);
+            trailingTcs.TrySetResult();
+        });
+
+        // Sibling must complete despite the failed flow having a delayed-pending trailing.
+        // The recovery's drain reads the wire concurrently with awaiting outstanding -
+        // architectural requirement for TCP-window-deadlock safety on workloads where the
+        // failed flow's trailing might be parked on the send buffer.
+        await RunAsync(protocol, "select 1");
+
+        await protocol.CompleteAsync();
+    }
+
+    // Substitution-substrate contract: PipelineTask kind with a trailing that ALSO faults.
+    // The recovery's TrailingPhase observes-and-discards the outstanding's exception (the
+    // failed flow's primary fault is already in FailureException; the trailing's outcome is
+    // subordinate). Recovery then proceeds with WriteSync + drain. This is the critical
+    // anti-recovery-on-recovery property: the framework does NOT re-enter TryRecoverItemFailure
+    // for the trailing's fault - if we naively re-awaited the trailing without catching, the
+    // recovery would fault and Slon's recovery-on-recovery assert would fire.
+    [TestMethod]
+    public async Task PipelineTask_PendingTrailingThatAlsoFaults_RecoveryObservesAndDiscardsAndProceeds()
+    {
+        var protocol = await ConnectAsync();
+        var trailingTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        var faulting = new FaultingFlow(async: true, FaultPhase.PipelineTask, WriteShape.ParseBindExecuteNoSync)
+        {
+            ControllableTrailing = trailingTcs,
+        };
+        Assert.IsTrue(protocol.TryQueue(faulting));
+
+        // Fault the trailing after a short delay - the recovery must catch and discard, not
+        // propagate it into a second policy consultation.
+        _ = Task.Run(async () =>
+        {
+            await Task.Delay(50);
+            trailingTcs.TrySetException(new InvalidOperationException("synthetic trailing fault"));
+        });
+
+        // Sibling completes despite the failed flow's BOTH pipeline AND trailing tasks having
+        // faulted. The wire is still intact (the WriteSync went out, the drain consumed the
+        // failed flow's inherited RFQs).
+        await RunAsync(protocol, "select 1");
+
+        await protocol.CompleteAsync();
+    }
+
+    // Substitution-substrate contract: the slot inheritance. While recovery is the
+    // ExecutingItem (its tenure), the FAILED flow's identity is extended through the
+    // substitute via the gate permissivity in ThrowIfCannotWrite. We verify the recovery
+    // mechanism end-to-end by confirming that the failed flow's binding discharge completes
+    // it with its original exception, AND a subsequent flow runs successfully (proves wire
+    // was cleaned by the substitute).
+    [TestMethod]
+    public async Task PipelineTask_RecoverySubstitute_DischargesFailedFlowBindingAndCleansWire()
+    {
+        var protocol = await ConnectAsync();
+
+        var faulting = new FaultingFlow(async: true, FaultPhase.PipelineTask, WriteShape.ParseBindExecuteNoSync);
+        Assert.IsTrue(protocol.TryQueue(faulting));
+
+        // Failed flow completes via the binding discharge (RecoveryDrainFlow.FailedFlow
+        // captured at TryRecoverItemFailure time; CompleteItem fires on the failed flow when
+        // recovery completes). Its exception is the original synthetic fault, NOT the
+        // recovery's behavior.
+        Exception? failedCompletion = null;
+        try { await faulting.WaitForComplete().AsTask().WaitAsync(TimeSpan.FromSeconds(10)); }
+        catch (Exception ex) { failedCompletion = ex; }
+        Assert.IsInstanceOfType<InvalidOperationException>(failedCompletion);
+        StringAssert.Contains(failedCompletion!.Message, "synthetic");
+
+        // Wire was cleaned by the substitute (recovery's WriteSync + drain).
+        await RunAsync(protocol, "select 1");
+
+        await protocol.CompleteAsync();
     }
 }

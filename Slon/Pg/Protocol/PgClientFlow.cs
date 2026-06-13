@@ -522,10 +522,18 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IThreadPoolWorkItem
 
         public void ThrowIfCannotWrite()
         {
-            if (!ReferenceEquals(flow, control.ExecutorFlow))
-                ThrowHelper.ThrowInvalidOperation(
-                    "Flow cannot write anymore. All writes must happen during the first execution phase " +
-                    "which ends after the Execute method returns the inner task.");
+            var executing = control.ExecutorFlow;
+            if (ReferenceEquals(flow, executing))
+                return;
+            // Substitution-substrate gate: the failed flow's trailing task continues writing
+            // legitimately during the recovery's tenure (recovery took the executor slot in
+            // its place; the failed flow's write phase is extended through the substitute).
+            // Cold path - never hit on the hot common case.
+            if (executing is Flows.RecoveryDrainFlow recovery && ReferenceEquals(flow, recovery.FailedFlow))
+                return;
+            ThrowHelper.ThrowInvalidOperation(
+                "Flow cannot write anymore. All writes must happen during the first execution phase " +
+                "which ends after the Execute method returns the inner task.");
         }
 
         // Activation-task-source primitives surfaced as "decoder ready / on decoder" because that's
