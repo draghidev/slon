@@ -12,26 +12,24 @@ namespace Slon.Tests;
 [TestClass]
 public class AutoPrepareWireTests
 {
+    // Each test customizes auto-prepare thresholds and inspects CommandTracker state, so the
+    // data source must be isolated per test (sharing would cross-pollute prepared-statement
+    // names and admission counters). Routes through AdoTestPool so endpoint and credentials
+    // stay centralized; the test-specific knobs ride the configure delegate.
     static SlonDataSource CreateDataSource(
         int maxAutoPreparations = 10,
         int autoMinimumUses = 5,
         int maxPoolSize = 4,
         TimeSpan? heartbeatInterval = null,
         TimeSpan? maintenanceInterval = null)
-    {
-        return new SlonDataSource(new SlonDataSourceOptions
+        => AdoTestPool.NewIsolatedDataSource(o => o with
         {
-            EndPoint = new IPEndPoint(IPAddress.Loopback, 5432),
-            Username = "postgres",
-            Password = "postgres123",
-            Database = "postgres",
             MaxPoolSize = maxPoolSize,
             MaxActiveAutoPreparations = maxAutoPreparations,
             AutoPreparationMinimumUses = autoMinimumUses,
             HeartbeatInterval = heartbeatInterval ?? TimeSpan.FromSeconds(1),
             MaintenanceInterval = maintenanceInterval ?? TimeSpan.FromSeconds(1),
         });
-    }
 
     [TestMethod]
     public async Task AutoPrepares_After_Threshold()

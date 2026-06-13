@@ -1,40 +1,30 @@
-using System.Net;
 using Microsoft.VisualStudio.TestTools.UnitTesting;
 using Slon.Pg;
 using Slon.Pg.Protocol;
 using Slon.Pg.Protocol.Flows;
-using Slon.Transport;
 
-namespace Slon.Tests;
+namespace Slon.Tests.Pg;
 
 // End-to-end tests for PgClientProtocol completion and failure surfaces: CompleteAsync,
 // DisposeAsync, Dispose, FailProtocol. Verifies graceful vs forceful semantics, idempotency,
 // and the heartbeat-based parked-flow propagation that fails activation sources when AbortToken
 // fires on a flow that's enqueued but not yet activated.
+// Class-serial: every test runs with a 50ms HeartbeatInterval to narrow the parked-flow
+// propagation window. Method-level parallelism would multiply concurrent fast-tick
+// heartbeats within this class and starve the TP, masking the timing the tests measure.
 [TestClass]
+[DoNotParallelize]
 public class ProtocolCompletionTests
 {
-    static PgClientOptions NewOptions() => new()
+    // Isolated per test by design: every test in this file fully destroys (CompleteAsync,
+    // DisposeAsync, Dispose, FailProtocol) the protocol. Cannot share via PgTestPool's lease
+    // path. Custom heartbeat/completion timeouts narrow the parked-flow propagation window
+    // the tests exercise.
+    static Task<PgClientProtocol> ConnectAsync() => PgTestPool.NewIsolatedAsync(o =>
     {
-        EndPoint = new IPEndPoint(IPAddress.Loopback, 5432),
-        Username = "postgres",
-        Password = "postgres123",
-        Database = "postgres",
-    };
-
-    static async Task<PgClientProtocol> ConnectAsync()
-    {
-        var options = NewOptions();
-        var transport = await SocketStreamConnection.ConnectAsync((IPEndPoint)options.EndPoint);
-        var protocolOptions = new PgClientProtocolOptions(options)
-        {
-            CompletionTimeout = TimeSpan.FromMilliseconds(500),
-            HeartbeatInterval = TimeSpan.FromMilliseconds(50),
-        };
-        var protocol = PgClientProtocol.Create(protocolOptions);
-        await protocol.StartAsync(options, transport);
-        return protocol;
-    }
+        o.CompletionTimeout = TimeSpan.FromMilliseconds(500);
+        o.HeartbeatInterval = TimeSpan.FromMilliseconds(50);
+    });
 
     static async Task RunAsync(PgClientProtocol protocol, string sql)
     {

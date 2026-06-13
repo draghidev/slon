@@ -7,7 +7,7 @@ using Slon.Pg.Protocol.Flows;
 using Slon.Runtime.CompilerServices;
 using Slon.Transport;
 
-namespace Slon.Tests;
+namespace Slon.Tests.Pg;
 
 // End-to-end tests for PgClientProtocol.Policy.TryRecoverItemFailure and the substitute
 // RecoveryDrainFlow it returns. Each test wires a real PG connection, queues a deliberately
@@ -27,22 +27,14 @@ namespace Slon.Tests;
 [TestClass]
 public class RecoveryTests
 {
-    static PgClientOptions NewOptions() => new()
-    {
-        EndPoint = new IPEndPoint(IPAddress.Loopback, 5432),
-        Username = "postgres",
-        Password = "postgres123",
-        Database = "postgres",
-    };
+    // Isolated per test by design: every recovery test faults a flow or kills the transport.
+    // Cannot share via PgTestPool's lease path. The fault-injection tests further down
+    // construct their own transport inline because they need to call transport.Writer/Reader
+    // .Complete to synthesize wire death; this helper only covers the recoverable cases that
+    // own a clean protocol up to the point of injecting the fault inside a FaultingFlow.
+    static Task<PgClientProtocol> ConnectAsync() => PgTestPool.NewIsolatedAsync();
 
-    static async Task<PgClientProtocol> ConnectAsync()
-    {
-        var options = NewOptions();
-        var transport = await SocketStreamConnection.ConnectAsync((IPEndPoint)options.EndPoint);
-        var protocol = PgClientProtocol.Create(new PgClientProtocolOptions(options));
-        await protocol.StartAsync(options, transport);
-        return protocol;
-    }
+    static PgClientOptions NewOptions() => PgTestPool.NewOptions();
 
     static async Task RunAsync(PgClientProtocol protocol, string sql)
     {

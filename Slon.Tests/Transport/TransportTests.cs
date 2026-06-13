@@ -6,7 +6,7 @@ using System.Security.Cryptography.X509Certificates;
 using Microsoft.VisualStudio.TestTools.UnitTesting;
 using Slon.Transport;
 
-namespace Slon.Tests;
+namespace Slon.Tests.Transport;
 
 // Unit tests for the non-blocking transport primitives in isolation: the WriteResumeSignal
 // auto-reset cycle and inline-continuation guarantee, the ResumableScope TLS lifecycle,
