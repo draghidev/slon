@@ -20,7 +20,7 @@ sealed class PgConnectionFactory : IPoolConnectionFactory<PgConnection>
         _tracker = tracker;
         _configureOptions = configureOptions;
         if (configureOptions is null)
-            _sharedOptions = new PgClientProtocolOptions(clientOptions);
+            _sharedOptions = new PgClientProtocolOptions(clientOptions) { CancelSender = SendCancelAsync };
     }
 
     PgClientProtocolOptions CreateOptions()
@@ -28,8 +28,27 @@ sealed class PgConnectionFactory : IPoolConnectionFactory<PgConnection>
         if (_sharedOptions is not null)
             return _sharedOptions;
         var options = new PgClientProtocolOptions(_clientOptions);
+        options.CancelSender = SendCancelAsync;
         _configureOptions!.Invoke(options);
         return options;
+    }
+
+    // Side-channel cancel orchestration: opens a fresh transport matching the main connection's
+    // policy, delivers the CancelRequest via the protocol-layer wire helper, disposes the
+    // transport on every path. Passed to PgClientProtocolOptions.CancelSender so the protocol
+    // layer can fire-and-forget without knowing about transports.
+    async ValueTask SendCancelAsync(int processId, int secretKey, CancellationToken cancellationToken)
+    {
+        var transport = await _transportConnectionFactory.ConnectAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            await CancelRequest.SendAsync(transport, processId, secretKey, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            if (transport is IAsyncDisposable disposable)
+                await disposable.DisposeAsync().ConfigureAwait(false);
+        }
     }
 
     PgConnection Create(ConnectionPoolContext<PgConnection>? poolContext, TimeSpan timeout = default)

@@ -53,6 +53,15 @@ sealed class PgClientProtocolOptions
     public TimeSpan FlowActivationTimeout { get; set; }
     public TimeSpan HeartbeatInterval { get; set; } = TimeSpan.FromSeconds(1);
     public TimeSpan ReadTimeout { get; set; } = Timeout.InfiniteTimeSpan;
+
+    /// Cancel-request sender for the protocol's side-channel CancelRequest. Receives
+    /// (processId, secretKey, cancellationToken); implementation opens a fresh transport
+    /// matching the main connection's policy, sends the request via
+    /// <see cref="CancelRequest.SendAsync"/>, and disposes the transport. Narrow on purpose:
+    /// the protocol only needs "deliver a cancel for these credentials," not the broader
+    /// transport-acquisition surface. Null = no sender wired (the standalone protocol-package
+    /// consumer path); cancel feature unavailable, all main-connection-only usage still works.
+    public Func<int, int, CancellationToken, ValueTask>? CancelSender { get; set; }
 }
 
 sealed class PgClientProtocol : IDisposable, IAsyncDisposable
