@@ -24,6 +24,18 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
     CancellationToken _callerCancellationToken;
     CancellationTokenRegistration _callerCancellationTokenRegistration;
 
+    // Consumer-gone signal: set only by the enumerator's Dispose/DisposeAsync - those are the
+    // sole "I'm abandoning the result stream" assertions. The caller's CancellationToken is NOT
+    // a consumer-gone signal: a fired CT may just mean "skip this result" or "stop waiting for
+    // this row" with the consumer still interested in subsequent results (NextResult, the next
+    // command's output). The body reads this at handoff boundaries (next commit will wire the
+    // drain transition). Deliberately not exposed as a CancellationToken - a public CT would
+    // invite I/O ops to register on it and any wire read could throw OCE, breaking the "drain
+    // wire to clean state" guarantee the signal exists to enable.
+    bool _consumerGone;
+    internal bool IsConsumerGone => Volatile.Read(ref _consumerGone);
+    void MarkConsumerGone() => Volatile.Write(ref _consumerGone, true);
+
     // Result state
     Slon.Threading.Tasks.Sources.ManualResetValueTaskSourceCore<bool> _enumeratorMoveNextTaskSource;
     CommandResult<ResultMessageEnumerator>? _enumeratorCurrent;
@@ -590,6 +602,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
         _callerCancellationToken = default;
         _callerCancellationTokenRegistration.Dispose();
         _callerCancellationTokenRegistration = default;
+        _consumerGone = false;
         // Dispatch state is per-tenure.
         _pipelinePromise = null;
         _context = default;
@@ -718,6 +731,10 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
             if (flow._enumeratorCompleted)
                 return;
 
+            // Consumer-gone: tells the body to stop yielding new results and drain the wire on
+            // its own (next commit will wire the body observation). Until then this is just a
+            // signal recorded for the body to read at its next boundary.
+            flow.MarkConsumerGone();
             while (MoveNext())
                 Current.Dispose();
         }
@@ -729,6 +746,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
             if (flow is null)
                 return new();
 
+            flow.MarkConsumerGone();
             ValueTask<bool> task;
             while ((task = MoveNextAsync()).IsCompletedSuccessfully)
             {
