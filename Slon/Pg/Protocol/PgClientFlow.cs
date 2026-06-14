@@ -378,11 +378,34 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IThreadPoolWorkItem
             }
         }
 
-        /// <summary>
-        /// 
-        /// </summary>
-        /// <param name="backendMessage"></param>
-        /// <returns>True if the message was fully handled (if not it will be surfaced to the flow).</returns>
+        /// <summary>Try-shape sync attempt: returns true if the message was processed
+        /// without needing I/O. <paramref name="handled"/> is set to true if the message
+        /// was consumed by the protocol layer (caller should skip and pull the next one)
+        /// and false if it should be surfaced to the flow.
+        ///
+        /// Returns false ONLY when the type's handler genuinely requires async work; today
+        /// no branch does, so this never bails. Callers that hit a false return must NOT
+        /// commit any peeked state and must propagate the bail up to a caller that can
+        /// await (typically by falling back through <see cref="HandleMessageAuto"/>).</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public bool TryHandleMessage(in BackendMessage backendMessage, out bool handled)
+        {
+            if (backendMessage.Header.Type
+                is PgTypes.BackendType.ReadyForQuery
+                or PgTypes.BackendType.NoticeResponse
+                or PgTypes.BackendType.NotificationResponse
+                or PgTypes.BackendType.ParameterStatus)
+            {
+                return TryHandleMessageCore(backendMessage, out handled);
+            }
+            handled = false;
+            return true;
+        }
+
+        /// <summary>True if the message was fully handled (if not it will be surfaced to
+        /// the flow). The async-capable counterpart of <see cref="TryHandleMessage"/>:
+        /// callers that can await use this, sync hot-path callers use TryHandleMessage and
+        /// bail recursively if it returns false.</summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public ValueTask<bool> HandleMessageAuto(in BackendMessage backendMessage)
         {
@@ -392,6 +415,33 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IThreadPoolWorkItem
                 or PgTypes.BackendType.NotificationResponse
                 or PgTypes.BackendType.ParameterStatus
                 ? HandleMessageAutoCore(backendMessage) : new(false);
+        }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        bool TryHandleMessageCore(BackendMessage backendMessage, out bool handled)
+        {
+            switch (backendMessage.Header.Type)
+            {
+                case PgTypes.BackendType.ReadyForQuery:
+                    flow._rfqCount -= 1;
+                    if (flow._rfqCount is 0)
+                        control.OnFlowRfq(backendMessage);
+                    handled = false;
+                    return true;
+                case PgTypes.BackendType.NoticeResponse:
+                    handled = true;
+                    return true;
+                case PgTypes.BackendType.NotificationResponse:
+                    handled = true;
+                    return true;
+                case PgTypes.BackendType.ParameterStatus:
+                    control.OnParameterStatus(backendMessage);
+                    handled = true;
+                    return true;
+                default:
+                    handled = false;
+                    return true;
+            }
         }
 
         [MethodImpl(MethodImplOptions.NoInlining)]

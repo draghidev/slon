@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Collections;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
@@ -198,8 +199,26 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public bool TryGetNext(out BackendMessage message)
     {
-        if (_messageContext.TryMoveNext())
+        // Peek - try - commit. Mirrors MoveNext/MoveNextAsync's auto-handled skip + RFQ
+        // accounting on the sync-fast path. If we don't run the handler here, a body that
+        // reads its terminating RFQ via TryGetNext (the message is buffered, so the async
+        // path is never taken) leaves _rfqCount stale at 1 - and a tail-time fault then
+        // routes the wrong outstanding-RFQ count to TryRecoverItemFailure, letting
+        // RecoveryDrainFlow consume an RFQ that already landed and silently swallow the
+        // next flow's response.
+        //
+        // TryHandleMessage returns false ONLY when the type's handler requires I/O. In
+        // that case we bail without committing the peek - the caller falls back to
+        // MoveNextAsync, which reuses the peek slot via the cheap TryMoveNext path and
+        // routes the message through the async-capable HandleMessageAuto. No sync-over-
+        // async on the fast path.
+        while (_messageContext.TryPeekNext(out var peeked))
         {
+            if (!CurrentExecutionControl.TryHandleMessage(peeked, out var handled))
+                break;
+            _messageContext.TryMoveNext();
+            if (handled)
+                continue;
             message = _messageContext.Current;
             return true;
         }
@@ -292,6 +311,13 @@ sealed class BackendMessageContext
     BackendMessage _current;
     short _version;
 
+    // Peek slot: TryPeekNext advances the real batch cursor into here, so the header parse
+    // happens at peek time and a follow-up TryMoveNext can publish without re-parsing. Cleared
+    // by TryMoveNext on commit or by SetBatch (a fresh batch retires any prior peek).
+    bool _hasPeeked;
+    BackendHeader _peekedHeader;
+    ReadOnlySequence<byte> _peekedBuffer;
+
     public BackendMessage Current
     {
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -306,10 +332,47 @@ sealed class BackendMessageContext
     }
 
     public bool TryMoveNext()
-        => BackendMessage.TryCreateFromBatch(ref _remainingBatch, this, ++_version, out _current);
+    {
+        if (_hasPeeked)
+        {
+            _hasPeeked = false;
+            _current = new BackendMessage(_peekedHeader, _peekedBuffer, this, ++_version);
+            _peekedBuffer = default;
+            return true;
+        }
+        return BackendMessage.TryCreateFromBatch(ref _remainingBatch, this, ++_version, out _current);
+    }
+
+    // Reads the next message WITHOUT publishing it as Current. The remaining batch cursor
+    // really advances past the header, but the parsed (header, buffer) lands in the peek
+    // slot and the follow-up TryMoveNext picks it up without re-parsing. The returned
+    // BackendMessage is valid until the next TryMoveNext (which bumps the version token);
+    // use it immediately, don't store it.
+    public bool TryPeekNext(out BackendMessage message)
+    {
+        if (_hasPeeked)
+        {
+            message = new BackendMessage(_peekedHeader, _peekedBuffer, this, _version);
+            return true;
+        }
+        if (!_remainingBatch.TryReadNextInPlace(out _peekedHeader, out _peekedBuffer, out _))
+        {
+            message = default;
+            return false;
+        }
+        _hasPeeked = true;
+        message = new BackendMessage(_peekedHeader, _peekedBuffer, this, _version);
+        return true;
+    }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public void SetBatch(BackendMessageBatch batch) => _remainingBatch = batch;
+    public void SetBatch(BackendMessageBatch batch)
+    {
+        // A fresh batch retires the peeked-from-previous-batch state.
+        _hasPeeked = false;
+        _peekedBuffer = default;
+        _remainingBatch = batch;
+    }
 }
 
 readonly struct ErrorOrNoticeMessage
