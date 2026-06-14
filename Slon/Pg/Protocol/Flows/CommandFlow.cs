@@ -360,14 +360,16 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                 }
                 result.Initialize(_commandIndex, descriptor, _requestedRowDescription, !command.DescribeOnly, command.IsSimple());
 
-                // Drain transition: when the enumerator has been disposed by the consumer, skip
-                // the user-handoff for this and every subsequent command. The body owns the
-                // remaining wire-byte consumption end-to-end (DataRows + CommandComplete per
-                // command, then the trailing RFQ) via the existing ResultMessageEnumerator
-                // dispose path. The body's own SetResult(null) at the loop's natural exit
-                // signals completion to the consumer's still-pending MoveNextAsync, so the
-                // dispose-side drain loop terminates cleanly when the wire reaches RFQ.
-                if (!IsConsumerGone)
+                // Drain transition: when either the consumer has abandoned the result stream
+                // (Enumerator.Dispose) OR the protocol has fired StoppingToken (graceful
+                // shutdown), skip the user-handoff for this and every subsequent command. The
+                // body owns the remaining wire-byte consumption end-to-end (DataRows +
+                // CommandComplete per command, then the trailing RFQ) via the existing
+                // ResultMessageEnumerator dispose path. The body's own SetResult(null) at the
+                // loop's natural exit signals completion to the consumer's still-pending
+                // MoveNextAsync (or to the protocol's shutdown sweep), so the dispose-side
+                // drain loop terminates cleanly when the wire reaches RFQ.
+                if (!IsConsumerGone && !context.StoppingToken.IsCancellationRequested)
                 {
                     _isResultReady = true;
                     SetResult(result);
