@@ -67,6 +67,15 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
     Heartbeat? _heartbeat;
     Action? _poolConnectionIdleSignal;
 
+    // Backend identity from BackendKeyData (received during StartupFlow). Kept as two separate
+    // fields rather than a struct because the consumers differ: process id is useful for
+    // diagnostics / logging / "which backend is this connection" inspection; secret key is only
+    // ever payload for the side-channel CancelRequest. Bundling would smear the secret into
+    // observability code that has no business with it. Both default to 0 pre-startup; the cancel
+    // arm site asserts non-zero process id before issuing.
+    int _backendProcessId;
+    int _backendSecretKey;
+
     // Framework state, formerly inherited from Protocol<TFlow>.
     // Two-token cancellation cascade:
     // StoppingToken = graceful drain signal. Body polls at handoff/coordination boundaries (per-
@@ -176,16 +185,23 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
         await StartAsync(flow, flow.WaitForComplete(cancellationToken), cancellationToken).ConfigureAwait(false);
     }
 
-    async ValueTask StartAsync(PgClientFlow? flow, ValueTask flowCompletion, CancellationToken cancellationToken = default)
+    async ValueTask StartAsync(StartupFlow flow, ValueTask flowCompletion, CancellationToken cancellationToken = default)
     {
         _source = PgClientFlowSource.Create(this, _options.ExecutionScheduler);
         _pipeline = Pipeline.Create<PgClientFlow, Policy, PgClientFlowSource, PgClientFlowSource.Enumerator>(new Policy(this), _source);
-        if (flow is not null && !TryQueueFlow(flow, ProtocolStatus.Created))
+        if (!TryQueueFlow(flow, ProtocolStatus.Created))
             throw new InvalidOperationException("Could not enqueue starting flow, protocol is not in a valid state to start.");
         try
         {
             if (flowCompletion != default)
                 await flowCompletion.ConfigureAwait(false);
+            // Pull the BackendKeyData values once startup has settled. The flow's parsing happens
+            // during ExecuteAuto; by the time flowCompletion observes success the values are
+            // visible (the flow's task chain is the happens-before edge). After this single write
+            // the protocol's fields are effectively readonly - they're never written elsewhere
+            // and only exposed via Control's getters.
+            _backendProcessId = flow.BackendProcessId;
+            _backendSecretKey = flow.BackendSecretKey;
             SignalReady();
         }
         catch (Exception ex)
@@ -646,6 +662,12 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
         public PgClientFlow? ActivatedFlow => protocol._pipeline.ActivatedItem;
 
         public PgProtocolDataWriter Writer => protocol._protocolDataWriter;
+
+        // Backend identity from BackendKeyData (pulled from StartupFlow after startup completes).
+        // Process id is the diagnostic-safe value (logs, "which backend"); secret key is restricted
+        // to the CancelRequest payload. 0 = not yet received.
+        public int BackendProcessId => protocol._backendProcessId;
+        public int BackendSecretKey => protocol._backendSecretKey;
 
         // Tokens live on the protocol; per-flow storage is unnecessary since the protocol's
         // tokens are stable across the flow's tenure. Surface them through Control so

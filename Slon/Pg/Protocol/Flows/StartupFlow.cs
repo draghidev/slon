@@ -11,6 +11,13 @@ sealed class StartupFlow : PgClientFlow
     readonly TimeSpan _startupTimeout;
     readonly List<KeyValuePair<string, string>> _parameters;
 
+    // Parsed from the BackendKeyData wire message. Pulled by PgClientProtocol after the flow
+    // completes; the protocol stores them as its own fields and exposes them via Control.
+    // 0 = not yet parsed (the wire format guarantees ProcessId is a non-zero OS PID, so 0 is a
+    // safe "not received" sentinel; SecretKey is opaque 32-bit so ProcessId is the indicator).
+    internal int BackendProcessId { get; private set; }
+    internal int BackendSecretKey { get; private set; }
+
     public StartupFlow(bool async, PgClientOptions options, TimeSpan startupTimeout = default) : base(supportsPipelining: false)
     {
         _options = options;
@@ -94,9 +101,16 @@ sealed class StartupFlow : PgClientFlow
 
         // PgClientFlow will handle ParameterStatus messages, so we just need to handle BackendKeyData and RFQ.
         message = await decoder.GetNextAsync().ConfigureAwait(false);
-        // TODO store on protocol
         if (message.EnsureExpectedOrError(BackendType.BackendKeyData) is { } keyDataError)
             PostgresException.Throw(keyDataError);
+        message.DebugEnsureBuffered();
+        var keyReader = message.BodyReader;
+        if (!keyReader.TryReadBigEndian(out int processId))
+            ThrowHelper.ThrowNotEnoughData(nameof(processId));
+        if (!keyReader.TryReadBigEndian(out int secretKey))
+            ThrowHelper.ThrowNotEnoughData(nameof(secretKey));
+        BackendProcessId = processId;
+        BackendSecretKey = secretKey;
 
         message = await decoder.GetNextAsync().ConfigureAwait(false);
         if (message.EnsureExpectedOrError(BackendType.ReadyForQuery) is { } rfqError)
