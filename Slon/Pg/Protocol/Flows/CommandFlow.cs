@@ -360,24 +360,35 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                 }
                 result.Initialize(_commandIndex, descriptor, _requestedRowDescription, !command.DescribeOnly, command.IsSimple());
 
-                _isResultReady = true;
-                SetResult(result);
+                // Drain transition: when the enumerator has been disposed by the consumer, skip
+                // the user-handoff for this and every subsequent command. The body owns the
+                // remaining wire-byte consumption end-to-end (DataRows + CommandComplete per
+                // command, then the trailing RFQ) via the existing ResultMessageEnumerator
+                // dispose path. The body's own SetResult(null) at the loop's natural exit
+                // signals completion to the consumer's still-pending MoveNextAsync, so the
+                // dispose-side drain loop terminates cleanly when the wire reaches RFQ.
+                if (!IsConsumerGone)
+                {
+                    _isResultReady = true;
+                    SetResult(result);
 
-                if (IsAsync)
-                    await _callerInteractionCore.GetGateTask(this).ConfigureAwait(false);
-                else
-                    await SetContinuationAndUnblockWaiter().ConfigureAwait(false);
+                    if (IsAsync)
+                        await _callerInteractionCore.GetGateTask(this).ConfigureAwait(false);
+                    else
+                        await SetContinuationAndUnblockWaiter().ConfigureAwait(false);
 
-                /* The next MoveNext or MoveNextAsync call resumes here. */
+                    /* The next MoveNext or MoveNextAsync call resumes here. */
 
-                // TODO if it's not disposed yet we should capture any exceptions and set it on MoveNext task source
-                // TODO e.g. with the message "Previous command result was not disposed and completed with an exception, see inner exception for more details.".
-                // TODO we can just await _callerInteractionCore as the next movenext should be clean.
-                // TODO unless we conclude there is no exception that could come from current that we don't consider critical (e.g. flow abort).
+                    // TODO if it's not disposed yet we should capture any exceptions and set it on MoveNext task source
+                    // TODO e.g. with the message "Previous command result was not disposed and completed with an exception, see inner exception for more details.".
+                    // TODO we can just await _callerInteractionCore as the next movenext should be clean.
+                    // TODO unless we conclude there is no exception that could come from current that we don't consider critical (e.g. flow abort).
+                }
 
                 // We check IsAsync again as it can change after every resumption.
                 // Current is disposed here, something the user might have done, but if not we'll do it here.
                 // This also causes us to pick up any I/O exception thrown during user code that was stored on the resultmessage enumerator.
+                // In drain mode this dispose IS the drain: it reads remaining DataRows + CommandComplete for the current command.
                 state = ref context.GetProtocolStatic<ReadState>();
                 if (IsAsync)
                     await state.ResultMessageEnumerator.DisposeAsync().ConfigureAwait(false);
