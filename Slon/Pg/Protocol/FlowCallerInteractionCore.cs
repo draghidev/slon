@@ -13,7 +13,16 @@ struct FlowCallerInteractionCore<TResult>
 {
     ManualResetEventSlim? _mres;
     Action? _continuation;
+    // Wake-eligible continuation slot. Separate from _continuation because the latter
+    // deliberately stays set after the caller takes it (HasContinuation acts as a "handoff
+    // already done" marker). Re-queueing the stale _continuation on TP after the body has
+    // already resumed crashes the process: that continuation points at a completed state
+    // machine. _wakeContinuation has claim-and-clear semantics: set in OnCompleted,
+    // Exchange-claimed by WaitForContinuation OR RequestWake. Verified: WakeProtocol.tla.
+    Action? _wakeContinuation;
     bool _progressSignaled;
+    // One-shot flag set by RequestWake; consumed by the OnCompleted post-store re-check.
+    bool _wakeRequested;
 
     public Slon.Threading.Tasks.Sources.ManualResetValueTaskSourceCore<TResult> GateTaskSource;
 
@@ -69,12 +78,30 @@ struct FlowCallerInteractionCore<TResult>
                 _progressSignaled = false;
                 return null;
             }
+            // Claim wake-eligibility so a concurrent RequestWake doesn't also queue the
+            // continuation. _continuation itself stays for HasContinuation's marker role.
+            Interlocked.Exchange(ref _wakeContinuation, null);
             return _continuation!;
         }
         finally
         {
             IsWaiting = false;
         }
+    }
+
+    // External wake request from consumer-side state changes (Enumerator.Dispose /
+    // DisposeAsync). Spec: WakeProtocol.tla. Fires both wake mechanisms:
+    //   - SignalProgress wakes a sync caller blocked in WaitForContinuation.
+    //   - Interlocked.Exchange on _wakeContinuation queues the body's resume action to TP if
+    //     present, covering async DisposeAsync on a sync-suspended body where GateTaskSource
+    //     can't reach the wait.
+    public void RequestWake()
+    {
+        Interlocked.Exchange(ref _wakeRequested, true);
+        SignalProgress();
+        var stored = Interlocked.Exchange(ref _wakeContinuation, null);
+        if (stored is not null)
+            ThreadPool.UnsafeQueueUserWorkItem(static s => ((Action)s!)(), (object)stored);
     }
 
     // Wake any WaitForContinuation that's parked without registering a continuation. Used by
@@ -94,7 +121,9 @@ struct FlowCallerInteractionCore<TResult>
     {
         _mres?.Reset();
         _continuation = null;
+        _wakeContinuation = null;
         _progressSignaled = false;
+        _wakeRequested = false;
         GateTaskSource.Reset();
     }
 
@@ -121,7 +150,21 @@ struct FlowCallerInteractionCore<TResult>
                 ref var field = ref fieldRef.Invoke();
                 if (!ReferenceEquals(field._continuation, continuation))
                     Volatile.Write(ref field._continuation, continuation);
+                // _wakeContinuation is the wake-eligibility slot. Interlocked.Exchange acts
+                // as a full memory barrier so the prior store to _continuation is ordered
+                // before the _wakeRequested read below (StoreLoad).
+                Interlocked.Exchange(ref field._wakeContinuation, continuation);
                 field.GetMres().Set();
+                // Race-safe re-check: if RequestWake ran before our store, it saw
+                // _wakeContinuation = null and didn't queue. _wakeRequested stays set; self-
+                // wake here. Exchange-claim ensures exactly-once delivery if RequestWake races
+                // (one observes non-null, the other gets null).
+                if (Volatile.Read(ref field._wakeRequested))
+                {
+                    var stored = Interlocked.Exchange(ref field._wakeContinuation, null);
+                    if (stored is not null)
+                        ThreadPool.UnsafeQueueUserWorkItem(static s => ((Action)s!)(), (object)stored);
+                }
             }
 
             public void UnsafeOnCompleted(Action continuation) => OnCompleted(continuation);

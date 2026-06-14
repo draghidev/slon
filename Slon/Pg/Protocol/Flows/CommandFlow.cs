@@ -34,7 +34,14 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
     // wire to clean state" guarantee the signal exists to enable.
     bool _consumerGone;
     internal bool IsConsumerGone => Volatile.Read(ref _consumerGone);
-    void MarkConsumerGone() => Volatile.Write(ref _consumerGone, true);
+    void MarkConsumerGone()
+    {
+        Volatile.Write(ref _consumerGone, true);
+        // RequestWake covers async DisposeAsync on a sync-suspended body: GateTaskSource
+        // (from MoveNextAsync) can't wake a body waiting in SetContinuationAndUnblockWaiter.
+        // Spec: WakeProtocol.tla.
+        _callerInteractionCore.RequestWake();
+    }
 
     // Result state
     Slon.Threading.Tasks.Sources.ManualResetValueTaskSourceCore<bool> _enumeratorMoveNextTaskSource;

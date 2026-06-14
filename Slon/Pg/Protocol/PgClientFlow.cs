@@ -30,7 +30,11 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IThreadPoolWorkItem
     bool _lastMessageInducesRfq;
     // We store the IsAsync value at bind time so the protocol can keep track of pipeline stalls correctly.
     bool _isAsyncAtBind;
-    bool? _isAsync;
+    // Tri-state int (0 = unset, 1 = true, 2 = false) instead of bool? so reads / writes can be
+    // ordered via Volatile.Read / Volatile.Write. The flow body and the consumer (via MoveNext's
+    // sync<->async flip) can race on this; without ordering the post-wake-protocol body can read
+    // a stale value and take the wrong I/O path.
+    int _isAsyncState;
 
     // Flow lifecycle state. Replaces the spin-state-laden FlowStatus machine that
     // used to live in ProtocolFlow. Reads happen on the consumer thread after the
@@ -62,8 +66,13 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IThreadPoolWorkItem
 
     protected bool IsAsync
     {
-        get => _isAsync ?? false;
-        set => _isAsync = value;
+        // Volatile.Read because the consumer thread can flip _isAsyncState via MoveNextAsync's
+        // sync->async transition concurrently with the body reading it. Without the fence the
+        // body's post-wake check (when the wake protocol resumes a sync-suspended body via
+        // TP after the consumer flipped to async) could see a stale value and take the sync
+        // I/O path on a flow that's now async, blocking on I/O that never completes sync.
+        get => Volatile.Read(ref _isAsyncState) == 1;
+        set => Volatile.Write(ref _isAsyncState, value ? 1 : 2);
     }
 
 
@@ -81,12 +90,13 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IThreadPoolWorkItem
     {
         get
         {
-            if (_isAsync is not { } async)
+            var state = Volatile.Read(ref _isAsyncState);
+            if (state == 0)
             {
                 ThrowHelper.ThrowInvalidOperation("IsAsync was not set by flow before it was queued.");
                 return default;
             }
-            return async;
+            return state == 1;
         }
     }
 
@@ -412,13 +422,14 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IThreadPoolWorkItem
 
         public void Bind(TimeSpan activationTimeout)
         {
-            if (flow._isAsync is not { } async)
+            var state = Volatile.Read(ref flow._isAsyncState);
+            if (state == 0)
             {
                 ThrowHelper.ThrowInvalidOperation("IsAsync was not set by flow before it was queued.");
                 return;
             }
 
-            flow._isAsyncAtBind = async;
+            flow._isAsyncAtBind = state == 1;
             flow._remainingActivationTimeout = activationTimeout;
         }
 
