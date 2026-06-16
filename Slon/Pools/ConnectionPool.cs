@@ -514,7 +514,7 @@ static class ConnectionPool
             TimeoutSource = null;
             timeoutSource ??= new PooledLinkedSource(ReturnTimeoutSource);
             timeoutSource.CancelAfter(timeout);
-            timeoutSource.Initialize(cancellationToken.Register(static state => ((CancellationTokenSource)state!).Cancel(), timeoutSource));
+            timeoutSource.Initialize(cancellationToken.UnsafeRegister(static state => ((CancellationTokenSource)state!).Cancel(), timeoutSource));
             return timeoutSource;
         }
     }
