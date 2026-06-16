@@ -1,107 +1,218 @@
-using Microsoft.VisualStudio.TestTools.UnitTesting;
 using Slon.Pg;
+using Slon.Pg.Protocol;
 using Slon.Pg.Protocol.Flows;
 
 namespace Slon.Tests.Pg;
 
 // CommandFlow body-side drain mode: when the consumer abandons the result stream
-// (Enumerator.Dispose) or the protocol fires StoppingToken (graceful shutdown), the body
-// skips the user-handoff for remaining commands and drains the wire to RFQ on its own.
-// Distinct from RecoveryDrainFlow (protocol-level recovery drain) and pipeline drain
-// (framework-level CompleteAsync sweep) - "drain" is overloaded in this codebase, this one
-// is the per-CommandFlow consumer-abandonment drain specifically.
+// (Enumerator.Dispose / DisposeAsync) or the protocol fires StoppingToken (graceful
+// shutdown), the body skips the user-handoff for remaining commands and drains the wire
+// to RFQ on its own. Parameterized over (flowAsync, useAsyncDispose).
 [TestClass]
 public class CommandDrainTests
 {
-    // Existing behavior verified: walking the outer enumerator to NextResult drives the
-    // body to dispose the current ResultMessageEnumerator (draining DataRows + CC) before
-    // yielding the next command's result. Single resultset drained body-side, next result
-    // still flows to consumer.
+    static async ValueTask Dispose(CommandFlow.Enumerator e, bool useAsyncDispose)
+    {
+        if (useAsyncDispose)
+            await e.DisposeAsync();
+        else
+            e.Dispose();
+    }
+
+    static CommandFlow.Enumerator GetEnumerator(CommandFlow flow, bool flowAsync)
+        => flowAsync ? flow.GetAsyncEnumerator() : flow.GetEnumerator();
+
+    static async ValueTask<bool> MoveNext(CommandFlow.Enumerator e, bool flowAsync)
+        => flowAsync ? await e.MoveNextAsync() : e.MoveNext();
+
     [TestMethod]
-    public async Task NextCommandResult_DrainsCurrentCommandBodySide()
+    [DataRow(true, true, DisplayName = "async flow, async dispose")]
+    [DataRow(true, false, DisplayName = "async flow, sync dispose")]
+    [DataRow(false, true, DisplayName = "sync flow, async dispose")]
+    [DataRow(false, false, DisplayName = "sync flow, sync dispose")]
+    public async Task NextCommandResult_DrainsCurrentCommandBodySide(bool flowAsync, bool useAsyncDispose)
     {
         await using var lease = await PgTestPool.LeaseAsync();
         var protocol = lease.Protocol;
 
-        var flow = new CommandFlow(async: true,
+        var flow = new CommandFlow(flowAsync,
             Command.Create("select generate_series(1, 100)"),
             Command.Create("select 'second'"));
         Assert.IsTrue(protocol.TryQueue(flow));
 
-        var e = flow.GetAsyncEnumerator();
+        var e = GetEnumerator(flow, flowAsync);
 
-        Assert.IsTrue(await e.MoveNextAsync(), "first command result not delivered");
-        // Don't read any rows from the first command - just advance the outer enumerator.
-        // Body's dispose-side drain consumes the remaining DataRows + CommandComplete before
-        // yielding the second command's result.
-        Assert.IsTrue(await e.MoveNextAsync(), "second command result not delivered after drain of first");
-        Assert.IsFalse(await e.MoveNextAsync(), "third call should return false (no more results)");
-        await e.DisposeAsync();
+        Assert.IsTrue(await MoveNext(e, flowAsync), "first command result not delivered");
+        Assert.IsTrue(await MoveNext(e, flowAsync), "second command result not delivered after drain of first");
+        Assert.IsFalse(await MoveNext(e, flowAsync), "third call should return false (no more results)");
+        await Dispose(e, useAsyncDispose);
 
-        // Connection is at clean RFQ - prove via a follow-up query.
         await PgTestPool.RunAsync(protocol, "select 1");
     }
 
-    // Full drain via consumer-gone: Enumerator.DisposeAsync mid-batch transitions the body
-    // into drain mode for ALL remaining commands. Body silently consumes their wire bytes
-    // (Parse/Bind/Describe responses + DataRows + CommandComplete each) to the trailing
-    // RFQ without yielding anything else to the consumer. Connection reaches clean RFQ.
     [TestMethod]
-    public async Task ConsumerDispose_MidBatch_BodyDrainsRemaining_ConnectionUsable()
+    [DataRow(true, true, DisplayName = "async flow, async dispose")]
+    [DataRow(true, false, DisplayName = "async flow, sync dispose")]
+    [DataRow(false, true, DisplayName = "sync flow, async dispose")]
+    [DataRow(false, false, DisplayName = "sync flow, sync dispose")]
+    public async Task ConsumerDispose_MidBatch_BodyDrainsRemaining_ConnectionUsable(bool flowAsync, bool useAsyncDispose)
     {
         await using var lease = await PgTestPool.LeaseAsync();
         var protocol = lease.Protocol;
 
-        var flow = new CommandFlow(async: true,
+        var flow = new CommandFlow(flowAsync,
             Command.Create("select generate_series(1, 50)"),
             Command.Create("select 'two'"),
             Command.Create("select 'three'"));
         Assert.IsTrue(protocol.TryQueue(flow));
 
-        var e = flow.GetAsyncEnumerator();
-        Assert.IsTrue(await e.MoveNextAsync(), "first command result not delivered");
+        var e = GetEnumerator(flow, flowAsync);
+        Assert.IsTrue(await MoveNext(e, flowAsync), "first command result not delivered");
 
-        // Dispose mid-batch. Without drain mode, the body would wait forever for the consumer
-        // to call MoveNext to drive forward through 2 more commands. With drain mode, the
-        // body sees IsConsumerGone, drains commands 1-3 + RFQ, completes the move-next source,
-        // and DisposeAsync returns once the wire is clean.
-        await e.DisposeAsync();
+        await Dispose(e, useAsyncDispose);
 
-        // Connection is at clean RFQ - prove via a follow-up query on the same protocol.
         await PgTestPool.RunAsync(protocol, "select 1");
     }
 
-    // Full drain via StoppingToken: protocol's graceful CompleteAsync fires StoppingToken,
-    // the body sees it at the next per-command boundary and drains the same way. Verifies
-    // the OR-converged drain transition: either input (consumer-gone or StoppingToken) is
-    // sufficient to start the drain.
     [TestMethod]
-    public async Task StoppingToken_MidBatch_BodyDrainsRemaining_FlowCompletesCleanly()
+    [DataRow(true, DisplayName = "async flow")]
+    [DataRow(false, DisplayName = "sync flow")]
+    public async Task StoppingToken_MidBatch_BodyDrainsRemaining_FlowCompletesCleanly(bool flowAsync)
     {
-        // NewIsolated because CompleteAsync makes the protocol unusable afterwards.
+        var protocol = await PgTestPool.NewIsolatedAsync();
+
+        var flow = new CommandFlow(flowAsync,
+            Command.Create("select generate_series(1, 50)"),
+            Command.Create("select 'two'"),
+            Command.Create("select 'three'"));
+        Assert.IsTrue(protocol.TryQueue(flow));
+
+        var e = GetEnumerator(flow, flowAsync);
+        Assert.IsTrue(await MoveNext(e, flowAsync), "first command result not delivered");
+
+        var completeTask = protocol.CompleteAsync();
+
+        // With the consumer still active, StoppingToken faults the move-next source with the
+        // close exception rather than silently skipping remaining CommandResults.
+        await Assert.ThrowsExactlyAsync<PgClientClosedException>(async () => await MoveNext(e, flowAsync));
+        await e.DisposeAsync();
+
+        await completeTask.AsTask().WaitAsync(TimeSpan.FromSeconds(10));
+    }
+
+    // Graceful shutdown overlapping consumer-side dispose. The first MoveNext's outcome may
+    // be a row delivery, a PgClientClosedException, or a quiet drain depending on timing, but
+    // each (flowAsync, useAsyncDispose) pair must settle CompleteAsync cleanly.
+    [TestMethod]
+    [DataRow(true, true, DisplayName = "async flow, async dispose")]
+    [DataRow(true, false, DisplayName = "async flow, sync dispose")]
+    [DataRow(false, true, DisplayName = "sync flow, async dispose")]
+    [DataRow(false, false, DisplayName = "sync flow, sync dispose")]
+    public async Task StoppingToken_MidBatch_FollowedByDispose_FlowCompletesCleanly(bool flowAsync, bool useAsyncDispose)
+    {
+        var protocol = await PgTestPool.NewIsolatedAsync();
+
+        var flow = new CommandFlow(flowAsync,
+            Command.Create("select generate_series(1, 50)"),
+            Command.Create("select 'two'"),
+            Command.Create("select 'three'"));
+        Assert.IsTrue(protocol.TryQueue(flow));
+
+        var e = GetEnumerator(flow, flowAsync);
+        // Fire the first MoveNext as a task so CompleteAsync can race the delivery.
+        var firstTask = MoveNext(e, flowAsync).AsTask();
+        var completeTask = protocol.CompleteAsync();
+
+        // The first MoveNext may complete with a row or throw PgClientClosedException; both are
+        // valid settle states and the dispose below converges regardless.
+        try { await firstTask; }
+        catch (PgClientClosedException) { }
+        await Dispose(e, useAsyncDispose);
+
+        await completeTask.AsTask().WaitAsync(TimeSpan.FromSeconds(10));
+    }
+
+    // Async flow: shutdown signalled before the consumer ever touches the flow. The parked
+    // gate await is faulted by the heartbeat-driven OnStopping and the consumer's MoveNext
+    // surfaces PgClientClosedException without any delivery.
+    [TestMethod]
+    public async Task StoppingToken_PreFireAsync_BodyFaultsWithoutDelivery()
+    {
         var protocol = await PgTestPool.NewIsolatedAsync();
 
         var flow = new CommandFlow(async: true,
             Command.Create("select generate_series(1, 50)"),
-            Command.Create("select 'two'"),
-            Command.Create("select 'three'"));
+            Command.Create("select 'two'"));
+        Assert.IsTrue(protocol.TryQueue(flow));
+
+        var completeTask = protocol.CompleteAsync();
+
+        var e = flow.GetAsyncEnumerator();
+        await Assert.ThrowsExactlyAsync<PgClientClosedException>(async () => await e.MoveNextAsync());
+        await e.DisposeAsync();
+
+        await completeTask.AsTask().WaitAsync(TimeSpan.FromSeconds(10));
+    }
+
+    // Pipelined multi-flow: both flows queued before any MoveNext, then CompleteAsync fires.
+    // A delivers (its writes flush, postgres responds), B faults via OnStopping, and both
+    // enumerators settle cleanly.
+    [TestMethod]
+    [DoNotParallelize]
+    public async Task StoppingToken_PipelinedFlows_AllDrainCleanly()
+    {
+        var protocol = await PgTestPool.NewIsolatedAsync();
+
+        var flowA = new CommandFlow(async: true,
+            Command.Create("select generate_series(1, 20)"),
+            Command.Create("select 'a-two'"));
+        var flowB = new CommandFlow(async: true, Command.Create("select 'b'"));
+        Assert.IsTrue(protocol.TryQueue(flowA));
+        Assert.IsTrue(protocol.TryQueue(flowB));
+
+        var eA = flowA.GetAsyncEnumerator();
+        var eB = flowB.GetAsyncEnumerator();
+
+        // Fire the MoveNext as a task so CompleteAsync can run concurrently.
+        var aFirstTask = eA.MoveNextAsync().AsTask();
+        var completeTask = protocol.CompleteAsync();
+
+        // StoppingToken fires before A's body reaches the pre-deliver handoff, so the body
+        // faults the move-next source with the close exception rather than dropping results.
+        // B faults via the same path through OnStopping.
+        await Assert.ThrowsExactlyAsync<PgClientClosedException>(async () => await aFirstTask);
+        await Assert.ThrowsExactlyAsync<PgClientClosedException>(async () => await eB.MoveNextAsync());
+        await eA.DisposeAsync();
+        await eB.DisposeAsync();
+
+        await completeTask.AsTask().WaitAsync(TimeSpan.FromSeconds(10));
+    }
+
+    // Graceful-then-abort escalation: a body parked on actual I/O (pg_sleep keeps the server
+    // busy for 30s) can't observe StoppingToken via the per-CommandResult check because it
+    // never gets there. CompleteAsync's graceful path schedules AbortToken via
+    // CancelAfter(CompletionTimeout); when the timeout fires the decoder's CTS-linked CT
+    // throws, the body's catch routes the closed exception out, and the consumer's pending
+    // MoveNextAsync surfaces PgClientClosedException.
+    [TestMethod]
+    public async Task StoppingToken_GracefulEscalatesToAbort_AsyncFlowFaultsWithClosedException()
+    {
+        // Narrow timeout, but safe parallelized: the body is parked on pg_sleep the whole window,
+        // so the graceful->abort escalation is deterministic - there is no timing race to lose.
+        var protocol = await PgTestPool.NewIsolatedAsync(o => o.CompletionTimeout = TimeSpan.FromMilliseconds(100));
+
+        var flow = new CommandFlow(async: true, Command.Create("select pg_sleep(30)"));
         Assert.IsTrue(protocol.TryQueue(flow));
 
         var e = flow.GetAsyncEnumerator();
-        Assert.IsTrue(await e.MoveNextAsync(), "first command result not delivered");
+        var moveNextTask = e.MoveNextAsync().AsTask();
 
-        // Fire graceful shutdown. StoppingToken cancels; the framework's drain awaits the
-        // in-flight flow's completion. Body sees StoppingToken at the next boundary and
-        // skips the user-handoff for the remaining commands.
         var completeTask = protocol.CompleteAsync();
 
-        // Drive the consumer side forward. The body, parked on the gate from MoveNextAsync
-        // returning true above, wakes here, sees StoppingToken, and skips to drain mode.
-        // Body's SetResult(null) at loop exit makes this final call return false.
-        Assert.IsFalse(await e.MoveNextAsync(), "drain should signal completion to consumer");
+        await Assert.ThrowsExactlyAsync<PgClientClosedException>(
+            async () => await moveNextTask.WaitAsync(TimeSpan.FromSeconds(10)));
         await e.DisposeAsync();
 
-        // Graceful shutdown completes cleanly - the body drained without faulting.
         await completeTask.AsTask().WaitAsync(TimeSpan.FromSeconds(10));
     }
 }

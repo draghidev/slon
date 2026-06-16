@@ -96,6 +96,18 @@ public class RecoveryTests
         /// of capturing-and-awaiting `OutstandingPhaseTask` (move-to-trailing path).
         public TaskCompletionSource? ControllableTrailing { get; init; }
 
+        /// When set, the flow's PIPELINE task acquires the decoder (the read turn) and holds it
+        /// until this completes - a real read still in flight on the single-consumer wire. Pair
+        /// with FaultPhase.TrailingTask so the trailing faults while the read is parked: the
+        /// framework then hands the pending READ as OutstandingPhaseTask, and the recovery must
+        /// await it before its own DrainPhase read (the read-side mirror of ControllableTrailing).
+        public TaskCompletionSource? ControllablePipelineRead { get; init; }
+
+        /// Completed by the pipeline read once it has actually acquired the decoder (the read turn).
+        /// Lets a test fault the trailing only AFTER the read is genuinely holding the turn, so the
+        /// recovery runs while the outstanding read is live (the definitive read-outstanding case).
+        public TaskCompletionSource? PipelineReadAcquired { get; init; }
+
         public FaultingFlow(bool async, FaultPhase phase, WriteShape shape)
             : base(supportsPipelining: true)
         {
@@ -131,9 +143,11 @@ public class RecoveryTests
             if (_phase is FaultPhase.PreReturn)
                 throw new InvalidOperationException("FaultingFlow pre-return synthetic failure.");
 
-            ValueTask pipelineTask = _phase is FaultPhase.PipelineTask
-                ? FailedTask()
-                : ValueTask.CompletedTask;
+            ValueTask pipelineTask;
+            if (ControllablePipelineRead is { } readGate)
+                pipelineTask = HoldReadTurn(context, readGate, PipelineReadAcquired);
+            else
+                pipelineTask = _phase is FaultPhase.PipelineTask ? FailedTask() : ValueTask.CompletedTask;
             ValueTask trailingTask;
             if (ControllableTrailing is { } controllable)
             {
@@ -155,6 +169,18 @@ public class RecoveryTests
 
             static ValueTask FailedTask()
                 => new(Task.FromException(new InvalidOperationException("FaultingFlow synthetic failure.")));
+
+            // Acquire the decoder (the single-consumer read turn), signal it, then do a REAL parked
+            // read. This is the unfinished pipelineTask: when the recovery activates and robs the
+            // turn, this read's next decoder USE fails the per-use validity check and faults - and
+            // that late fault on an already-recovering flow is the recovery-of-recovery trigger.
+            static async ValueTask HoldReadTurn(Context context, TaskCompletionSource gate, TaskCompletionSource? acquired)
+            {
+                PgDecoder decoder = await context.GetDecoderAsync().ConfigureAwait(false);
+                acquired?.TrySetResult();
+                _ = gate; // vestigial; the read parks on the wire, not the gate
+                await decoder.GetNextAsync().ConfigureAwait(false);
+            }
         }
     }
 
@@ -379,7 +405,7 @@ public class RecoveryTests
     public async Task RecoveryItselfFails_FailedFlowCompletes_WithBothFaults()
     {
         var options = NewOptions();
-        var transport = await SocketStreamConnection.ConnectAsync((IPEndPoint)options.EndPoint);
+        var transport = await SocketStreamConnection.ConnectAsync(options.EndPoint);
         var protocol = PgClientProtocol.Create(new PgClientProtocolOptions(options));
         await protocol.StartAsync(options, transport);
 
@@ -422,7 +448,7 @@ public class RecoveryTests
     public async Task RecoveryReadFails_FailedFlowCompletes_WithBothFaults()
     {
         var options = NewOptions();
-        var transport = await SocketStreamConnection.ConnectAsync((IPEndPoint)options.EndPoint);
+        var transport = await SocketStreamConnection.ConnectAsync(options.EndPoint);
         var protocol = PgClientProtocol.Create(new PgClientProtocolOptions(options));
         await protocol.StartAsync(options, transport);
 
@@ -491,6 +517,94 @@ public class RecoveryTests
         await RunAsync(protocol, "select 1");
 
         await protocol.CompleteAsync();
+    }
+
+    // Sync-flow variant of the pending-trailing move-to-trailing path (the "sync in trailing"
+    // punch-list check). The recovery inherits IsAsync=false, so its Sync flush runs on the sync
+    // path. The move-to-trailing deadlock-avoidance relies on DrainPhase reading the wire
+    // CONCURRENTLY with the wait on outstanding; if a sync recovery serializes
+    // trailing-await-then-drain, the TCP-window cycle re-forms. The sync flow runs off-thread with
+    // a timeout so a recovery deadlock surfaces as a loud TimeoutException, not a hung runner.
+    [TestMethod]
+    public async Task SyncFlowFailure_PendingTrailing_DrainsConcurrentlyWithoutDeadlock()
+    {
+        var protocol = await ConnectAsync();
+        try
+        {
+            var trailingTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var faulting = new FaultingFlow(async: false, FaultPhase.PipelineTask, WriteShape.ParseBindExecuteNoSync)
+            {
+                ControllableTrailing = trailingTcs,
+            };
+            Assert.IsTrue(protocol.TryQueue(faulting));
+
+            _ = Task.Run(async () =>
+            {
+                await Task.Delay(50);
+                trailingTcs.TrySetResult();
+            });
+
+            // Off-thread: RunSync's blocking MoveNext drives the wire on a TP thread, so a recovery
+            // deadlock surfaces as this timeout rather than wedging the test thread.
+            await Task.Run(() => RunSync(protocol, "select 1")).WaitAsync(TimeSpan.FromSeconds(10));
+        }
+        finally
+        {
+            // A wedged protocol's completion may also hang; guard it so a deadlock result stays a
+            // clean TimeoutException from the body, not a hung cleanup.
+            try { await protocol.CompleteAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(5)); }
+            catch { }
+        }
+    }
+
+    // Read-outstanding direction (the inverse of ThrowIfCannotWrite's failed-flow WRITE permit):
+    // the trailing faults only AFTER the pipeline read has genuinely acquired the decoder
+    // (PipelineReadAcquired), so recovery is installed while the failed read still holds the turn.
+    // This is NOT benign on its own - if recovery's ActivateHeadItem robbed the read-turn, the
+    // failed read would decode the wrong message and its late fault would re-enter nonexistent
+    // recovery-of-recovery. The fix is what this test pins: the policy forwards OutstandingPhaseTask
+    // for the TrailingExecutionTask kind (outstandingIsRead), the decoder permit
+    // (RecoveryDrainFlow.FailedReadOutstanding -> PgDecoder.CurrentExecutionControl) resolves to the
+    // FailedFlow so the in-flight read finishes on its OWN control, and DrainPhase awaits that read
+    // before the recovery takes the read turn. A timeout/desync here means that sequencing
+    // regressed.
+    [TestMethod]
+    public async Task TrailingTask_FailsWhileReadHeld_RecoveryDoesNotCollideOnReadTurn()
+    {
+        var protocol = await ConnectAsync();
+        try
+        {
+            var releaseGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var acquired = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var trailing = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+            var faulting = new FaultingFlow(async: true, FaultPhase.TrailingTask, WriteShape.ParseBindExecuteNoSync)
+            {
+                ControllablePipelineRead = releaseGate,
+                PipelineReadAcquired = acquired,
+                ControllableTrailing = trailing,
+            };
+            Assert.IsTrue(protocol.TryQueue(faulting));
+
+            _ = Task.Run(async () =>
+            {
+                await acquired.Task.ConfigureAwait(false);   // the read is now holding the decoder
+                trailing.TrySetException(new InvalidOperationException("synthetic trailing fault while read held"));
+                await Task.Delay(50).ConfigureAwait(false);
+                releaseGate.TrySetResult();
+            });
+
+            // Assert the scenario was actually exercised (the read genuinely held the turn) before
+            // asserting the sibling drains cleanly - so a green run can't be a false positive from
+            // the read failing to acquire.
+            await acquired.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            await RunAsync(protocol, "select 1").WaitAsync(TimeSpan.FromSeconds(15));
+        }
+        finally
+        {
+            try { await protocol.CompleteAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(5)); }
+            catch { }
+        }
     }
 
     // Substitution-substrate contract: PipelineTask kind with a trailing that ALSO faults.

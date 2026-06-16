@@ -79,10 +79,17 @@ public class ProtocolCompletionTests
         var flow = new CommandFlow(async: true, Command.Create("select pg_sleep(0.05)"));
         Assert.IsTrue(protocol.TryQueue(flow));
 
+        // Graceful close while a consumer is mid-iteration: the move-next source faults with
+        // PgClientClosedException so the consumer's MoveNextAsync surfaces it (input-commands-
+        // equals-output-results coherence rule). The consumer disposes on the exception path.
         var runTask = Task.Run(async () =>
         {
             var e = flow.GetAsyncEnumerator();
-            while (await e.MoveNextAsync()) { }
+            try
+            {
+                while (await e.MoveNextAsync()) { }
+            }
+            catch (PgClientClosedException) { }
             await e.DisposeAsync();
         });
 

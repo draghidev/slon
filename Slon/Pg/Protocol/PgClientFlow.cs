@@ -36,14 +36,13 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IThreadPoolWorkItem
     // a stale value and take the wrong I/O path.
     int _isAsyncState;
 
-    // Flow lifecycle state. Replaces the spin-state-laden FlowStatus machine that
-    // used to live in ProtocolFlow. Reads happen on the consumer thread after the
-    // executor has settled, so plain flags are sufficient.
+    // Flow lifecycle state. Reads happen on the consumer thread after the executor has settled,
+    // so plain flags are sufficient.
     bool _started;
     bool _completed;
     TaskCompletionSource _completionTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
-    // Actvation state.
+    // Activation state.
     Slon.Threading.Tasks.Sources.ManualResetValueTaskSourceCore<PgDecoder> _activationTaskSource;
     CancellationTokenRegistration _activationCancellationTokenRegistration;
     TimeSpan _remainingActivationTimeout;
@@ -52,35 +51,25 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IThreadPoolWorkItem
     Action<PgClientFlow, Exception?, object?>? _completionAction;
     object? _completionState;
 
-    /// The flow's body. The "Auto" suffix is the protocol package's convention for "this method's
-    /// contract adapts to the bound flow mode (sync or async)". The body internally
-    /// dispatches between sync and async I/O based on <see cref="IsAsync"/> for each per-call read.
-    /// Helper APIs the body calls come as explicit sync/async pairs (e.g.
-    /// <c>ReadUntilExecute</c> / <c>ReadUntilExecuteAsync</c>, <c>Write</c> / <c>WriteAsync</c>).
-    /// The body picks one at each call site rather than threading a mode flag through a wrapper.
-    ///
-    /// Prefer async/await in both modes. Sync mode affects scheduling, not body syntax. A fully
-    /// sync body that needs the decoder calls <c>GetDecoderAuto</c> for a blocking get. Don't
-    /// mix sync I/O calls inside an <c>async</c> body or vice versa.
+    /// The flow's body. "Auto" is the protocol-package convention for "adapts to the bound mode
+    /// (sync or async)": the body dispatches between sync and async I/O per read based on IsAsync,
+    /// calling explicit sync/async helper pairs (ReadUntilExecute / ReadUntilExecuteAsync) at each
+    /// site. Prefer async/await in both modes - sync mode affects scheduling, not syntax. Don't mix
+    /// sync and async I/O calls within one body.
     protected abstract ValueTask<FlowTasks> ExecuteAuto(Context context);
 
     protected bool IsAsync
     {
-        // Volatile.Read because the consumer thread can flip _isAsyncState via MoveNextAsync's
-        // sync->async transition concurrently with the body reading it. Without the fence the
-        // body's post-wake check (when the wake protocol resumes a sync-suspended body via
-        // TP after the consumer flipped to async) could see a stale value and take the sync
-        // I/O path on a flow that's now async, blocking on I/O that never completes sync.
+        // Volatile.Read: the consumer thread can flip _isAsyncState (sync->async) concurrently with
+        // the body reading it. Without the fence a post-wake check could see a stale value and take
+        // the sync I/O path on a now-async flow, blocking on I/O that never completes sync.
         get => Volatile.Read(ref _isAsyncState) == 1;
         set => Volatile.Write(ref _isAsyncState, value ? 1 : 2);
     }
 
 
-    // The bind-time async snapshot. Stable across the flow's tenure (unlike IsAsync, which a
-    // flow body may mutate for sync/async mixing). Used by the policy to decide whether
-    // activation can run inline: sync flows park their caller via Task wait-handle (bounded
-    // signal cost), so inline-Activate is safe. Async flows can attach arbitrary continuations,
-    // so they must go through TP to avoid pinning the advancer latch.
+    // The bind-time async snapshot, stable across the flow's tenure (unlike IsAsync, which a body
+    // may mutate). The policy uses it to decide inline vs TP activation.
     internal bool IsAsyncAtBind => _isAsyncAtBind;
 
     // Pre-bind read of IsAsync for the enqueue path: the protocol routes sync flows through an
@@ -144,6 +133,11 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IThreadPoolWorkItem
 
     protected virtual void OnHeartbeat(TimeSpan interval) {}
     protected virtual void OnAbort(PgClientClosedException exception) {}
+    /// Graceful-shutdown observation point. Fires while StoppingToken is set but before the
+    /// AbortToken escalation. Flow types whose body can park on a non-IO rendezvous (CommandFlow's
+    /// GateTask) override this to wake it so the body short-circuits instead of waiting for
+    /// AbortToken. Idempotent across heartbeat ticks (subclasses use TrySet).
+    protected virtual void OnStopping(PgClientClosedException exception) {}
     protected virtual void OnReset() {}
     /// Completion observation point for the flow. On exceptional completion a flow must fault
     /// its caller-facing sources here: the body's own fault paths only run when the body ran,
@@ -176,60 +170,48 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IThreadPoolWorkItem
         /// nesting layer.
         public bool IsProtocolClosed => _executionControl.IsProtocolClosed;
 
+        /// The canonical PgClientClosedException for this protocol once Shutdown has entered.
+        /// Materialized before the StoppingToken / AbortToken cancellations, so observers waking on
+        /// those tokens always see a non-null value.
+        public PgClientClosedException? ClosedException => _executionControl.ClosedException;
+
         public ref readonly TState GetProtocolStatic<TState>()
             => ref _executionControl.GetProtocolStatic<TState>();
 
         public PgEncoder GetEncoder()
             => _executionControl.GetEncoder();
 
-        /// Returns an awaitable for the decoder. The <c>Async</c> suffix marks this as
-        /// intrinsically asynchronous. Activation is a cross-flow rendezvous, completed by
-        /// another flow's thread. The awaiter's <c>GetResult</c> throws if not yet completed.
-        /// async bodies use <c>await</c>. Sync bodies that want a blocking call should use
-        /// <see cref="GetDecoderAuto"/>. Direct-dispatch callers (e.g. CommandFlow's
-        /// shared-promise pattern) use IsCompleted + (Unsafe)OnCompleted to register
-        /// continuations without going through await machinery.
-        ///
-        /// The optional cancellation token lets the flow unwind itself rather than holding a
-        /// continuation that may never complete. Wire bytes the flow already emitted are owned
-        /// by the protocol and drained on the flow's behalf when it unwinds.
+        /// Returns an awaitable for the decoder. Activation is a cross-flow rendezvous completed by
+        /// another flow's thread, so GetResult throws if not yet completed - async bodies await,
+        /// sync bodies use GetDecoderAuto, and direct dispatchers use IsCompleted + (Unsafe)OnCompleted.
+        /// The optional token lets the flow unwind rather than hold a continuation that may never
+        /// complete. Bytes it already emitted are drained by the protocol on its behalf.
         public DecoderAwaitable GetDecoderAsync(CancellationToken cancellationToken = default)
             => new(_executionControl, cancellationToken, auto: false);
 
-        /// Mode-adaptive wrapper. Returns a <see cref="DecoderAwaitable"/> that, when awaited
-        /// by a sync flow body and activation hasn't fired yet, blocks via the AsTask bridge
-        /// inside <c>OnCompleted</c> and runs the continuation inline. Async flow bodies get the
-        /// standard async-continuation behavior. Call sites <c>await</c> uniformly without
-        /// branching on <c>IsAsync</c> themselves.
+        /// Mode-adaptive wrapper. For a sync body whose activation hasn't fired, blocks via the AsTask
+        /// bridge and runs the continuation inline. Async bodies get standard async continuation. Call
+        /// sites await uniformly without branching on IsAsync.
         public DecoderAwaitable GetDecoderAuto(CancellationToken cancellationToken = default)
             => new(_executionControl, cancellationToken, auto: true);
     }
 
-    // Self-awaitable for `await context.GetDecoderAsync()` plus direct-dispatch interaction:
-    //
-    // - `await` syntax: the C# compiler checks IsCompleted and calls GetResult only when true.
-    //   If not yet ready it schedules the continuation via OnCompleted(Action) /
-    //   UnsafeOnCompleted(Action).
-    //
-    // - Direct dispatchers (CommandFlow's shared-promise pattern): use IsCompleted +
-    //   OnCompleted(Action<object?>, object?) / UnsafeOnCompleted(Action<object?>, object?) to
-    //   register continuations without closure allocation. GetResult is only valid after
-    //   IsCompleted is true (standard awaiter contract).
+    // Self-awaitable for `await context.GetDecoderAsync()` and direct-dispatch. Under await the
+    // compiler checks IsCompleted and only schedules via (Unsafe)OnCompleted(Action) when not ready.
+    // Direct dispatchers (CommandFlow's shared-promise pattern) instead use IsCompleted +
+    // (Unsafe)OnCompleted(Action<object?>, object?) to register without a closure allocation.
     protected readonly struct DecoderAwaitable(ExecutionControl control, CancellationToken cancellationToken, bool auto) : ICriticalNotifyCompletion
     {
         public DecoderAwaitable GetAwaiter() => this;
 
-        // Sync-flow auto path claims completed up front so the await machinery takes the sync
-        // shortcut (no state machine box allocated, no continuation registered) and falls
-        // straight to GetResult, which blocks via AsTask if activation hasn't fired yet.
-        // Async flows reflect SETTLED (not just succeeded): a faulted activation completes
-        // the await so GetResult rethrows (see IsDecoderSettled).
+        // Sync-flow auto path claims completed up front so the await machinery takes the sync shortcut
+        // (no box, no continuation) straight to GetResult, which blocks via AsTask if activation hasn't
+        // fired. Async flows reflect SETTLED not just succeeded, so a faulted activation completes the
+        // await and GetResult rethrows.
         public bool IsCompleted => control.IsDecoderSettled || (auto && !control.IsAsync);
 
-        // Only valid after IsCompleted is true. For the sync-flow auto path, IsCompleted is
-        // true unconditionally, so this may run while the decoder isn't actually ready. In
-        // that case we block via the AsTask bridge. Async flows follow the standard awaiter
-        // contract and the compiler guarantees IsCompleted has fired before this.
+        // Only valid after IsCompleted. The sync-flow auto path reports IsCompleted unconditionally,
+        // so this may run before the decoder is ready and blocks via the AsTask bridge.
         public PgDecoder GetResult()
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -378,15 +360,11 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IThreadPoolWorkItem
             }
         }
 
-        /// <summary>Try-shape sync attempt: returns true if the message was processed
-        /// without needing I/O. <paramref name="handled"/> is set to true if the message
-        /// was consumed by the protocol layer (caller should skip and pull the next one)
-        /// and false if it should be surfaced to the flow.
-        ///
-        /// Returns false ONLY when the type's handler genuinely requires async work; today
-        /// no branch does, so this never bails. Callers that hit a false return must NOT
-        /// commit any peeked state and must propagate the bail up to a caller that can
-        /// await (typically by falling back through <see cref="HandleMessageAuto"/>).</summary>
+        /// Try-shape sync attempt: returns true if the message was processed without I/O. handled is
+        /// true if the protocol layer consumed it (caller skips and pulls the next), false if it
+        /// should be surfaced to the flow. Returns false only when a handler genuinely needs async
+        /// work - no branch does today, so it never bails. A false return must not commit peeked state
+        /// and must propagate up to a caller that can await (via HandleMessageAuto).
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public bool TryHandleMessage(in BackendMessage backendMessage, out bool handled)
         {
@@ -402,10 +380,9 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IThreadPoolWorkItem
             return true;
         }
 
-        /// <summary>True if the message was fully handled (if not it will be surfaced to
-        /// the flow). The async-capable counterpart of <see cref="TryHandleMessage"/>:
-        /// callers that can await use this, sync hot-path callers use TryHandleMessage and
-        /// bail recursively if it returns false.</summary>
+        /// True if the message was fully handled (else it's surfaced to the flow). Async-capable
+        /// counterpart of TryHandleMessage, for callers that can await; sync hot-path callers use
+        /// TryHandleMessage and bail recursively on false.
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public ValueTask<bool> HandleMessageAuto(in BackendMessage backendMessage)
         {
@@ -487,6 +464,7 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IThreadPoolWorkItem
         public CancellationToken AbortToken => control.AbortToken;
         public CancellationToken StoppingToken => control.StoppingToken;
         public bool IsProtocolClosed => control.ClosedException is not null;
+        public PgClientClosedException? ClosedException => control.ClosedException;
 
         public ValueTask<FlowTasks> ExecuteAuto()
             => IsAsync ? flow.ExecuteAuto(new(this)) : ExecuteSynchronously();
@@ -528,12 +506,16 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IThreadPoolWorkItem
                 return;
             }
 
-            // Same sentinel guard as PgDecoder.OnHeartbeat: InfiniteTimeSpan (-1ms) and Zero
-            // both mean "no activation timeout". Without the guard an infinite budget reads
-            // as instantly expired and the first heartbeat tick spuriously times out any
-            // flow still pending activation (observed as ~1s "Operation timed out waiting
-            // for activation" failures under contention with the protocol-level default
-            // ConnectionTimeout = Infinite).
+            // Graceful-stopping propagation. AbortToken faults the activation source, but StoppingToken
+            // must reach the body-side gates too, else a flow dispatched but never cranked by the
+            // consumer stays parked until CompletionTimeout escalates to AbortToken. ClosedException is
+            // materialized before _stoppingCts fires, so it's non-null here.
+            if (control.StoppingToken.IsCancellationRequested && !flow._completed)
+                flow.OnStopping(control.ClosedException!);
+
+            // Same sentinel guard as PgDecoder.OnHeartbeat: InfiniteTimeSpan and Zero both mean "no
+            // activation timeout". Without it an infinite budget reads as instantly expired and the
+            // first heartbeat tick times out any flow still pending activation.
             if (flow._remainingActivationTimeout != Timeout.InfiniteTimeSpan && flow._remainingActivationTimeout != TimeSpan.Zero
                 && flow._activationTaskSource.GetStatus(flow._activationTaskSource.Version) is ValueTaskSourceStatus.Pending
                 && (flow._remainingActivationTimeout -= interval) <= TimeSpan.Zero)
@@ -560,14 +542,11 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IThreadPoolWorkItem
                 flow._completionTcs.TrySetException(exception);
             else
                 flow._completionTcs.TrySetResult();
-            // Deliberately NO activation-source faulting here: a parked deferred dispatch
-            // holds no resources (TryStart happens only when the bridge runs), the caller is
-            // faulted via OnComplete, and Reset clears the registration on reuse. Invoking
-            // the bridge on a completed flow would create-and-start the body for a dead
-            // tenure - it takes the shared pipelined-read promise tenure for nothing and
-            // races instance reuse on this very source (observed as double continuation
-            // registration aborts). The heartbeat abort path keeps its own faulting; that is
-            // protocol teardown, not per-flow completion.
+            // Deliberately NO activation-source faulting here: a parked deferred dispatch holds no
+            // resources, the caller is faulted via OnComplete, and Reset clears the registration on
+            // reuse. Invoking the bridge on a completed flow would create-and-start the body for a
+            // dead tenure, taking the shared read promise for nothing and racing instance reuse. The
+            // heartbeat abort path keeps its own faulting - that's protocol teardown, not completion.
             flow.OnComplete(exception);
             flow._completionAction?.Invoke(flow, exception, flow._completionState);
         }
@@ -603,13 +582,10 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IThreadPoolWorkItem
         public bool IsDecoderReady
             => flow._activationTaskSource.GetStatus(flow._activationTaskSource.Version) is ValueTaskSourceStatus.Succeeded;
 
-        /// Awaiter-completion check: completed means SETTLED, not succeeded. A faulted
-        /// activation (timeout, abort) must complete the await so GetResult rethrows into
-        /// the body's catch paths. Treating Faulted as pending parks the body on a source
-        /// that will never transition again, and its late registration lands on the slot the
-        /// dispatch bridge still occupies (invocation does not clear the continuation; only
-        /// Reset does) - observed as an unhandled InvalidOperationException on the TP under
-        /// activation-timeout conditions.
+        /// Awaiter-completion check: completed means SETTLED, not succeeded. A faulted activation
+        /// (timeout, abort) must complete the await so GetResult rethrows into the body's catch paths.
+        /// Treating Faulted as pending parks the body on a source that never transitions again, and
+        /// its late registration lands on the slot the dispatch bridge still occupies.
         public bool IsDecoderSettled
             => flow._activationTaskSource.GetStatus(flow._activationTaskSource.Version) is not ValueTaskSourceStatus.Pending;
         public PgDecoder GetDecoderResult()

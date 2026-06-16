@@ -24,8 +24,15 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
         get
         {
             Debug.Assert(_control is not null);
-            Debug.Assert(_control.ActivatedFlow is not null);
-            return _control.ActivatedFlow.GetExecutionControl(_control);
+            var activated = _control.ActivatedFlow;
+            Debug.Assert(activated is not null);
+            // Read-side substitution permit (inverse of ThrowIfCannotWrite): while a recovery holds
+            // the ActivatedFlow but its failed flow still has an in-flight read, resolve to the failed
+            // flow until that read finishes. Otherwise the failed read decodes against the recovery's
+            // read-state and its late fault re-enters nonexistent recovery-of-recovery.
+            if (activated is Flows.RecoveryDrainFlow { FailedReadOutstanding: true } recovery)
+                return recovery.FailedFlow!.GetExecutionControl(_control);
+            return activated.GetExecutionControl(_control);
         }
     }
 
@@ -58,10 +65,9 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
 
     void OnHeartbeat(TimeSpan elapsed)
     {
-        // Both InfiniteTimeSpan and Zero are treated as "no timeout" - the latter falls out of
-        // Command.Timeout defaulting to default(TimeSpan), which is the common "I didn't set a
-        // timeout" case. Without the Zero guard the first heartbeat tick would fire the cancel
-        // immediately and abort any read parked on actual I/O.
+        // Both InfiniteTimeSpan and Zero are treated as "no timeout" (Zero is the default(TimeSpan)
+        // "no timeout set" case). Without the Zero guard the first heartbeat tick would fire the
+        // cancel immediately and abort any read parked on I/O.
         if (_remainingTimeout != Timeout.InfiniteTimeSpan && _remainingTimeout != TimeSpan.Zero
             && (_remainingTimeout -= elapsed) <= TimeSpan.Zero)
             _cancellationTokenSource.Cancel();
@@ -73,12 +79,24 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
     ValueTask<bool> IAsyncEnumerator<BackendMessage>.MoveNextAsync() => MoveNextAsync(CancellationToken.None);
 
     // Recycle a CTS cancelled by timeout or user-CT from the previous call. Abort is terminal,
-    // never recycle past it. Single recycle site (here, not OnHeartbeat / Core's finally) so
-    // there's no race between heartbeat thread and the flow's own teardown.
+    // never recycle past it. Single recycle site so the heartbeat thread and the flow's own
+    // teardown can't race it.
     void EnsureUsableCts()
     {
         if (_cancellationTokenSource.IsCancellationRequested && !_abortToken.IsCancellationRequested)
             _cancellationTokenSource = CancellationTokenSource.CreateLinkedTokenSource(_abortToken);
+    }
+
+    // Translate a read cancellation (an OCE on our cancelled CTS) to the protocol's typed surface,
+    // shared by sync and async paths. The CTS also fires on read-timeout, hence the timeout branch.
+    // Returns rather than throws so a sync caller's throw keeps definite assignment.
+    Exception TranslateReadCancellation(OperationCanceledException oce, CancellationToken cancellationToken)
+    {
+        if (_abortToken.IsCancellationRequested && _control.ClosedException is { } closed)
+            return closed;
+        if (cancellationToken.IsCancellationRequested)
+            return new OperationCanceledException(cancellationToken);
+        return new TimeoutException("Read timed out.", oce);
     }
 
     /// Flow-owned escape hatch from a parked read. Without it the only break-out is protocol
@@ -92,7 +110,20 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
             var context = _messageContext;
             if (!context.TryMoveNext())
             {
-                var task = _messageBatchEnumerator.MoveNextAsync(_cancellationTokenSource.Token);
+                // The read can throw OCE synchronously: if the CTS (linked to AbortToken) is already
+                // cancelled at entry, it throws before returning a task, bypassing MoveNextAsyncCore's
+                // catch (which only runs when the read parks). A pre-check is a TOCTOU, so catch the
+                // synchronous throw and run it through the same translation as the async path.
+                ValueTask<bool> task;
+                try
+                {
+                    task = _messageBatchEnumerator.MoveNextAsync(_cancellationTokenSource.Token);
+                }
+                catch (OperationCanceledException oce) when
+                    (oce.CancellationToken == _cancellationTokenSource.Token && _cancellationTokenSource.IsCancellationRequested)
+                {
+                    throw TranslateReadCancellation(oce, cancellationToken);
+                }
                 if (!task.IsCompletedSuccessfully)
                     return MoveNextAsyncCore(task, null, cancellationToken);
 
@@ -167,14 +198,7 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
                     catch (OperationCanceledException oce) when
                         (oce.CancellationToken == _cancellationTokenSource.Token && _cancellationTokenSource.IsCancellationRequested)
                     {
-                        // Gate on this protocol's own abort token so a different protocol's
-                        // closure can't be mistaken for ours; the CTS would otherwise also
-                        // observe cancellation via the read-timeout heartbeat path.
-                        if (_abortToken.IsCancellationRequested)
-                            _control.ThrowIfClosed();
-                        if (cancellationToken.IsCancellationRequested)
-                            throw new OperationCanceledException(cancellationToken);
-                        throw new TimeoutException("Read timed out.", oce);
+                        throw TranslateReadCancellation(oce, cancellationToken);
                     }
 
                     messageHandledTask = CurrentExecutionControl.HandleMessageAuto(_messageContext.Current);
@@ -199,19 +223,10 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public bool TryGetNext(out BackendMessage message)
     {
-        // Peek - try - commit. Mirrors MoveNext/MoveNextAsync's auto-handled skip + RFQ
-        // accounting on the sync-fast path. If we don't run the handler here, a body that
-        // reads its terminating RFQ via TryGetNext (the message is buffered, so the async
-        // path is never taken) leaves _rfqCount stale at 1 - and a tail-time fault then
-        // routes the wrong outstanding-RFQ count to TryRecoverItemFailure, letting
-        // RecoveryDrainFlow consume an RFQ that already landed and silently swallow the
-        // next flow's response.
-        //
-        // TryHandleMessage returns false ONLY when the type's handler requires I/O. In
-        // that case we bail without committing the peek - the caller falls back to
-        // MoveNextAsync, which reuses the peek slot via the cheap TryMoveNext path and
-        // routes the message through the async-capable HandleMessageAuto. No sync-over-
-        // async on the fast path.
+        // Peek - try - commit, mirroring MoveNext's auto-handled skip + RFQ accounting on the sync-fast
+        // path. Run the handler here: a body reading its terminating RFQ via TryGetNext would otherwise
+        // leave _rfqCount stale and route the wrong count to recovery. TryHandleMessage returns false
+        // only when the handler needs I/O, where we bail and the caller falls back to MoveNextAsync.
         while (_messageContext.TryPeekNext(out var peeked))
         {
             if (!CurrentExecutionControl.TryHandleMessage(peeked, out var handled))

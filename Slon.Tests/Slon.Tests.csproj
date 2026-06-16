@@ -11,6 +11,7 @@
     <ItemGroup>
         <!-- https://youtrack.jetbrains.com/issue/RIDER-129745/Microsoft-Testing-Platform-v2-is-broken-in-Rider -->
         <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.3.0" />
+        <PackageReference Include="Microsoft.Extensions.TimeProvider.Testing" Version="9.0.0" />
         <ProjectReference Include="../Slon/Slon.csproj" />
     </ItemGroup>
 </Project>
