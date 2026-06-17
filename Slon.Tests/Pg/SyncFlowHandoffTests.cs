@@ -51,9 +51,18 @@ public class SyncFlowHandoffTests
             "expected no growth under the handoff design (caller's thread does all work)");
     }
 
-    // Strong-negative test: measures TP completed-work-item delta during a sync flow and
-    // compares against the ambient drift baseline. Requires isolation from concurrent test
-    // TP activity to be meaningful. Run individually:
+    // Strong-negative smoke test: measures TP completed-work-item delta during a sync flow and
+    // compares against the ambient drift baseline. Only worth running when working in the sync
+    // flow / idle-handoff area, as a spot-check that the handoff still enqueues nothing.
+    //
+    // It stays [Ignore]'d, NOT for lack of a cleaner metric, but because the metric is the point.
+    // ThreadPool.CompletedWorkItemCount is a process-global oracle: it counts EVERYTHING, including
+    // a dispatch we never tracked (a stray continuation, a BCL path we didn't anticipate). That is
+    // exactly what the test exists to catch. A pipeline-local counter we increment ourselves cannot
+    // replace it: it only sees dispatches we already know about, so it would pass precisely when an
+    // untracked enqueue is the bug. The same "counts everything" property makes it un-isolatable in
+    // suite, any concurrent test's TP activity pollutes the delta. So isolation must come from a
+    // quiet process (run solo), not a narrower metric. Do not "fix" this into a local counter.
     //   dotnet test --filter IdlePipeline_DoesNotChurnThreadPool
     //
     // Empirically (verified via dotnet-trace) the per-query TP work-item delta over ambient is at
@@ -67,7 +76,7 @@ public class SyncFlowHandoffTests
     // a parked-MRES that the executor's IValueTaskSource.OnCompleted sets, so the sync caller's
     // thread blocks on what it would block on anyway, no TP enqueue.
     [TestMethod]
-    [Ignore("Requires isolation from concurrent test TP activity. Run individually.")]
+    [Ignore("Global TP-counter oracle (counts untracked dispatches) needs a quiet process; run solo when touching sync flow / idle handoff. Not replaceable by a local counter.")]
     public async Task IdlePipeline_DoesNotChurnThreadPool()
     {
         await using var lease = await PgTestPool.LeaseAsync();
