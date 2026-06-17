@@ -1,3 +1,5 @@
+using Microsoft.Extensions.Time.Testing;
+
 namespace Slon.Tests;
 
 // Wire-level smoke tests for auto-prepare. Each test drives commands against real PostgreSQL,
@@ -17,7 +19,8 @@ public class AutoPrepareWireTests
         int autoMinimumUses = 5,
         int maxPoolSize = 4,
         TimeSpan? heartbeatInterval = null,
-        TimeSpan? maintenanceInterval = null)
+        TimeSpan? maintenanceInterval = null,
+        TimeProvider? timeProvider = null)
         => AdoTestPool.NewIsolatedDataSource(o => o with
         {
             MaxPoolSize = maxPoolSize,
@@ -25,6 +28,7 @@ public class AutoPrepareWireTests
             AutoPreparationMinimumUses = autoMinimumUses,
             HeartbeatInterval = heartbeatInterval ?? TimeSpan.FromSeconds(1),
             MaintenanceInterval = maintenanceInterval ?? TimeSpan.FromSeconds(1),
+            TimeProvider = timeProvider ?? TimeProvider.System,
         });
 
     [TestMethod]
@@ -151,15 +155,21 @@ public class AutoPrepareWireTests
         }
     }
 
+    // The MaintenanceFlow that drains the EvictDeallocate fires on a heartbeat tick. Driving that
+    // tick off the real clock made this flake under suite TP load (the PeriodicTimer and the poll
+    // loop both starved). A FakeTimeProvider removes that dependency: we advance the clock ourselves
+    // to fire the heartbeat on demand. The drain itself still does a real DEALLOCATE round-trip to
+    // PostgreSQL, so a bounded await remains, but it only covers fast protocol I/O, not the
+    // starvation-sensitive heartbeat scheduling that caused the flake.
     [TestMethod]
-    [Ignore("Flaky under concurrent test runs (multiple fast-tick Heartbeat instances contend on the thread pool). Verified passing in isolation — proves wire-side DEALLOCATE drains presence after eviction. Re-run individually when wanting confirmation: `dotnet test --filter Eviction_Drains_MaintenanceQueue_AndClearsPresence`.")]
     public async Task Eviction_Drains_MaintenanceQueue_AndClearsPresence()
     {
-        // Fast heartbeat so the MaintenanceFlow fires within test timeout.
+        var fake = new FakeTimeProvider();
         var tick = TimeSpan.FromMilliseconds(50);
         await using var ds = CreateDataSource(
             maxAutoPreparations: 2, autoMinimumUses: 3,
-            heartbeatInterval: tick, maintenanceInterval: tick);
+            heartbeatInterval: tick, maintenanceInterval: tick,
+            timeProvider: fake);
         await using var conn = await ds.OpenConnectionAsync(CancellationToken.None);
 
         const string sqlA = "select 300 as drain_a";
@@ -172,15 +182,18 @@ public class AutoPrepareWireTests
 
         var pg = conn.UnderlyingPgConnection!;
 
-        // Wait for maintenance flow to drain. Polls at 50ms. With the 50ms heartbeat tick we
-        // typically see the drain land within a few hundred ms. Five-second budget for safety
-        // against TP scheduling under concurrent test runs.
+        // The eviction fanout has already pushed the EvictDeallocate synchronously. Each iteration
+        // advances the fake clock one interval to deterministically fire a heartbeat (arming the
+        // MaintenanceFlow), then yields so the queued flow can run its DEALLOCATE. A frozen clock
+        // would only fire once, so we re-advance each loop to be robust against the heartbeat
+        // continuation not having armed before the first check.
         var deadline = DateTime.UtcNow.AddSeconds(5);
         while (DateTime.UtcNow < deadline)
         {
+            fake.Advance(tick);
             if (!pg.TrackedEntries.Any(e => e.Command.CommandText == sqlA))
                 break;
-            await Task.Delay(50);
+            await Task.Delay(20);
         }
 
         Assert.IsFalse(
