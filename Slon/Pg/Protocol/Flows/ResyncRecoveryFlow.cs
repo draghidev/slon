@@ -22,6 +22,7 @@ sealed class ResyncRecoveryFlow : PgClientFlow
     ValueTask _outstandingTrailing;
     bool _outstandingIsRead;
     bool _canWriteSync;
+    PgClientProtocol.Control? _control;
 
     /// The flow this recovery supplanted, carried so the policy can complete it when the
     /// recovery completes. The failed item's lifetime deliberately extends as far as the
@@ -54,6 +55,7 @@ sealed class ResyncRecoveryFlow : PgClientFlow
     {
         var recovery = new ResyncRecoveryFlow(supportsPipelining: true) { IsAsync = failedFlow.IsAsyncAtBind };
         recovery.GetExecutionControl(control).TransferInheritedRfqCount(inheritedRfqCount);
+        recovery._control = control;
         recovery.FailedFlow = failedFlow;
         recovery.FailureException = exception;
         recovery._outstandingTrailing = outstandingTrailing;
@@ -72,6 +74,7 @@ sealed class ResyncRecoveryFlow : PgClientFlow
         _outstandingTrailing = default;
         _outstandingIsRead = false;
         _canWriteSync = false;
+        _control = null;
         FailedFlow = null;
         FailureException = null;
     }
@@ -141,6 +144,11 @@ sealed class ResyncRecoveryFlow : PgClientFlow
                 // or we'd resolve it out from under it. Observe-and-discard, subordinate to our failure.
                 try { await _outstandingTrailing.ConfigureAwait(false); }
                 catch { /* subordinate to the failure we're recovering from */ }
+
+                // The read may have crossed inherited RFQs after Create snapshotted the count,
+                // decrementing the failed flow's own counter. Reconcile against its now-final live
+                // count so we drain only what remains, not what the read already consumed.
+                _drainCount = FailedFlow!.GetExecutionControl(_control!).RfqCount + (_canWriteSync ? 1 : 0);
             }
             var decoder = await context.GetDecoderAsync().ConfigureAwait(false);
             int remaining = _drainCount;

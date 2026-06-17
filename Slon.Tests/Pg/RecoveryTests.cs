@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using Slon.Pg;
 using Slon.Pg.Protocol;
 using Slon.Pg.Protocol.Flows;
@@ -69,7 +70,10 @@ public class RecoveryTests
         None,
         QueryNoFlush,
         ParseBindExecuteNoSync,
-        MultipleSyncsNoFlush
+        MultipleSyncsNoFlush,
+        // Two simple queries: two inherited RFQs, each with a real result (so a held read has a
+        // non-auto message to return and terminate on, unlike MultipleSyncsNoFlush's bare Syncs).
+        TwoQueriesNoFlush
     }
 
     // Test flow that lets each test pick its failure phase and write shape. Recovery's input
@@ -105,6 +109,11 @@ public class RecoveryTests
         /// recovery runs while the outstanding read is live (the definitive read-outstanding case).
         public TaskCompletionSource? PipelineReadAcquired { get; init; }
 
+        /// Number of messages the held read consumes before completing. >1 lets the read cross an
+        /// inherited RFQ boundary, so a test can park it before the boundary, fault, then let it
+        /// cross post-snapshot (the drain-count reconciliation probe).
+        public int HeldReadConsumeCount { get; init; } = 1;
+
         public FaultingFlow(bool async, FaultPhase phase, WriteShape shape)
             : base(supportsPipelining: true)
         {
@@ -133,6 +142,10 @@ public class RecoveryTests
                     encoder.WriteSync();
                     encoder.WriteSync();
                     break;
+                case WriteShape.TwoQueriesNoFlush:
+                    encoder.WriteQuery("select 1");
+                    encoder.WriteQuery("select 2");
+                    break;
             }
 
             AfterWrites?.Invoke();
@@ -142,7 +155,7 @@ public class RecoveryTests
 
             ValueTask pipelineTask;
             if (ControllablePipelineRead is { } readGate)
-                pipelineTask = HoldReadTurn(context, readGate, PipelineReadAcquired);
+                pipelineTask = HoldReadTurn(context, readGate, PipelineReadAcquired, HeldReadConsumeCount);
             else
                 pipelineTask = _phase is FaultPhase.PipelineTask ? FailedTask() : ValueTask.CompletedTask;
             ValueTask trailingTask;
@@ -171,12 +184,13 @@ public class RecoveryTests
             // read. This is the unfinished pipelineTask: when the recovery activates and robs the
             // turn, this read's next decoder USE fails the per-use validity check and faults - and
             // that late fault on an already-recovering flow is the recovery-of-recovery trigger.
-            static async ValueTask HoldReadTurn(Context context, TaskCompletionSource gate, TaskCompletionSource? acquired)
+            static async ValueTask HoldReadTurn(Context context, TaskCompletionSource gate, TaskCompletionSource? acquired, int consumeCount)
             {
                 PgDecoder decoder = await context.GetDecoderAsync().ConfigureAwait(false);
                 acquired?.TrySetResult();
                 _ = gate; // vestigial; the read parks on the wire, not the gate
-                await decoder.GetNextAsync().ConfigureAwait(false);
+                for (var i = 0; i < consumeCount; i++)
+                    await decoder.GetNextAsync().ConfigureAwait(false);
             }
         }
     }
@@ -667,5 +681,106 @@ public class RecoveryTests
         await RunAsync(protocol, "select 1");
 
         await protocol.CompleteAsync();
+    }
+
+    // Regression guard for the drain-count over-drain fix. Scripted no-PG harness: two RFQ-inducing
+    // writes (snapshot RfqCount = 2); the held read consumes one message before the trailing faults
+    // (parked before RFQ#1) and the rest after. With count 2 the second read crosses RFQ#1
+    // post-snapshot. Returns how the failed flow completed: its synthetic fault on success, a
+    // TimeoutException if recovery parked.
+    async Task<Exception?> RunDrainReconciliationScenario(int heldReadConsumeCount)
+    {
+        var options = PgTestPool.NewOptions();
+        var transport = new BackpressureWriteTransport(Handshake(), sendWindow: 1 << 20);
+        var protocol = PgClientProtocol.Create(new PgClientProtocolOptions(options));
+        await protocol.StartAsync(options, transport);
+
+        var releaseGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var acquired = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var trailing = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        var faulting = new FaultingFlow(async: true, FaultPhase.TrailingTask, WriteShape.TwoQueriesNoFlush)
+        {
+            ControllablePipelineRead = releaseGate,
+            PipelineReadAcquired = acquired,
+            ControllableTrailing = trailing,
+            HeldReadConsumeCount = heldReadConsumeCount,
+        };
+        Assert.IsTrue(protocol.TryQueue(faulting));
+        var completed = faulting.WaitForComplete().AsTask();
+
+        try
+        {
+            await acquired.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+            transport.ReleaseSegment(CommandComplete());
+            await Task.Delay(50);
+
+            trailing.TrySetException(new InvalidOperationException("synthetic trailing fault while read held"));
+            await Task.Delay(50);
+
+            transport.ReleaseSegment(ReadyForQuery());
+            transport.ReleaseSegment(CommandComplete());
+            transport.ReleaseSegment(ReadyForQuery());
+
+            try { await completed.WaitAsync(TimeSpan.FromSeconds(8)); return null; }
+            catch (Exception ex) { return ex; }
+        }
+        finally
+        {
+            try { await protocol.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(5)); }
+            catch { }
+        }
+    }
+
+    // Control: the held read consumes only its one message and finishes BEFORE the fault, so it
+    // never crosses an RFQ. Same recovery path and bytes as the repro below - the only difference
+    // is the crossing - so this passing isolates the crossing as the cause.
+    [TestMethod]
+    public async Task ReadStopsBeforeRfq_RecoveryDrainsClean()
+    {
+        var completion = await RunDrainReconciliationScenario(heldReadConsumeCount: 1);
+        Assert.IsNotInstanceOfType<TimeoutException>(completion, "control must not park: the read never crosses an RFQ");
+        Assert.IsInstanceOfType<InvalidOperationException>(completion, "failed flow should complete with its synthetic fault");
+    }
+
+    // The held read crosses RFQ#1 after recovery snapshots RfqCount, so DrainPhase must reconcile
+    // against the failed flow's live count and drain only the one remaining RFQ. Before the fix
+    // this timed out - recovery drained the snapshot and parked for an RFQ the read had consumed.
+    [TestMethod]
+    public async Task ReadCrossesRfqAfterSnapshot_RecoveryReconciles()
+    {
+        var completion = await RunDrainReconciliationScenario(heldReadConsumeCount: 2);
+        Assert.IsNotInstanceOfType<TimeoutException>(completion, "recovery over-drained: drained snapshotted RfqCount ignoring the RFQ the read crossed post-snapshot");
+        Assert.IsInstanceOfType<InvalidOperationException>(completion, "failed flow should complete with its synthetic fault once recovery reconciles");
+    }
+
+    static byte[] Handshake()
+    {
+        var b = new byte[64];
+        var o = 0;
+        b[o++] = (byte)'R'; BinaryPrimitives.WriteInt32BigEndian(b.AsSpan(o), 8); o += 4; BinaryPrimitives.WriteInt32BigEndian(b.AsSpan(o), 0); o += 4;
+        b[o++] = (byte)'K'; BinaryPrimitives.WriteInt32BigEndian(b.AsSpan(o), 12); o += 4; BinaryPrimitives.WriteInt32BigEndian(b.AsSpan(o), 4321); o += 4; BinaryPrimitives.WriteInt32BigEndian(b.AsSpan(o), 8765); o += 4;
+        b[o++] = (byte)'Z'; BinaryPrimitives.WriteInt32BigEndian(b.AsSpan(o), 5); o += 4; b[o++] = (byte)'I';
+        return b.AsSpan(0, o).ToArray();
+    }
+
+    static byte[] CommandComplete()
+    {
+        ReadOnlySpan<byte> body = "SELECT 1 "u8;
+        var msg = new byte[1 + 4 + body.Length];
+        msg[0] = (byte)'C';
+        BinaryPrimitives.WriteInt32BigEndian(msg.AsSpan(1), 4 + body.Length);
+        body.CopyTo(msg.AsSpan(5));
+        return msg;
+    }
+
+    static byte[] ReadyForQuery()
+    {
+        var msg = new byte[6];
+        msg[0] = (byte)'Z';
+        BinaryPrimitives.WriteInt32BigEndian(msg.AsSpan(1), 5);
+        msg[5] = (byte)'I';
+        return msg;
     }
 }
