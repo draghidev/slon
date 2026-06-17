@@ -1,5 +1,4 @@
 using System.Diagnostics;
-using System.Net;
 using Slon.Pg;
 using Slon.Pg.Protocol;
 using Slon.Pg.Protocol.Flows;
@@ -17,7 +16,7 @@ public class PgConnectionTests
 {
     static PgClientOptions NewOptions() => new()
     {
-        EndPoint = new IPEndPoint(IPAddress.Loopback, 5432),
+        EndPoint = TestEndPoint.Default,
         Username = "postgres",
         Password = "postgres123",
         Database = "postgres",
@@ -26,7 +25,7 @@ public class PgConnectionTests
     static async Task<PgConnection> ConnectAsync()
     {
         var options = NewOptions();
-        var transport = await SocketStreamConnection.ConnectAsync((IPEndPoint)options.EndPoint);
+        var transport = await SocketStreamConnection.ConnectAsync(options.EndPoint);
         var conn = await PgConnection.CreateAsync(new PgClientProtocolOptions(options), options, transport);
         // No pool managing this conn. Mark in-service ourselves.
         conn.Start();

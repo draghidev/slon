@@ -63,7 +63,7 @@ sealed class SocketStreamConnection : TransportConnection, IDisposable, IAsyncDi
 
         return new(new SealedNetworkStream(socket, ownsSocket: true), options);
 
-        static void ConnectWithTimeout(Socket socket, IPEndPoint endPoint, TimeSpan timeout)
+        static void ConnectWithTimeout(Socket socket, EndPoint endPoint, TimeSpan timeout)
         {
             socket.Blocking = false;
             try
@@ -101,21 +101,23 @@ sealed class SocketStreamConnection : TransportConnection, IDisposable, IAsyncDi
         await _stream.DisposeAsync().ConfigureAwait(false);
     }
 
-    static IPEndPoint ResolveEndPoint(EndPoint endPoint)
+    static EndPoint ResolveEndPoint(EndPoint endPoint)
         => endPoint switch
         {
             DnsEndPoint dnsEndPoint
                 => new IPEndPoint(Dns.GetHostAddresses(dnsEndPoint.Host, dnsEndPoint.AddressFamily)[0], dnsEndPoint.Port),
             IPEndPoint value => value,
+            UnixDomainSocketEndPoint value => value,
             _ => throw new NotSupportedException("EndPoint not supported")
         };
 
-    static async ValueTask<IPEndPoint> ResolveEndPointAsync(EndPoint endPoint, CancellationToken cancellationToken = default)
+    static async ValueTask<EndPoint> ResolveEndPointAsync(EndPoint endPoint, CancellationToken cancellationToken = default)
         => endPoint switch
         {
             DnsEndPoint dnsEndPoint
                 => new IPEndPoint((await Dns.GetHostAddressesAsync(dnsEndPoint.Host, dnsEndPoint.AddressFamily, cancellationToken).ConfigureAwait(false))[0], dnsEndPoint.Port),
             IPEndPoint value => value,
+            UnixDomainSocketEndPoint value => value,
             _ => throw new NotSupportedException("EndPoint not supported")
         };
 

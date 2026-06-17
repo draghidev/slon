@@ -202,13 +202,11 @@ public class TransportTests
 
     static X509Certificate2 CreateSelfSignedCert()
     {
-        using var rsa = RSA.Create(2048);
-        var req = new CertificateRequest("CN=localhost", rsa, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+        using var ecdsa = ECDsa.Create(ECCurve.NamedCurves.nistP256);
+        var req = new CertificateRequest("CN=localhost", ecdsa, HashAlgorithmName.SHA256);
         var sanBuilder = new SubjectAlternativeNameBuilder();
         sanBuilder.AddDnsName("localhost");
         req.CertificateExtensions.Add(sanBuilder.Build());
-        var cert = req.CreateSelfSigned(DateTimeOffset.UtcNow.AddDays(-1), DateTimeOffset.UtcNow.AddDays(1));
-        var pfx = cert.Export(X509ContentType.Pfx);
-        return X509CertificateLoader.LoadPkcs12(pfx, password: null);
+        return req.CreateSelfSigned(DateTimeOffset.UtcNow.AddDays(-1), DateTimeOffset.UtcNow.AddDays(1));
     }
 }

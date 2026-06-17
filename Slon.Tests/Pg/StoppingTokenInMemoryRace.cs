@@ -190,8 +190,10 @@ public class StoppingTokenInMemoryRace
     static async Task<(byte[] handshake, IReadOnlyList<byte[]> segments)> CaptureAsync(PgClientOptions options)
     {
         Log("capture: connecting");
-        var sock = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp) { NoDelay = true };
-        await sock.ConnectAsync((IPEndPoint)options.EndPoint);
+        var sock = options.EndPoint is UnixDomainSocketEndPoint
+            ? new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified)
+            : new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp) { NoDelay = true };
+        await sock.ConnectAsync(options.EndPoint);
         var recStream = new RecordingStream(new NetworkStream(sock, ownsSocket: true));
         var transport = new StreamTransport(PipeReader.Create(recStream), PipeWriter.Create(recStream));
 

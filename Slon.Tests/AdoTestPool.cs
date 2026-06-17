@@ -1,5 +1,3 @@
-using System.Net;
-
 namespace Slon.Tests;
 
 // Assembly-scoped SlonDataSource for ADO-layer tests that complete cleanly with the default
@@ -15,7 +13,7 @@ static class AdoTestPool
     // pressure into one-wire-per-method and hide real concurrent-dispatch bugs.
     internal static SlonDataSourceOptions NewOptions() => new()
     {
-        EndPoint = new IPEndPoint(IPAddress.Loopback, 5432),
+        EndPoint = TestEndPoint.Default,
         Username = "postgres",
         Password = "postgres123",
         Database = "postgres",

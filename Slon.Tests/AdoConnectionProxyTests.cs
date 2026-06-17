@@ -1,5 +1,4 @@
 using System.Diagnostics;
-using System.Net;
 using Slon.Pg;
 using Slon.Pg.Protocol.Flows;
 using Slon.Pools;
@@ -16,7 +15,7 @@ public class AdoConnectionProxyTests
 {
     static PgClientOptions NewOptions() => new()
     {
-        EndPoint = new IPEndPoint(IPAddress.Loopback, 5432),
+        EndPoint = TestEndPoint.Default,
         Username = "postgres",
         Password = "postgres123",
         Database = "postgres",
