@@ -31,7 +31,7 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
             // the ActivatedFlow but its failed flow still has an in-flight read, resolve to the failed
             // flow until that read finishes. Otherwise the failed read decodes against the recovery's
             // read-state and its late fault re-enters nonexistent recovery-of-recovery.
-            if (activated is Flows.RecoveryDrainFlow { FailedReadOutstanding: true } recovery)
+            if (activated is Flows.ResyncRecoveryFlow { FailedReadOutstanding: true } recovery)
                 return recovery.FailedFlow!.GetExecutionControl(_control);
             return activated.GetExecutionControl(_control);
         }

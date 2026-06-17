@@ -7,7 +7,7 @@ using Slon.Transport;
 namespace Slon.Tests.Pg;
 
 // End-to-end tests for PgClientProtocol.Policy.TryRecoverItemFailure and the substitute
-// RecoveryDrainFlow it returns. Each test wires a real PG connection, queues a deliberately
+// ResyncRecoveryFlow it returns. Each test wires a real PG connection, queues a deliberately
 // throwing flow at a chosen failure point, then verifies that subsequent flows on the same
 // protocol still succeed (the wire was cleaned by the recovery item).
 //
@@ -16,7 +16,7 @@ namespace Slon.Tests.Pg;
 //
 // Verification contract note. The pipeline framework deliberately does NOT complete a failed
 // item when TryRecoverItemFailure returns true - the recovery item substitutes for it, and the
-// POLICY completes the failed flow when the recovery completes (RecoveryDrainFlow.BindFailedFlow
+// POLICY completes the failed flow when the recovery completes (ResyncRecoveryFlow.BindFailedFlow
 // -> CompleteItem's binding discharge; the failed item's lifetime extends as far as the
 // recovery does). Most tests still verify via the next flow succeeding (the wire was cleaned);
 // the failed flow's own completion carries its original exception, plus the recovery's fault
@@ -386,7 +386,7 @@ public class RecoveryTests
     }
 
     // The recovery itself failing: the transport is dead by the time the recovery drain tries
-    // to flush, so the RecoveryDrainFlow faults instead of cleaning the wire. Two contracts
+    // to flush, so the ResyncRecoveryFlow faults instead of cleaning the wire. Two contracts
     // under test: (1) recovery-of-recovery does not exist - the recovery's own fault completes
     // it directly (in a Debug run, a policy re-consult would fire TryRecoverItemFailure's
     // assert and crash the test); (2) the binding discharge still completes the FAILED flow on
@@ -478,8 +478,8 @@ public class RecoveryTests
 
     // Substitution-substrate contract: PipelineTask kind with a still-in-flight trailing.
     // The framework captures the failed flow's TrailingExecutionTask into the context's
-    // OutstandingPhaseTask and the policy hands it to RecoveryDrainFlow.BindFailedFlow.
-    // RecoveryDrainFlow's ExecuteAuto sees the trailing as not-completed-successfully and
+    // OutstandingPhaseTask and the policy hands it to ResyncRecoveryFlow.BindFailedFlow.
+    // ResyncRecoveryFlow's ExecuteAuto sees the trailing as not-completed-successfully and
     // takes the move-to-trailing path: returns FlowTasks fast (no inline-await wedge of the
     // executor pump), and the actual await of outstanding + WriteSync happens in the
     // recovery's trailing phase running concurrently with its DrainPhase. Pending outstanding
@@ -561,7 +561,7 @@ public class RecoveryTests
     // failed read would decode the wrong message and its late fault would re-enter nonexistent
     // recovery-of-recovery. The fix is what this test pins: the policy forwards OutstandingPhaseTask
     // for the TrailingExecutionTask kind (outstandingIsRead), the decoder permit
-    // (RecoveryDrainFlow.FailedReadOutstanding -> PgDecoder.CurrentExecutionControl) resolves to the
+    // (ResyncRecoveryFlow.FailedReadOutstanding -> PgDecoder.CurrentExecutionControl) resolves to the
     // FailedFlow so the in-flight read finishes on its OWN control, and DrainPhase awaits that read
     // before the recovery takes the read turn. A timeout/desync here means that sequencing
     // regressed.
@@ -653,7 +653,7 @@ public class RecoveryTests
         var faulting = new FaultingFlow(async: true, FaultPhase.PipelineTask, WriteShape.ParseBindExecuteNoSync);
         Assert.IsTrue(protocol.TryQueue(faulting));
 
-        // Failed flow completes via the binding discharge (RecoveryDrainFlow.FailedFlow
+        // Failed flow completes via the binding discharge (ResyncRecoveryFlow.FailedFlow
         // captured at TryRecoverItemFailure time; CompleteItem fires on the failed flow when
         // recovery completes). Its exception is the original synthetic fault, NOT the
         // recovery's behavior.

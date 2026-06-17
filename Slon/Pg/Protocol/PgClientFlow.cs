@@ -569,7 +569,7 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IThreadPoolWorkItem
             // legitimately during the recovery's tenure (recovery took the executor slot in
             // its place; the failed flow's write phase is extended through the substitute).
             // Cold path - never hit on the hot common case.
-            if (executing is Flows.RecoveryDrainFlow recovery && ReferenceEquals(flow, recovery.FailedFlow))
+            if (executing is Flows.ResyncRecoveryFlow recovery && ReferenceEquals(flow, recovery.FailedFlow))
                 return;
             ThrowHelper.ThrowInvalidOperation(
                 "Flow cannot write anymore. All writes must happen during the first execution phase " +

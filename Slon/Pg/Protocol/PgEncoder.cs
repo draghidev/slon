@@ -279,7 +279,7 @@ readonly struct PgEncoder
 
     // Recovery hook: pad a torn in-flight message to its declared length with zero bytes so the
     // server's framing reader exits the message at the declared boundary. Returns the byte count
-    // written (0 = nothing in flight or message was already complete). Callers (RecoveryDrainFlow)
+    // written (0 = nothing in flight or message was already complete). Callers (ResyncRecoveryFlow)
     // pair this with a subsequent WriteSync + flush so the server discards the padded message
     // garbage as an ERROR and resyncs on the Sync's RFQ.
     internal int PadCurrentMessage() => _writer.CompleteCurrentMessageWithPadding();

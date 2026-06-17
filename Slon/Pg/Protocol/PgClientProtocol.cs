@@ -483,7 +483,7 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
             // before OnCompleted's depth-0 CAS, the comparand matches the new activation (ABA) and
             // severs a live binding. Ordering the release first closes this by causality. Recovery
             // items take the hardened path (capture + try/finally) out-of-line to keep this inlineable.
-            if (item is RecoveryDrainFlow { FailedFlow: { } failedFlow } recovery)
+            if (item is ResyncRecoveryFlow { FailedFlow: { } failedFlow } recovery)
             {
                 CompleteRecoveryItem(recovery, failedFlow, remainingDepth, exception);
                 return;
@@ -494,25 +494,25 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
         }
 
         [MethodImpl(MethodImplOptions.NoInlining)]
-        void CompleteRecoveryItem(RecoveryDrainFlow recovery, PgClientFlow failedFlow, int remainingDepth, Exception? exception)
+        void CompleteRecoveryItem(ResyncRecoveryFlow resyncRecovery, PgClientFlow failedFlow, int remainingDepth, Exception? exception)
         {
-            // Capture the binding BEFORE Complete fires the recovery's completion action:
+            // Capture the binding BEFORE Complete fires the resyncRecovery's completion action:
             // completion is the reuse gate, and a Reset on reuse clears the binding (same
             // causality as the OnCompleted-before-Complete ordering below).
-            var failureException = recovery.FailureException!;
+            var failureException = resyncRecovery.FailureException!;
 
-            _protocol.FlowControl.OnCompleted(recovery, remainingDepth);
+            _protocol.FlowControl.OnCompleted(resyncRecovery, remainingDepth);
             try
             {
-                recovery.GetExecutionControl(_protocol.FlowControl).Complete(exception);
+                resyncRecovery.GetExecutionControl(_protocol.FlowControl).Complete(exception);
             }
             finally
             {
-                // A recovery's completion ends its supplanted flow's extended lifetime: the wire is
+                // A resyncRecovery's completion ends its supplanted flow's extended lifetime: the wire is
                 // resynced (or dead) and nothing references the failed tenure. The supplanted flow
-                // completes on EVERY exit (including the recovery's own fault), or its caller strands.
-                // A recovery that also died attaches its fault behind the original failure as inner.
-                // Single-level by construction: TryRecoverItemFailure refuses RecoveryDrainFlow items.
+                // completes on EVERY exit (including the resyncRecovery's own fault), or its caller strands.
+                // A resyncRecovery that also died attaches its fault behind the original failure as inner.
+                // Single-level by construction: TryRecoverItemFailure refuses ResyncRecoveryFlow items.
                 failedFlow.GetExecutionControl(_protocol.FlowControl).Complete(
                     exception is null ? failureException : new AggregateException(failureException, exception));
             }
@@ -579,7 +579,7 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
             // Recovery-on-recovery does not exist (the framework guarantees it: a committed
             // recovery's late fault travels as a marker exception and completes directly,
             // never consulted here).
-            System.Diagnostics.Debug.Assert(failedItem is not RecoveryDrainFlow,
+            System.Diagnostics.Debug.Assert(failedItem is not ResyncRecoveryFlow,
                 "Recovery item routed back into TryRecoverItemFailure - recovery-on-recovery must not exist.");
 
             // Pipeline is shutting down: skip recovery and let the framework propagate the failure.
@@ -617,7 +617,7 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
             // (CompleteItem fires when the recovery completes). The failed item's lifetime extends as
             // far as the recovery, so its dispatch state, RFQ bookkeeping, and registrations release
             // before the instance can be reused.
-            recoveryItem = RecoveryDrainFlow.Create(
+            recoveryItem = ResyncRecoveryFlow.Create(
                 _protocol.FlowControl, failedItem, context.Exception, outstandingPhase, outstandingIsRead, failedItemControl.RfqCount, canWriteSync);
             return true;
         }

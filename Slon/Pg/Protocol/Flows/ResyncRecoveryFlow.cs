@@ -16,7 +16,7 @@ namespace Slon.Pg.Protocol.Flows;
 //
 // Scope: resyncs non-COPY, non-torn wire state. COPY terminators and torn-frame repair are future
 // work; see the markers in ExecuteAuto.
-sealed class RecoveryDrainFlow : PgClientFlow
+sealed class ResyncRecoveryFlow : PgClientFlow
 {
     int _drainCount;
     ValueTask _outstandingTrailing;
@@ -43,7 +43,7 @@ sealed class RecoveryDrainFlow : PgClientFlow
 
     // A recovery is always bound to a failed flow. drainCount = inheritedRfqCount plus the
     // recovery's own Sync when canWriteSync. The rfq transfer routes through ExecutionControl.
-    public static RecoveryDrainFlow Create(
+    public static ResyncRecoveryFlow Create(
         PgClientProtocol.Control control,
         PgClientFlow failedFlow,
         Exception exception,
@@ -52,7 +52,7 @@ sealed class RecoveryDrainFlow : PgClientFlow
         int inheritedRfqCount,
         bool canWriteSync)
     {
-        var recovery = new RecoveryDrainFlow(supportsPipelining: true) { IsAsync = failedFlow.IsAsyncAtBind };
+        var recovery = new ResyncRecoveryFlow(supportsPipelining: true) { IsAsync = failedFlow.IsAsyncAtBind };
         recovery.GetExecutionControl(control).TransferInheritedRfqCount(inheritedRfqCount);
         recovery.FailedFlow = failedFlow;
         recovery.FailureException = exception;
@@ -63,7 +63,7 @@ sealed class RecoveryDrainFlow : PgClientFlow
         return recovery;
     }
 
-    RecoveryDrainFlow(bool supportsPipelining) : base(supportsPipelining) { }
+    ResyncRecoveryFlow(bool supportsPipelining) : base(supportsPipelining) { }
 
     public new void Reset()
     {
