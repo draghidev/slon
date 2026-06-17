@@ -37,6 +37,7 @@ sealed class PgClientProtocolOptions
         ReadTimeout = options.ReadTimeout;
         HeartbeatInterval = options.HeartbeatInterval;
         FlowActivationTimeout = options.ConnectionTimeout;
+        TimeProvider = options.TimeProvider;
     }
 
     public TimeProvider TimeProvider { get; set; } = TimeProvider.System;

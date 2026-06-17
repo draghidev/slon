@@ -52,6 +52,8 @@ public record SlonDataSourceOptions
     // surface would require thinking through "what's a sensible knob for end users."
     internal TimeSpan HeartbeatInterval { get; init; } = TimeSpan.FromSeconds(1);
     internal TimeSpan MaintenanceInterval { get; init; } = TimeSpan.FromSeconds(1);
+    // Clock driving the heartbeat (and through it maintenance). Tests inject a FakeTimeProvider.
+    internal TimeProvider TimeProvider { get; init; } = TimeProvider.System;
 
     internal PgClientOptions ToPgClientOptions() => new()
     {
@@ -61,6 +63,7 @@ public record SlonDataSourceOptions
         Password = Password,
         HeartbeatInterval = HeartbeatInterval,
         MaintenanceInterval = MaintenanceInterval,
+        TimeProvider = TimeProvider,
     };
 
     internal bool Validate()
@@ -203,6 +206,7 @@ public sealed class SlonDataSource: DbDataSource
                     {
                         MaxConnections = _options.MaxPoolSize,
                         HeartbeatInterval = _options.HeartbeatInterval,
+                        TimeProvider = _options.TimeProvider,
                     });
                 _clientFactory = factory;
                 _dbDependencies = deps;

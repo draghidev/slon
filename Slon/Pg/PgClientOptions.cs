@@ -10,6 +10,9 @@ sealed class PgClientOptions
     // maintenance flow is scheduled. Setting this larger than HeartbeatInterval grows batches at
     // the cost of cleanup latency.
     internal TimeSpan MaintenanceInterval { get; init; } = TimeSpan.FromSeconds(1);
+    // Clock for the pool heartbeat and protocol timers. Tests inject a FakeTimeProvider to drive
+    // maintenance deterministically; production leaves it as the system clock.
+    internal TimeProvider TimeProvider { get; init; } = TimeProvider.System;
 
     public required EndPoint EndPoint { get; init; }
     public required string Username { get; init; }
