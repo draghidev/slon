@@ -552,6 +552,11 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public void ActivateHeadItem(PgClientFlow item, bool preferAsync = true)
         {
+            // Bind the decoder synchronously now: the pipeline has just published item to the
+            // ActivatedItem slot on this thread, so the bind reads the slot when it agrees with item.
+            // Only the body wake is deferred below.
+            _protocol.FlowControl.BindDecoder(item);
+
             // Inline-activate when the framework allows it (preferAsync=false) or the flow is sync:
             // sync flows park on a kernel wait-handle signal, bounded cost, safe under the advancer
             // latch. Async flows can attach arbitrary await continuations, so they go through TP.
@@ -766,15 +771,24 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
             return flow.GetExecutionControl(this).ExecuteAuto();
         }
 
-        internal void Activate(PgClientFlow flow)
+        // Bind the shared decoder to the flow being activated. Runs synchronously inside the policy's
+        // ActivateHeadItem, where the pipeline has just published this flow to the ActivatedItem slot
+        // on the same thread, so Initialize reads the slot when it provably agrees with the flow.
+        // Deferring the bind into the TP wake let a dispatch outlive the flow's retirement and bind
+        // against a depth-0-cleared slot.
+        internal void BindDecoder(PgClientFlow flow)
         {
             var control = flow.GetExecutionControl(this);
             if (!control.IsPipelined)
                 Interlocked.Decrement(ref protocol._pipelineStalls);
-            var decoder = protocol._pgDecoder;
-            decoder.Initialize(this);
-            control.Activate(decoder);
+            protocol._pgDecoder.Initialize(this);
         }
+
+        // Wake the flow's body with the bound decoder. Resumes the body inline, so async flows run this
+        // off the executor via the TP dispatch. Safe to lag the flow's retirement: TrySetResult no-ops
+        // on a flow the abort already faulted.
+        internal void Activate(PgClientFlow flow)
+            => flow.GetExecutionControl(this).Activate(protocol._pgDecoder);
 
         internal void OnCompleted(PgClientFlow flow, int remainingDepth)
         {

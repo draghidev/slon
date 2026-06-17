@@ -21,6 +21,11 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IThreadPoolWorkItem
         var control = _pendingActivationControl;
         Debug.Assert(control is not null);
         _pendingActivationControl = null;
+        // The decoder bind already ran synchronously at activation; this dispatch is only the body
+        // wake. Skip it for a flow the abort retired before the dispatch ran: its activation source is
+        // already faulted so the wake would no-op, and skipping keeps us off a dead tenure.
+        if (Volatile.Read(ref _completed))
+            return;
         control!.Activate(this);
     }
 
