@@ -75,6 +75,9 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
         _callerInteractionCore.Initialize();
     }
 
+    // Interactive: a command carries a caller's patience (ConnectionTimeout), so arm the activation timeout.
+    protected override bool EnableActivationTimeout => true;
+
     internal static CommandFlow CreateUninitialized() => new();
 
     public CommandFlow(bool async, params ReadOnlySpan<Command> commands) : this()

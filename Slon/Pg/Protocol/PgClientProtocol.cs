@@ -435,6 +435,8 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
     internal ValueTask Heartbeat(TimeSpan period)
     {
         var control = FlowControl;
+        // Wrong-tenure hazard if a timeout-armed flow is ever pooled (enforced against in
+        // PgClientFlow.Reset). The fix's per-flow placement-stamp capture lands here.
         foreach (var flow in GetFlows())
         {
             try

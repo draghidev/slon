@@ -125,6 +125,15 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IThreadPoolWorkItem
     public void Reset()
     {
         Debug.Assert(IsPending || IsCompleted, "Cannot reset a flow that is mid-execution.");
+        // Enforcement (TODO until landed). Pooling (reset + reuse) a flow that arms the activation
+        // timeout is unsafe: the heartbeat's activation-timeout TrySetException is generation-agnostic,
+        // so a recycled instance can be wrong-tenure-completed by a stale timeout from the prior tenure.
+        // The fix is a global monotonic placement stamp carried with the item and on the flow, validated
+        // at the completer (tear-tolerant by uniqueness, no seqlock; failure reduces to a full int
+        // rollover, a fail-loud TimeoutException at worst). Until that lands, refuse to recycle a
+        // timeout-armed flow rather than let the race silently reappear.
+        if (EnableActivationTimeout)
+            ThrowHelper.ThrowInvalidOperation("Cannot pool a flow with EnableActivationTimeout: a recycled instance can be wrong-tenure-completed by a stale activation timeout. Implement generation-checked completion first.");
         _started = false;
         _completed = false;
         _completionTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -134,7 +143,11 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IThreadPoolWorkItem
         OnReset();
     }
 
-
+    // Interactive flows (CommandFlow) override this to opt in to the activation timeout, which models
+    // a caller's patience (ConnectionTimeout). Background flows have no caller, so by default they
+    // wait indefinitely for activation rather than busy-looping queue/timeout/re-arm, and stay off
+    // the heartbeat's generation-agnostic timeout completer.
+    protected virtual bool EnableActivationTimeout => false;
 
     protected virtual void OnHeartbeat(TimeSpan interval) {}
     protected virtual void OnAbort(PgClientClosedException exception) {}
@@ -462,7 +475,9 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IThreadPoolWorkItem
             }
 
             flow._isAsyncAtBind = state == 1;
-            flow._remainingActivationTimeout = activationTimeout;
+            // Only interactive flows arm the activation timeout. Infinite means the heartbeat's
+            // timeout branch never fires for this flow (see OnHeartbeat).
+            flow._remainingActivationTimeout = flow.EnableActivationTimeout ? activationTimeout : Timeout.InfiniteTimeSpan;
         }
 
         // Tokens are routed from Control (protocol-owned). No per-flow storage.
@@ -521,6 +536,9 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IThreadPoolWorkItem
             // Same sentinel guard as PgDecoder.OnHeartbeat: InfiniteTimeSpan and Zero both mean "no
             // activation timeout". Without it an infinite budget reads as instantly expired and the
             // first heartbeat tick times out any flow still pending activation.
+            // Wrong-tenure hazard if a timeout-armed flow is ever pooled (this TrySetException is
+            // generation-agnostic). Enforced against in PgClientFlow.Reset; the gen-checked completer
+            // lands here.
             if (flow._remainingActivationTimeout != Timeout.InfiniteTimeSpan && flow._remainingActivationTimeout != TimeSpan.Zero
                 && flow._activationTaskSource.GetStatus(flow._activationTaskSource.Version) is ValueTaskSourceStatus.Pending
                 && (flow._remainingActivationTimeout -= interval) <= TimeSpan.Zero)

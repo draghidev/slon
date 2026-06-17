@@ -62,6 +62,9 @@ sealed class AdoConnectionProxy : IDisposable, IAsyncDisposable
     public CommandFlow RentCommandFlow(bool async, in CommandFlowOptions options)
     {
         return new CommandFlow(async, options);
+        // Re-enabling this (and ReturnCommandFlow) pools CommandFlow, which arms the activation timeout.
+        // PgClientFlow.Reset throws on that combination until generation-checked completion lands (the
+        // wrong-tenure heartbeat hazard).
         // return Interlocked.Exchange(ref _cachedFlow, null) ?? new();
     }
 
