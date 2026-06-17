@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Runtime.CompilerServices;
 using Draghi.Pipelining;
 using Draghi.Pipelining.Internal;
 
@@ -342,13 +343,24 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
             return false;
         }
 
-        /// Miss path. The common no-flush wait takes the thin signal shape. Flush-before-wait is
-        /// intrinsically async (in-flight flows have written queries the server hasn't seen, so
-        /// without the flush their read phase hangs), so that case rides the Task shape.
+        /// Miss path. The common no-flush wait takes the thin signal shape. A flush is needed when
+        /// in-flight flows have written queries the server hasn't seen (without it their read phase
+        /// hangs), but the flush itself almost always completes inline (the socket send buffer has
+        /// room), so we flush synchronously and fall through to the same thin signal. Only genuine
+        /// write backpressure - flush not completing inline - rides the Task shape.
         public WaitForNextAwaitable WaitForNextAsync()
         {
             if (_state.Protocol.UnflushedBytes is not 0)
-                return WaitForNextAwaitable.FromTask(FlushThenWaitAsync());
+            {
+                // CancellationToken.None on purpose: abort is gated inside the writer, whose flush
+                // runs on its own _cts (linked to AbortToken) and translates to closed on fire, so
+                // a faulted flush surfaces below as not-completed-successfully and rethrows. The
+                // passed token is only the per-flow escape hatch, which the executor's wait doesn't use.
+                var flushTask = _state.Protocol.FlushAsync(CancellationToken.None);
+                if (!flushTask.IsCompletedSuccessfully)
+                    return WaitForNextAwaitable.FromTask(FlushThenWaitAsync(flushTask));
+                flushTask.GetAwaiter().GetResult();
+            }
             return WaitCore();
         }
 
@@ -398,12 +410,12 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
             return wakeSignal.Arm();
         }
 
-        async ValueTask<bool> FlushThenWaitAsync()
+        // Only reached on real write backpressure (the flush didn't complete inline), so a pooled
+        // box is plenty - the promise-reuse builder would be overkill for how rarely this fires.
+        [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
+        async ValueTask<bool> FlushThenWaitAsync(ValueTask flushTask)
         {
-            // CancellationToken.None on purpose: in-flight flows have written bytes that must
-            // reach the wire so their read phase can drain. The writer's own _cts (linked to
-            // AbortToken) is the correct cancellation gate for transport-level abort.
-            await _state.Protocol.FlushAsync(CancellationToken.None).ConfigureAwait(false);
+            await flushTask.ConfigureAwait(false);
             return await WaitCore();
         }
 
