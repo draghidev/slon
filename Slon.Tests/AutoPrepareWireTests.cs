@@ -1,5 +1,3 @@
-using Microsoft.Extensions.Time.Testing;
-
 namespace Slon.Tests;
 
 // Wire-level smoke tests for auto-prepare. Each test drives commands against real PostgreSQL,
@@ -19,8 +17,7 @@ public class AutoPrepareWireTests
         int autoMinimumUses = 5,
         int maxPoolSize = 4,
         TimeSpan? heartbeatInterval = null,
-        TimeSpan? maintenanceInterval = null,
-        TimeProvider? timeProvider = null)
+        TimeSpan? maintenanceInterval = null)
         => AdoTestPool.NewIsolatedDataSource(o => o with
         {
             MaxPoolSize = maxPoolSize,
@@ -28,7 +25,6 @@ public class AutoPrepareWireTests
             AutoPreparationMinimumUses = autoMinimumUses,
             HeartbeatInterval = heartbeatInterval ?? TimeSpan.FromSeconds(1),
             MaintenanceInterval = maintenanceInterval ?? TimeSpan.FromSeconds(1),
-            TimeProvider = timeProvider ?? TimeProvider.System,
         });
 
     [TestMethod]
@@ -155,57 +151,60 @@ public class AutoPrepareWireTests
         }
     }
 
-    // The MaintenanceFlow that drains the EvictDeallocate fires on a heartbeat tick. Driving that
-    // tick off the real clock made this flake under suite TP load (the PeriodicTimer and the poll
-    // loop both starved). A FakeTimeProvider removes that dependency: we advance the clock ourselves
-    // to fire the heartbeat on demand. The drain itself still does a real DEALLOCATE round-trip to
-    // PostgreSQL, so a bounded await remains, but it only covers fast protocol I/O, not the
-    // starvation-sensitive heartbeat scheduling that caused the flake.
+    // Eviction queues an EvictDeallocate for the LRU victim; draining it must clear the victim from
+    // the connection's presence map. Two things made the old version flake:
+    //
+    //  1. The drain rode a heartbeat tick. Waiting on that real-time tick starved under suite TP
+    //     load (a FakeTimeProvider didn't help either, since the continuation responding to the tick
+    //     is itself a ThreadPool work item). We instead push a probe carrying a completion TCS:
+    //     PushMaintenance force-arms a MaintenanceFlow immediately onto the protocol executor (the
+    //     reliable path commands use), and FIFO ordering means the probe's completion fires only
+    //     after the EvictDeallocate ahead of it has drained. A Close against a nonexistent statement
+    //     is a no-op per protocol (CloseComplete), so the probe touches no real server state.
+    //
+    //  2. The LRU stamp is Environment.TickCount64 ("statistical only", ~15ms resolution), so sqlA
+    //     and sqlB used back-to-back could tie and either become the approximate-LRU victim. A 50ms
+    //     gap after each group puts them in distinct ticks, making sqlA deterministically the oldest.
     [TestMethod]
     public async Task Eviction_Drains_MaintenanceQueue_AndClearsPresence()
     {
-        var fake = new FakeTimeProvider();
-        var tick = TimeSpan.FromMilliseconds(50);
-        await using var ds = CreateDataSource(
-            maxAutoPreparations: 2, autoMinimumUses: 3,
-            heartbeatInterval: tick, maintenanceInterval: tick,
-            timeProvider: fake);
+        await using var ds = CreateDataSource(maxAutoPreparations: 2, autoMinimumUses: 3);
         await using var conn = await ds.OpenConnectionAsync(CancellationToken.None);
 
         const string sqlA = "select 300 as drain_a";
         const string sqlB = "select 301 as drain_b";
         const string sqlC = "select 302 as drain_c";
 
+        // Separate the access stamps so sqlA is unambiguously the LRU victim. The gap must exceed
+        // the TickCount64 resolution; 50ms is comfortably above it.
+        var stampGap = TimeSpan.FromMilliseconds(50);
         await RunN(conn, sqlA, 4);
+        await Task.Delay(stampGap);
         await RunN(conn, sqlB, 4);
+        await Task.Delay(stampGap);
         await RunN(conn, sqlC, 4);
 
         var pg = conn.UnderlyingPgConnection!;
 
-        // The eviction fanout has already pushed the EvictDeallocate synchronously. Each iteration
-        // advances the fake clock one interval to deterministically fire a heartbeat (arming the
-        // MaintenanceFlow), then yields so the queued flow can run its DEALLOCATE. A frozen clock
-        // would only fire once, so we re-advance each loop to be robust against the heartbeat
-        // continuation not having armed before the first check.
-        var deadline = DateTime.UtcNow.AddSeconds(5);
-        while (DateTime.UtcNow < deadline)
-        {
-            fake.Advance(tick);
-            if (!pg.TrackedEntries.Any(e => e.Command.CommandText == sqlA))
-                break;
-            await Task.Delay(20);
-        }
+        // sqlA was evicted synchronously under the admission lock when sqlC crossed the cap: it is
+        // invalidated in presence with an EvictDeallocate queued, both before sqlC's run returned.
+        var sqlAEntry = pg.TrackedEntries.FirstOrDefault(e => e.Command.CommandText == sqlA);
+        Assert.IsNotNull(sqlAEntry.Command, "Expected sqlA still present (invalidated) before the drain.");
+        Assert.IsTrue(sqlAEntry.Command.IsInvalid, "Expected sqlA to be the invalidated LRU victim.");
+        Assert.IsTrue(
+            pg.PeekMaintenance().OfType<EvictDeallocate>().Any(e => e.Tracked.CommandText == sqlA),
+            "Expected a queued EvictDeallocate for the evicted sqlA.");
 
+        var drained = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        pg.PushMaintenance(new CloseStatement("slon_test_drain_probe") { Completion = drained });
+        await drained.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+        // The completion fires from the flow's cleanup walk, after RemoveTracked for sqlA and before
+        // CommitMaintenanceRange. Presence is the meaningful invariant and is settled here; the queue
+        // may still be transiently linked, so we don't assert on it.
         Assert.IsFalse(
             pg.TrackedEntries.Any(e => e.Command.CommandText == sqlA),
-            "Expected MaintenanceFlow to have drained the EvictDeallocate and removed sqlA from presence within deadline.");
-
-        // The maintenance queue should also be empty after the drain (or at least not contain
-        // a stale EvictDeallocate for sqlA).
-        var pending = pg.PeekMaintenance();
-        Assert.IsFalse(
-            pending.OfType<EvictDeallocate>().Any(e => e.Tracked.CommandText == sqlA),
-            $"Did not expect a stale EvictDeallocate for sqlA after drain; queue: {pending.Length} items.");
+            "Expected the MaintenanceFlow to have drained the EvictDeallocate and removed sqlA from presence.");
     }
 
     [TestMethod]
