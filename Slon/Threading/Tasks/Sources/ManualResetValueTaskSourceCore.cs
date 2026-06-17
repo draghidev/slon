@@ -60,7 +60,9 @@ struct ManualResetValueTaskSourceCore<TResult>
         _capturedContext = null;
         _error = null;
         _result = default;
-        _completed = default;
+        // Release, written last: a concurrent completer's CAS (acquire) observing false then sees
+        // the resets above. Without it a racing TrySet could complete a half-reset source.
+        Volatile.Write(ref _completed, false);
     }
 
     /// <summary>Completes with a successful result.</summary>
