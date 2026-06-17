@@ -83,7 +83,8 @@ sealed class PipeSegmentEnumerator<TSegmenter, TSegment>(PipeReader reader, TSeg
             case OperationStatus.Done:
                 ArgumentOutOfRangeException.ThrowIfNegativeOrZero(_currentLength, "segmentLength");
                 _consumePosition = _currentLength <= result.Buffer.Length ? result.Buffer.GetPosition(_currentLength) : null;
-                _examinedPosition = result.Buffer.End;
+                // Stop examined at the segment boundary so trailing buffered bytes (next segment's data) stay visible to the next ReadAsync.
+                _examinedPosition = _consumePosition ?? result.Buffer.End;
                 return new(true);
             case OperationStatus.DestinationTooSmall:
                 ThrowHelper.ThrowInvalidOperation();
@@ -137,7 +138,8 @@ sealed class PipeSegmentEnumerator<TSegmenter, TSegment>(PipeReader reader, TSeg
                     case OperationStatus.Done:
                         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(_currentLength, "segmentLength");
                         _consumePosition = _currentLength <= result.Buffer.Length ? result.Buffer.GetPosition(_currentLength) : null;
-                        _examinedPosition = result.Buffer.End;
+                        // Stop examined at the segment boundary so trailing buffered bytes stay visible to the next ReadAsync.
+                        _examinedPosition = _consumePosition ?? result.Buffer.End;
                         return true;
                     case OperationStatus.DestinationTooSmall:
                         ThrowHelper.ThrowInvalidOperation();
@@ -233,7 +235,8 @@ sealed class PipeSegmentEnumerator<TSegmenter, TSegment>(PipeReader reader, TSeg
                 case OperationStatus.Done:
                     ArgumentOutOfRangeException.ThrowIfNegativeOrZero(_currentLength, "segmentLength");
                     _consumePosition = _currentLength <= result.Buffer.Length ? result.Buffer.GetPosition(_currentLength) : null;
-                    _examinedPosition = result.Buffer.End;
+                    // Stop examined at the segment boundary so trailing buffered bytes stay visible to the next ReadAsync.
+                    _examinedPosition = _consumePosition ?? result.Buffer.End;
                     return true;
                 case OperationStatus.DestinationTooSmall:
                     ThrowHelper.ThrowInvalidOperation();
