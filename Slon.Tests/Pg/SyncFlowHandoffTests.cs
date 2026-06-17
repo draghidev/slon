@@ -1,6 +1,3 @@
-using Microsoft.VisualStudio.TestTools.UnitTesting;
-using Slon.Pg.Protocol;
-
 namespace Slon.Tests.Pg;
 
 // Focus: the guarantees PgClientFlowSource's sync handoff promises that the basic completion

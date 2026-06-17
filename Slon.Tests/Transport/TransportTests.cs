@@ -3,7 +3,6 @@ using System.Net.Security;
 using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
-using Microsoft.VisualStudio.TestTools.UnitTesting;
 using Slon.Transport;
 
 namespace Slon.Tests.Transport;

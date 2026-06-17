@@ -1,4 +1,3 @@
-using Microsoft.VisualStudio.TestTools.UnitTesting;
 using Slon.Pg;
 using Slon.Pg.Protocol;
 using Slon.Pg.Protocol.Flows;
@@ -10,8 +9,8 @@ namespace Slon.Tests.Pg;
 // Hammers two patterns inside a single test method so the loop runs in one process — much faster
 // per attempt than restarting the test runner per iteration.
 //
-// Iterations override via DRAGHI_STRESS_ITERATIONS (default 50). Default is a fast regression
-// guard now the race is fixed; explicit stress runs override (e.g. DRAGHI_STRESS_ITERATIONS=2000).
+// Iterations override via SLON_STRESS_ITERATIONS (default 50). Default is a fast regression
+// guard now the race is fixed; explicit stress runs override (e.g. SLON_STRESS_ITERATIONS=2000).
 // Each test runs isolated against its own protocol so a failure inside the loop doesn't poison
 // sibling tests.
 [TestClass]
@@ -21,7 +20,7 @@ public class RecoveryStressTests
     {
         get
         {
-            var raw = Environment.GetEnvironmentVariable("DRAGHI_STRESS_ITERATIONS");
+            var raw = Environment.GetEnvironmentVariable("SLON_STRESS_ITERATIONS");
             return int.TryParse(raw, out var n) && n > 0 ? n : 50;
         }
     }

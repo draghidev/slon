@@ -1,4 +1,3 @@
-using Microsoft.VisualStudio.TestTools.UnitTesting;
 using Slon.Tests.Pg;
 
 // Method-level parallelism by default. Classes that can't tolerate it

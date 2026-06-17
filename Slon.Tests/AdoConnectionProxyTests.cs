@@ -1,8 +1,6 @@
 using System.Diagnostics;
 using System.Net;
-using Microsoft.VisualStudio.TestTools.UnitTesting;
 using Slon.Pg;
-using Slon.Pg.Protocol;
 using Slon.Pg.Protocol.Flows;
 using Slon.Pools;
 using Slon.Transport;

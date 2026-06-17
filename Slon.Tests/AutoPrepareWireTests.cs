@@ -1,7 +1,3 @@
-using System.Net;
-using Microsoft.VisualStudio.TestTools.UnitTesting;
-using Slon;
-
 namespace Slon.Tests;
 
 // Wire-level smoke tests for auto-prepare. Each test drives commands against real PostgreSQL,

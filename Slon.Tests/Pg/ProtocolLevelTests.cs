@@ -1,5 +1,4 @@
 using System.Diagnostics;
-using Microsoft.VisualStudio.TestTools.UnitTesting;
 using Slon.Pg;
 using Slon.Pg.Protocol.Flows;
 

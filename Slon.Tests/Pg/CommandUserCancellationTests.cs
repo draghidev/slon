@@ -1,5 +1,4 @@
 using Slon.Pg;
-using Slon.Pg.Protocol;
 using Slon.Pg.Protocol.Flows;
 
 namespace Slon.Tests.Pg;

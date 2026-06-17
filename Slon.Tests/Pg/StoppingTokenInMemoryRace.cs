@@ -1,14 +1,8 @@
-using System;
 using System.Buffers;
-using System.Collections.Generic;
 using System.Diagnostics;
-using System.Net;
 using System.Net.Sockets;
 using System.IO.Pipelines;
-using System.Threading;
-using System.Threading.Tasks;
 using Microsoft.Extensions.Time.Testing;
-using Microsoft.VisualStudio.TestTools.UnitTesting;
 using Slon.Pg;
 using Slon.Pg.Protocol;
 using Slon.Pg.Protocol.Flows;
