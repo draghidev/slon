@@ -702,8 +702,9 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                 flow.IsAsync = false;
             }
 
-            // We reset the source here to mirror the async side.
-            flow._enumeratorMoveNextTaskSource.Reset();
+            // See MoveNextAsync: rearm only once the body has run; the first-call source is fresh.
+            if (Volatile.Read(ref flow._bodyStarted))
+                flow._enumeratorMoveNextTaskSource.Reset();
             // Two wake reasons: a continuation was registered (drive the body forward inline)
             // or the body signaled progress (a result, completion, or fault landed on the
             // move-next task source while we were parked). In the progress-only case there is
@@ -749,8 +750,13 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                     flow._enumeratorMoveNextTaskSource.CanCompleteConcurrently = true;
             }
 
-            // We reset the source ourselves in case the flow isn't waiting yet, as we must return a fresh task.
-            flow._enumeratorMoveNextTaskSource.Reset();
+            // Rearm only a source the body already completed. Before the body runs the source is
+            // still fresh from OnReset, and a never-started flow can be faulted by the framework
+            // (OnComplete -> HandleException) concurrently; resetting here would be the consumer
+            // write that races that fault. Gated on _bodyStarted the framework stays the sole writer
+            // on the never-started path, and once the body runs it is the sole gate-ordered completer.
+            if (Volatile.Read(ref flow._bodyStarted))
+                flow._enumeratorMoveNextTaskSource.Reset();
             // TrySet: CancelPendingWait (abort) can fault the gate concurrently. If it won the CAS,
             // no-op here. The body observes the faulted gate and terminates with the recorded fault.
             flow._callerInteractionCore.GateTaskSource.TrySetResult(default);
