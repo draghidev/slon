@@ -112,7 +112,7 @@ public class TransportTests
         var endpoint = (IPEndPoint)listener.LocalEndpoint;
 
         var acceptTask = listener.AcceptSocketAsync();
-        await using var conn = await SocketStreamConnection.ConnectAsync(endpoint);
+        var conn = await SocketStreamConnection.ConnectAsync(endpoint);
         using var serverSocket = await acceptTask;
 
         var payload = new byte[] { 0x01, 0x02, 0x03, 0x04, 0x05 };
@@ -137,6 +137,10 @@ public class TransportTests
             total += n;
         }
         CollectionAssert.AreEqual(payload, received);
+
+        // No connection-level disposal anymore: release through the endpoints, which own the socket.
+        conn.Writer.Complete();
+        conn.Reader.Complete();
 
         static async ValueTask<System.IO.Pipelines.FlushResult> WriteAndFlush(SocketStreamConnection c, byte[] data)
         {

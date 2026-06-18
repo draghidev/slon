@@ -172,21 +172,49 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
 
     public void Start(PgClientOptions options, TransportConnection connection, Action? onIdle = null, TimeSpan timeout = default)
     {
-        if (connection.Reader is not StreamPipeReader || connection.Writer is not StreamPipeWriter)
-            ThrowHelper.ThrowInvalidOperation("Transport does not support synchronous I/O.");
+        try
+        {
+            if (connection.Reader is not StreamPipeReader || connection.Writer is not StreamPipeWriter)
+                ThrowHelper.ThrowInvalidOperation("Transport does not support synchronous I/O.");
 
-        Initialize(connection, onIdle);
-        var flow = new StartupFlow(async: false, options, timeout == default ? options.ConnectionTimeout : timeout);
-        var task = StartAsync(flow, flow.WaitForComplete());
-        Debug.Assert(task.IsCompleted);
-        task.AsTask().GetAwaiter().GetResult();
+            Initialize(connection, onIdle);
+            var flow = new StartupFlow(async: false, options, timeout == default ? options.ConnectionTimeout : timeout);
+            var task = StartAsync(flow, flow.WaitForComplete());
+            Debug.Assert(task.IsCompleted);
+            task.AsTask().GetAwaiter().GetResult();
+        }
+        catch (Exception ex) when (Status is ProtocolStatus.Created)
+        {
+            ReleaseTransportOnStartFailure(connection, ex);
+            throw;
+        }
     }
 
     public async ValueTask StartAsync(PgClientOptions options, TransportConnection connection, Action? onIdle = null, CancellationToken cancellationToken = default)
     {
-        Initialize(connection, onIdle);
-        var flow = new StartupFlow(async: true, options, options.ConnectionTimeout);
-        await StartAsync(flow, flow.WaitForComplete(cancellationToken), cancellationToken).ConfigureAwait(false);
+        try
+        {
+            Initialize(connection, onIdle);
+            var flow = new StartupFlow(async: true, options, options.ConnectionTimeout);
+            await StartAsync(flow, flow.WaitForComplete(cancellationToken), cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (Status is ProtocolStatus.Created)
+        {
+            ReleaseTransportOnStartFailure(connection, ex);
+            throw;
+        }
+    }
+
+    // Startup failed before the protocol could take over teardown - the sync-capability check,
+    // Initialize, pipeline construction, or queueing the startup flow, all before FailProtocol can run
+    // (it needs the pipeline). Release the just-connected transport so the socket doesn't leak. The
+    // callers' Status==Created filter skips failures the startup flow itself raised: those go through
+    // FailProtocol -> Shutdown, which transitions past Created and owns the teardown.
+    static void ReleaseTransportOnStartFailure(TransportConnection connection, Exception reason)
+    {
+        connection.Abort();
+        connection.Writer.Complete(reason);
+        connection.Reader.Complete(reason);
     }
 
     async ValueTask StartAsync(StartupFlow flow, ValueTask flowCompletion, CancellationToken cancellationToken = default)
@@ -401,8 +429,10 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
             // Sync Cancel: AbortToken is internal-only, callbacks are framework-authored and audited.
             _abortCts.Cancel();
             // Break the wire so parked sync I/O faults into the translation path; async I/O already
-            // unblocks off AbortToken. Must happen BEFORE the drain awaits in-flight flows below, or
-            // a flow parked in a blocking read would never complete and the drain would hang.
+            // unblocks off AbortToken. Must happen BEFORE the drain awaits in-flight flows below, or a
+            // flow parked in a blocking read would never complete and the drain would hang. The abortive
+            // close (RST, never blocks - a graceful close itself can hang on a wedged peer) faults the
+            // parked read and leaves the buffers for the later Complete. No-op for async/pipe transports.
             _connection?.Abort();
         }
         else
@@ -443,12 +473,19 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
             // here, and SignalDraining gates this to the first shutdown, so the wire is closed exactly
             // once at completion - NOT gated on Dispose. The transport is not observable protocol
             // state: unlike the cancellation sources (whose tokens a caller may still read after a
-            // graceful CompleteAsync), a completed protocol's wire can't be reached by anyone. Closes
-            // the socket (idempotent after the forceful Abort) and returns the reader/writer pooled
-            // buffers. By here no read is parked on the segments. Without this, a CompleteAsync that
-            // was never followed by Dispose leaked its socket (max_connections).
-            if (_connection is IAsyncDisposable disposableConnection)
-                await disposableConnection.DisposeAsync().ConfigureAwait(false);
+            // graceful CompleteAsync), a completed protocol's wire can't be reached by anyone. Without
+            // this, a CompleteAsync never followed by Dispose leaked its socket (max_connections).
+            if (_connection is not null)
+            {
+                // Release the transport through the endpoints the protocol holds - the connection owns
+                // no teardown. Error-complete the writer (DISCARDS any buffered write rather than
+                // flushing it: graceful reached a clean RFQ, forceful already Abort'd the socket; the
+                // error completion writes nothing and never starts the flush promise), then complete
+                // the reader via the enumerator that owns it. Both dispose the shared stream
+                // (idempotent), closing the socket.
+                await _connection.Writer.CompleteAsync(closedException).ConfigureAwait(false);
+                await _pipeSegmentEnumerator.DisposeAsync().ConfigureAwait(false);
+            }
         }
     }
 
@@ -588,7 +625,15 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
                 // tenure makes the per-flow field safe.
                 item.PrepareActivationDispatch(_protocol.FlowControl);
                 if (ActivationScheduler is { } scheduler)
-                    scheduler.SubmitDetached(ActivationWorkItemAction, item, preferLocal: true);
+                {
+                    // A user scheduler MAY throw on submit (like TaskScheduler.QueueTask), but we run
+                    // in a detached activation work-item with no per-task channel, and the scheduler is
+                    // shared across the connection, so a throw means every future activation fails too.
+                    // Surface it by tearing the connection down (FailProtocol), not by limping onto the
+                    // ThreadPool against the caller's chosen scheduler.
+                    try { scheduler.SubmitDetached(ActivationWorkItemAction, item, preferLocal: true); }
+                    catch (Exception ex) { /* TODO log */ _protocol.FailProtocol(ex); }
+                }
                 else
                     ThreadPool.UnsafeQueueUserWorkItem(item, preferLocal: true);
             }
@@ -809,6 +854,9 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
         internal void Activate(PgClientFlow flow)
             => flow.GetExecutionControl(this).Activate(protocol._pgDecoder);
 
+        // Self-evict route for the flow layer's completion-callback seam (see ExecutionControl.Complete).
+        internal void FailProtocol(Exception? reason) => protocol.FailProtocol(reason);
+
         internal void OnCompleted(PgClientFlow flow, int remainingDepth)
         {
             // At pipeline park (remainingDepth == 0) release the rooted read-state buffers and signal
@@ -818,7 +866,13 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
             if (remainingDepth is 0)
             {
                 _commandFlowReadState = new();
-                protocol._poolConnectionIdleSignal?.Invoke();
+                // The pool idle hook runs in the advancer/retirement work-item context: a raw throw
+                // would crash that thread unobserved. But don't just swallow either - if the hook that
+                // reclaims this connection is throwing, the integration is broken and the pipeline won't
+                // get cleaned up naturally, so tear down via FailProtocol (fire-and-forget self-evict;
+                // the pool picks it up through the status flag).
+                try { protocol._poolConnectionIdleSignal?.Invoke(); }
+                catch (Exception ex) { /* TODO log */ protocol.FailProtocol(ex); }
             }
         }
 

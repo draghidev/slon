@@ -73,7 +73,13 @@ abstract class StreamPipeWriter : PipeWriter
         IsWriterCompleted = true;
         try
         {
-            FlushCore(writeToStream: exception == null, ReadOnlySpan<byte>.Empty, Timeout.InfiniteTimeSpan);
+            // Only flush a clean completion that has buffered data. An error completion (exception !=
+            // null) discards; an empty buffer has nothing to write. Unlike the BCL - whose unconditional
+            // flush-on-complete is a benign no-op - our single reusable flush promise faults
+            // ("already executing") if completion starts it while it overlaps another flush, so we skip
+            // the call entirely. Mirrors FlushAsync's own BufferedBytes-is-0 guard.
+            if (exception is null && Segments.BufferedBytes > 0)
+                FlushCore(writeToStream: true, ReadOnlySpan<byte>.Empty, Timeout.InfiniteTimeSpan);
         }
         finally
         {
@@ -96,7 +102,11 @@ abstract class StreamPipeWriter : PipeWriter
         IsWriterCompleted = true;
         try
         {
-            await FlushAsyncCore(writeToStream, data: ReadOnlyMemory<byte>.Empty, CancellationToken.None).ConfigureAwait(false);
+            // See Complete: skip the flush call unless there's buffered data to write on a clean
+            // completion. writeToStream is false on an error completion. Avoids needlessly starting
+            // the single reusable flush promise (which faults if it overlaps another flush).
+            if (writeToStream && Segments.BufferedBytes > 0)
+                await FlushAsyncCore(writeToStream, data: ReadOnlyMemory<byte>.Empty, CancellationToken.None).ConfigureAwait(false);
         }
         finally
         {

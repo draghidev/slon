@@ -5,9 +5,10 @@ using Slon.Pipelines;
 
 namespace Slon.Transport;
 
-sealed class SocketStreamConnection : TransportConnection, IDisposable, IAsyncDisposable
+sealed class SocketStreamConnection : TransportConnection
 {
     readonly SealedNetworkStream _stream;
+    bool _aborted;
 
     SocketStreamConnection(SealedNetworkStream stream, TransportConnectionOptions options)
     {
@@ -89,24 +90,19 @@ sealed class SocketStreamConnection : TransportConnection, IDisposable, IAsyncDi
         }
     }
 
-    // Close the socket only, to fault parked sync I/O. Leaves the reader/writer (and their pooled
-    // buffers) for the full Dispose that follows the drain, since a parked read may still hold a
-    // reserved segment. Disposing the stream mid-Read is the standard way to break a blocking
-    // Socket.Receive/Poll.
-    public override void Abort() => _stream.Dispose();
-
-    public void Dispose()
+    // No connection-level DISPOSAL: the Reader and Writer own the stream (LeaveOpen is false), so
+    // completing them closes the socket. The one socket-specific teardown is the abortive close:
+    // socket.Close(0) sets a 0-linger close -> sends RST. It never blocks (a graceful Dispose can hang
+    // flushing the FIN against a wedged peer), faults any parked sync read (fd gone -> the read throws),
+    // and skips TIME_WAIT. Leaves the reader/writer buffers for the later Complete (a parked read may
+    // hold a reserved segment). The generic finalize stays on the reader/writer's Complete.
+    // Idempotent: Close(0) sets LingerState then disposes, and setting LingerState on an already-disposed
+    // socket throws, so gate behind a flag - multiple release sites (the factory's pre-Start cleanup and
+    // the protocol's start-failure cleanup) can both reach here.
+    public override void Abort()
     {
-        Reader.Complete();
-        Writer.Complete();
-        _stream.Dispose();
-    }
-
-    public async ValueTask DisposeAsync()
-    {
-        await Reader.CompleteAsync().ConfigureAwait(false);
-        await Writer.CompleteAsync().ConfigureAwait(false);
-        await _stream.DisposeAsync().ConfigureAwait(false);
+        if (!Interlocked.Exchange(ref _aborted, true))
+            _stream.Socket.Close(0);
     }
 
     static EndPoint ResolveEndPoint(EndPoint endPoint)

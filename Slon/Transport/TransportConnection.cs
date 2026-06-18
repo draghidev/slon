@@ -29,13 +29,13 @@ abstract class TransportConnection
     // Parks the calling thread until the transport is writable.
     public abstract void WaitWritable();
 
-    // Forcibly breaks the wire so any parked I/O faults promptly. The async paths unblock off
-    // AbortToken, but a sync read/write is in a blocking syscall that no token reaches - only
-    // closing the underlying handle gets it out. Called from the forceful-abort path BEFORE the
-    // drain awaits the in-flight flows, so a parked sync read faults (into the read translation)
-    // and the drain can complete. Distinct from full disposal: it must NOT release the reader's
-    // buffers, which a parked read may still be writing into. Default no-op suits in-memory
-    // transports whose tests unblock via token cancellation.
+    // Faults parked I/O terminally without blocking and without releasing the reader/writer buffers
+    // (a parked read may hold a reserved segment; those go on the later Complete). Generic finalize
+    // stays on the reader/writer's Complete - this is only the "break it now, with a reason the other
+    // end understands" step that a graceful close can't do safely (it can hang on a wedged peer).
+    // Socket transports do a 0-linger abortive close (RST). A pipe transport overrides to Complete its
+    // end with a sentinel exception the read end recognizes as an abort - the in-memory analogue of the
+    // RST. Default no-op: our async transports unblock off AbortToken and never take the sync path.
     public virtual void Abort() { }
 
     public abstract class Factory(TransportConnectionOptions? options = null)

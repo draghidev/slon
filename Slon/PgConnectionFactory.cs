@@ -40,28 +40,68 @@ sealed class PgConnectionFactory : IPoolConnectionFactory<PgConnection>
     async ValueTask SendCancelAsync(int processId, int secretKey, CancellationToken cancellationToken)
     {
         var transport = await _transportConnectionFactory.ConnectAsync(cancellationToken).ConfigureAwait(false);
+        Exception? sendError = null;
         try
         {
             await CancelRequest.SendAsync(transport, processId, secretKey, cancellationToken).ConfigureAwait(false);
         }
+        catch (Exception ex)
+        {
+            sendError = ex;
+            throw;
+        }
         finally
         {
-            if (transport is IAsyncDisposable disposable)
-                await disposable.DisposeAsync().ConfigureAwait(false);
+            // TransportConnection has no Dispose surface; release via the abortive close (socket) plus
+            // endpoint completion (returns the pooled buffers). The server tears down its side after a
+            // CancelRequest, so an abortive RST on ours is fine. Error-complete the writer with sendError
+            // so a packet half-written before a fault is discarded rather than flushed onto the closed
+            // socket (a clean send leaves nothing buffered, so the null reason never starts a flush).
+            transport.Abort();
+            await transport.Writer.CompleteAsync(sendError).ConfigureAwait(false);
+            await transport.Reader.CompleteAsync().ConfigureAwait(false);
         }
     }
 
     PgConnection Create(ConnectionPoolContext<PgConnection>? poolContext, TimeSpan timeout = default)
     {
         var transport = _transportConnectionFactory.Connect(timeout);
-        return PgConnection.Create(CreateOptions(), _clientOptions, transport, _tracker, poolContext, timeout);
+        try
+        {
+            return PgConnection.Create(CreateOptions(), _clientOptions, transport, _tracker, poolContext, timeout);
+        }
+        catch (Exception ex)
+        {
+            ReleaseTransport(transport, ex);
+            throw;
+        }
     }
 
     async ValueTask<PgConnection> CreateAsync(ConnectionPoolContext<PgConnection>? poolContext, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
         var transport = await _transportConnectionFactory.ConnectAsync(cancellationToken).ConfigureAwait(false);
-        return await PgConnection.CreateAsync(CreateOptions(), _clientOptions, transport, _tracker, poolContext, cancellationToken).ConfigureAwait(false);
+        try
+        {
+            return await PgConnection.CreateAsync(CreateOptions(), _clientOptions, transport, _tracker, poolContext, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            ReleaseTransport(transport, ex);
+            throw;
+        }
+    }
+
+    // The transport is the factory's until PgConnection takes ownership (inside its protocol.Start). A
+    // throw before that - pool/idle-signal wiring, options, or Start's own pre-pipeline failure (which
+    // self-releases; Abort is idempotent and Complete is a no-op once completed, so the double is
+    // harmless) - would orphan the just-connected socket. Release it through the same vocabulary the
+    // protocol uses: abortive close (socket) + error-complete the endpoints (discard, return buffers).
+    static void ReleaseTransport(TransportConnection transport, Exception reason)
+    {
+        transport.Abort();
+        transport.Writer.Complete(reason);
+        transport.Reader.Complete(reason);
     }
 
     public PgConnection Create(TimeSpan timeout = default)
