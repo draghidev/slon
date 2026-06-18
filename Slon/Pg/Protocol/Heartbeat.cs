@@ -51,15 +51,7 @@ public sealed class Heartbeat : IDisposable
                 {
                     var period = _timer.Period;
                     var nowTimestamp = _timeProvider.GetTimestamp();
-                    if (previousTickTimestamp != 0)
-                    {
-                        var elapsed = _timeProvider.GetElapsedTime(previousTickTimestamp, nowTimestamp);
-                        if (elapsed.TotalMilliseconds > period.TotalMilliseconds * DriftThresholdMultiplier
-                            && OnDrift is { } handler)
-                        {
-                            handler(period, elapsed);
-                        }
-                    }
+                    var previousTimestamp = previousTickTimestamp;
                     previousTickTimestamp = nowTimestamp;
 
                     try
@@ -74,6 +66,19 @@ public sealed class Heartbeat : IDisposable
                             next = next.Next;
                         }
                         await Task.WhenAll(tasks).ConfigureAwait(false);
+
+                        // Drift reporting after the tick's actions: OnDrift is a best-effort observer
+                        // and shares this catch, so a throwing handler can't starve the actions above
+                        // or stop the clock. 0 = no prior tick to measure against.
+                        if (previousTimestamp != 0)
+                        {
+                            var elapsed = _timeProvider.GetElapsedTime(previousTimestamp, nowTimestamp);
+                            if (elapsed.TotalMilliseconds > period.TotalMilliseconds * DriftThresholdMultiplier
+                                && OnDrift is { } handler)
+                            {
+                                handler(period, elapsed);
+                            }
+                        }
                     }
                     catch (Exception)
                     {

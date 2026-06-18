@@ -571,7 +571,13 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IThreadPoolWorkItem
             // dead tenure, taking the shared read promise for nothing and racing instance reuse. The
             // heartbeat abort path keeps its own faulting - that's protocol teardown, not completion.
             flow.OnComplete(exception);
-            flow._completionAction?.Invoke(flow, exception, flow._completionState);
+            // The completion callback runs from CompleteItem in the advancer/retirement work-item
+            // context: a raw throw would crash that thread unobserved. Don't swallow either - a
+            // throwing completion callback means the consumer-side integration is broken, so the
+            // pipeline won't drain naturally. Tear down via FailProtocol (fire-and-forget self-evict).
+            // The flow itself is already completed (TCS set above); this callback is a notification.
+            try { flow._completionAction?.Invoke(flow, exception, flow._completionState); }
+            catch (Exception ex) { /* TODO log */ control.FailProtocol(ex); }
         }
 
         public ref readonly TState GetProtocolStatic<TState>()

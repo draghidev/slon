@@ -624,16 +624,10 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
                 // ran the later flow and the earlier never activated. One pending activation per flow
                 // tenure makes the per-flow field safe.
                 item.PrepareActivationDispatch(_protocol.FlowControl);
+                // SubmitDetached must not throw (the PipeScheduler.Schedule-style dispatch contract); a
+                // caller handing us a fallible scheduler owns the resulting connection breakage. No guard.
                 if (ActivationScheduler is { } scheduler)
-                {
-                    // A user scheduler MAY throw on submit (like TaskScheduler.QueueTask), but we run
-                    // in a detached activation work-item with no per-task channel, and the scheduler is
-                    // shared across the connection, so a throw means every future activation fails too.
-                    // Surface it by tearing the connection down (FailProtocol), not by limping onto the
-                    // ThreadPool against the caller's chosen scheduler.
-                    try { scheduler.SubmitDetached(ActivationWorkItemAction, item, preferLocal: true); }
-                    catch (Exception ex) { /* TODO log */ _protocol.FailProtocol(ex); }
-                }
+                    scheduler.SubmitDetached(ActivationWorkItemAction, item, preferLocal: true);
                 else
                     ThreadPool.UnsafeQueueUserWorkItem(item, preferLocal: true);
             }
