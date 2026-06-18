@@ -146,7 +146,19 @@ sealed class PgProtocolDataWriter(IOutputWriter<byte> writer, Encoding clientEnc
     public void Flush(TimeSpan timeout = default)
     {
         AdvanceMessageBytesFlushed(checked((int)_bufferingWriter.UnflushedBytes));
-        _bufferingWriter.Flush(timeout);
+        try
+        {
+            _bufferingWriter.Flush(timeout);
+        }
+        catch when (_abortToken.IsCancellationRequested)
+        {
+            // Sync writers park on the socket deadline, not the abort token, so an abort that
+            // fires mid-flush only surfaces here as the timeout/socket fault once the deadline
+            // expires. Mirror the async catch: translate to the typed closed exception so the
+            // late-waking thread sees PgClientClosedException, not a bare TimeoutException.
+            _control.ThrowIfClosed();
+            throw;
+        }
     }
 
     /// Flow-owned escape hatch from a parked flush. Without it the only break-out is protocol
