@@ -160,19 +160,15 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                     writeTask = WriteAllCommandsResumable();
             }
 
-            // Await writes here in the outer phase rather than returning writeTask as trailing.
-            // Leaving the async write as trailing left the next flow's first decoder read parked
-            // forever: the framework's between-iterations await on the trailing slot didn't
-            // sequence the byte flush before the next flow's body started its decoder read.
-            // Awaiting inline guarantees bytes reached the wire before DispatchPipelinedRead
-            // returns. The Resumable sync path stays out of this branch (awaited via
-            // RunResumableTask below).
+            // Observe an already-completed write here so a synchronously-faulted task throws inside
+            // this try and routes through HandleException; otherwise it would surface only later via
+            // the framework's trailing-task await, outside this scope. A still-pending write stays
+            // unawaited and rides the trailing slot (read-concurrent-with-write, see the return). The
+            // sync path wraps it in the resumable driver; the async path returns the raw flush task.
             if (writeTask.IsCompleted)
                 writeTask.GetAwaiter().GetResult();
             else if (!IsAsync)
                 writeTask = encoder.RunResumableTask(writeTask);
-            else
-                await writeTask.ConfigureAwait(false);
         }
         catch (Exception ex)
         {
@@ -180,14 +176,15 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
             throw;
         }
 
-        // Async-flow path: writes have been awaited above, so trailing is default. Sync-flow
-        // path: writeTask is the RunResumableTask wrapper, returned as trailing so the
-        // framework's between-iterations await holds for transport-level backpressure (TCP-
-        // window-deadlock prevention). Write failures are treated as transport death (ASP.NET-
-        // style). The next operation discovers a broken connection, no per-flow error bubbling
-        // needed.
+        // Return the write as the trailing slot. The read is dispatched as the pipeline task and
+        // parks concurrently, so a back-pressured flush is drained by the outstanding read off the
+        // same socket (there is no background read pump). This is the TCP-window-deadlock guard. The
+        // framework's between-iterations trailing await provides single-producer writer hygiene:
+        // CompleteItem fires only after trailing is observed, regardless of when the read settles.
+        // Write failures are transport death (ASP.NET-style); the next operation discovers the broken
+        // connection, so no per-flow error bubbling here.
         return new FlowTasks(
-            trailingExecutionTask: IsAsync ? default : writeTask,
+            trailingExecutionTask: writeTask,
             pipelineTask: DispatchPipelinedRead(context, context.GetProtocolStatic<ReadState>().ReadPromise));
 
         async ValueTask WriteAllCommandsAsync()
@@ -246,8 +243,8 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
 
         _context = context;
         _pipelinePromise = promise;
-        waiter.OnCompleted(static state =>  // ConfigureAwait(false): the continuation is a static bridge into framework state, no scheduling context needed
-
+        // Static continuation: a bridge into framework state, so no captured scheduling context is needed.
+        waiter.OnCompleted(static state =>
         {
             var flow = (CommandFlow)state!;
             var promise = flow._pipelinePromise!;
@@ -330,7 +327,6 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                         => ((CommandFlow)state!)._enumeratorMoveNextTaskSource.TrySetException(new OperationCanceledException(token)), this);
                 }
 
-                command = ref _options.Commands.ItemRef(_commandIndex);
                 if (IsAsync)
                     (_pgError, _requestedRowDescription) = await command.ReadUntilExecuteAsync(_decoder).ConfigureAwait(false);
                 else
