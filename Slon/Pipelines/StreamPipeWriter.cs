@@ -10,19 +10,22 @@ abstract class StreamPipeWriter : PipeWriter
     readonly ValueTaskSourcePromise<FlushResult> _flushAsyncCorePromise = new();
     bool _isFlushActive;
 
-    protected AutoResetCancellationTokenSource PendingFlushTokenSource { get; }
+    // Null when CancelPendingFlush is not supported (conduit mode): the caller's token then threads
+    // straight to the underlying stream op, so we allocate neither this source nor a per-flush
+    // registration. Only worth backing when the bottom is a non-token-cancelable channel (a pipe).
+    protected AutoResetCancellationTokenSource? PendingFlushTokenSource { get; }
     protected bool IsWriterCompleted { get; set; }
     protected SegmentChainBuilder Segments { get; }
     protected bool LeaveOpen { get; }
     protected Stream Stream { get; }
     protected int? WriteTimeout { get; }
 
-    public StreamPipeWriter(Stream writingStream, StreamPipeWriterOptions options)
+    public StreamPipeWriter(Stream writingStream, StreamPipeWriterOptions options, bool supportCancelPending = true)
     {
         ArgumentNullException.ThrowIfNull(writingStream);
         ArgumentNullException.ThrowIfNull(options);
 
-        PendingFlushTokenSource = new();
+        PendingFlushTokenSource = supportCancelPending ? new() : null;
         Segments = new SegmentChainBuilder(options.Pool, options.MinimumBufferSize);
         Stream = writingStream;
         LeaveOpen = options.LeaveOpen;
@@ -54,7 +57,7 @@ abstract class StreamPipeWriter : PipeWriter
     public override Span<byte> GetSpan(int sizeHint = 0) => GetMemory(sizeHint).Span;
 
     /// <inheritdoc />
-    public override void CancelPendingFlush() => PendingFlushTokenSource.Cancel();
+    public override void CancelPendingFlush() => PendingFlushTokenSource?.Cancel();
 
     public virtual bool CanTimeout { get; }
 
@@ -74,7 +77,7 @@ abstract class StreamPipeWriter : PipeWriter
         }
         finally
         {
-            PendingFlushTokenSource.Dispose();
+            PendingFlushTokenSource?.Dispose();
             Segments.Dispose();
             if (!LeaveOpen)
                 Stream.Dispose();
@@ -97,7 +100,7 @@ abstract class StreamPipeWriter : PipeWriter
         }
         finally
         {
-            PendingFlushTokenSource.Dispose();
+            PendingFlushTokenSource?.Dispose();
             Segments.Dispose();
             if (!LeaveOpen)
                 await Stream.DisposeAsync().ConfigureAwait(false);
@@ -115,7 +118,7 @@ abstract class StreamPipeWriter : PipeWriter
     /// <inheritdoc />
     public override ValueTask<FlushResult> FlushAsync(CancellationToken cancellationToken = default)
     {
-        var canceled = PendingFlushTokenSource.Token.IsCancellationRequested;
+        var canceled = PendingFlushTokenSource?.Token.IsCancellationRequested ?? false;
         if (Segments.BufferedBytes is 0 || canceled)
             return new(new FlushResult(isCanceled: canceled, isCompleted: false));
 
@@ -132,7 +135,7 @@ abstract class StreamPipeWriter : PipeWriter
 
     public override ValueTask<FlushResult> WriteAsync(ReadOnlyMemory<byte> source, CancellationToken cancellationToken = default)
     {
-        if (PendingFlushTokenSource.Token.IsCancellationRequested)
+        if (PendingFlushTokenSource?.Token.IsCancellationRequested == true)
             return new(new FlushResult(isCanceled: true, isCompleted: false));
 
         return FlushAsyncCore(writeToStream: true, data: source, cancellationToken);
@@ -233,7 +236,7 @@ abstract class StreamPipeWriter : PipeWriter
         }
 
         [AsyncMethodBuilder(typeof(PromiseAsyncValueTaskMethodBuilder<>))]
-        async ValueTask<FlushResult> FlushAsyncCore(AutoResetCancellationTokenSource tokenSource, bool writeToStream, ReadOnlyMemory<byte> data, CancellationToken cancellationToken)
+        async ValueTask<FlushResult> FlushAsyncCore(AutoResetCancellationTokenSource? tokenSource, bool writeToStream, ReadOnlyMemory<byte> data, CancellationToken cancellationToken)
         {
             // Cancellation token was already checked before getting here.
 
@@ -243,13 +246,19 @@ abstract class StreamPipeWriter : PipeWriter
                 ThrowAlreadyFlushing();
             }
 
+            // Conduit mode (no source): the caller's token threads straight to the stream op, no
+            // registration. Otherwise hook the caller's token onto the source so CancelPendingFlush
+            // and the caller's token both cancel.
             CancellationTokenRegistration reg = default;
-            if (cancellationToken.CanBeCanceled)
+            CancellationToken token;
+            if (tokenSource is { } src)
             {
-                reg = tokenSource.UnsafeRegister(cancellationToken);
+                if (cancellationToken.CanBeCanceled)
+                    reg = src.UnsafeRegister(cancellationToken);
+                token = src.Token;
             }
-
-            var token = tokenSource.Token;
+            else
+                token = cancellationToken;
             try
             {
                 var didWrite = false;
@@ -350,4 +359,4 @@ abstract class StreamPipeWriter : PipeWriter
         => throw new InvalidOperationException("Concurrent flushes are not supported.");
 }
 
-sealed class DefaultStreamPipeWriter(Stream writingStream, StreamPipeWriterOptions options) : StreamPipeWriter(writingStream, options);
+sealed class DefaultStreamPipeWriter(Stream writingStream, StreamPipeWriterOptions options, bool supportCancelPending = true) : StreamPipeWriter(writingStream, options, supportCancelPending);

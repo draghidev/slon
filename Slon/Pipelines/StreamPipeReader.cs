@@ -10,7 +10,9 @@ abstract class StreamPipeReader : PipeReader
     readonly ValueTaskSourcePromise<ReadResult> _readAsyncCorePromise = new();
     bool _isReadActive;
 
-    protected AutoResetCancellationTokenSource PendingReadTokenSource { get; }
+    // Null in conduit mode (CancelPendingRead unsupported): the caller's token threads straight to
+    // the underlying stream read, so neither this source nor a per-read registration is allocated.
+    protected AutoResetCancellationTokenSource? PendingReadTokenSource { get; }
     protected bool IsReaderCompleted { get; set; }
     protected SegmentChainBuilder Segments { get; }
     protected bool LeaveOpen { get; }
@@ -24,7 +26,7 @@ abstract class StreamPipeReader : PipeReader
     /// </summary>
     /// <param name="readingStream">The stream to read from.</param>
     /// <param name="options">The options to use.</param>
-    protected StreamPipeReader(Stream readingStream, StreamPipeReaderOptions options)
+    protected StreamPipeReader(Stream readingStream, StreamPipeReaderOptions options, bool supportCancelPending = true)
     {
         ArgumentNullException.ThrowIfNull(readingStream);
         ArgumentNullException.ThrowIfNull(options);
@@ -32,7 +34,7 @@ abstract class StreamPipeReader : PipeReader
         Stream = readingStream;
         Segments = new(options.Pool, options.BufferSize, options.MinimumReadSize);
         LeaveOpen = options.LeaveOpen;
-        PendingReadTokenSource = new();
+        PendingReadTokenSource = supportCancelPending ? new() : null;
         UseZeroByteReads = options.UseZeroByteReads;
         var canTimeout = readingStream.CanTimeout;
         CanTimeout = canTimeout;
@@ -63,7 +65,7 @@ abstract class StreamPipeReader : PipeReader
 
     /// <inheritdoc />
     public override void CancelPendingRead()
-        => PendingReadTokenSource.Cancel();
+        => PendingReadTokenSource?.Cancel();
 
     /// <inheritdoc />
     public override void Complete(Exception? exception = null)
@@ -72,7 +74,7 @@ abstract class StreamPipeReader : PipeReader
             return;
 
         IsReaderCompleted = true;
-        PendingReadTokenSource.Dispose();
+        PendingReadTokenSource?.Dispose();
         Segments.Dispose();
         if (!LeaveOpen)
             Stream.Dispose();
@@ -85,7 +87,7 @@ abstract class StreamPipeReader : PipeReader
             return new();
 
         IsReaderCompleted = true;
-        PendingReadTokenSource.Dispose();
+        PendingReadTokenSource?.Dispose();
         Segments.Dispose();
         return !LeaveOpen ? Stream.DisposeAsync() : new();
     }
@@ -110,7 +112,7 @@ abstract class StreamPipeReader : PipeReader
         if (cancellationToken.IsCancellationRequested)
             return ValueTask.FromException<ReadResult>(new OperationCanceledException(cancellationToken));
 
-        if (PendingReadTokenSource.Token.IsCancellationRequested)
+        if (PendingReadTokenSource?.Token.IsCancellationRequested == true)
             return new ValueTask<ReadResult>(new ReadResult(default, isCanceled: true, isCompleted: false));
 
         return TryReadCore(out var readResult) ? new(readResult) : ReadAsyncCore(0, cancellationToken);
@@ -143,7 +145,7 @@ abstract class StreamPipeReader : PipeReader
         if (cancellationToken.IsCancellationRequested)
             return ValueTask.FromException<ReadResult>(new OperationCanceledException(cancellationToken));
 
-        if (PendingReadTokenSource.Token.IsCancellationRequested)
+        if (PendingReadTokenSource?.Token.IsCancellationRequested == true)
             return new ValueTask<ReadResult>(new ReadResult(default, isCanceled: true, isCompleted: false));
 
         if (Segments.BufferedBytes >= minimumSize && TryReadCore(out var readResult))
@@ -271,7 +273,7 @@ abstract class StreamPipeReader : PipeReader
         }
 
         [AsyncMethodBuilder(typeof(PromiseAsyncValueTaskMethodBuilder<>))]
-        async ValueTask<ReadResult> ReadAsyncCore(int minimumSize, AutoResetCancellationTokenSource tokenSource, CancellationToken cancellationToken)
+        async ValueTask<ReadResult> ReadAsyncCore(int minimumSize, AutoResetCancellationTokenSource? tokenSource, CancellationToken cancellationToken)
         {
             // Cancellation token was already checked before getting here.
 
@@ -281,13 +283,18 @@ abstract class StreamPipeReader : PipeReader
                 ThrowAlreadyReading();
             }
 
+            // Conduit mode (no source): caller's token threads straight to the stream read, no
+            // registration. Otherwise hook the caller's token onto the source.
             CancellationTokenRegistration reg = default;
-            if (cancellationToken.CanBeCanceled)
+            CancellationToken token;
+            if (tokenSource is { } src)
             {
-                reg = tokenSource.UnsafeRegister(cancellationToken);
+                if (cancellationToken.CanBeCanceled)
+                    reg = src.UnsafeRegister(cancellationToken);
+                token = src.Token;
             }
-
-            var token = tokenSource.Token;
+            else
+                token = cancellationToken;
             try
             {
                 // This optimization only makes sense if we don't have anything buffered
@@ -352,16 +359,21 @@ abstract class StreamPipeReader : PipeReader
     protected async Task CopyToAsyncCore(PipeWriter destination, CancellationToken cancellationToken = default)
     {
         var tokenSource = PendingReadTokenSource;
-        var token = tokenSource.Token;
-        if (token.IsCancellationRequested)
-        {
-            ThrowReadCanceled();
-        }
-
         CancellationTokenRegistration reg = default;
-        if (cancellationToken.CanBeCanceled)
+        CancellationToken token;
+        if (tokenSource is { } src)
         {
-            reg = tokenSource.UnsafeRegister(cancellationToken);
+            token = src.Token;
+            if (token.IsCancellationRequested)
+                ThrowReadCanceled();
+            if (cancellationToken.CanBeCanceled)
+                reg = src.UnsafeRegister(cancellationToken);
+        }
+        else
+        {
+            token = cancellationToken;
+            if (token.IsCancellationRequested)
+                ThrowReadCanceled();
         }
 
         try
@@ -412,16 +424,21 @@ abstract class StreamPipeReader : PipeReader
     protected async Task CopyToAsyncCore(Stream destination, CancellationToken cancellationToken = default)
     {
         var tokenSource = PendingReadTokenSource;
-        var token = tokenSource.Token;
-        if (token.IsCancellationRequested)
-        {
-            ThrowReadCanceled();
-        }
-
         CancellationTokenRegistration reg = default;
-        if (cancellationToken.CanBeCanceled)
+        CancellationToken token;
+        if (tokenSource is { } src)
         {
-            reg = tokenSource.UnsafeRegister(cancellationToken);
+            token = src.Token;
+            if (token.IsCancellationRequested)
+                ThrowReadCanceled();
+            if (cancellationToken.CanBeCanceled)
+                reg = src.UnsafeRegister(cancellationToken);
+        }
+        else
+        {
+            token = cancellationToken;
+            if (token.IsCancellationRequested)
+                ThrowReadCanceled();
         }
 
         try
@@ -505,4 +522,4 @@ abstract class StreamPipeReader : PipeReader
         => throw new InvalidOperationException("Concurrent reads are not supported.");
 }
 
-sealed class DefaultStreamPipeReader(Stream readingStream, StreamPipeReaderOptions options) : StreamPipeReader(readingStream, options);
+sealed class DefaultStreamPipeReader(Stream readingStream, StreamPipeReaderOptions options, bool supportCancelPending = true) : StreamPipeReader(readingStream, options, supportCancelPending);
