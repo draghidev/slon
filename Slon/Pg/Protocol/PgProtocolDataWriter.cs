@@ -47,7 +47,14 @@ sealed class PgProtocolDataWriter(IOutputWriter<byte> writer, Encoding clientEnc
     // WouldBlock. WaitWritable forwards to the transport's wait callback (typically
     // Socket.Poll on a SelectMode.SelectWrite), parking the calling thread until writable.
     public void SignalWritable() => WritableSignal.Signal();
+    public void SignalFault(Exception exception) => WritableSignal.SignalFault(exception);
     public void WaitWritable() => waitWritable();
+
+    // Abort-to-typed-exception translation shared by the sync flush catch and the resumable driver:
+    // the canonical closed exception once the abort token has fired, else the original. Mirrors the
+    // async flush catch so every sync seam surfaces PgClientClosedException, not a bare deadline fault.
+    public Exception TranslateAbort(Exception ex)
+        => _abortToken.IsCancellationRequested && _control.ClosedException is { } closed ? closed : ex;
 
     internal void CopyFrom<TBuffer>(TBuffer buffer) where TBuffer : ICopyableBuffer<byte>
         => buffer.CopyTo(writer);
@@ -150,14 +157,13 @@ sealed class PgProtocolDataWriter(IOutputWriter<byte> writer, Encoding clientEnc
         {
             _bufferingWriter.Flush(timeout);
         }
-        catch when (_abortToken.IsCancellationRequested)
+        catch (Exception ex) when (_abortToken.IsCancellationRequested)
         {
             // Sync writers park on the socket deadline, not the abort token, so an abort that
             // fires mid-flush only surfaces here as the timeout/socket fault once the deadline
-            // expires. Mirror the async catch: translate to the typed closed exception so the
-            // late-waking thread sees PgClientClosedException, not a bare TimeoutException.
-            _control.ThrowIfClosed();
-            throw;
+            // expires. Translate to the typed closed exception so the late-waking thread sees
+            // PgClientClosedException, not a bare TimeoutException.
+            throw TranslateAbort(ex);
         }
     }
 

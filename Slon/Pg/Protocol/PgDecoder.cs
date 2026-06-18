@@ -282,7 +282,19 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
                         timeoutSet = true;
                     }
 
-                    var success = _messageBatchEnumerator.MoveNext(_remainingTimeout);
+                    bool success;
+                    try
+                    {
+                        success = _messageBatchEnumerator.MoveNext(_remainingTimeout);
+                    }
+                    catch (Exception) when (_abortToken.IsCancellationRequested && _control.ClosedException is { } closed)
+                    {
+                        // Sync reads block in a syscall no token reaches; a forceful abort breaks them
+                        // by closing the socket, surfacing as ObjectDisposedException / IOException /
+                        // TimeoutException rather than an OCE. Translate any of them to the typed closed
+                        // exception, mirroring the async path's TranslateReadCancellation.
+                        throw closed;
+                    }
                     context.SetBatch(_messageBatchEnumerator.Current);
                     if (!success)
                         return false;

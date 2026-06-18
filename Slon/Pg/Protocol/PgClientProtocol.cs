@@ -64,6 +64,7 @@ sealed class PgClientProtocolOptions
 sealed class PgClientProtocol : IDisposable, IAsyncDisposable
 {
     readonly PgClientProtocolOptions _options;
+    TransportConnection _connection = null!;
     IOutputWriter<byte> _pipeWriter = null!;
     PgProtocolDataWriter _protocolDataWriter = null!;
     PipeSegmentEnumerator<BackendMessageBatch.Segmenter, BackendMessageBatch> _pipeSegmentEnumerator = null!;
@@ -149,6 +150,7 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
 
     void Initialize(TransportConnection connection, Action? onIdle)
     {
+        _connection = connection;
         _pipeWriter = connection.Writer as IOutputWriter<byte> ?? new PipeStreamingWriter(connection.Writer);
         _protocolDataWriter = new(_pipeWriter, PgClientOptions.PreStartupEncoding, connection.WaitWritable, AbortToken, FlowControl);
         _pipeSegmentEnumerator = new(connection.Reader, new(), ownsReader: true);
@@ -340,9 +342,10 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
         => FireAndForget(DisposeAsyncCore(reason));
 
     /// Shared core for the Dispose paths: forceful Shutdown wrapped with resource disposal as a
-    /// single fire-and-forget unit. Resources stay alive across a graceful
-    /// <see cref="CompleteAsync"/> so the caller can still observe state via the cached tokens;
-    /// only Dispose paths release them. Idempotent via <c>_disposed</c>.
+    /// single fire-and-forget unit. The OBSERVABLE resources (the cancellation sources, whose tokens
+    /// a caller may still read after a graceful <see cref="CompleteAsync"/>) stay alive until a
+    /// Dispose path releases them here. The transport is not observable and is released by Shutdown
+    /// at completion regardless of path. Idempotent via <c>_disposed</c>.
     bool _disposed;
     async ValueTask DisposeAsyncCore(Exception? closeReason)
     {
@@ -355,8 +358,11 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
         finally
         {
             _heartbeat?.Dispose();
-            // Disposing _abortCts releases the scheduled CancelAfter(CompletionTimeout) timer without
-            // firing it. By here the protocol is Completed, so nothing registers against the dead source.
+            // The transport was already released by Shutdown's completion (it's not observable state).
+            // Here we release only the OBSERVABLE resources - the cancellation sources whose tokens a
+            // caller may still read after a graceful CompleteAsync. That's what makes these Dispose-
+            // gated rather than completion-gated. Disposing _abortCts also drops the scheduled
+            // CancelAfter(CompletionTimeout) timer without firing it.
             _abortCts.Dispose();
             _stoppingCts.Dispose();
         }
@@ -394,6 +400,10 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
         {
             // Sync Cancel: AbortToken is internal-only, callbacks are framework-authored and audited.
             _abortCts.Cancel();
+            // Break the wire so parked sync I/O faults into the translation path; async I/O already
+            // unblocks off AbortToken. Must happen BEFORE the drain awaits in-flight flows below, or
+            // a flow parked in a blocking read would never complete and the drain would hang.
+            _connection?.Abort();
         }
         else
         {
@@ -429,6 +439,16 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
             // Disarm the CTS scheduled by the graceful path.
             _abortCts.CancelAfter(Timeout.InfiniteTimeSpan);
             SignalCompleted();
+            // Release the transport once the drain has completed. Both graceful and forceful reach
+            // here, and SignalDraining gates this to the first shutdown, so the wire is closed exactly
+            // once at completion - NOT gated on Dispose. The transport is not observable protocol
+            // state: unlike the cancellation sources (whose tokens a caller may still read after a
+            // graceful CompleteAsync), a completed protocol's wire can't be reached by anyone. Closes
+            // the socket (idempotent after the forceful Abort) and returns the reader/writer pooled
+            // buffers. By here no read is parked on the segments. Without this, a CompleteAsync that
+            // was never followed by Dispose leaked its socket (max_connections).
+            if (_connection is IAsyncDisposable disposableConnection)
+                await disposableConnection.DisposeAsync().ConfigureAwait(false);
         }
     }
 
@@ -544,7 +564,7 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
                 // pre-flush race with that trailing is intentionally unhandled - the single-producer
                 // writer fail-fasts on overlapping flush, surfacing a real bug rather than hiding it.
                 var writer = protocol._protocolDataWriter;
-                if (writer.UnflushedBytes > 1000)
+                if (writer.UnflushedBytes > PgEncoder.FlushThreshold)
                     await writer.FlushAsync(protocol._abortToken).ConfigureAwait(false);
                 var tasks = await protocol.FlowControl.Execute(item).ConfigureAwait(false);
                 return new PipelineItemResult(tasks.TrailingExecutionTask, tasks.PipelineTask);

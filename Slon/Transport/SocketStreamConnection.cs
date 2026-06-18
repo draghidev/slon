@@ -89,6 +89,12 @@ sealed class SocketStreamConnection : TransportConnection, IDisposable, IAsyncDi
         }
     }
 
+    // Close the socket only, to fault parked sync I/O. Leaves the reader/writer (and their pooled
+    // buffers) for the full Dispose that follows the drain, since a parked read may still hold a
+    // reserved segment. Disposing the stream mid-Read is the standard way to break a blocking
+    // Socket.Receive/Poll.
+    public override void Abort() => _stream.Dispose();
+
     public void Dispose()
     {
         Reader.Complete();

@@ -40,6 +40,8 @@ readonly struct PgEncoder
     // sync drivers can park and signal without reaching into the transport directly.
     void WaitWritable() => _writer.WaitWritable();
     void SignalWritable() => _writer.SignalWritable();
+    void SignalFault(Exception exception) => _writer.SignalFault(exception);
+    Exception TranslateAbort(Exception ex) => _writer.TranslateAbort(ex);
 
     // Dispatches a pending Resumable's driver loop to a LongRunning thread. Caller is
     // expected to have already observed that the resumable isn't completed (so the shunt is
@@ -56,7 +58,19 @@ readonly struct PgEncoder
             using var _ = e.BeginResumableScope();
             while (!t.IsCompleted)
             {
-                e.WaitWritable();
+                try
+                {
+                    e.WaitWritable();
+                }
+                catch (Exception ex)
+                {
+                    // WritableSignal has no fault path of its own, so a WaitWritable throw (deadline
+                    // expiry, abort) would strand the parked write coroutine and leak the exception
+                    // onto this side task. Route it through the signal so the coroutine unwinds and
+                    // the abort-translated exception reaches the flow's execute path.
+                    e.SignalFault(e.TranslateAbort(ex));
+                    break;
+                }
                 e.SignalWritable();
             }
             t.GetAwaiter().GetResult();
@@ -370,31 +384,37 @@ readonly struct PgEncoder
     // holds the signal reference and drives it externally via WaitWritable plus
     // signal.Signal. No try/catch at this layer, the transport is the coroutine, the flow
     // is the driver.
+    // Bytes a pipelined flow may accumulate before a flush is forced. The cross-item pre-flush in
+    // PgClientProtocol shares this bound.
+    internal const int FlushThreshold = 1000;
+
+    // Async-path flush deferral. A pipelined async flush isn't followed by a read in the first phase,
+    // so it can be delayed to batch with later writes - but only while the buffer stays under the
+    // threshold. Past it the flush must run to bound buffering and apply send-window backpressure; the
+    // resulting (possibly parked) flush rides the trailing slot, drained by the concurrent read. Sync
+    // flushes never defer (see Flush/FlushResumable).
+    bool CanDelayFlush => _executionControl.IsPipelined && _writer.UnflushedBytes < FlushThreshold;
+
+    // Sync flushes always run: a sync flow owns the executor for its duration, so a deferred flush
+    // would never be picked up (the source never unwinds to the cross-item pre-flush) and the pipeline
+    // would stall behind buffered, unsent bytes. Deferral becomes viable only once the sync executor
+    // runs on its own thread.
     public ValueTask FlushResumable()
     {
         _executionControl.ThrowIfCannotWrite();
-        // When a flow pipelines a flush never gets followed by a read - in the first phase - so we can always delay flushes.
-        if (_executionControl.IsPipelined)
-            return default;
-
         return _writer.FlushAsync(default);
     }
 
     public void Flush()
     {
         _executionControl.ThrowIfCannotWrite();
-        // When a flow pipelines a flush never gets followed by a read - in the first phase - so we can always delay flushes.
-        if (_executionControl.IsPipelined)
-            return;
-
         _writer.Flush();
     }
 
     public ValueTask FlushAsync(CancellationToken cancellationToken = default)
     {
         _executionControl.ThrowIfCannotWrite();
-        // When a flow pipelines a flush never gets followed by a read - in the first phase - so we can always delay flushes.
-        if (_executionControl.IsPipelined)
+        if (CanDelayFlush)
             return new();
 
         return _writer.FlushAsync(cancellationToken);
