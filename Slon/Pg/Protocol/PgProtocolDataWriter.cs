@@ -64,6 +64,11 @@ sealed class PgProtocolDataWriter(IOutputWriter<byte> writer, Encoding clientEnc
 
     public long UnflushedBytes => _bufferingWriter.UnflushedBytes;
 
+    // Buffered bytes above which a flush is forced rather than deferred. Sized to ~one MTU so a forced
+    // flush maps to roughly a single segment. Single source of truth: the encoder's in-flow deferral
+    // (PgEncoder.CanDelayFlush) and the source's arm gate (PgClientFlowSource) both key off it.
+    internal const long UnflushedBytesFlushThreshold = 1000;
+
     // Arms message-length tracking for a new message. `totalLength` is the on-wire size of the
     // full message (type byte + length field + body, e.g. 5 + bodyLength for normal frontend
     // messages). Validates the previous message wrote exactly its declared length before

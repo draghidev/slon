@@ -193,9 +193,6 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
         // shutdown flush fire first) or UnflushedBytes past the flush threshold. WaitCore re-arms
         // when it returns Retry, after its flush has run.
         public bool ArmedForGetNext = true;
-        // Unflushed bytes above this force the arm gate even when the source is quiescent, so writes
-        // don't pile up indefinitely under sustained back-to-back enqueues.
-        public const long UnflushedBytesFlushThreshold = 1000;
 
         public readonly Lock SyncWaiterLock = new();
         public SyncHandoffEntry? SyncHead;
@@ -326,7 +323,7 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
             // Arm gate: under the periodic-flush threshold each TryGetNext-consume requires a fresh
             // WaitForNextAsync round to fire the flush seam. WaitCore sets the flag on Retry; we clear
             // it here on consume so the next pull is gated again. Outside that, the fast path runs.
-            var needsArm = _state.Protocol.UnflushedBytes >= State.UnflushedBytesFlushThreshold;
+            var needsArm = _state.Protocol.UnflushedBytes >= PgProtocolDataWriter.UnflushedBytesFlushThreshold;
             if (needsArm && !Volatile.Read(ref _state.ArmedForGetNext))
             {
                 item = null;

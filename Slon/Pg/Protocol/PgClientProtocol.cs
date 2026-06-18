@@ -558,14 +558,11 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
             static async ValueTask<PipelineItemResult> ExecuteCore(
                 PgClientProtocol protocol, PgClientFlow item, CancellationToken cancellationToken)
             {
-                // Pre-flush of cross-item buffered bytes, lifted from Control.Execute: it's policy-level
-                // writer hygiene between items, not part of any flow's ExecuteAuto. A recovery whose
-                // failed flow's trailing is still in-flight awaits it inside its own ExecuteAuto. The
-                // pre-flush race with that trailing is intentionally unhandled - the single-producer
-                // writer fail-fasts on overlapping flush, surfacing a real bug rather than hiding it.
-                var writer = protocol._protocolDataWriter;
-                if (writer.UnflushedBytes > PgEncoder.FlushThreshold)
-                    await writer.FlushAsync(protocol._abortToken).ConfigureAwait(false);
+                // No cross-item pre-flush: buffered bytes are flushed by the writing flow's own
+                // end-of-write flush once accumulation crosses the writer's threshold (which reads the
+                // shared, cumulative UnflushedBytes), and any sub-threshold remainder is drained by the
+                // source's arm gate / idle flush before the executor parks. A pre-flush here would
+                // re-check the same cumulative bound the source and the flows already enforce.
                 var tasks = await protocol.FlowControl.Execute(item).ConfigureAwait(false);
                 return new PipelineItemResult(tasks.TrailingExecutionTask, tasks.PipelineTask);
             }

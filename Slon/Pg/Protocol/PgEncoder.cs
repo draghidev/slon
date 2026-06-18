@@ -384,16 +384,13 @@ readonly struct PgEncoder
     // holds the signal reference and drives it externally via WaitWritable plus
     // signal.Signal. No try/catch at this layer, the transport is the coroutine, the flow
     // is the driver.
-    // Bytes a pipelined flow may accumulate before a flush is forced. The cross-item pre-flush in
-    // PgClientProtocol shares this bound.
-    internal const int FlushThreshold = 1000;
 
     // Async-path flush deferral. A pipelined async flush isn't followed by a read in the first phase,
     // so it can be delayed to batch with later writes - but only while the buffer stays under the
-    // threshold. Past it the flush must run to bound buffering and apply send-window backpressure; the
-    // resulting (possibly parked) flush rides the trailing slot, drained by the concurrent read. Sync
-    // flushes never defer (see Flush/FlushResumable).
-    bool CanDelayFlush => _executionControl.IsPipelined && _writer.UnflushedBytes < FlushThreshold;
+    // writer's flush threshold. Past it the flush must run to bound buffering and apply send-window
+    // backpressure; the resulting (possibly parked) flush rides the trailing slot, drained by the
+    // concurrent read. Sync flushes never defer (see Flush/FlushResumable).
+    bool CanDelayFlush => _executionControl.IsPipelined && _writer.UnflushedBytes < PgProtocolDataWriter.UnflushedBytesFlushThreshold;
 
     // Sync flushes always run: a sync flow owns the executor for its duration, so a deferred flush
     // would never be picked up (the source never unwinds to the cross-item pre-flush) and the pipeline
