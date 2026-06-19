@@ -190,6 +190,7 @@ sealed class PgConnection : IPoolConnection<PgConnection>
     // IPoolConnection<PgConnection>
     public bool IsIdle => _protocol.IsIdle;
     public bool IsCompleted => _protocol.IsCompleted;
+    public Exception? CompletionException => _protocol.CompletionException;
     public int CompareTo(PgConnection? other) => _protocol.CompareTo(other?._protocol);
 
     public ValueTask CompleteAsync(Exception? exception = null)

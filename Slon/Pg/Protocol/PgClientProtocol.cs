@@ -132,6 +132,12 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
     // to these. Keeps the protocol package decoupled from Slon.Pools' typed context.
     internal bool IsIdle => PipelineDepth is 0;
     internal bool IsCompleted => Status is ProtocolStatus.Completed;
+    // The cause that closed the protocol, or null if it completed cleanly. _closedException wraps the
+    // shutdown's closeReason as its inner; the inner is the raw cause (a fault from FailProtocol / wire
+    // death), null for a graceful CompleteAsync or a clean forceful DisposeAsync. A null check tells
+    // clean-vs-faulted and the value tells why. No separate status is needed: a faulted connection still
+    // reaches Completed, so IsCompleted already evicts it.
+    internal Exception? CompletionException => _closedException?.InnerException;
     internal int CompareTo(PgClientProtocol? other)
     {
         // null instances are always better, they represent empty connection slots.
