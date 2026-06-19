@@ -11,8 +11,8 @@ namespace Slon.Tests.Pg;
 // RunResumableTask drives the sync write coroutine on a LongRunning thread via WaitWritable. The
 // WritableSignal the body parks on had no fault field, so a WaitWritable throw (deadline / abort)
 // stranded the coroutine and leaked onto the side task instead of reaching the flow. The fix routes
-// the throw through WritableSignal.SignalFault (after TranslateAbort) so the coroutine unwinds with
-// the translated exception.
+// the throw through WritableSignal.Signal(exception) (after TranslateAbort) so the coroutine
+// unwinds with the translated exception.
 //
 // Isolated on purpose. A full sync CommandFlow always has a following read whose OWN abort
 // translation yields the same PgClientClosedException, so a flow-level test passes with or without

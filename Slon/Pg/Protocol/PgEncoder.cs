@@ -39,8 +39,7 @@ readonly struct PgEncoder
     // Forwards to the underlying writer so the sync encoder variants and higher-composition
     // sync drivers can park and signal without reaching into the transport directly.
     void WaitWritable() => _writer.WaitWritable();
-    void SignalWritable() => _writer.SignalWritable();
-    void SignalFault(Exception exception) => _writer.SignalFault(exception);
+    void SignalWritable(Exception? exception = null) => _writer.SignalWritable(exception);
     Exception TranslateAbort(Exception ex) => _writer.TranslateAbort(ex);
 
     // Dispatches a pending Resumable's driver loop to a LongRunning thread. Caller is
@@ -48,7 +47,7 @@ readonly struct PgEncoder
     // needed). The LongRunning delegate opens its own ResumableScope so the transport's TLS
     // slot stays populated through the resumption thread's lifetime, then runs the same
     // driver body the sync wrappers use inline
-    // (while (!t.IsCompleted) { WaitWritable, SignalWritable }, then GetResult).
+    // (while (!t.IsCompleted) { WaitWritable, Signal }, then GetResult).
     public ValueTask RunResumableTask(ValueTask resumable)
     {
         var encoder = this;
@@ -64,11 +63,11 @@ readonly struct PgEncoder
                 }
                 catch (Exception ex)
                 {
-                    // WritableSignal has no fault path of its own, so a WaitWritable throw (deadline
-                    // expiry, abort) would strand the parked write coroutine and leak the exception
-                    // onto this side task. Route it through the signal so the coroutine unwinds and
-                    // the abort-translated exception reaches the flow's execute path.
-                    e.SignalFault(e.TranslateAbort(ex));
+                    // A WaitWritable throw (deadline expiry, abort) would otherwise strand the parked
+                    // write coroutine and leak the exception onto this side task. Route it through the
+                    // signal's fault path so the coroutine unwinds and the abort-translated exception
+                    // reaches the flow's execute path.
+                    e.SignalWritable(e.TranslateAbort(ex));
                     break;
                 }
                 e.SignalWritable();

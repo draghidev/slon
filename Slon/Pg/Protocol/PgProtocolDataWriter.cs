@@ -27,7 +27,7 @@ sealed class PgProtocolDataWriter(IOutputWriter<byte> writer, Encoding clientEnc
     // Per-connection cached signal. The flow parks this in
     // TransportConnection.SyncNonBlockingSignal around each Resumable call, the transport
     // returns it on WouldBlock as the pending source, the flow's driver fires it via
-    // SignalWritable. Reused across operations thanks to auto-reset on consumption.
+    // Signal. Reused across operations thanks to auto-reset on consumption.
     public WritableSignal WritableSignal { get; } = new();
 
     // Maps a thrown exception to a SocketError, or null when the exception isn't recognizable
@@ -42,12 +42,11 @@ sealed class PgProtocolDataWriter(IOutputWriter<byte> writer, Encoding clientEnc
         return null;
     }
 
-    // Driver hooks for the sync wrappers and higher-composition sync drivers. SignalWritable
+    // Driver hooks for the sync wrappers and higher-composition sync drivers. Signal
     // fires the cached writable signal, releasing any coroutine awaiter that captured it on
     // WouldBlock. WaitWritable forwards to the transport's wait callback (typically
     // Socket.Poll on a SelectMode.SelectWrite), parking the calling thread until writable.
-    public void SignalWritable() => WritableSignal.Signal();
-    public void SignalFault(Exception exception) => WritableSignal.SignalFault(exception);
+    public void SignalWritable(Exception? exception = null) => WritableSignal.Signal(exception);
     public void WaitWritable() => waitWritable();
 
     // Abort-to-typed-exception translation shared by the sync flush catch and the resumable driver:
