@@ -127,7 +127,7 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
         _abortToken = _abortCts.Token;
         _stoppingCts = new();
         _stoppingToken = _stoppingCts.Token;
-        FlowControl = new Control(this);
+        FlowControl = new Control(this, poolFacing: true);
     }
 
     public string CurrentSearchPath { get; set; } = "public";
@@ -265,7 +265,8 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
     async ValueTask StartAsync(StartupFlow flow, ValueTask flowCompletion, CancellationToken cancellationToken = default)
     {
         _source = PgClientFlowSource.Create(this, _options.ExecutionScheduler);
-        _pipeline = Pipeline.Create<PgClientFlow, Policy, PgClientFlowSource, PgClientFlowSource.Enumerator>(new Policy(this), _source);
+        _pipeline = Pipeline.Create<PgClientFlow, Policy, PgClientFlowSource, PgClientFlowSource.Enumerator>(new Policy(this, FlowControl), _source);
+        FlowControl.BindPipeline(new PipelineFlowSlots<Policy, PgClientFlowSource, PgClientFlowSource.Enumerator>(_pipeline));
         if (!TryQueueFlow(flow, ProtocolStatus.Created))
             throw new InvalidOperationException("Could not enqueue starting flow, protocol is not in a valid state to start.");
         try
@@ -637,12 +638,15 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
 
     readonly struct Policy : IPipelinePolicy<PgClientFlow>
     {
-        readonly PgClientProtocol _protocol;
+        readonly Control _control;
         readonly ValueTaskSourcePromise<PipelineItemResult> _promise;
 
-        public Policy(PgClientProtocol protocol)
+        // Parameterized by Control (not the protocol) so the same policy drives both the protocol's
+        // outer pipeline (FlowControl) and an exclusive flow's inner pipeline (its own Control reading
+        // the inner pipeline's slots). The divergence lives in the Control, not here.
+        public Policy(PgClientProtocol protocol, Control control)
         {
-            _protocol = protocol;
+            _control = control;
             _promise = new();
             ActivationScheduler = protocol._options.ActivationScheduler;
         }
@@ -664,8 +668,8 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
                 return;
             }
 
-            _protocol.FlowControl.OnCompleted(item, remainingDepth);
-            item.GetExecutionControl(_protocol.FlowControl).Complete(exception);
+            _control.OnCompleted(item, remainingDepth);
+            item.GetExecutionControl(_control).Complete(exception);
         }
 
         [MethodImpl(MethodImplOptions.NoInlining)]
@@ -676,10 +680,10 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
             // causality as the OnCompleted-before-Complete ordering below).
             var failureException = resyncRecovery.FailureException!;
 
-            _protocol.FlowControl.OnCompleted(resyncRecovery, remainingDepth);
+            _control.OnCompleted(resyncRecovery, remainingDepth);
             try
             {
-                resyncRecovery.GetExecutionControl(_protocol.FlowControl).Complete(exception);
+                resyncRecovery.GetExecutionControl(_control).Complete(exception);
             }
             finally
             {
@@ -688,7 +692,7 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
                 // completes on EVERY exit (including the resyncRecovery's own fault), or its caller strands.
                 // A resyncRecovery that also died attaches its fault behind the original failure as inner.
                 // Single-level by construction: TryRecoverItemFailure refuses ResyncRecoveryFlow items.
-                failedFlow.GetExecutionControl(_protocol.FlowControl).Complete(
+                failedFlow.GetExecutionControl(_control).Complete(
                     exception is null ? failureException : new AggregateException(failureException, exception));
             }
         }
@@ -696,11 +700,11 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public ValueTask<PipelineItemResult> ExecuteItemAsync(PgClientFlow item, CancellationToken cancellationToken)
         {
-            item.GetExecutionControl(_protocol.FlowControl).Start();
+            item.GetExecutionControl(_control).Start();
             PromiseAsyncValueTaskMethodBuilder<PipelineItemResult>.Promise = _promise;
             try
             {
-                return ExecuteCore(_protocol, item, cancellationToken);
+                return ExecuteCore(_control, item, cancellationToken);
             }
             finally
             {
@@ -709,14 +713,14 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
 
             [AsyncMethodBuilder(typeof(PromiseAsyncValueTaskMethodBuilder<>))]
             static async ValueTask<PipelineItemResult> ExecuteCore(
-                PgClientProtocol protocol, PgClientFlow item, CancellationToken cancellationToken)
+                Control control, PgClientFlow item, CancellationToken cancellationToken)
             {
                 // No cross-item pre-flush: buffered bytes are flushed by the writing flow's own
                 // end-of-write flush once accumulation crosses the writer's threshold (which reads the
                 // shared, cumulative UnflushedBytes), and any sub-threshold remainder is drained by the
                 // source's arm gate / idle flush before the executor parks. A pre-flush here would
                 // re-check the same cumulative bound the source and the flows already enforce.
-                var tasks = await protocol.FlowControl.Execute(item).ConfigureAwait(false);
+                var tasks = await control.Execute(item).ConfigureAwait(false);
                 return new PipelineItemResult(tasks.TrailingExecutionTask, tasks.PipelineTask);
             }
         }
@@ -727,7 +731,7 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
             // Bind the decoder synchronously now: the pipeline has just published item to the
             // ActivatedItem slot on this thread, so the bind reads the slot when it agrees with item.
             // Only the body wake is deferred below.
-            _protocol.FlowControl.BindDecoder(item);
+            _control.BindDecoder(item);
 
             // Inline-activate when the framework allows it (preferAsync=false) or the flow is sync:
             // sync flows park on a kernel wait-handle signal, bounded cost, safe under the advancer
@@ -739,7 +743,7 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
                 // two activations in flight let the second Initialize overwrite the first, so both
                 // ran the later flow and the earlier never activated. One pending activation per flow
                 // tenure makes the per-flow field safe.
-                item.PrepareActivationDispatch(_protocol.FlowControl);
+                item.PrepareActivationDispatch(_control);
                 // SubmitDetached must not throw (the PipeScheduler.Schedule-style dispatch contract); a
                 // caller handing us a fallible scheduler owns the resulting connection breakage. No guard.
                 if (ActivationScheduler is { } scheduler)
@@ -748,7 +752,7 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
                     ThreadPool.UnsafeQueueUserWorkItem(item, preferLocal: true);
             }
             else
-                _protocol.FlowControl.Activate(item);
+                _control.Activate(item);
         }
 
         static readonly Action<object?> ActivationWorkItemAction = static state => ((IThreadPoolWorkItem)state!).Execute();
@@ -768,7 +772,7 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
                 return false;
             }
 
-            var failedItemControl = failedItem.GetExecutionControl(_protocol.FlowControl);
+            var failedItemControl = failedItem.GetExecutionControl(_control);
 
             // Substitute-write gate. Both must hold for recovery to inject a terminating Sync:
             //   - The failure kind hasn't closed the failed flow's write window (PipelineTaskWaiter
@@ -797,20 +801,26 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
             // far as the recovery, so its dispatch state, RFQ bookkeeping, and registrations release
             // before the instance can be reused.
             recoveryItem = ResyncRecoveryFlow.Create(
-                _protocol.FlowControl, failedItem, context.Exception, outstandingPhase, outstandingIsRead, failedItemControl.RfqCount, canWriteSync);
+                _control, failedItem, context.Exception, outstandingPhase, outstandingIsRead, failedItemControl.RfqCount, canWriteSync);
             return true;
         }
 
     }
 
-    internal sealed class Control(PgClientProtocol protocol) : IProtocolStatic<CommandFlow.ReadState>
+    internal sealed class Control(PgClientProtocol protocol, bool poolFacing) : IProtocolStatic<CommandFlow.ReadState>
     {
-        // ExecutorFlow / ActivatedFlow source directly from the pipeline's slots - the single-pump
-        // invariant + in-order Activate-before-Complete make these the single source of truth.
-        // ExecutorFlow is the write-phase identity (ThrowIfCannotWrite); ActivatedFlow is the
-        // read-channel current-reader handle (PgDecoder routes messages to it).
-        public PgClientFlow? ExecutorFlow => protocol._pipeline.ExecutingItem;
-        public PgClientFlow? ActivatedFlow => protocol._pipeline.ActivatedItem;
+        // The pipeline whose slots this Control reads, bound right after that pipeline is created. The
+        // outer (pool-facing) Control reads the protocol's own pipeline; an exclusive flow's inner
+        // Control reads its inner pipeline - both through the same IPipelineSlots handle, so any
+        // nesting depth composes. ExecutorFlow / ActivatedFlow are the single source of truth (the
+        // single-pump invariant + in-order Activate-before-Complete): ExecutorFlow is the write-phase
+        // identity (ThrowIfCannotWrite); ActivatedFlow is the read-channel current-reader handle
+        // (PgDecoder routes messages to it).
+        IFlowSlots _slots = null!;
+        public void BindPipeline(IFlowSlots slots) => _slots = slots;
+
+        public PgClientFlow? ExecutorFlow => _slots.ExecutingItem;
+        public PgClientFlow? ActivatedFlow => _slots.ActivatedItem;
 
         public PgProtocolDataWriter Writer => protocol._protocolDataWriter;
 
@@ -974,7 +984,9 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
             // flow including ones faulted before bind). Throughput: every retirement counts. Stalls: a
             // non-pipelined flow held the wire serialized from queue until its RFQ here (not just until
             // bind), so decrement here - measures the serialization window, never orphans an increment.
-            if (protocol._scoringEnabled)
+            // Pool-facing only: an inner (exclusive-flow) subflow's retirement isn't a pool-unit event,
+            // so it neither feeds the load score nor signals pool idle below.
+            if (poolFacing && protocol._scoringEnabled)
             {
                 Interlocked.Increment(ref protocol._completionCount);
                 if (!flow.GetExecutionControl(this).IsPipelined)
@@ -993,8 +1005,11 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
                 // reclaims this connection is throwing, the integration is broken and the pipeline won't
                 // get cleaned up naturally, so tear down via FailProtocol (fire-and-forget self-evict;
                 // the pool picks it up through the status flag).
-                try { protocol._poolConnectionIdleSignal?.Invoke(); }
-                catch (Exception ex) { /* TODO log */ protocol.FailProtocol(ex); }
+                if (poolFacing)
+                {
+                    try { protocol._poolConnectionIdleSignal?.Invoke(); }
+                    catch (Exception ex) { /* TODO log */ protocol.FailProtocol(ex); }
+                }
             }
         }
 

@@ -28,7 +28,7 @@ public class WriteDriverFaultRoutingTests
         // A real protocol, driven to closed, just to obtain the canonical ClosedException.
         var closedProtocol = await PgTestPool.NewIsolatedAsync();
         await closedProtocol.DisposeAsync();
-        var control = new PgClientProtocol.Control(closedProtocol);
+        var control = new PgClientProtocol.Control(closedProtocol, poolFacing: true);
         Assert.IsNotNull(control.ClosedException, "protocol should be closed after DisposeAsync");
 
         // WaitWritable stands in for the parked sync write's deadline/abort fault. A pre-cancelled
