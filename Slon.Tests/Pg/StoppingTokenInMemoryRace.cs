@@ -101,6 +101,11 @@ public class StoppingTokenInMemoryRace
         await protocol.StartAsync(options, transport);
         Log($"{variant} rep{rep} started");
 
+        // Arm the deterministic read-park gate before any flow is queued. The first read-park the
+        // protocol takes after the handshake is A's body waiting for its response; the executor may
+        // activate A autonomously (before MoveNext), so arm ahead of TryQueue to never miss it.
+        var aParkedOnRead = transport.ArmReadPark();
+
         var flowA = new CommandFlow(async: true,
             Command.Create("select generate_series(1, 20)"),
             Command.Create("select 'a-two'"));
@@ -111,16 +116,21 @@ public class StoppingTokenInMemoryRace
         var eA = flowA.GetAsyncEnumerator();
         var eB = flowB.GetAsyncEnumerator();
 
-        // Fire A's first MoveNext. A's command bytes don't flush until CompleteAsync arms the flush
-        // gate (the pipelined-write seam), so the body can't reach its read-park until then.
+        // Fire A's first MoveNext. A writes its command (buffered; the flush is deferred until
+        // CompleteAsync) and parks on its response read.
         var aFirstTask = eA.MoveNextAsync().AsTask();
 
-        // StoppingToken + flush. Side effect: A's command bytes hit the wire; the body then parks on
-        // its response read.
+        // Pin the interleaving deterministically: wait until A has actually parked mid-read BEFORE
+        // completing, rather than racing A's dispatch against source-completion (the race that let A
+        // drain inert ~0.6% of reps, which the old byte-poll masked as 5s of silent green). A timeout
+        // here is a real "scenario never set up" failure, not slowness.
+        Log($"{variant} rep{rep} awaiting A read-park");
+        try { await aParkedOnRead.WaitAsync(Cap); }
+        catch (TimeoutException) { return $"flowA never parked on its read within {Cap} - scenario not set up (dispatch raced completion)"; }
+
+        // StoppingToken + flush. A is parked mid-read; completion can no longer drain it inert.
         var completeTask = protocol.CompleteAsync().AsTask();
-        Log($"{variant} rep{rep} completeAsync called, waiting quiesce");
-        await transport.WaitClientQuiesceAsync();
-        Log($"{variant} rep{rep} quiesced");
+        Log($"{variant} rep{rep} A parked, completeAsync called");
 
         string? captured = null;
         void Catch(string where, Exception ex)
@@ -367,17 +377,24 @@ public class StoppingTokenInMemoryRace
     {
         readonly Pipe _toClient = new();
         readonly Pipe _toServer = new();
-        long _clientBytes;
+        readonly ReadParkSignalingReader _reader;
 
-        public override PipeReader Reader => _toClient.Reader;
+        public override PipeReader Reader => _reader;
         public override PipeWriter Writer => _toServer.Writer;
         public override void WaitWritable() { }
 
         public GatedReplayTransport(byte[] handshake)
         {
+            _reader = new ReadParkSignalingReader(_toClient.Reader);
             _toClient.Writer.WriteAsync(handshake).AsTask().GetAwaiter().GetResult();
             _ = DrainClient();
         }
+
+        // Arm a one-shot signal that completes when the protocol next parks on a read (ReadAsync
+        // returns pending) - i.e. an in-flight flow has written its command and is waiting for its
+        // response. Deterministic replacement for byte-polling: guarantees the flow is dispatched and
+        // parked mid-read before the test perturbs completion, instead of racing dispatch.
+        public Task ArmReadPark() => _reader.ArmReadPark();
 
         public void ReleaseSegment(byte[] bytes)
         {
@@ -391,29 +408,6 @@ public class StoppingTokenInMemoryRace
             }
         }
 
-        // Wait until the client has written some bytes and then gone quiet (body parked on its read).
-        public async Task WaitClientQuiesceAsync(int quietMs = 5, int timeoutMs = 5000)
-        {
-            var sw = Stopwatch.StartNew();
-            long last = -1;
-            var stable = 0;
-            while (sw.ElapsedMilliseconds < timeoutMs)
-            {
-                var cur = Interlocked.Read(ref _clientBytes);
-                if (cur > 0 && cur == last)
-                {
-                    if (++stable >= quietMs)
-                        return;
-                }
-                else
-                {
-                    stable = 0;
-                }
-                last = cur;
-                await Task.Delay(1);
-            }
-        }
-
         async Task DrainClient()
         {
             try
@@ -421,8 +415,6 @@ public class StoppingTokenInMemoryRace
                 while (true)
                 {
                     var r = await _toServer.Reader.ReadAsync();
-                    if (r.Buffer.Length > 0)
-                        Interlocked.Add(ref _clientBytes, r.Buffer.Length);
                     _toServer.Reader.AdvanceTo(r.Buffer.End);
                     if (r.IsCompleted)
                         break;
@@ -432,5 +424,41 @@ public class StoppingTokenInMemoryRace
             {
             }
         }
+    }
+
+    // Delegating PipeReader that signals an armed one-shot TCS when ReadAsync returns pending (the
+    // protocol parked waiting for data). Lets the harness gate deterministically on "a flow is parked
+    // mid-read" instead of polling write-byte counts.
+    sealed class ReadParkSignalingReader : PipeReader
+    {
+        readonly PipeReader _inner;
+        TaskCompletionSource? _park;
+
+        public ReadParkSignalingReader(PipeReader inner) => _inner = inner;
+
+        public Task ArmReadPark()
+        {
+            var tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            Volatile.Write(ref _park, tcs);
+            return tcs.Task;
+        }
+
+        // The protocol's transport read (PipeSegmentEnumerator) funnels through ReadAsync, including
+        // via the base ReadAtLeastAsync default; signaling here covers both. AdvanceTo is delegated
+        // verbatim (no teeing), so the base default's position tracking stays correct.
+        public override ValueTask<ReadResult> ReadAsync(CancellationToken cancellationToken = default)
+        {
+            var vt = _inner.ReadAsync(cancellationToken);
+            if (!vt.IsCompleted)
+                Volatile.Read(ref _park)?.TrySetResult();
+            return vt;
+        }
+
+        public override bool TryRead(out ReadResult result) => _inner.TryRead(out result);
+        public override void AdvanceTo(SequencePosition consumed) => _inner.AdvanceTo(consumed);
+        public override void AdvanceTo(SequencePosition consumed, SequencePosition examined) => _inner.AdvanceTo(consumed, examined);
+        public override void CancelPendingRead() => _inner.CancelPendingRead();
+        public override void Complete(Exception? exception = null) => _inner.Complete(exception);
+        public override ValueTask CompleteAsync(Exception? exception = null) => _inner.CompleteAsync(exception);
     }
 }

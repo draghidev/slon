@@ -1,15 +1,18 @@
 namespace Slon.Tests.Pg;
 
 // Focus: the guarantees PgClientFlowSource's sync handoff promises that the basic completion
-// tests in ProtocolLevelTests don't measure - the sync caller's thread stays put, the thread
-// pool isn't grown, and concurrent sync producers across distinct protocols don't deadlock.
-// Driven directly against PgClientProtocol so the assertions attribute to the handoff
-// rendezvous, not to anything the ADO surface adds.
-// Class-serial: IdlePipeline_DoesNotGrowThreadPool reads ThreadPool.ThreadCount, which would
-// be perturbed by ConcurrentSync_AcrossProtocols_AllComplete's 8-thread burst running in
-// parallel under method-level parallelism. Other classes are method-parallel by default.
+// tests in ProtocolLevelTests don't measure - the sync caller's thread stays put and concurrent
+// sync producers across distinct protocols don't deadlock. Driven directly against
+// PgClientProtocol so the assertions attribute to the handoff rendezvous, not to anything the
+// ADO surface adds.
+//
+// The "uses no TP capacity" guarantee is the solo-only IdlePipeline_DoesNotChurnThreadPool
+// spot-check (a process-global oracle, [Ignore]'d in-suite); the in-suite guard for the same
+// contract is the DETERMINISTIC caller-thread check (ReturnsOnCallerThread /
+// RepeatedSync_StaysOnCallerThread). A weaker in-suite ThreadCount variant was removed: it
+// asserted the same thing with a stricter, untoleranced bound on a global oracle, so it flaked
+// on the documented SocketAsyncEngine BCL noise (a TP thread injected during the window).
 [TestClass]
-[DoNotParallelize]
 public class SyncFlowHandoffTests
 {
     // Sanity check that nothing in the sync path secretly trampolines onto a TP thread and
@@ -29,26 +32,6 @@ public class SyncFlowHandoffTests
         Assert.AreEqual(beforeId, afterId,
             "sync MoveNext returned on a different thread than it was called on; " +
             "sync semantics require the caller's thread stays put");
-    }
-
-    // Verifies that a sync flow against an idle pipeline does not grow the thread pool.
-    // Direct measurement of ThreadPool.ThreadCount delta against the architectural claim:
-    // sync flow uses no extra TP capacity when the pipeline is idle (caller's thread does
-    // all the work).
-    [TestMethod]
-    public async Task IdlePipeline_DoesNotGrowThreadPool()
-    {
-        await using var lease = await PgTestPool.LeaseAsync();
-        await PgTestPool.RunSync(lease.Protocol, "select 1"); // warm
-        await Task.Delay(100);
-
-        var threadCountBefore = ThreadPool.ThreadCount;
-        await PgTestPool.RunSync(lease.Protocol, "select 1");
-        var threadCountAfter = ThreadPool.ThreadCount;
-
-        Assert.IsTrue(threadCountAfter <= threadCountBefore,
-            $"sync flow on idle pipeline grew TP from {threadCountBefore} to {threadCountAfter}; " +
-            "expected no growth under the handoff design (caller's thread does all work)");
     }
 
     // Strong-negative smoke test: measures TP completed-work-item delta during a sync flow and

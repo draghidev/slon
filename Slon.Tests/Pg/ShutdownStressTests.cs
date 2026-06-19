@@ -49,8 +49,10 @@ public class ShutdownStressTests
     //
     // Handshake-only replay: both flows' command reads park (no response in the pipe), so the race
     // under test is purely dispatch (executor dequeue) vs shutdown (Complete + the inert-queue
-    // drain). A short CompletionTimeout escalates to AbortToken to unblock the parked reads so each
-    // iteration terminates fast. Faithfully reproducing the post-response pre-deliver path would
+    // drain). A short CompletionTimeout escalates to AbortToken, and a short HeartbeatInterval
+    // propagates it to the parked reads fast: parked-flow abort propagation is heartbeat-driven, so
+    // the default 1s interval would otherwise leave each iteration parked up to a second (the suite's
+    // residual ~1s variance). Faithfully reproducing the post-response pre-deliver path would
     // need wire latency we can't control per iteration; instant-replay there just desyncs the
     // pipelined decoder (a harness artifact, not the product fault). The torn-read NRE lives in the
     // dispatch/inert-drain coordination, which this exercises directly.
@@ -63,7 +65,7 @@ public class ShutdownStressTests
 
         await RunIterationsAsync(async i =>
         {
-            var protocolOptions = new PgClientProtocolOptions(options) { CompletionTimeout = TimeSpan.FromMilliseconds(2) };
+            var protocolOptions = new PgClientProtocolOptions(options) { CompletionTimeout = TimeSpan.FromMilliseconds(2), HeartbeatInterval = TimeSpan.FromMilliseconds(5) };
             var protocol = PgClientProtocol.Create(protocolOptions);
             await protocol.StartAsync(options, new ReplayTransport(handshake));
             await RunIterationAsync(i, async () =>
@@ -102,7 +104,7 @@ public class ShutdownStressTests
 
         await RunIterationsAsync(async i =>
         {
-            var protocolOptions = new PgClientProtocolOptions(options) { CompletionTimeout = TimeSpan.FromMilliseconds(2) };
+            var protocolOptions = new PgClientProtocolOptions(options) { CompletionTimeout = TimeSpan.FromMilliseconds(2), HeartbeatInterval = TimeSpan.FromMilliseconds(5) };
             var protocol = PgClientProtocol.Create(protocolOptions);
             await protocol.StartAsync(options, new ReplayTransport(handshake));
             await RunIterationAsync(i, async () =>
@@ -128,8 +130,9 @@ public class ShutdownStressTests
     // PgClientClosedException (the protocol is shutting down), at any of several sites, so we
     // tolerate it globally and fail only on anything else.
     // Iterations are independent (a fresh protocol + transport each) and the per-iteration latency is
-    // dominated by the CompletionTimeout escalation that unblocks the parked reads - a timer wait, not
-    // CPU. Running them with bounded concurrency overlaps those waits, cutting wall-clock by ~DOP
+    // dominated by the abort escalation + heartbeat propagation that unblocks the parked reads (both
+    // kept to a few ms) - a timer wait, not CPU. Running them with bounded concurrency overlaps those
+    // waits, cutting wall-clock by ~DOP
     // without lowering the iteration count (the race coverage), and the added scheduling pressure
     // widens the dispatch-vs-shutdown interleavings the stress is hunting.
     static async Task RunIterationsAsync(Func<int, Task> iteration)
