@@ -189,10 +189,17 @@ sealed class PgProtocolDataWriter(IOutputWriter<byte> writer, Encoding clientEnc
             {
                 await task.ConfigureAwait(false);
             }
+            catch (Exception ex) when (_abortToken.IsCancellationRequested)
+            {
+                // Abort canceled the flush. .NET surfaces an entry cancel as an OCE but a mid-flight
+                // one as a wrapped IOException/SocketException, so catch type-agnostically (mirrors the
+                // sync seam above and the decoder's TranslateReadCancellation) and translate to the
+                // closed exception. Keyed on the abort token, not the exception type.
+                throw TranslateAbort(ex);
+            }
             catch (OperationCanceledException oce) when (oce.CancellationToken == _cts.Token)
             {
-                if (_abortToken.IsCancellationRequested)
-                    _control.ThrowIfClosed();
+                // Not abort (handled above): the flow's own escape-hatch CT fired. Surface as the caller's OCE.
                 if (cancellationToken.IsCancellationRequested)
                     throw new OperationCanceledException(cancellationToken);
                 throw;
