@@ -166,7 +166,7 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
 
     internal sealed class State
     {
-        public readonly PgClientProtocol Protocol;
+        public readonly FlushGate FlushGate;
         public readonly SingleProducerSingleConsumerQueue<PgClientFlow> Queue = new();
         // The wait-protocol WakeSignal with suspension observation enabled: the executor's waits
         // arm against it (thin path, no value-task source), and EnqueueSyncWithHandoff
@@ -188,11 +188,6 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
         // flow on its own thread, defeating the inline-on-caller's-thread guarantee.
         public bool HandoffAcked;
         public bool IsCompleted;
-        // Arm gate for TryGetNext. Normally true (fast path). Flipped false by TryGetNext-on-consume
-        // when the source needs a WaitForNextAsync round between dispatches: completion (lets the
-        // shutdown flush fire first) or UnflushedBytes past the flush threshold. WaitCore re-arms
-        // when it returns Retry, after its flush has run.
-        public bool ArmedForGetNext = true;
 
         public readonly Lock SyncWaiterLock = new();
         public SyncHandoffEntry? SyncHead;
@@ -200,7 +195,7 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
 
         public State(PgClientProtocol protocol, PipelineScheduler scheduler)
         {
-            Protocol = protocol;
+            FlushGate = new(protocol);
             WakeSignal = new(runContinuationsAsynchronously: true, scheduler, enableWaitForSuspended: true);
         }
 
@@ -321,10 +316,11 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
             }
 
             // Arm gate: under the periodic-flush threshold each TryGetNext-consume requires a fresh
-            // WaitForNextAsync round to fire the flush seam. WaitCore sets the flag on Retry; we clear
-            // it here on consume so the next pull is gated again. Outside that, the fast path runs.
-            var needsArm = _state.Protocol.UnflushedBytes >= PgProtocolDataWriter.UnflushedBytesFlushThreshold;
-            if (needsArm && !Volatile.Read(ref _state.ArmedForGetNext))
+            // WaitForNextAsync round to fire the flush seam. WaitCore re-arms on Retry; we consume it
+            // here on take so the next pull is gated again. Outside that, the fast path runs.
+            var gate = _state.FlushGate;
+            var needsArm = gate.NeedsArm;
+            if (needsArm && !gate.Armed)
             {
                 item = null;
                 return false;
@@ -332,7 +328,7 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
             if (_state.TryTakeHandoff() || (!Volatile.Read(ref _state.HandoffActive) && _state.TryDequeue()))
             {
                 if (needsArm)
-                    Volatile.Write(ref _state.ArmedForGetNext, false);
+                    gate.ConsumeArm();
                 item = _state.Current;
                 return true;
             }
@@ -347,17 +343,8 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
         /// write backpressure - flush not completing inline - rides the Task shape.
         public WaitForNextAwaitable WaitForNextAsync()
         {
-            if (_state.Protocol.UnflushedBytes is not 0)
-            {
-                // CancellationToken.None on purpose: abort is gated inside the writer, whose flush
-                // runs on its own _cts (linked to AbortToken) and translates to closed on fire, so
-                // a faulted flush surfaces below as not-completed-successfully and rethrows. The
-                // passed token is only the per-flow escape hatch, which the executor's wait doesn't use.
-                var flushTask = _state.Protocol.FlushAsync(CancellationToken.None);
-                if (!flushTask.IsCompletedSuccessfully)
-                    return WaitForNextAwaitable.FromTask(FlushThenWaitAsync(flushTask));
-                flushTask.GetAwaiter().GetResult();
-            }
+            if (_state.FlushGate.FlushBeforePark() is { } flushTask)
+                return WaitForNextAwaitable.FromTask(FlushThenWaitAsync(flushTask));
             return WaitCore();
         }
 
@@ -372,7 +359,7 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
             // rendezvous can't strand the sync caller.
             if (Volatile.Read(ref _state.HandoffAcked))
             {
-                Volatile.Write(ref _state.ArmedForGetNext, true);
+                _state.FlushGate.Rearm();
                 wakeSignal.ReleaseWakeLock();
                 return WaitForNextAwaitable.Retry();
             }
@@ -399,7 +386,7 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
             {
                 // An item is available - arm the next TryGetNext so it can consume one (only one
                 // while the flush-threshold gate holds, so a flush round lands between items).
-                Volatile.Write(ref _state.ArmedForGetNext, true);
+                _state.FlushGate.Rearm();
                 wakeSignal.ReleaseWakeLock();
                 return WaitForNextAwaitable.Retry();
             }
