@@ -94,7 +94,7 @@ public class ProtocolLevelTests
 
         await PgTestPool.RunAsync(protocol, "select 1"); // warm
 
-        var slow = new CommandFlow(async: true, Command.Create("select pg_sleep(0.1)"));
+        var slow = new CommandFlow(async: true, Command.Create("select pg_sleep(0.05)"));
         Assert.IsTrue(protocol.TryQueue(slow));
         var slowEnum = slow.GetAsyncEnumerator();
         var slowTask = DrainAsync(slowEnum);

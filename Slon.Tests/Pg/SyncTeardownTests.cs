@@ -43,8 +43,10 @@ public class SyncTeardownTests
             }
         });
 
-        // Let the query reach the wire and the read park on the (withheld) response.
-        await Task.Delay(250);
+        // Let the query reach the wire and the read park on the (withheld) response. 100ms is ~10x the
+        // real localhost park time; the test doesn't depend on the exact value, only that the read is
+        // parked before DisposeAsync.
+        await Task.Delay(100);
 
         // Forceful: fires AbortToken and aborts the transport (closes the socket), which is the only
         // thing that breaks the otherwise-uninterruptible blocking read.
