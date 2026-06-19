@@ -88,16 +88,18 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
             _cancellationTokenSource = CancellationTokenSource.CreateLinkedTokenSource(_abortToken);
     }
 
-    // Translate a read cancellation (an OCE on our cancelled CTS) to the protocol's typed surface,
-    // shared by sync and async paths. The CTS also fires on read-timeout, hence the timeout branch.
-    // Returns rather than throws so a sync caller's throw keeps definite assignment.
-    Exception TranslateReadCancellation(OperationCanceledException oce, CancellationToken cancellationToken)
+    // Translate a read cancellation to the protocol's typed surface, shared by sync and async paths.
+    // The cause is an OCE when the cancel landed before/at the read's start, or an IOException /
+    // SocketException / ObjectDisposedException when our CTS aborted (or Abort closed the socket under)
+    // an in-flight receive. The CTS also fires on read-timeout, hence the timeout branch. Returns rather
+    // than throws so a sync caller's throw keeps definite assignment.
+    Exception TranslateReadCancellation(Exception cause, CancellationToken cancellationToken)
     {
         if (_abortToken.IsCancellationRequested && _control.ClosedException is { } closed)
             return closed;
         if (cancellationToken.IsCancellationRequested)
             return new OperationCanceledException(cancellationToken);
-        return new TimeoutException("Read timed out.", oce);
+        return new TimeoutException("Read timed out.", cause);
     }
 
     /// Flow-owned escape hatch from a parked read. Without it the only break-out is protocol
@@ -120,10 +122,15 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
                 {
                     task = _messageBatchEnumerator.MoveNextAsync(_cancellationTokenSource.Token);
                 }
-                catch (OperationCanceledException oce) when
-                    (oce.CancellationToken == _cancellationTokenSource.Token && _cancellationTokenSource.IsCancellationRequested)
+                catch (Exception ex) when (_cancellationTokenSource.IsCancellationRequested)
                 {
-                    throw TranslateReadCancellation(oce, cancellationToken);
+                    // Key on the cancel state - which the protocol owns - NOT the exception type. A
+                    // cancelled read surfaces an OCE when the token is tripped at entry, but whatever the
+                    // transport throws when an in-flight read is aborted otherwise (today a wrapped socket
+                    // exception / ObjectDisposedException; another transport would throw its own). Keying
+                    // on the type would couple us to one transport's exception vocabulary and silently
+                    // fail to translate another's. Translate whatever it is; mirrors the sync MoveNext.
+                    throw TranslateReadCancellation(ex, cancellationToken);
                 }
                 if (!task.IsCompletedSuccessfully)
                     return MoveNextAsyncCore(task, null, cancellationToken);
@@ -196,10 +203,11 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
                         if (!_messageContext.TryMoveNext())
                             ThrowHelper.ThrowInvalidOperation("No message in a new batch");
                     }
-                    catch (OperationCanceledException oce) when
-                        (oce.CancellationToken == _cancellationTokenSource.Token && _cancellationTokenSource.IsCancellationRequested)
+                    catch (Exception ex) when (_cancellationTokenSource.IsCancellationRequested)
                     {
-                        throw TranslateReadCancellation(oce, cancellationToken);
+                        // Key on cancel state, not exception type, so the translation stays independent
+                        // of the transport's exception vocabulary (see the entry-catch note above).
+                        throw TranslateReadCancellation(ex, cancellationToken);
                     }
 
                     messageHandledTask = CurrentExecutionControl.HandleMessageAuto(_messageContext.Current);
