@@ -24,7 +24,8 @@ static class CancelRequest
 
     // Sends the 16-byte cancel request on the provided transport and waits for the server's FIN.
     // Caller owns the transport lifecycle: opens the connection (with the same TLS / endpoint
-    // policy as the main connection it's cancelling) before calling, disposes after. The cancel
+    // policy as the main connection it's cancelling) before calling, releases it (abortive close +
+    // endpoint completion - the connection has no Dispose surface) after. The cancel
     // request itself is fire-and-forget at the protocol level - no in-band ack - so this method
     // returns when the server closes its end (the only confirmation that the request was
     // received). Throws on transport faults.
