@@ -131,9 +131,12 @@ public sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
 
         future = null;
         // Single pass through stripes. Empty / completed slots claim immediately (open new).
-        // Non-idle conns are remembered as the multiplex fallback. Only taken after the walk
-        // confirms no growth path is available.
-        T? multiplexCandidate = null;
+        // Non-idle conns are the multiplex fallback, taken only after the walk confirms no growth path.
+        // Power-of-two-choices: remember the first TWO non-idle conns seen from the random start and pick
+        // the lower-load one via a single CompareTo. This consults the score without the O(N) full-rank
+        // scan that made scoring too slow to keep wired originally - the walk visits every slot anyway,
+        // so this is one extra ref plus one compare.
+        T? cand1 = null, cand2 = null;
         for (var i = startIndex; i < startIndex + connections.Length; i++)
         {
             ref var item = ref connections[i < connections.Length ? i : i - connections.Length];
@@ -146,9 +149,11 @@ public sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
                     return false;
                 }
 
-                // Remember first non-idle as the multiplex fallback. Don't take yet.
-                if (multiplexCandidate is null && !conn.IsIdle)
-                    multiplexCandidate = conn;
+                if (!conn.IsIdle)
+                {
+                    if (cand1 is null) cand1 = conn;
+                    else cand2 ??= conn;
+                }
             }
             else if (Interlocked.CompareExchange(ref item, future ??= new ConnectionFuture(), conn) == conn)
             {
@@ -158,7 +163,8 @@ public sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
             }
         }
 
-        // No growth path. Multiplex onto a busy conn we saw during the walk.
+        // No growth path. Multiplex onto the less-loaded of the two sampled busy conns.
+        var multiplexCandidate = cand2 is not null && cand1!.CompareTo(cand2) > 0 ? cand2 : cand1;
         if (multiplexCandidate is not null && DoSchedule(new(multiplexCandidate, cancellationToken, idle: false), schedule, state))
         {
             future = null;

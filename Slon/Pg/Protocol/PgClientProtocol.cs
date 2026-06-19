@@ -71,6 +71,22 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
     PgDecoder _pgDecoder = null!;
 
     int _pipelineStalls;
+    // Scoring inputs (the stall count, and the tick/age/throughput counters added for load scoring) are
+    // a POOL concern: a standalone protocol has no pool consuming CompareTo, so it shouldn't pay to
+    // maintain them. Set from onIdle in Initialize - non-null means an orchestrator (pool) drives us.
+    bool _scoringEnabled;
+    // Coarse monotonic clock for load scoring: incremented once per heartbeat tick (~HeartbeatInterval),
+    // so flow-age and throughput are measured in ticks with no wall-clock reads on any hot path. Single
+    // writer (the heartbeat); readers (flow-dispatch stamp, CompareTo) use a plain atomic int read.
+    int _heartbeatTick;
+    // Throughput (completions per tick), EWMA-smoothed in the heartbeat so a single quiet tick doesn't
+    // tank the rate. _completionCount is the running total (bumped at retirement); the heartbeat diffs it
+    // against _lastTickCompletions and folds the delta in. _currentFlowStartTick is the active (head)
+    // flow's start tick - currentTick minus it is the head's age, the "stuck on a long query" signal.
+    int _completionCount;
+    int _lastTickCompletions;
+    double _throughputPerTick;
+    int _currentFlowStartTick;
     Heartbeat? _heartbeat;
     Action? _poolConnectionIdleSignal;
 
@@ -144,11 +160,31 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
         if (other is null)
             return 1;
 
-        // Arbitrary factor for stalls :)
-        var score = PipelineDepth + (_pipelineStalls * 4);
-        var otherScore = other.PipelineDepth + (other._pipelineStalls * 4);
-
+        var score = LoadScore();
+        var otherScore = other.LoadScore();
         return score < otherScore ? -1 : score == otherScore ? 0 : 1;
+    }
+
+    // Estimated backlog in ticks (lower = better target). Little's Law core: expected wait = depth /
+    // throughput (W = L/λ), so a deep-but-fast connection scores lower than a shallow-but-stuck one. The
+    // throughput floor turns a zero-rate-with-work connection into a large W (correctly "stuck"); an idle
+    // connection short-circuits to 0. Stalls (non-pipelined flows serialize the wire) and a head flow
+    // running past the age threshold (stuck on a long op) add tick-equivalent penalties on top. All knobs
+    // are deliberately rough - power-of-two selection only needs the comparison to be directionally right.
+    double LoadScore()
+    {
+        var depth = PipelineDepth;
+        if (depth == 0)
+            return 0;
+
+        const double RateFloor = 0.5, StallWeight = 2, AgePenalty = 5;
+        const int AgeThresholdTicks = 3;
+
+        var rate = Math.Max(_throughputPerTick, RateFloor);
+        var score = depth / rate + _pipelineStalls * StallWeight;
+        if (_heartbeatTick - _currentFlowStartTick > AgeThresholdTicks)
+            score += AgePenalty;
+        return score;
     }
 
     public static PgClientProtocol Create(PgClientProtocolOptions protocolOptions)
@@ -161,6 +197,9 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
         _protocolDataWriter = new(_pipeWriter, PgClientOptions.PreStartupEncoding, connection.WaitWritable, AbortToken, FlowControl);
         _pipeSegmentEnumerator = new(connection.Reader, new(), ownsReader: true);
         _pgDecoder = new(_pipeSegmentEnumerator, AbortToken, _options.ReadTimeout);
+
+        // Scoring is a pool concern: only maintain its inputs when an orchestrator drives us.
+        _scoringEnabled = onIdle is not null;
 
         // A non-null onIdle means an external orchestrator (pool, PgConnection) drives us,
         // including the heartbeat tick. When null, we run our own heartbeat so standalone
@@ -302,7 +341,7 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
         // Bind
         var control = flow.GetExecutionControl(FlowControl);
         control.Bind(_options.FlowActivationTimeout);
-        if (!control.IsPipelined)
+        if (_scoringEnabled && !control.IsPipelined)
             Interlocked.Increment(ref _pipelineStalls);
 
         return true;
@@ -557,6 +596,17 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
 
     internal ValueTask Heartbeat(TimeSpan period)
     {
+        if (_scoringEnabled)
+        {
+            _heartbeatTick++;
+            // Completions since last tick = throughput-per-tick; fold into the EWMA. Single writer (this
+            // handler), so plain arithmetic; the score reads the smoothed value.
+            var completedThisTick = _completionCount - _lastTickCompletions;
+            _lastTickCompletions = _completionCount;
+            const double Alpha = 0.3;
+            _throughputPerTick = Alpha * completedThisTick + (1 - Alpha) * _throughputPerTick;
+        }
+
         var control = FlowControl;
         // Wrong-tenure hazard if a timeout-armed flow is ever pooled (enforced against in
         // PgClientFlow.Reset). The fix's per-flow placement-stamp capture lands here.
@@ -902,9 +952,10 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
         // against a depth-0-cleared slot.
         internal void BindDecoder(PgClientFlow flow)
         {
-            var control = flow.GetExecutionControl(this);
-            if (!control.IsPipelined)
-                Interlocked.Decrement(ref protocol._pipelineStalls);
+            // Stamp the head flow's start tick at activation (this is the active reader). currentTick
+            // minus it gives the head's running age for the load score.
+            if (protocol._scoringEnabled)
+                protocol._currentFlowStartTick = protocol._heartbeatTick;
             protocol._pgDecoder.Initialize(this);
         }
 
@@ -919,6 +970,17 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
 
         internal void OnCompleted(PgClientFlow flow, int remainingDepth)
         {
+            // Scoring inputs maintained at retirement (the universal completion point, fires for every
+            // flow including ones faulted before bind). Throughput: every retirement counts. Stalls: a
+            // non-pipelined flow held the wire serialized from queue until its RFQ here (not just until
+            // bind), so decrement here - measures the serialization window, never orphans an increment.
+            if (protocol._scoringEnabled)
+            {
+                Interlocked.Increment(ref protocol._completionCount);
+                if (!flow.GetExecutionControl(this).IsPipelined)
+                    Interlocked.Decrement(ref protocol._pipelineStalls);
+            }
+
             // At pipeline park (remainingDepth == 0) release the rooted read-state buffers and signal
             // the pool's idle hook. The framework manages the ActivatedItem slot (cleared right after
             // this), and the in-order Activate-before-Complete invariant means no successor Activate
