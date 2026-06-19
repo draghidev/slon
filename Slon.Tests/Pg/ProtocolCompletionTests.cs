@@ -138,6 +138,54 @@ public class ProtocolCompletionTests
         }
     }
 
+    // Graceful CompleteAsync racing forceful DisposeAsync on the SAME protocol under maximal
+    // overlap, with an in-flight flow so the drain has real residual work. SignalDraining only
+    // returns false once Completed, so during the drain window BOTH calls can run a Shutdown body:
+    // double _source.SetDrainSignal (second overwrites the first's executorStopped TCS), double
+    // _pipeline.CompleteAsync, double DrainInertItems. Asserts teardown still converges - no hang,
+    // ends Completed, the consumer sees only a clean closed exception. Looped to surface the race.
+    [TestMethod]
+    public async Task CompleteAsync_RacingDisposeAsync_ConvergesCleanly()
+    {
+        for (var i = 0; i < 50; i++)
+        {
+            var protocol = await ConnectAsync();
+            var flow = new CommandFlow(async: true, Command.Create("select pg_sleep(0.02)"));
+            Assert.IsTrue(protocol.TryQueue(flow));
+
+            var runTask = Task.Run(async () =>
+            {
+                var e = flow.GetAsyncEnumerator();
+                try
+                {
+                    while (await e.MoveNextAsync()) { }
+                }
+                catch (PgClientClosedException)
+                {
+                }
+                await e.DisposeAsync();
+            });
+
+            // Release both teardowns from a single gate so they start as close to simultaneously
+            // as the scheduler allows, maximizing the overlap window.
+            using var gate = new ManualResetEventSlim(false);
+            var complete = Task.Run(async () =>
+            {
+                gate.Wait();
+                await protocol.CompleteAsync();
+            });
+            var dispose = Task.Run(async () =>
+            {
+                gate.Wait();
+                await protocol.DisposeAsync();
+            });
+            gate.Set();
+
+            await Task.WhenAll(complete, dispose, runTask).WaitAsync(TimeSpan.FromSeconds(10));
+            Assert.IsTrue(protocol.IsCompleted, $"iteration {i}: protocol did not reach Completed");
+        }
+    }
+
     // CompleteAsync with a parked flow (enqueued but not yet activated). The graceful drain
     // observes the flow, AbortToken fires when CompletionTimeout elapses, heartbeat propagates
     // the closed exception into the flow's activation source. Flow's MoveNextAsync surfaces

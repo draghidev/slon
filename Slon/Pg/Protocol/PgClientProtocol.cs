@@ -410,32 +410,80 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
         }
     }
 
-    async ValueTask Shutdown(Exception? closeReason, bool forceful)
+    // Single-winner drain. The first Shutdown caller claims this and runs the body; concurrent and later
+    // callers await the same completion. Two bodies would race the CTS lifecycle (a forceful
+    // DisposeAsyncCore disposing _abortCts while a graceful body is still in its finally) and double-arm
+    // the drain signal. SignalDraining can't gate this alone - it returns true throughout the Draining
+    // window, so a graceful CompleteAsync and a forceful DisposeAsync both pass during the drain.
+    TaskCompletionSource? _shutdownCompletion;
+
+    ValueTask Shutdown(Exception? closeReason, bool forceful)
     {
-        // First-writer-wins. SignalDraining returns false when status is already Completed.
-        if (!SignalDraining())
-            return;
+        bool owner;
+        TaskCompletionSource completion;
+        lock (_syncRoot)
+        {
+            owner = _shutdownCompletion is null;
+            if (owner)
+            {
+                // Materialize the canonical closed exception BEFORE any cancellation can fire (the forceful
+                // escalation below, or the body's graceful cancel). A sync read/flow faulting on the
+                // abortive close or AbortToken translates to it (PgDecoder reads _closedException); if it's
+                // still null when the wire breaks, the raw ObjectDisposedException leaks instead. The owner
+                // sets it once; losers read the same instance. Wraps closeReason as inner.
+                _closedException = new PgClientClosedException(closeReason);
+                _shutdownCompletion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            }
+            completion = _shutdownCompletion!;
+        }
 
-        // Materialize the canonical closed exception BEFORE firing any cancellation so an observer
-        // waking on AbortToken / StoppingToken sees the same instance. It wraps closeReason as inner.
-        var closedException = new PgClientClosedException(closeReason);
-        _closedException = closedException;
-
-        // Parked-flow propagation is heartbeat-driven for both paths: ExecutionControl.OnHeartbeat
-        // observes AbortToken and fails the activation source within HeartbeatInterval. Forceful
-        // disposal accepts that latency too.
+        // Forceful escalation: idempotent, applied by ANY forceful caller - including one that loses the
+        // drain claim to a concurrent graceful CompleteAsync - so a forceful Dispose can break a graceful
+        // drain that would otherwise hang on a wedged peer. AbortToken + the abortive close (RST, never
+        // blocks) fault parked sync I/O into the translation path; async I/O already unblocks off
+        // AbortToken. Runs AFTER the claim so _closedException is set: a loser's lock acquisition
+        // happens-after the owner's materialize. _abortCts is live: DisposeAsyncCore (the only forceful
+        // caller, gated by _disposed so it runs once) fires this before its await and disposes the CTSes
+        // only afterwards.
         if (forceful)
         {
-            // Sync Cancel: AbortToken is internal-only, callbacks are framework-authored and audited.
             _abortCts.Cancel();
-            // Break the wire so parked sync I/O faults into the translation path; async I/O already
-            // unblocks off AbortToken. Must happen BEFORE the drain awaits in-flight flows below, or a
-            // flow parked in a blocking read would never complete and the drain would hang. The abortive
-            // close (RST, never blocks - a graceful close itself can hang on a wedged peer) faults the
-            // parked read and leaves the buffers for the later Complete. No-op for async/pipe transports.
             _connection?.Abort();
         }
-        else
+
+        return owner ? DriveShutdownAsync(forceful, completion) : new ValueTask(completion.Task);
+    }
+
+    // Owns the single drain body and publishes its outcome to every awaiting caller. Run outside
+    // _syncRoot (the gate only claims under the lock) so the body's awaits / cancellation callbacks
+    // never execute while the lock is held.
+    async ValueTask DriveShutdownAsync(bool forceful, TaskCompletionSource completion)
+    {
+        try
+        {
+            await RunShutdownAsync(forceful).ConfigureAwait(false);
+            completion.SetResult();
+        }
+        catch (Exception ex)
+        {
+            completion.SetException(ex);
+            throw;
+        }
+    }
+
+    async Task RunShutdownAsync(bool forceful)
+    {
+        SignalDraining();
+
+        // Set by the Shutdown gate under _syncRoot before any cancellation fired.
+        var closedException = _closedException!;
+
+        // Graceful: bound the drain with CompletionTimeout (AbortToken escalates on expiry) and fire
+        // StoppingToken so the body drains to a clean RFQ. Forceful already fired AbortToken + the
+        // abortive Abort in the Shutdown gate, so it goes straight to the drain. Parked-flow propagation
+        // is heartbeat-driven either way (ExecutionControl.OnHeartbeat fails the activation source within
+        // HeartbeatInterval; forceful disposal accepts that latency too).
+        if (!forceful)
         {
             _abortCts.CancelAfter(_options.CompletionTimeout);
             await _stoppingCts.CancelAsync().ConfigureAwait(false);
@@ -464,17 +512,29 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
             // policy.CompleteItem.
             await completeTask.ConfigureAwait(false);
         }
+        catch (PgClientClosedException)
+        {
+            // Expected forced-close outcome, not a fault to surface. When the wire is torn down mid-drain
+            // (a forceful Abort, or a forceful sibling racing this graceful drain), the executor's pre-park
+            // flush faults with the closed exception. ExecuteSource's sanctioned-shutdown catch swallows
+            // only a token-matched OCE, but the writer translates the abort to PgClientClosedException, so
+            // it escapes into completeTask. The pipeline still ran its own teardown (DrainOnCompletionAsync
+            // + enumerator dispose) in its finally, so the residual is drained - only the exception bubbles
+            // here. Swallow it so CompleteAsync/DisposeAsync complete normally. Catch the type, not a single
+            // instance: a concurrent graceful+forceful pair each materialize their own closed exception and
+            // either may win _closedException, so both are equally expected here.
+        }
         finally
         {
             // Disarm the CTS scheduled by the graceful path.
             _abortCts.CancelAfter(Timeout.InfiniteTimeSpan);
             SignalCompleted();
-            // Release the transport once the drain has completed. Both graceful and forceful reach
-            // here, and SignalDraining gates this to the first shutdown, so the wire is closed exactly
-            // once at completion - NOT gated on Dispose. The transport is not observable protocol
-            // state: unlike the cancellation sources (whose tokens a caller may still read after a
-            // graceful CompleteAsync), a completed protocol's wire can't be reached by anyone. Without
-            // this, a CompleteAsync never followed by Dispose leaked its socket (max_connections).
+            // Release the transport once the drain has completed. Single-winner gating runs this body
+            // exactly once, so the wire is closed exactly once at completion - NOT gated on Dispose. The
+            // transport is not observable protocol state: unlike the cancellation sources (whose tokens a
+            // caller may still read after a graceful CompleteAsync), a completed protocol's wire can't be
+            // reached by anyone. Without this, a CompleteAsync never followed by Dispose leaked its socket
+            // (max_connections).
             if (_connection is not null)
             {
                 // Release the transport through the endpoints the protocol holds - the connection owns
