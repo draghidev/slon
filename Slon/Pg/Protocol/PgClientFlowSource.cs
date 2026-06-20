@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using Draghi.Pipelining;
 using Draghi.Pipelining.Internal;
@@ -55,11 +54,12 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
 
     /// Synchronously enqueues a sync-mode flow and blocks until the executor processes it on the
     /// caller's thread, which drives the rendezvous and the body. No TP work item at any point.
-    /// Three-step rendezvous. 1: claim the handoff slot (serializes concurrent sync callers) and gate
-    /// async signals via HandoffActive. 2: wait on the parked MRES, set once the executor's awaiter
-    /// calls OnCompleted (after draining existing items to its park point). 3: set the VTS result
-    /// inline, resuming the executor's continuation here to pull the flow and process it. If async
-    /// producers deferred items during the window, wake the executor on TP afterward, else zero TP.
+    /// 1: take the handoff slot (FIFO-serializes concurrent sync callers) and gate async signals via
+    /// HandoffActive. 2: publish the flow and claim the executor's parked wait under the wake lock,
+    /// acking the slot only on a winning claim so a racing async wake can't snipe it; re-wait and
+    /// retry if the executor was busy. The claim dispatches the executor's continuation inline here
+    /// to pull the flow and process it. If async producers deferred items during the window, wake
+    /// the executor on TP afterward, else zero TP.
     public void EnqueueSyncWithHandoff(PgClientFlow flow)
     {
         if (Volatile.Read(ref _state.IsCompleted))
@@ -88,20 +88,34 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
 
         _state.OnEnqueue?.Invoke();
 
-        // Publish to the handoff slot. The previous head (if any) re-suspended the executor and
-        // the suspension observation is already set. If we're the original head and the executor
-        // was busy we still wait for the natural suspension.
+        // Publish the slot, then claim the executor's parked wait inline so its continuation runs
+        // on this thread and pulls the flow. The claim and the HandoffAcked store are one wake-lock
+        // hold: acking only once we own the parked wait (_pending observed true under the lock means
+        // the executor is parked, not mid-pull) is what stops a racing async wake from sniping the
+        // slot. HandoffActive is set under SyncWaiterLock, not the wake lock, so an async Execute can
+        // read it stale-false (no StoreLoad ordering across the two locks), pass its gate, and claim
+        // the parked wait we expected. That is no longer fatal: if our claim loses, the executor
+        // re-arms under HandoffActive (skip-queue, so it parks without taking the unacked slot);
+        // WaitForSuspended blocks until that re-arm and we retry. The common idle case claims on the
+        // first try with no WaitForSuspended round.
+        var wakeSignal = _state.WakeSignal;
         Volatile.Write(ref _state.HandoffSlot, entry.Flow);
-        _state.WakeSignal.WaitForSuspended();
-        // Ack only AFTER WaitForSuspended returns. TryGetNext gates on this so the executor
-        // can't snipe HandoffSlot during a between-items pull that doesn't suspend.
-        Volatile.Write(ref _state.HandoffAcked, true);
-        // Inline claim: guaranteed to win - async signals defer during HandoffActive and Complete's
-        // wake defers too, so nothing else can consume the suspended wait between our observation and
-        // this claim. The executor's continuation runs on this thread: it retries TryGetNext, takes
-        // the acked slot, and the flow is processed inline before this call returns.
-        var claimed = _state.WakeSignal.Signal(runContinuationsAsynchronously: false);
-        Debug.Assert(claimed, "Sync handoff lost its rendezvous: the suspended wait was claimed elsewhere.");
+        while (true)
+        {
+            wakeSignal.AcquireWakeLock();
+            if (wakeSignal.TryClaimLocked())
+            {
+                Volatile.Write(ref _state.HandoffAcked, true);
+                wakeSignal.ReleaseWakeLock();
+                wakeSignal.DispatchClaimed(runContinuationsAsynchronously: false);
+                break;
+            }
+            wakeSignal.ReleaseWakeLock();
+            // Executor busy: it drains to its park point and re-arms (reset of the suspension
+            // observation by whatever claim made _pending false means this blocks rather than
+            // spinning on a stale TRUE), then we retry the claim.
+            wakeSignal.WaitForSuspended();
+        }
 
         // Baton hand-off: pop self from head, peek next. If a next waiter exists, signal it.
         // Otherwise close out the chain.
