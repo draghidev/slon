@@ -366,6 +366,13 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
 
             if (isAsync)
                 enqueue = _source.Enqueue(flow);
+            else
+                // Depth increment under _syncRoot: DepthState.IncrementDepth is non-atomic single-
+                // producer, so the sync path's increment must serialize with the async Enqueue's
+                // (line above, same lock) or concurrent same-protocol callers race it (lost increment
+                // -> negative depth -> "double completion" assert). The blocking handoff rendezvous
+                // stays OUTSIDE the lock.
+                _source.RegisterEnqueue();
         }
         if (isAsync)
         {
@@ -373,7 +380,7 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
         }
         else
         {
-            _source.EnqueueSyncWithHandoff(flow);
+            _source.EnqueueSyncWithHandoff(flow, invokeOnEnqueue: false);
         }
         return true;
     }

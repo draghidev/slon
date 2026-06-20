@@ -52,6 +52,12 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
         return new(_state);
     }
 
+    /// Invoke the OnEnqueue (depth) hook on its own. The protocol calls this under _syncRoot for the
+    /// sync path so the non-atomic single-producer IncrementDepth doesn't race a concurrent async
+    /// Enqueue's increment (which also runs under _syncRoot). Then it calls EnqueueSyncWithHandoff with
+    /// invokeOnEnqueue:false so the count isn't doubled.
+    internal void RegisterEnqueue() => _state.OnEnqueue?.Invoke();
+
     /// Synchronously enqueues a sync-mode flow and blocks until the executor processes it on the
     /// caller's thread, which drives the rendezvous and the body. No TP work item at any point.
     /// 1: take the handoff slot (FIFO-serializes concurrent sync callers) and gate async signals via
@@ -60,7 +66,11 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
     /// retry if the executor was busy. The claim dispatches the executor's continuation inline here
     /// to pull the flow and process it. If async producers deferred items during the window, wake
     /// the executor on TP afterward, else zero TP.
-    public void EnqueueSyncWithHandoff(PgClientFlow flow)
+    // invokeOnEnqueue=false when the caller already invoked the OnEnqueue (depth) hook under its own
+    // producer serialization (the protocol does this under _syncRoot, since DepthState.IncrementDepth
+    // is non-atomic single-producer and a concurrent async Enqueue would otherwise race it). The
+    // exclusive nested caller has no concurrent async producer, so it keeps the default.
+    public void EnqueueSyncWithHandoff(PgClientFlow flow, bool invokeOnEnqueue = true)
     {
         if (Volatile.Read(ref _state.IsCompleted))
             ThrowCompleted();
@@ -86,7 +96,8 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
         if (!isHead)
             entry.WakeMres.Wait();
 
-        _state.OnEnqueue?.Invoke();
+        if (invokeOnEnqueue)
+            _state.OnEnqueue?.Invoke();
 
         // Publish the slot, then claim the executor's parked wait inline so its continuation runs
         // on this thread and pulls the flow. The claim and the HandoffAcked store are one wake-lock
