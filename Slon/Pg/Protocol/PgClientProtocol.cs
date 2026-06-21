@@ -400,24 +400,18 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
             if (predicate?.Invoke(state) == false)
                 return false;
 
+            // The async Enqueue writes the SPSC storage, so it must serialize with concurrent
+            // same-protocol async producers (single-producer contract). The sync path uses the separate
+            // HandoffSlot, so it needs no lock here; its blocking rendezvous stays OUTSIDE the lock.
+            // Depth is no longer counted at enqueue (it's counted at dispatch, executor-single-writer),
+            // so there is no producer-side increment to serialize.
             if (isAsync)
                 enqueue = _source.Enqueue(flow);
-            else
-                // Depth increment under _syncRoot: DepthState.IncrementDepth is non-atomic single-
-                // producer, so the sync path's increment must serialize with the async Enqueue's
-                // (line above, same lock) or concurrent same-protocol callers race it (lost increment
-                // -> negative depth -> "double completion" assert). The blocking handoff rendezvous
-                // stays OUTSIDE the lock.
-                _source.RegisterEnqueue();
         }
         if (isAsync)
-        {
             enqueue.Execute(runContinuationsAsynchronously: true);
-        }
         else
-        {
-            _source.EnqueueSyncWithHandoff(flow, invokeOnEnqueue: false);
-        }
+            _source.EnqueueSyncWithHandoff(flow);
         return true;
     }
 

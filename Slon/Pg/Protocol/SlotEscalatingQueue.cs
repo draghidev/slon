@@ -37,6 +37,18 @@ struct SlotEscalatingQueue<T> where T : class
     /// True once escalated to the queue tier. Stable after first true.
     public bool IsEscalated => Volatile.Read(ref _queue) is not null;
 
+    /// Best-effort gauge: items held (slot occupancy + escalated-queue length). Lock-free, may be
+    /// stale - a telemetry/backlog read, not a synchronization primitive.
+    public int Count
+    {
+        get
+        {
+            var n = Volatile.Read(ref _slot) is null ? 0 : 1;
+            var queue = Volatile.Read(ref _queue);
+            return queue is null ? n : n + queue.Count;
+        }
+    }
+
     /// Producer (single thread). Latched: straight to the queue. Else fill the empty slot, or
     /// escalate on overlap - leaving the head in the slot (no move, no claim race), queuing only the
     /// overflow, publishing (release) so the consumer's acquire sees it, then latching.
