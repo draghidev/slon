@@ -90,7 +90,12 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
                 _state.SyncTail.Next = entry;
             _state.SyncTail = entry;
             if (isHead)
-                Volatile.Write(ref _state.HandoffActive, true);
+                // Full-fence open (Interlocked, not Volatile.Write), symmetric with the close-out's
+                // clear. A release-only open sits in this thread's store buffer past a concurrent
+                // Complete/Execute's HandoffActive read: that reader sees the window stale-closed, skips
+                // its defer, and claims the wait this handoff is rendezvousing on - the executor resolves
+                // completed or wakes on the wrong thread, stranding the sync caller.
+                Interlocked.Exchange(ref _state.HandoffActive, true);
         }
 
         if (!isHead)
