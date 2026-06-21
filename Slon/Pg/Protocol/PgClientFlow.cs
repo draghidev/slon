@@ -569,16 +569,23 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IThreadPoolWorkItem
                 return;
             flow._completed = true;
             flow._activationCancellationTokenRegistration.Dispose();
-            if (exception is not null)
-                flow._completionTcs.TrySetException(exception);
-            else
-                flow._completionTcs.TrySetResult();
+            // OnComplete BEFORE the completion TCS, so WaitForComplete (the done-signal) resolves only
+            // after teardown has fully run - "done" means "fully torn down" for every flow. Otherwise a
+            // waiter keyed on WaitForComplete observes done and, for a pooled flyweight, re-Initializes
+            // the instance while this OnComplete is still in flight: a stale OnComplete then lands on the
+            // next tenure's freshly-Reset state and its teardown overlaps the next tenure's shared-wire
+            // use. Wrapped so a throwing teardown can't strand the TCS (every WaitForComplete would hang).
             // Deliberately NO activation-source faulting here: a parked deferred dispatch holds no
             // resources, the caller is faulted via OnComplete, and Reset clears the registration on
             // reuse. Invoking the bridge on a completed flow would create-and-start the body for a
             // dead tenure, taking the shared read promise for nothing and racing instance reuse. The
             // heartbeat abort path keeps its own faulting - that's protocol teardown, not completion.
-            flow.OnComplete(exception);
+            try { flow.OnComplete(exception); }
+            catch (Exception ex) { /* TODO log */ control.FailProtocol(ex); }
+            if (exception is not null)
+                flow._completionTcs.TrySetException(exception);
+            else
+                flow._completionTcs.TrySetResult();
             // The completion callback runs from CompleteItem in the advancer/retirement work-item
             // context: a raw throw would crash that thread unobserved. Don't swallow either - a
             // throwing completion callback means the consumer-side integration is broken, so the
