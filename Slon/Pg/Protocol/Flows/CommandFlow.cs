@@ -258,8 +258,17 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
         waiter.OnCompleted(static state =>
         {
             var flow = (CommandFlow)state!;
-            var promise = flow._pipelinePromise!;
             var ctx = flow._context;
+            // We only have a claim on the shared promise if we actually activated (got a decoder). The
+            // wake can also come from teardown faulting the activation source to unstrand us; we never
+            // took the wire then, so Starting ExecutePipelined would tenure a promise a successor may
+            // already hold (TryStart -> "already executing"). Surface the close to our own source instead.
+            if (!ctx.GetDecoderAsync().GetAwaiter().IsCompletedSuccessfully)
+            {
+                flow._executePipelinedCore.SetException(ctx.ClosedException ?? new PgClientClosedException(null));
+                return;
+            }
+            var promise = flow._pipelinePromise!;
             PromiseAsyncValueTaskMethodBuilder.Promise = promise;
             try
             {

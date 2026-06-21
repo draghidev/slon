@@ -232,6 +232,9 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IThreadPoolWorkItem
         // fired. Async flows reflect SETTLED not just succeeded, so a faulted activation completes the
         // await and GetResult rethrows.
         public bool IsCompleted => control.IsDecoderSettled || (auto && !control.IsAsync);
+        // Settled with a real decoder (Activate ran), vs woken by a teardown completion. A deferred
+        // dispatch only has a claim on the shared promise when this is true.
+        public bool IsCompletedSuccessfully => control.IsDecoderReady;
 
         // Only valid after IsCompleted. The sync-flow auto path reports IsCompleted unconditionally,
         // so this may run before the decoder is ready and blocks via the AsTask bridge.
