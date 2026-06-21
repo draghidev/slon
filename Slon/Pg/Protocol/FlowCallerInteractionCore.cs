@@ -23,6 +23,19 @@ struct FlowCallerInteractionCore<TResult>
     bool _progressSignaled;
     // One-shot flag set by RequestWake; consumed by the OnCompleted post-store re-check.
     bool _wakeRequested;
+    // The sticky close-latch: the canonical close exception for this flow's tenure, set out-of-band by
+    // the protocol abort/stopping (CancelPendingWait) AND by the body's terminal close paths. The
+    // consumer reads it on every Reset rearm to self-deliver the close to its just-armed generation,
+    // so the live generation always has a completer regardless of which writer set the latch. Two
+    // authorities (protocol abort, consumer Reset) agree without the abort ever targeting a version:
+    // the abort only flips this monotone latch; the consumer delivers. First-writer-wins via CAS so a
+    // concurrent abort + body-terminal cannot tear it. Cleared per tenure in Reset.
+    Exception? _closeException;
+    public Exception? CloseException => Volatile.Read(ref _closeException);
+    // Set the latch, monotone (first writer wins). Returns the latched exception (this call's or the
+    // prior winner's), never null.
+    public Exception SetCloseLatch(Exception exception)
+        => Interlocked.CompareExchange(ref _closeException, exception, null) ?? exception;
 
     public Slon.Threading.Tasks.Sources.ManualResetValueTaskSourceCore<TResult> GateTaskSource;
 
@@ -35,7 +48,10 @@ struct FlowCallerInteractionCore<TResult>
 
     public void CancelPendingWait(Exception exception)
     {
-        GateTaskSource.TrySetException(exception, runContinuationsAsynchronously: true);
+        // Latch first (monotone), then fault the gate, so a consumer observing the gate fault always
+        // reads the latch set.
+        var latched = SetCloseLatch(exception);
+        GateTaskSource.TrySetException(latched, runContinuationsAsynchronously: true);
         _mres?.Set();
     }
 
@@ -124,6 +140,7 @@ struct FlowCallerInteractionCore<TResult>
         _wakeContinuation = null;
         _progressSignaled = false;
         _wakeRequested = false;
+        _closeException = null;
         GateTaskSource.Reset();
     }
 

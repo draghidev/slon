@@ -48,15 +48,22 @@ public class RacingDisposeInMemoryRace
     // parking the body's drain on its second read.
     static byte[]? _handshake;
     static IReadOnlyList<byte[]>? _messages;
+    // Three-command flow capture: command boundaries (CommandComplete) inside one Sync, so the body
+    // parks on the INTER-RESULT gate between commands - the multi-command lost-completion window.
+    static IReadOnlyList<byte[]>? _multiMessages;
     static PgClientOptions? _options;
 
     [ClassInitialize]
     public static async Task ClassInit(TestContext _)
     {
         _options = PgTestPool.NewOptions();
-        var (handshake, response) = await CaptureAsync(_options);
+        var (handshake, response) = await CaptureAsync(_options, Command.Create("select generate_series(1, 3)"));
         _handshake = handshake;
         _messages = SplitMessages(response);
+
+        var (_, multiResponse) = await CaptureAsync(_options,
+            Command.Create("select 1"), Command.Create("select 2"), Command.Create("select 3"));
+        _multiMessages = SplitMessages(multiResponse);
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -147,6 +154,63 @@ public class RacingDisposeInMemoryRace
         for (var i = 0; i < msgs.Count; i++)
             if (msgs[i].Length > 0 && msgs[i][0] == (byte)'C')
                 return i;
+        return msgs.Count;
+    }
+
+    // Build a 3-command flow parked on the INTER-RESULT gate after command 1's result, with command 2
+    // and 3 bytes HELD. The body delivered result 1 and is awaiting the consumer's next MoveNextAsync
+    // (which opens the gate to drive the body to command 2). This is the multi-command lost-completion
+    // window: a graceful close fired here must still converge the consumer (the body parked on the
+    // inter-result gate must wake and drain, and the consumer's generation must get a completer).
+    static async Task<Scenario> BuildMultiToFirstResultParked()
+    {
+        var clock = new FakeTimeProvider();
+        var transport = new GatedReplayTransport(_handshake!);
+        var protocolOptions = new PgClientProtocolOptions(_options!)
+        {
+            TimeProvider = clock,
+            HeartbeatInterval = TimeSpan.FromSeconds(1),
+            CompletionTimeout = TimeSpan.FromSeconds(30),
+        };
+        var protocol = PgClientProtocol.Create(protocolOptions);
+        await protocol.StartAsync(_options!, transport);
+
+        var aParked = transport.ArmReadPark();
+        var flow = new CommandFlow(async: true,
+            Command.Create("select 1"), Command.Create("select 2"), Command.Create("select 3"));
+        Assert.IsTrue(protocol.TryQueue(flow));
+        var e = flow.GetAsyncEnumerator();
+
+        var first = e.MoveNextAsync().AsTask();
+        await aParked.WaitAsync(Cap);
+
+        // Release command 1's result (T, D, C) so the body delivers result 1 and parks on the
+        // inter-result gate. Hold everything from command 2's RowDescription onward.
+        var msgs = _multiMessages!;
+        var release = MessagesThroughFirstCommandComplete(msgs);
+        for (var i = 0; i < release; i++)
+            transport.ReleaseSegment(msgs[i]);
+
+        Assert.IsTrue(await first.WaitAsync(Cap), "first MoveNextAsync did not deliver result 1");
+        await SettleAsync();
+
+        return new Scenario
+        {
+            Protocol = protocol,
+            Transport = transport,
+            Clock = clock,
+            Enumerator = e,
+            Messages = msgs,
+        };
+    }
+
+    // Count of wire messages through (including) the first CommandComplete ('C') - command 1's full
+    // result. Releasing these delivers result 1 and parks the body on the inter-result gate.
+    static int MessagesThroughFirstCommandComplete(IReadOnlyList<byte[]> msgs)
+    {
+        for (var i = 0; i < msgs.Count; i++)
+            if (msgs[i].Length > 0 && msgs[i][0] == (byte)'C')
+                return i + 1;
         return msgs.Count;
     }
 
@@ -294,6 +358,73 @@ public class RacingDisposeInMemoryRace
             "ordering 3 (read-fault): read-fault produced a lost-completion hang - unexpected on this flow");
     }
 
+    // Multi-command convergence under graceful close while the body is parked on the INTER-RESULT gate
+    // (between command 1 and 2), with no heartbeat tick and no forceful abort. Asserts the consumer
+    // converges (drains command 2/3 to a clean close). NOTE: several backstops can drive convergence
+    // here (the consumer gate-open, the pipeline shutdown drain, and - in sync-continuation builds - the
+    // inline ping-pong), so this is a convergence regression test, not an isolation of any one waker. The
+    // never-started lost-completion (the actual reported hang) is gated by the stress repro + dump.
+    [TestMethod]
+    public async Task MultiCommand_GracefulCloseAtInterResultGate_Converges()
+    {
+        await using var s = await BuildMultiToFirstResultParked();
+        var consumer = new GranularConsumer(s.Enumerator);
+
+        // Graceful StoppingToken only - deliberately no heartbeat, no forceful DisposeAsync.
+        var complete = s.Protocol.CompleteAsync().AsTask();
+        await SettleAsync();
+
+        // Drive the consumer loop: its next MoveNextAsync must open the gate-parked body. Release the
+        // held command 2/3 bytes so the woken body can drain to RFQ naturally (graceful path).
+        var loop = consumer.RunLoop();
+        for (var i = 0; i < s.Messages.Count; i++)
+            s.Transport.ReleaseSegment(s.Messages[i]);
+
+        var done = await Task.WhenAny(loop, Task.Delay(HangCap));
+        var converged = done == loop;
+
+        s.Clock.Advance(TimeSpan.FromSeconds(120));
+        try { await complete.WaitAsync(Cap); } catch { }
+        try { await consumer.RunDispose().WaitAsync(Cap); } catch { }
+
+        Assert.IsTrue(converged,
+            "multi-command: consumer hung at the inter-result gate under graceful close - body not woken without a heartbeat");
+    }
+
+    // Point-C outcome (deterministic replacement for ProtocolCompletionTests.DisposeAfterFirstResult_-
+    // NextMoveNextSurfacesClosedException). Result 1 delivered, body parked on the inter-result gate; a
+    // forceful teardown fires AbortToken and one heartbeat tick faults that gate BEFORE the consumer's
+    // next MoveNextAsync (the live test's Task.Delay(50) window, made deterministic via the
+    // FakeTimeProvider). The body's HandleException then no-ops on the already-consumed result-1
+    // generation; the next MoveNextAsync must self-deliver the close (or complete) and NEVER re-yield
+    // the stale result 1. Ordering3_GateFaultNoOp asserts the read loop converges; a stale re-yield does
+    // not hang, so this pins the specific next-call outcome the loop cannot catch.
+    [TestMethod]
+    public async Task GateFaultBeforeNextMoveNext_SelfDeliversClose_NeverReYieldsStale()
+    {
+        await using var s = await BuildToFirstResultParked();
+
+        var dispose = s.Protocol.DisposeAsync().AsTask();
+        s.Heartbeat();
+        await SettleAsync();
+
+        bool more;
+        try
+        {
+            more = await s.Enumerator.MoveNextAsync().AsTask().WaitAsync(HangCap);
+        }
+        catch (PgClientClosedException)
+        {
+            more = false;
+        }
+        Assert.IsFalse(more,
+            "the next MoveNextAsync re-yielded the stale result 1 instead of surfacing close/complete");
+
+        s.Clock.Advance(TimeSpan.FromSeconds(120));
+        try { await dispose.WaitAsync(Cap); } catch { }
+        try { await s.Enumerator.DisposeAsync(); } catch { }
+    }
+
     static async Task SettleAsync()
     {
         for (var i = 0; i < 8; i++)
@@ -304,7 +435,7 @@ public class RacingDisposeInMemoryRace
     // ---------------------------------------------------------------------------------------------
     // Capture machinery (shared shape with StoppingTokenInMemoryRace).
     // ---------------------------------------------------------------------------------------------
-    static async Task<(byte[] handshake, byte[] response)> CaptureAsync(PgClientOptions options)
+    static async Task<(byte[] handshake, byte[] response)> CaptureAsync(PgClientOptions options, params Command[] commands)
     {
         var sock = options.EndPoint is UnixDomainSocketEndPoint
             ? new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified)
@@ -317,7 +448,7 @@ public class RacingDisposeInMemoryRace
         await protocol.StartAsync(options, transport);
         var handshakeLen = recStream.RecordedLength;
 
-        var flow = new CommandFlow(async: true, Command.Create("select generate_series(1, 3)"));
+        var flow = new CommandFlow(async: true, commands);
         Assert.IsTrue(protocol.TryQueue(flow));
         var e = flow.GetAsyncEnumerator();
         while (await e.MoveNextAsync())

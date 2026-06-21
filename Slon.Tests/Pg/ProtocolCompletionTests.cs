@@ -186,6 +186,114 @@ public class ProtocolCompletionTests
         }
     }
 
+    // Multi-command variant: an inter-result gate at EACH of the 3 results, so the call-k gate-fault-
+    // before-Reset race repeats per result rather than only at the single terminal. Exercises whether
+    // the first-call gate + HE-on-success + self-delivery hold across multiple mid-flow generations.
+    [TestMethod]
+    public async Task CompleteAsync_RacingDisposeAsync_MultiCommand_ConvergesCleanly()
+    {
+        for (var i = 0; i < 30; i++)
+        {
+            var protocol = await ConnectAsync();
+            var flow = new CommandFlow(async: true,
+                Command.Create("select pg_sleep(0.01)"), Command.Create("select 2"), Command.Create("select 3"));
+            Assert.IsTrue(protocol.TryQueue(flow));
+            var runTask = Task.Run(async () =>
+            {
+                var e = flow.GetAsyncEnumerator();
+                try
+                {
+                    while (await e.MoveNextAsync()) { }
+                }
+                catch (PgClientClosedException)
+                {
+                }
+                await e.DisposeAsync();
+            });
+            using var gate = new ManualResetEventSlim(false);
+            var complete = Task.Run(async () => { gate.Wait(); await protocol.CompleteAsync(); });
+            var dispose = Task.Run(async () => { gate.Wait(); await protocol.DisposeAsync(); });
+            gate.Set();
+            await Task.WhenAll(complete, dispose, runTask).WaitAsync(TimeSpan.FromSeconds(10));
+            Assert.IsTrue(protocol.IsCompleted, $"iteration {i}: protocol did not reach Completed");
+        }
+    }
+
+    // Pipelined variant: N flows queued, drained in order, while teardown races. Exercises the
+    // executor's multi-flow drain + the shared read baton handed across flows under abort, not just a
+    // single flow's teardown.
+    [TestMethod]
+    public async Task CompleteAsync_RacingDisposeAsync_Pipelined_ConvergesCleanly()
+    {
+        for (var i = 0; i < 20; i++)
+        {
+            var protocol = await ConnectAsync();
+            const int batch = 5;
+            var flows = new CommandFlow[batch];
+            for (int k = 0; k < batch; k++)
+            {
+                flows[k] = new CommandFlow(async: true, Command.Create("select pg_sleep(0.01)"));
+                Assert.IsTrue(protocol.TryQueue(flows[k]));
+            }
+            var runTask = Task.Run(async () =>
+            {
+                for (int k = 0; k < batch; k++)
+                {
+                    var e = flows[k].GetAsyncEnumerator();
+                    try
+                    {
+                        while (await e.MoveNextAsync()) { }
+                    }
+                    catch (PgClientClosedException)
+                    {
+                        await e.DisposeAsync();
+                        break;
+                    }
+                    await e.DisposeAsync();
+                }
+            });
+            using var gate = new ManualResetEventSlim(false);
+            var complete = Task.Run(async () => { gate.Wait(); await protocol.CompleteAsync(); });
+            var dispose = Task.Run(async () => { gate.Wait(); await protocol.DisposeAsync(); });
+            gate.Set();
+            await Task.WhenAll(complete, dispose, runTask).WaitAsync(TimeSpan.FromSeconds(10));
+            Assert.IsTrue(protocol.IsCompleted, $"iteration {i}: protocol did not reach Completed");
+        }
+    }
+
+    // Sync-flow variant of the racing teardown. The sync MoveNext rendezvous (WaitForContinuation)
+    // is a different path than MoveNextAsync's gate-open self-delivery, so this exercises whether the
+    // sync teardown also converges (the early sync-rendezvous wedge was a sync flow's
+    // SetContinuationAndUnblockWaiter). MoveNext blocks, so it runs on its own thread.
+    [TestMethod]
+    public async Task CompleteAsync_RacingDisposeAsync_SyncFlow_ConvergesCleanly()
+    {
+        for (var i = 0; i < 30; i++)
+        {
+            var protocol = await ConnectAsync();
+            var flow = new CommandFlow(async: false, Command.Create("select pg_sleep(0.02)"));
+            Assert.IsTrue(protocol.TryQueue(flow));
+            var runTask = Task.Run(() =>
+            {
+                var e = flow.GetEnumerator();
+                try
+                {
+                    while (e.MoveNext()) { }
+                }
+                catch (PgClientClosedException)
+                {
+                }
+                e.Dispose();
+            });
+            using var gate = new ManualResetEventSlim(false);
+            var complete = Task.Run(async () => { gate.Wait(); await protocol.CompleteAsync(); });
+            var dispose = Task.Run(async () => { gate.Wait(); await protocol.DisposeAsync(); });
+            gate.Set();
+            await Task.WhenAll(complete, dispose, runTask).WaitAsync(TimeSpan.FromSeconds(10));
+            Assert.IsTrue(protocol.IsCompleted, $"iteration {i}: protocol did not reach Completed");
+        }
+    }
+
     // CompleteAsync with a parked flow (enqueued but not yet activated). The graceful drain
     // observes the flow, AbortToken fires when CompletionTimeout elapses, heartbeat propagates
     // the closed exception into the flow's activation source. Flow's MoveNextAsync surfaces

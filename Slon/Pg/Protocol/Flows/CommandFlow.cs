@@ -99,6 +99,13 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
     {
         IsAsync = async;
         _options = options;
+        // Arm thread-safe completion NOW (before queue, before any teardown can race), not lazily at
+        // GetAsyncEnumerator: a flow torn down before the consumer ever obtains its enumerator faults
+        // via OnComplete -> HandleException on another thread, which must complete the move-next source
+        // by CAS. This holds for SYNC flows too: teardown (OnAbort/OnStopping/OnComplete) fires from the
+        // heartbeat/shutdown thread, NOT the consumer thread the sync body is hogging - so the source has
+        // two concurrent writers regardless of flow mode. Re-armed per tenure here (OnReset disarms).
+        _enumeratorMoveNextTaskSource.CanCompleteConcurrently = true;
         return this;
     }
 
@@ -394,10 +401,10 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                 // NOT handled here; they flow through as failing CommandResults normally.
                 if (context.StoppingToken.IsCancellationRequested && !IsConsumerGone && !_enumeratorCompleted)
                 {
-                    _enumeratorCompleted = true;
-                    _enumeratorMoveNextTaskSource.SetException(
-                        context.ClosedException!,
-                        runContinuationsAsynchronously: true);
+                    // Latch the close (a consumer that Resets past this point self-delivers it), wake a
+                    // parked consumer, then drain.
+                    _callerInteractionCore.SetCloseLatch(context.ClosedException!);
+                    DeliverClose(context.ClosedException!);
                     MarkConsumerGone();
                 }
                 if (!IsConsumerGone)
@@ -498,6 +505,8 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
         catch (PgClientClosedException ex) when (context.IsProtocolClosed)
         {
             // Scope to our own closure so a nested protocol's close doesn't get treated as ours.
+            // Latch the close so a consumer that Resets after this point self-delivers it.
+            _callerInteractionCore.SetCloseLatch(ex);
             // Consumer-gone means a dead wire is the expected terminal: complete the move-next source
             // (false) and RETURN cleanly, the same shape as the graceful StoppingToken transition above
             // (SetResult on close, fall through to a clean body completion - no throw). This keeps the
@@ -572,6 +581,16 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                 }
             }
 
+            // Under close, the consumer owns delivery to whatever generation it armed (it self-delivers
+            // the latch on rearm). The body must NOT land a result or a clean completion - but it MUST
+            // wake a consumer currently PARKED on its generation. Deliver the close to the current
+            // generation: idempotent against the consumer's self-deliver, wakes a parked consumer, never
+            // lands a stale result.
+            if (_callerInteractionCore.CloseException is not null)
+            {
+                DeliverClose(_callerInteractionCore.CloseException);
+                return;
+            }
             // If the move-next source is already terminal (a pre-deliver path faulted it and
             // marked _enumeratorCompleted), the body's natural SetResult(null) would hit an
             // already-completed source and throw. The cancel is already communicated, so no-op.
@@ -616,8 +635,25 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
     /// mode and we must use TrySet semantics to absorb a lost race. Continuations run
     /// asynchronously: this can fire from the pipeline's completion chain and must not run
     /// caller code under it.
+    // Deliver the close to the consumer's CURRENT generation (wakes a parked consumer; idempotent
+    // against the consumer's own latch self-deliver). The source is in concurrent mode for every live
+    // flow (Initialize, sync and async), so TrySet is the safe completer for both - teardown faults from
+    // a different thread than the consumer regardless of mode. Marks terminal; signals the sync rendezvous.
+    void DeliverClose(Exception closeException)
+    {
+        _enumeratorMoveNextTaskSource.TrySetException(closeException, runContinuationsAsynchronously: true);
+        _enumeratorCompleted = true;
+        if (!IsAsync)
+            _callerInteractionCore.SignalProgress();
+    }
+
     void HandleException(Exception ex)
     {
+        // A close fault must latch so a consumer that Resets past this delivery self-delivers it - the
+        // never-started path (OnComplete -> HandleException, body never ran so no body-side latch set)
+        // is the one that strands an orphaned generation otherwise.
+        if (ex is PgClientClosedException closeEx)
+            _callerInteractionCore.SetCloseLatch(closeEx);
         if (_enumeratorCompleted)
             return;
         // Mark terminal only when the fault actually lands. A concurrent teardown TrySetException
@@ -626,15 +662,13 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
         // _enumeratorCompleted on that no-op would make the consumer's next MoveNext short-circuit onto
         // the stale consumed result; leaving it false lets that call fall through to its own faulted-
         // gate self-delivery, which completes the consumer's actual generation.
-        bool delivered;
-        if (_enumeratorMoveNextTaskSource.CanCompleteConcurrently)
-            delivered = _enumeratorMoveNextTaskSource.TrySetException(ex, runContinuationsAsynchronously: true);
-        else
-        {
-            _enumeratorMoveNextTaskSource.SetException(ex, runContinuationsAsynchronously: true);
-            delivered = true;
-        }
-        if (delivered)
+        // HandleException can fire from teardown (OnComplete/OnAbort/OnStopping) on the heartbeat or
+        // shutdown thread - NOT the consumer's thread - concurrently with the consumer's own completer.
+        // The source is in concurrent mode for every live flow (armed in Initialize, sync and async
+        // alike), so this is an atomic, idempotent CAS. A plain SetException would throw on an already-
+        // completed source and a status-check guard is TOCTOU. (Recovery used to swallow the resulting
+        // InvalidOperationException, masking the race.)
+        if (_enumeratorMoveNextTaskSource.TrySetException(ex, runContinuationsAsynchronously: true))
             _enumeratorCompleted = true;
         // Wake any sync MoveNext parked in WaitForContinuation. The body just faulted, so no
         // continuation will be registered. The caller needs to observe the exception via the
@@ -689,8 +723,8 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
         _commandIndex = -1;
         _executePipelinedCore.Reset();
         _enumeratorMoveNextTaskSource.Reset();
-        // Back to single-threaded completion; the next tenure re-arms it if it binds a
-        // cancelable token.
+        // Disarm while idle in the pool (no teardown can target a non-live flow). Initialize re-arms it
+        // before the flow is queued, so a live flow is always in concurrent-completion mode.
         _enumeratorMoveNextTaskSource.CanCompleteConcurrently = false;
         _enumeratorCurrent = default;
         _isResultReady = false;
@@ -746,9 +780,19 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
             if (flow is null)
                 return false;
 
-            // This may also throw any recorded exception.
+            // See MoveNextAsync: a version-less terminal that survived a Reset onto a fresh pending
+            // generation needs repair only under close (self-deliver the latch); otherwise return the
+            // terminal task as before.
             if (flow._enumeratorCompleted)
+            {
+                // Repair a version-less terminal that survived a Reset onto a fresh pending generation
+                // only under close: TrySet self-delivers the latch (idempotent, the source is concurrent
+                // for every live flow). The GetStatus check just skips needless churn on a completed gen.
+                if (flow._callerInteractionCore.CloseException is { } latched
+                    && flow._enumeratorMoveNextTaskSource.GetStatus(flow._enumeratorMoveNextTaskSource.Version) is ValueTaskSourceStatus.Pending)
+                    flow._enumeratorMoveNextTaskSource.TrySetException(latched, runContinuationsAsynchronously: true);
                 return flow.EnumeratorMoveNextTask.Result;
+            }
 
             if (flow.IsAsync)
             {
@@ -762,6 +806,13 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
             if (flow._consumerAdvanced)
                 flow._enumeratorMoveNextTaskSource.Reset();
             flow._consumerAdvanced = true;
+            // Close-latch self-deliver (sync): under close this call completes the generation it just
+            // armed, on its own thread.
+            if (flow._callerInteractionCore.CloseException is { } syncClosed)
+            {
+                flow.DeliverClose(syncClosed);
+                return flow.EnumeratorMoveNextTask.Result;
+            }
             // Two wake reasons: a continuation was registered (drive the body forward inline)
             // or the body signaled progress (a result, completion, or fault landed on the
             // move-next task source while we were parked). In the progress-only case there is
@@ -786,9 +837,18 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
             if (flow is null)
                 return new(false);
 
-            // This may also throw any recorded exception.
+            // Terminal short-circuit. _enumeratorCompleted is version-less and survives a Reset, so a
+            // terminal landed on a PRIOR generation leaves it set while the consumer is parked on a
+            // fresh, pending generation with no completer (the lost-completion). That only needs repair
+            // under CLOSE: self-deliver the latch to the current generation. In every other case keep
+            // the original behavior - return the terminal task (its GetResult replays the result/fault).
             if (flow._enumeratorCompleted)
+            {
+                if (flow._callerInteractionCore.CloseException is { } latched
+                    && flow._enumeratorMoveNextTaskSource.GetStatus(flow._enumeratorMoveNextTaskSource.Version) is ValueTaskSourceStatus.Pending)
+                    flow._enumeratorMoveNextTaskSource.TrySetException(latched, runContinuationsAsynchronously: true);
                 return flow.EnumeratorMoveNextTask;
+            }
 
             if (!flow.IsAsync)
             {
@@ -815,23 +875,16 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
             if (flow._consumerAdvanced)
                 flow._enumeratorMoveNextTaskSource.Reset();
             flow._consumerAdvanced = true;
-            // Open the gate to drive the body forward. A false return means a concurrent teardown
-            // (OnAbort/OnStopping -> CancelPendingWait) faulted the gate while the body was parked on
-            // it: the body's fault-wake races the Reset above and cannot reliably deliver to this
-            // generation (it may target the prior, already-consumed one and lose the completion).
-            // Surface the close exception to our own just-Reset generation here - on our thread,
-            // ordered after our Reset, sole completer until we park - so the body's HandleException
-            // TrySet simply no-ops. CanCompleteConcurrently is on for async (see GetAsyncEnumerator).
-            // A false TrySetResult means the gate is already completed - but not necessarily by a
-            // teardown. It can also be in a transient succeeded state the body has not yet consumed+
-            // Reset. Only self-deliver when CancelPendingWait actually faulted it (CancelException set);
-            // otherwise the body will deliver to our generation, so just await it.
-            if (!flow._callerInteractionCore.GateTaskSource.TrySetResult(default)
-                && flow._callerInteractionCore.CancelException is { } closed)
-            {
-                flow._enumeratorMoveNextTaskSource.TrySetException(closed, runContinuationsAsynchronously: true);
-                flow._enumeratorCompleted = true;
-            }
+            // Open the gate to drive the body forward, OR self-deliver the close under close. Under close
+            // the body parked on the inter-result gate is woken by the consumer's gate-open (the always-
+            // present, heartbeat-independent waker - the heartbeat's CancelPendingWait is an optimization
+            // on top). A false TrySetResult means the gate was already faulted by a teardown.
+            flow._callerInteractionCore.GateTaskSource.TrySetResult(default);
+            // Close-latch self-deliver: under close THIS call is the sole completer of the generation it
+            // just armed - self-deliver here, ordered after our Reset, so the live generation always has
+            // a completer. Idempotent against a racing body writer (CAS). Read the latch AFTER the Reset.
+            if (flow._callerInteractionCore.CloseException is { } closed)
+                flow.DeliverClose(closed);
             return flow.EnumeratorMoveNextTask;
         }
 

@@ -54,12 +54,15 @@ public class PipelineBatchTests
             await DrainExpecting(cmds[k], flowAsync, 1);
     }
 
+    // Backstop iteration count for the handoff/shared-promise race guards. The race is structurally
+    // fixed (the Interlocked HandoffActive open), so the default is sized for a per-commit backstop, not
+    // to reliably reproduce the original bug; SLON_STRESS_ITERATIONS scales it up for a soak.
     static int StressIters
     {
         get
         {
             var raw = Environment.GetEnvironmentVariable("SLON_STRESS_ITERATIONS");
-            return int.TryParse(raw, out var n) && n > 0 ? n : 4000;
+            return int.TryParse(raw, out var n) && n > 0 ? n : 2000;
         }
     }
 
@@ -174,7 +177,9 @@ public class PipelineBatchTests
     [TestMethod]
     public async Task ConcurrentAsyncAndSync_SameProtocol_NoSharedPromiseCollision()
     {
-        var iters = StressIters;
+        // Secondary guard overlapping ConcurrentSyncAndAsync's free-running coverage, so it runs a
+        // quarter of the iterations; SLON_STRESS_ITERATIONS still scales it for a heavy soak.
+        var iters = StressIters / 4;
         var protocol = await PgTestPool.NewIsolatedAsync();
         try
         {
