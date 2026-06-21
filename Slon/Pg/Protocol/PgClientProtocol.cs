@@ -61,7 +61,7 @@ sealed class PgClientProtocolOptions
     public Func<int, int, CancellationToken, ValueTask>? CancelSender { get; set; }
 }
 
-sealed class PgClientProtocol : IDisposable, IAsyncDisposable
+sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
 {
     readonly PgClientProtocolOptions _options;
     TransportConnection _connection = null!;
@@ -111,18 +111,12 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
     readonly CloseSignal _close;
     Pipeline<PgClientFlow, Policy, PgClientFlowSource, PgClientFlowSource.Enumerator> _pipeline = null!;
     PgClientFlowSource _source;
-    // Cached exclusive-scope machinery. The inner pipeline is a flyweight (reused via Initialize) and
-    // the hosting flow is pooled with it - on the common ADO path an open connection is an exclusive
-    // scope, so allocating per scope would tax every execute. One scope at a time per connection (an
-    // exclusive scope is, by definition, not concurrent with another on the same connection).
-    Control? _exclusiveInnerControl;
-    Pipeline<PgClientFlow, Policy, PgClientFlowSource, PgClientFlowSource.Enumerator>? _exclusiveInnerPipeline;
-    Flows.ExclusiveAccessFlow? _exclusiveFlow;
-    // The active scope's linked close signal (a child of _close). Per-connection flyweight, created once
-    // with the exclusive machinery, reused across scopes (it stays untripped on the normal completion
-    // path). Inner flows read it through the inner Control so a protocol stop/abort cascades into the
-    // scope via the link, while a scope-only trip leaves the protocol token untouched.
-    CloseSignal? _exclusiveScopeClose;
+    // Cached exclusive-scope flyweight, collapsed into one reusable state object (inner control, inner
+    // pipeline, scope CloseSignal, the per-scope decoder/writer shells, the pooled hosting flow). On the
+    // common ADO path an open connection is an exclusive scope, so allocating per scope would tax every
+    // execute. One per connection: the outer pipeline stalls for the whole scope, so a second concurrent
+    // state would have nothing to run.
+    ExclusiveScopeState? _exclusiveScope;
     readonly Lock _syncRoot = new();
     ProtocolStatus _status = ProtocolStatus.Created;
     // Track draining count so overlapping recovery starts/ends don't signal ready too early.
@@ -374,47 +368,19 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
     internal Flows.ExclusiveAccessFlow BeginExclusiveScope(bool async)
     {
         var innerSource = PgClientFlowSource.Create(this, _options.ExecutionScheduler);
-        if (_exclusiveInnerPipeline is null)
-        {
-            var innerControl = _exclusiveInnerControl = new Control(this, poolFacing: false);
-            // Scope signal: a child linked to the protocol's _close, so a protocol stop/abort cascades
-            // into the scope's tokens through the link. Created once with the rest of the flyweight
-            // machinery and reused across scopes (it stays untripped on the normal completion path, so
-            // its linked CTSes stay pristine - the per-execute zero-alloc invariant).
-            var scopeClose = _exclusiveScopeClose = CloseSignal.CreateLinked(_close, _options.TimeProvider);
-            innerControl.BindScopeClose(scopeClose);
-            // Per-scope decoder/writer shells over the protocol's shared Read/WriteChannel, carrying the
-            // scope's abort token. A scope-only abort (ADO connection-dispose) trips scopeClose, breaking
-            // a subflow parked on a wire read/write through these shells, while the pooled protocol's own
-            // token (and base shells) stay untripped. Created once with the flyweight, reused across scopes.
-            var scopeDecoder = PgDecoder.CreateScopeShell(_pgDecoder, scopeClose.AbortToken, _options.ReadTimeout);
-            var scopeWriter = PgProtocolDataWriter.CreateScopeShell(_protocolDataWriter, scopeClose.AbortToken, innerControl);
-            innerControl.BindShells(scopeDecoder, scopeWriter);
-            var innerPipeline = _exclusiveInnerPipeline = Pipeline.Create<PgClientFlow, Policy, PgClientFlowSource, PgClientFlowSource.Enumerator>(
-                new Policy(this, innerControl), innerSource);
-            innerControl.BindPipeline(new PipelineFlowSlots<Policy, PgClientFlowSource, PgClientFlowSource.Enumerator>(innerPipeline));
-            _exclusiveFlow = new Flows.ExclusiveAccessFlow(innerControl, reason => _exclusiveInnerPipeline!.CompleteAsync(reason));
-        }
+        if (_exclusiveScope is null)
+            _exclusiveScope = ExclusiveScopeState.Create(this, innerSource);
         else
-        {
-            // Flyweight reuse. The cascade (OnStopping/OnAbort) is a second driver of the inner pipeline,
-            // so a prior scope that hasn't fully completed is now reachable here (it was not when only the
-            // user drove teardown). Refuse to re-init over a live prior scope - a lifecycle bug, not a
-            // recoverable state.
-            if (_exclusiveFlow is { IsCompleted: false })
-                ThrowHelper.ThrowInvalidOperation("Cannot begin an exclusive scope while the prior scope is still completing.");
-            Pipeline.Create<PgClientFlow, Policy, PgClientFlowSource, PgClientFlowSource.Enumerator>(
-                new Policy(this, _exclusiveInnerControl!), innerSource, _exclusiveInnerPipeline);
-            _exclusiveFlow!.Reset();
-        }
-        _exclusiveFlow!.PrepareScope(async, innerSource, _options.FlowActivationTimeout);
-        return Queue(_exclusiveFlow);
+            _exclusiveScope.ReArm(this, innerSource);
+        var flow = _exclusiveScope.Flow;
+        flow.PrepareScope(async, innerSource, _options.FlowActivationTimeout);
+        return Queue(flow);
     }
 
     // Scope-only abort: trips the active scope's CloseSignal, breaking any subflow parked on a wire
     // read/write via the scope shells' tokens, without touching the protocol's own token (the pooled
-    // protocol survives). The future ADO connection-dispose path drives this; today it is the R2 lever.
-    internal void AbortActiveScope() => _exclusiveScopeClose?.Abort();
+    // protocol survives). The future ADO connection-dispose path drives this.
+    internal void AbortActiveScope() => _exclusiveScope?.AbortScope();
 
     bool TryQueueFlow<TState>(PgClientFlow flow, Func<TState, bool>? predicate = null, TState state = default!)
         => TryQueueFlow(flow, ProtocolStatus.Ready, predicate, state);
@@ -514,7 +480,7 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
             // CancelAfter(CompletionTimeout) timer without firing it. The scope signal (a linked child)
             // is disposed too, releasing its registration on _close; the scope signal must be disposed
             // BEFORE its parent _close so the link registration is gone first.
-            _exclusiveScopeClose?.Dispose();
+            _exclusiveScope?.Dispose();
             _close.Dispose();
         }
     }
