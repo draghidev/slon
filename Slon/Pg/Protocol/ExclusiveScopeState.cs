@@ -20,31 +20,31 @@ sealed partial class PgClientProtocol
     // scope-state would have nothing to run. The inner pipeline uses the SAME PgClientFlowSource + Policy
     // as the protocol level (no divergence), so sync handoff and pipelining compose recursively to the
     // root. Nested in PgClientProtocol so it reaches Control/Policy without widening their accessibility.
-    sealed class ExclusiveScopeState
+    internal sealed class ExclusiveScopeState
     {
         readonly Control _innerControl;
         readonly CloseSignal _scopeClose;
-        Pipeline<PgClientFlow, Policy, PgClientFlowSource, PgClientFlowSource.Enumerator> _innerPipeline;
-        readonly ExclusiveAccessFlow _flow;
+        // Built lazily at the FIRST AcquireForTurn (null until then) and re-initialized on every later
+        // turn. Deferring construction to the turn means the inner executor starts at the won-turn point,
+        // never at begin - and a done-before-executed flow that skips the acquire starts nothing.
+        Pipeline<PgClientFlow, Policy, PgClientFlowSource, PgClientFlowSource.Enumerator>? _innerPipeline;
+        // Set once in Create after the flow is built (the flow holds a back-ref to this state, so the two
+        // are wired in two phases).
+        ExclusiveAccessFlow _flow = null!;
 
-        ExclusiveScopeState(
-            Control innerControl,
-            CloseSignal scopeClose,
-            Pipeline<PgClientFlow, Policy, PgClientFlowSource, PgClientFlowSource.Enumerator> innerPipeline,
-            ExclusiveAccessFlow flow)
+        ExclusiveScopeState(Control innerControl, CloseSignal scopeClose)
         {
             _innerControl = innerControl;
             _scopeClose = scopeClose;
-            _innerPipeline = innerPipeline;
-            _flow = flow;
         }
 
         public ExclusiveAccessFlow Flow => _flow;
 
-        // First-time construction of the whole flyweight. Builds the inner Control, links the scope signal
-        // to the protocol's _close, binds the per-scope shells over the protocol's shared channels, stands
-        // up the inner pipeline, and creates the hosting flow.
-        public static ExclusiveScopeState Create(PgClientProtocol protocol, PgClientFlowSource innerSource)
+        // Build the flyweight's stable resources: the inner Control, the scope CloseSignal (linked to the
+        // protocol's _close), the per-scope decoder/writer shells over the protocol's shared channels, and
+        // the hosting flow. Does NOT build the inner pipeline - that is deferred to the flow's first turn
+        // (AcquireForTurn), so the inner executor never starts at begin.
+        public static ExclusiveScopeState Create(PgClientProtocol protocol)
         {
             var innerControl = new Control(protocol, poolFacing: false);
 
@@ -62,25 +62,40 @@ sealed partial class PgClientProtocol
             var scopeWriter = PgProtocolDataWriter.CreateScopeShell(protocol._protocolDataWriter, scopeClose.AbortToken, innerControl);
             innerControl.BindShells(scopeDecoder, scopeWriter);
 
-            var innerPipeline = Pipeline.Create<PgClientFlow, Policy, PgClientFlowSource, PgClientFlowSource.Enumerator>(
-                new Policy(protocol, innerControl), innerSource);
-            innerControl.BindPipeline(new PipelineFlowSlots<Policy, PgClientFlowSource, PgClientFlowSource.Enumerator>(innerPipeline));
-
-            var flow = new ExclusiveAccessFlow(innerControl, reason => innerPipeline.CompleteAsync(reason));
-            return new ExclusiveScopeState(innerControl, scopeClose, innerPipeline, flow);
+            var state = new ExclusiveScopeState(innerControl, scopeClose);
+            // The flow holds a back-ref to the state so it can acquire (build/re-init the inner pipeline) at
+            // its TURN. CompleteInner reads _innerPipeline through the state so it follows the (re-)init; it
+            // is only reachable after AcquireForTurn has run (the flow owns the wire by then).
+            state._flow = new ExclusiveAccessFlow(protocol, innerControl, state, reason => state._innerPipeline!.CompleteAsync(reason));
+            return state;
         }
 
-        // Re-arm for a fresh scope on reuse: re-Initialize the inner pipeline over the existing Control with
-        // a fresh source, then Reset the pooled flow. The cascade (OnStopping/OnAbort) is a second driver of
-        // the inner pipeline, so a prior scope that hasn't fully completed is reachable here; refuse to
-        // re-init over a live prior scope - a lifecycle bug, not a recoverable state.
-        public void ReArm(PgClientProtocol protocol, PgClientFlowSource innerSource)
+        // Begin-time reuse guard: refuse a new scope while the prior one is still completing. The cascade
+        // (OnStopping/OnAbort) is a second driver of the inner pipeline, so a prior scope that hasn't fully
+        // completed is reachable here; re-init over a live prior scope is a lifecycle bug, not recoverable.
+        public void CheckReusable()
         {
             if (_flow is { IsCompleted: false })
                 ThrowHelper.ThrowInvalidOperation("Cannot begin an exclusive scope while the prior scope is still completing.");
-            Pipeline.Create<PgClientFlow, Policy, PgClientFlowSource, PgClientFlowSource.Enumerator>(
+        }
+
+        // Reset the pooled flow's framework + gate state for a fresh scope (begin-time, cheap).
+        public void ResetFlow() => _flow.Reset();
+
+        // Acquire the scope at the flow's TURN: create the fresh per-scope source, build the inner pipeline
+        // on the first turn (binding the Control to its slots), or re-initialize the existing one on later
+        // turns. The inner executor starts here, at the won-turn point - not at begin. Returns the source
+        // so the flow can Queue subflows onto it. A done-before-executed flow never calls this, so it
+        // creates no source and starts no executor.
+        public PgClientFlowSource AcquireForTurn(PgClientProtocol protocol)
+        {
+            var innerSource = PgClientFlowSource.Create(protocol, protocol._options.ExecutionScheduler);
+            var first = _innerPipeline is null;
+            _innerPipeline = Pipeline.Create<PgClientFlow, Policy, PgClientFlowSource, PgClientFlowSource.Enumerator>(
                 new Policy(protocol, _innerControl), innerSource, _innerPipeline);
-            _flow.Reset();
+            if (first)
+                _innerControl.BindPipeline(new PipelineFlowSlots<Policy, PgClientFlowSource, PgClientFlowSource.Enumerator>(_innerPipeline));
+            return innerSource;
         }
 
         // Trip the scope's CloseSignal only, breaking any subflow parked on a wire read/write via the scope

@@ -367,13 +367,19 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
     // flyweight and reused across scopes.
     internal Flows.ExclusiveAccessFlow BeginExclusiveScope(bool async)
     {
-        var innerSource = PgClientFlowSource.Create(this, _options.ExecutionScheduler);
         if (_exclusiveScope is null)
-            _exclusiveScope = ExclusiveScopeState.Create(this, innerSource);
+        {
+            _exclusiveScope = ExclusiveScopeState.Create(this);
+        }
         else
-            _exclusiveScope.ReArm(this, innerSource);
+        {
+            _exclusiveScope.CheckReusable();
+            _exclusiveScope.ResetFlow();
+        }
+        // No source, no inner-pipeline init here: the flow creates the source and starts the inner
+        // executor at its TURN (AcquireForTurn), so a never-consumed scope starts nothing.
         var flow = _exclusiveScope.Flow;
-        flow.PrepareScope(async, innerSource, _options.FlowActivationTimeout);
+        flow.PrepareScope(async, _options.FlowActivationTimeout);
         return Queue(flow);
     }
 

@@ -20,12 +20,19 @@ namespace Slon.Pg.Protocol.Flows;
 // the gates.
 sealed class ExclusiveAccessFlow : PgClientFlow
 {
-    // Stable across scopes (close over the cached flyweight pipeline). Reason carries the protocol's
-    // close into the inner CompleteAsync so inner items complete WITH the reason on abort.
+    // Stable across scopes (close over the cached flyweight). Reason carries the protocol's close into the
+    // inner CompleteAsync so inner items complete WITH the reason on abort. The state is the shared scope
+    // flyweight this flow acquires at its turn (AcquireForTurn builds/re-inits the inner pipeline and
+    // returns the fresh per-scope source).
+    readonly PgClientProtocol _protocol;
     readonly PgClientProtocol.Control _innerControl;
+    readonly PgClientProtocol.ExclusiveScopeState _state;
     readonly Func<Exception?, ValueTask> _completeInner;
-    // Per-scope, (re)set by PrepareScope.
-    PgClientFlowSource _innerSource;
+    // Per-scope. _innerSource is acquired at the turn (null pre-turn); _activationTimeout set by PrepareScope.
+    // _acquired flips true once AcquireForTurn has built/started the inner pipeline; pre-turn it is false,
+    // so the cascade hooks know there is no inner executor to drain (nothing was ever started).
+    PgClientFlowSource? _innerSource;
+    bool _acquired;
     TimeSpan _activationTimeout;
     TaskCompletionSource _handoffReady = new(TaskCreationOptions.RunContinuationsAsynchronously);
     TaskCompletionSource _scopeEnded = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -33,10 +40,12 @@ sealed class ExclusiveAccessFlow : PgClientFlow
     bool _innerStopping;
     bool _innerAborting;
 
-    internal ExclusiveAccessFlow(PgClientProtocol.Control innerControl, Func<Exception?, ValueTask> completeInner)
+    internal ExclusiveAccessFlow(PgClientProtocol protocol, PgClientProtocol.Control innerControl, PgClientProtocol.ExclusiveScopeState state, Func<Exception?, ValueTask> completeInner)
         : base(supportsPipelining: false)
     {
+        _protocol = protocol;
         _innerControl = innerControl;
+        _state = state;
         _completeInner = completeInner;
     }
 
@@ -49,11 +58,12 @@ sealed class ExclusiveAccessFlow : PgClientFlow
     // then an acquire never times out - it waits for the wire indefinitely.
     // protected override bool EnableActivationTimeout => true;
 
-    // Re-point at a fresh scope. Called by the protocol after re-Initializing the inner pipeline with
-    // innerSource, and after Reset (on reuse) has refreshed the framework + gate state.
-    internal void PrepareScope(bool async, PgClientFlowSource innerSource, TimeSpan activationTimeout)
+    // Re-point at a fresh scope (begin-time, cheap). The inner source + inner pipeline are NOT set here -
+    // the flow acquires them at its TURN (AcquireForTurn), so a never-consumed scope starts nothing.
+    internal void PrepareScope(bool async, TimeSpan activationTimeout)
     {
-        _innerSource = innerSource;
+        _innerSource = null;
+        _acquired = false;
         _activationTimeout = activationTimeout;
         IsAsync = async;
     }
@@ -77,13 +87,16 @@ sealed class ExclusiveAccessFlow : PgClientFlow
     /// level down.
     public T Queue<T>(T subflow, CancellationToken cancellationToken = default) where T : PgClientFlow
     {
+        // The scope source is acquired at the turn; Queue is only valid after HandoffReady has resolved
+        // (the caller awaits it before submitting), so the source is non-null here.
+        var innerSource = _innerSource ?? throw new InvalidOperationException("Cannot submit a subflow before the scope is acquired (await HandoffReady first).");
         if (cancellationToken.CanBeCanceled)
             subflow.BindCallerToken(cancellationToken);
         subflow.GetExecutionControl(_innerControl).Bind(_activationTimeout);
         if (subflow.IsAsyncForEnqueue)
-            _innerSource.Enqueue(subflow).Execute(runContinuationsAsynchronously: true);
+            innerSource.Enqueue(subflow).Execute(runContinuationsAsynchronously: true);
         else
-            _innerSource.EnqueueSyncWithHandoff(subflow);
+            innerSource.EnqueueSyncWithHandoff(subflow);
         return subflow;
     }
 
@@ -106,8 +119,13 @@ sealed class ExclusiveAccessFlow : PgClientFlow
     {
         // Wait for activation - we now own the wire exclusively. We never read/write the wire
         // ourselves; the inner pipeline's subflows do, rebinding the shared decoder via the inner
-        // Control, so the decoder we receive here is discarded.
+        // Control, so the decoder we receive here is discarded. A successful return is the won-turn
+        // proof (the activation source is the single arbiter), so the acquire below is race-free.
         _ = await context.GetDecoderAsync().ConfigureAwait(false);
+        // Acquire the scope at the turn: create the fresh source + start the inner executor. Deferred to
+        // here so the inner pipeline only ever runs for a flow that actually won its turn.
+        _innerSource = _state.AcquireForTurn(_protocol);
+        Volatile.Write(ref _acquired, true);
         // Hand the connection to the user; they submit subflows and end the scope.
         _handoffReady.SetResult();
         // Hold the wire until the scope ends (inner pipeline drained by CompleteScopeAsync).
@@ -135,23 +153,29 @@ sealed class ExclusiveAccessFlow : PgClientFlow
     // observed (never thrown into the heartbeat). Idempotent across ticks.
 
     // Graceful: drain the inner pipeline to a clean RFQ, THEN release the body. Releasing only after the
-    // drain settles lets in-flight inner subflows finish cleanly first.
+    // drain settles lets in-flight inner subflows finish cleanly first. Pre-turn (not acquired) there is
+    // no inner executor to drain - just release the body's gate; OnComplete faults HandoffReady. The
+    // scope signal is already tripped via its link, so an acquire racing this sees the close on its tokens.
     protected override void OnStopping(PgClientClosedException exception)
     {
         if (_innerStopping)
             return;
         _innerStopping = true;
-        DrainThenEndScope(_completeInner(null));
+        if (Volatile.Read(ref _acquired))
+            DrainThenEndScope(_completeInner(null));
+        else
+            _scopeEnded.TrySetResult();
     }
 
     // Forceful: complete the inner items WITH the reason, and release the body's gate immediately (the
-    // wire is dead - no clean drain to wait for).
+    // wire is dead - no clean drain to wait for). Pre-turn there is nothing to complete.
     protected override void OnAbort(PgClientClosedException exception)
     {
         if (_innerAborting)
             return;
         _innerAborting = true;
-        FireAndForget(_completeInner(exception));
+        if (Volatile.Read(ref _acquired))
+            FireAndForget(_completeInner(exception));
         _scopeEnded.TrySetResult();
     }
 
