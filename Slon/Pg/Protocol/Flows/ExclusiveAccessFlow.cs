@@ -36,6 +36,12 @@ sealed class ExclusiveAccessFlow : PgClientFlow
     TimeSpan _activationTimeout;
     TaskCompletionSource _handoffReady = new(TaskCreationOptions.RunContinuationsAsynchronously);
     TaskCompletionSource _scopeEnded = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    // Consumer-gone signal: set when the caller cancels its BeginScopeAsync wait (consumer-DETACH, NOT
+    // flow removal - the flow is issued, it still takes its turn). Pre-turn it makes the flow skip the
+    // acquire and retire fast (done-before-executed); mid-hold it ends the scope so the body returns
+    // even though the user will never call CompleteScopeAsync. NOT an activation-source fault, so the
+    // in-order wire handoff is preserved.
+    TaskCompletionSource _consumerGone = new(TaskCreationOptions.RunContinuationsAsynchronously);
     // Idempotence guards for the cascade hooks (fire once per tenure). Reset in OnReset.
     bool _innerStopping;
     bool _innerAborting;
@@ -72,6 +78,7 @@ sealed class ExclusiveAccessFlow : PgClientFlow
     {
         _handoffReady = new(TaskCreationOptions.RunContinuationsAsynchronously);
         _scopeEnded = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        _consumerGone = new(TaskCreationOptions.RunContinuationsAsynchronously);
         _innerStopping = false;
         _innerAborting = false;
     }
@@ -79,6 +86,31 @@ sealed class ExclusiveAccessFlow : PgClientFlow
     /// Resolves once this flow is activated and owns the wire - the caller awaits it to gain exclusive
     /// access before submitting any subflow. Faults if the flow is torn down before activation.
     public Task HandoffReady => _handoffReady.Task;
+
+    /// Acquire exclusive access, cancelably. Awaits the turn (HandoffReady); if the caller cancels before
+    /// the turn lands, DETACHES the consumer (the flow still takes its turn and retires fast - it is
+    /// already issued, can't be pulled from the outer pipeline) and throws OperationCanceledException.
+    /// Cancellation after the handoff is too late and resolves normally.
+    public async Task BeginScopeAsync(CancellationToken cancellationToken)
+    {
+        if (!cancellationToken.CanBeCanceled)
+        {
+            await _handoffReady.Task.ConfigureAwait(false);
+            return;
+        }
+        var cancelTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var reg = cancellationToken.UnsafeRegister(static (s, ct) => ((TaskCompletionSource)s!).TrySetCanceled(ct), cancelTcs);
+        var winner = await Task.WhenAny(_handoffReady.Task, cancelTcs.Task).ConfigureAwait(false);
+        if (winner == _handoffReady.Task)
+        {
+            await _handoffReady.Task.ConfigureAwait(false); // observe a pre-activation fault, if any
+            return;
+        }
+        // Caller gave up before the turn: detach the consumer and surface the cancel. The flow proceeds
+        // to its turn and retires fast (done-before-executed).
+        _consumerGone.TrySetResult();
+        cancellationToken.ThrowIfCancellationRequested();
+    }
 
     /// Queue a user subflow into the inner pipeline (FIFO - the inner pipeline is the same source +
     /// single-pump executor as the protocol's outer Queue, so submission order is execution order).
@@ -122,14 +154,25 @@ sealed class ExclusiveAccessFlow : PgClientFlow
         // Control, so the decoder we receive here is discarded. A successful return is the won-turn
         // proof (the activation source is the single arbiter), so the acquire below is race-free.
         _ = await context.GetDecoderAsync().ConfigureAwait(false);
+        // Done-before-executed: the consumer already detached (canceled BeginScopeAsync before the turn).
+        // We took our turn - can't be pulled from the outer pipeline - but there is no consumer to hand to,
+        // so skip the acquire entirely (no source, no inner executor) and retire immediately, handing the
+        // wire to the next waiter.
+        if (_consumerGone.Task.IsCompleted)
+            return ValueTask.CompletedTask;
         // Acquire the scope at the turn: create the fresh source + start the inner executor. Deferred to
         // here so the inner pipeline only ever runs for a flow that actually won its turn.
         _innerSource = _state.AcquireForTurn(_protocol);
         Volatile.Write(ref _acquired, true);
         // Hand the connection to the user; they submit subflows and end the scope.
         _handoffReady.SetResult();
-        // Hold the wire until the scope ends (inner pipeline drained by CompleteScopeAsync).
-        await _scopeEnded.Task.ConfigureAwait(false);
+        // Hold the wire until the scope ends (CompleteScopeAsync) OR the consumer detaches mid-hold (the
+        // user canceled after handoff and will never call CompleteScopeAsync). Either way the held scope
+        // must end so the body returns; a consumer-gone mid-hold drains the inner pipeline like a graceful
+        // end so the flyweight stays reusable.
+        var ended = await Task.WhenAny(_scopeEnded.Task, _consumerGone.Task).ConfigureAwait(false);
+        if (ended == _consumerGone.Task && Volatile.Read(ref _acquired))
+            await _completeInner(null).ConfigureAwait(false);
         return ValueTask.CompletedTask;
     }
 

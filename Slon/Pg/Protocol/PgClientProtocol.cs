@@ -367,18 +367,14 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
     // flyweight and reused across scopes.
     internal Flows.ExclusiveAccessFlow BeginExclusiveScope(bool async)
     {
-        if (_exclusiveScope is null)
-        {
-            _exclusiveScope = ExclusiveScopeState.Create(this);
-        }
-        else
-        {
-            _exclusiveScope.CheckReusable();
-            _exclusiveScope.ResetFlow();
-        }
+        _exclusiveScope ??= ExclusiveScopeState.Create(this);
+        // Rent a waiter: the cached flow on the common sequential path, an overflow flow when a prior
+        // scope is still live (concurrent begin). N waiters share the one state; the outer pipeline's
+        // ordering serializes their turns and is the fair hand-out. No begin-time reuse guard - a
+        // concurrent begin gets its own waiter rather than a throw.
+        var flow = _exclusiveScope.RentFlow();
         // No source, no inner-pipeline init here: the flow creates the source and starts the inner
         // executor at its TURN (AcquireForTurn), so a never-consumed scope starts nothing.
-        var flow = _exclusiveScope.Flow;
         flow.PrepareScope(async, _options.FlowActivationTimeout);
         return Queue(flow);
     }

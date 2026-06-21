@@ -22,28 +22,32 @@ sealed partial class PgClientProtocol
     // root. Nested in PgClientProtocol so it reaches Control/Policy without widening their accessibility.
     internal sealed class ExclusiveScopeState
     {
+        readonly PgClientProtocol _protocol;
         readonly Control _innerControl;
         readonly CloseSignal _scopeClose;
         // Built lazily at the FIRST AcquireForTurn (null until then) and re-initialized on every later
         // turn. Deferring construction to the turn means the inner executor starts at the won-turn point,
-        // never at begin - and a done-before-executed flow that skips the acquire starts nothing.
+        // never at begin - and a done-before-executed flow that skips the acquire starts nothing. Only the
+        // single activated flow ever touches it (the outer pipeline serializes turns), so the N waiters
+        // share it safely - handed serially, never concurrently.
         Pipeline<PgClientFlow, Policy, PgClientFlowSource, PgClientFlowSource.Enumerator>? _innerPipeline;
-        // Set once in Create after the flow is built (the flow holds a back-ref to this state, so the two
-        // are wired in two phases).
-        ExclusiveAccessFlow _flow = null!;
+        // The cached flow = the zero-alloc fast path for the common sequential case (one scope at a time).
+        // When it is still in a live scope, RentFlow allocates an overflow flow over the SAME state; the
+        // outer pipeline serializes them so only one holds the shared inner pipeline at a time. (Pooling
+        // overflow flows is a later optimization; today they are allocated fresh.)
+        ExclusiveAccessFlow _cachedFlow = null!;
 
-        ExclusiveScopeState(Control innerControl, CloseSignal scopeClose)
+        ExclusiveScopeState(PgClientProtocol protocol, Control innerControl, CloseSignal scopeClose)
         {
+            _protocol = protocol;
             _innerControl = innerControl;
             _scopeClose = scopeClose;
         }
 
-        public ExclusiveAccessFlow Flow => _flow;
-
         // Build the flyweight's stable resources: the inner Control, the scope CloseSignal (linked to the
         // protocol's _close), the per-scope decoder/writer shells over the protocol's shared channels, and
-        // the hosting flow. Does NOT build the inner pipeline - that is deferred to the flow's first turn
-        // (AcquireForTurn), so the inner executor never starts at begin.
+        // the cached hosting flow. Does NOT build the inner pipeline - that is deferred to a flow's first
+        // turn (AcquireForTurn), so the inner executor never starts at begin.
         public static ExclusiveScopeState Create(PgClientProtocol protocol)
         {
             var innerControl = new Control(protocol, poolFacing: false);
@@ -62,25 +66,31 @@ sealed partial class PgClientProtocol
             var scopeWriter = PgProtocolDataWriter.CreateScopeShell(protocol._protocolDataWriter, scopeClose.AbortToken, innerControl);
             innerControl.BindShells(scopeDecoder, scopeWriter);
 
-            var state = new ExclusiveScopeState(innerControl, scopeClose);
-            // The flow holds a back-ref to the state so it can acquire (build/re-init the inner pipeline) at
-            // its TURN. CompleteInner reads _innerPipeline through the state so it follows the (re-)init; it
-            // is only reachable after AcquireForTurn has run (the flow owns the wire by then).
-            state._flow = new ExclusiveAccessFlow(protocol, innerControl, state, reason => state._innerPipeline!.CompleteAsync(reason));
+            var state = new ExclusiveScopeState(protocol, innerControl, scopeClose);
+            state._cachedFlow = state.NewFlow();
             return state;
         }
 
-        // Begin-time reuse guard: refuse a new scope while the prior one is still completing. The cascade
-        // (OnStopping/OnAbort) is a second driver of the inner pipeline, so a prior scope that hasn't fully
-        // completed is reachable here; re-init over a live prior scope is a lifecycle bug, not recoverable.
-        public void CheckReusable()
-        {
-            if (_flow is { IsCompleted: false })
-                ThrowHelper.ThrowInvalidOperation("Cannot begin an exclusive scope while the prior scope is still completing.");
-        }
+        // A flow holds a back-ref to this state so it can acquire (build/re-init the inner pipeline) at its
+        // TURN. CompleteInner reads _innerPipeline through the state so it follows the (re-)init; it is only
+        // reachable after AcquireForTurn has run (the flow owns the wire by then). All flows over this state
+        // share the one inner pipeline, handed serially by the outer pipeline's ordering.
+        ExclusiveAccessFlow NewFlow()
+            => new(_protocol, _innerControl, this, reason => _innerPipeline!.CompleteAsync(reason));
 
-        // Reset the pooled flow's framework + gate state for a fresh scope (begin-time, cheap).
-        public void ResetFlow() => _flow.Reset();
+        // Rent a flow for a new scope. The cached flow when it is free (not in a live scope) - the zero-alloc
+        // common path; otherwise an overflow flow allocated fresh over the same state (a concurrent begin
+        // while a prior scope is still live). The returned flow is Reset and ready to enqueue. No
+        // begin-time guard / throw: a concurrent begin gets its own waiter instead of failing.
+        public ExclusiveAccessFlow RentFlow()
+        {
+            // Cached flow is available when it is not in a live scope (never started, or completed);
+            // otherwise allocate an overflow waiter over the same state.
+            var flow = _cachedFlow.IsPending || _cachedFlow.IsCompleted ? _cachedFlow : NewFlow();
+            if (flow.IsCompleted)
+                flow.Reset();
+            return flow;
+        }
 
         // Acquire the scope at the flow's TURN: create the fresh per-scope source, build the inner pipeline
         // on the first turn (binding the Control to its slots), or re-initialize the existing one on later
