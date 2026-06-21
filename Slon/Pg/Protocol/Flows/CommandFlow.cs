@@ -67,6 +67,13 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
     // TRUE once ExecutePipelined's state machine has begun running; from that point the
     // body's catch paths own caller-facing fault propagation.
     bool _bodyStarted;
+    // True once the consumer has made a prior MoveNext{Async} call. Gates the per-call source Reset:
+    // the FIRST call must never Reset (the body's first delivery - result, completion, or a teardown
+    // fault that bypasses the gate ordering - lands on the initial generation the consumer awaits).
+    // _bodyStarted is the wrong proxy here: the body can start and complete BEFORE the consumer's
+    // first call (executor-dispatched), so gating Reset on it rearms past a delivery the consumer
+    // never consumed. Consumer-thread-only, so no Volatile needed.
+    bool _consumerAdvanced;
 
     ValueTask<bool> EnumeratorMoveNextTask => new(this, _enumeratorMoveNextTaskSource.Version);
 
@@ -103,15 +110,21 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
         return new Enumerator(this);
     }
 
+    // Bind the caller token at submit so the eager write honors it (the pre-write consumer gate is
+    // gone, so the write no longer borrows the token from the first MoveNextAsync).
+    internal override void BindCallerToken(CancellationToken cancellationToken) => _callerCancellationToken = cancellationToken;
+
     public Enumerator GetAsyncEnumerator(CancellationToken cancellationToken = default)
     {
-        _callerCancellationToken = cancellationToken;
-        // A cancelable token arms the only truly concurrent completer of the move-next source
-        // (the cancellation registration completes it from an arbitrary thread while the body
-        // keeps reading). Pay for thread-safe completion only then; never disarm mid-tenure -
-        // a fired registration may still be in flight.
+        // Async enumeration always needs thread-safe completion: the body completes the move-next
+        // source from its own thread, AND the teardown (OnAbort/OnStopping via CancelPendingWait) is
+        // an independent concurrent completer that can fault the caller-interaction gate out from under
+        // a consumer mid-MoveNextAsync. A caller token adds the cancellation registration as a third
+        // completer; bind it only when cancelable so a no-token enumerator doesn't clobber a submit-
+        // bound token with None. Never disarm mid-tenure - a fired registration may still be in flight.
+        _enumeratorMoveNextTaskSource.CanCompleteConcurrently = true;
         if (cancellationToken.CanBeCanceled)
-            _enumeratorMoveNextTaskSource.CanCompleteConcurrently = true;
+            _callerCancellationToken = cancellationToken;
         return new(this);
     }
 
@@ -121,22 +134,16 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
         ValueTask writeTask;
         try
         {
-            if (IsAsync)
-            {
-                await _callerInteractionCore.GetGateTask(this).ConfigureAwait(false);
-            }
-            else
-            {
-                // There is a small window where an executor already on a separate thread races to this point before the caller can set IsWaiting.
-                // So we'll always do an unwind later on *if we didn't do it here* to make sure we won't stall the executor past writing.
-                // (another approach is a thread static to identify whether the executor is on the caller thread, but it's messy).
-                if (_callerInteractionCore.IsWaiting)
-                {
-                    // We're on the executor thread, unwind to let the caller do its own writes.
-                    // The executor task will properly await, freeing up its thread to do other work.
-                    await SetContinuationAndUnblockWaiter().ConfigureAwait(false);
-                }
-            }
+            // Async flows write EAGERLY - no pre-write consumer gate. The old `await GetGateTask`
+            // here fused the write to the first MoveNextAsync, which stranded a prior flow's deferred
+            // flush whenever the executor sat on this gate waiting for a consumer that hadn't engaged
+            // (batch-pipelining deadlock). The caller token is now bound at submit, so the write needs
+            // nothing from the consumer. The inter-result gate (the real backpressure rendezvous)
+            // stays. Sync flows still unwind so the caller's thread does its own writes:
+            //   small window: an executor on a separate thread can reach here before the caller sets
+            //   IsWaiting, so we always do the unwind later if we didn't here, to not stall past writing.
+            if (!IsAsync && _callerInteractionCore.IsWaiting)
+                await SetContinuationAndUnblockWaiter().ConfigureAwait(false);
 
             // All writes captured as a single task. If they back-pressure (TCP send buffer full) the
             // task is pending and the framework awaits it inline between iterations so the next item's
@@ -224,7 +231,11 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
     // promise allocations per protocol under pipelined load.
     ValueTask DispatchPipelinedRead(Context context, ValueTaskSourcePromise<bool> promise)
     {
-        var waiter = context.GetDecoderAuto().ConfigureAwait(false);
+        // Gate on ACTUAL activation (IsDecoderSettled via the non-auto awaitable), not GetDecoderAuto's
+        // sync-unconditional IsCompleted: a sync successor must not Start ExecutePipelined (tenuring the
+        // shared promise) before it's activated, or it collides with a predecessor still holding the
+        // promise. The sync block stays inside ExecutePipelined's own GetDecoderAuto.
+        var waiter = context.GetDecoderAsync().ConfigureAwait(false);
         if (waiter.IsCompleted)
         {
             // Handing the shared-promise-backed task to the framework is safe: the contract guarantees
@@ -382,25 +393,42 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                 }
                 if (!IsConsumerGone)
                 {
-                    _isResultReady = true;
-                    Volatile.Write(ref _inlineResultDelivery, true);
-                    try
-                    {
-                        SetResult(result);
-                    }
-                    finally
-                    {
-                        Volatile.Write(ref _inlineResultDelivery, false);
-                    }
+                    // First result, ASYNC ONLY: re-establish the gate-ordered rendezvous the eager
+                    // write removed. The write is now eager (so a batch's deferred flush is not stranded
+                    // behind a consumer gate), but an async body runs CONCURRENTLY and would complete the
+                    // move-next source before the consumer's first MoveNextAsync has Reset it and opened
+                    // the gate - that Reset then clobbers the delivered result (silent drop) and races
+                    // the non-concurrent SetResult (torn / lost-wake). Parking on the gate here restores
+                    // the Reset(0)->gate-open(0)->SetResult(0) edge that rounds 2..N already get below.
+                    // SYNC is exempt: its body runs on the caller's own MoveNext thread (no eager
+                    // delivery, no concurrent Reset), and a pre-delivery unwind would hand control back
+                    // to the caller before result1 exists (Sync_Completes hang). A consumer that disposes
+                    // without consuming drives this gate via MoveNextAsync, so the body still drains.
+                    if (_commandIndex is 0 && IsAsync)
+                        await _callerInteractionCore.GetGateTask(this).ConfigureAwait(false);
 
                     if (!IsConsumerGone)
                     {
-                        if (IsAsync)
-                            await _callerInteractionCore.GetGateTask(this).ConfigureAwait(false);
-                        else
-                            await SetContinuationAndUnblockWaiter().ConfigureAwait(false);
+                        _isResultReady = true;
+                        Volatile.Write(ref _inlineResultDelivery, true);
+                        try
+                        {
+                            SetResult(result);
+                        }
+                        finally
+                        {
+                            Volatile.Write(ref _inlineResultDelivery, false);
+                        }
 
-                        /* The next MoveNext or MoveNextAsync call resumes here. */
+                        if (!IsConsumerGone)
+                        {
+                            if (IsAsync)
+                                await _callerInteractionCore.GetGateTask(this).ConfigureAwait(false);
+                            else
+                                await SetContinuationAndUnblockWaiter().ConfigureAwait(false);
+
+                            /* The next MoveNext or MoveNextAsync call resumes here. */
+                        }
                     }
                 }
 
@@ -460,10 +488,19 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
         }
         catch (PgClientClosedException ex) when (context.IsProtocolClosed)
         {
-            // Scope the catch to our own closure so a nested protocol's closed exception
-            // bubbling through doesn't get treated as ours. HandleException signals the
-            // consumer's pending MoveNextTask before rethrow, otherwise the consumer
-            // stays parked forever even after the executor's recovery path runs.
+            // Scope to our own closure so a nested protocol's close doesn't get treated as ours.
+            // Consumer-gone means a dead wire is the expected terminal: complete the move-next source
+            // (false) and RETURN cleanly, the same shape as the graceful StoppingToken transition above
+            // (SetResult on close, fall through to a clean body completion - no throw). This keeps the
+            // close from propagating as an exception through the pipeline drain only to be swallowed by
+            // DisposeAsyncCore / the sync Dispose loop. A live consumer instead gets the close on its
+            // move-next source and we rethrow so it surfaces (and the framework runs recovery).
+            if (IsConsumerGone)
+            {
+                if (!_enumeratorCompleted)
+                    SetResult(null);
+                return;
+            }
             HandleException(ex);
             throw;
         }
@@ -574,14 +611,22 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
     {
         if (_enumeratorCompleted)
             return;
-        // Mark the flow terminally completed so the caller's next MoveNext returns the cached
-        // task result (which throws the exception) instead of resetting the source and parking.
-        _enumeratorCompleted = true;
-        // We have to make sure to unblock the caller if the flow failed to (could be a cancellation, io error, etc).
+        // Mark terminal only when the fault actually lands. A concurrent teardown TrySetException
+        // no-ops if it targets an already-completed generation - e.g. the abort faulted the inter-
+        // result gate and this fault hits the already-CONSUMED prior generation. Setting
+        // _enumeratorCompleted on that no-op would make the consumer's next MoveNext short-circuit onto
+        // the stale consumed result; leaving it false lets that call fall through to its own faulted-
+        // gate self-delivery, which completes the consumer's actual generation.
+        bool delivered;
         if (_enumeratorMoveNextTaskSource.CanCompleteConcurrently)
-            _enumeratorMoveNextTaskSource.TrySetException(ex, runContinuationsAsynchronously: true);
+            delivered = _enumeratorMoveNextTaskSource.TrySetException(ex, runContinuationsAsynchronously: true);
         else
+        {
             _enumeratorMoveNextTaskSource.SetException(ex, runContinuationsAsynchronously: true);
+            delivered = true;
+        }
+        if (delivered)
+            _enumeratorCompleted = true;
         // Wake any sync MoveNext parked in WaitForContinuation. The body just faulted, so no
         // continuation will be registered. The caller needs to observe the exception via the
         // move-next task source.
@@ -590,6 +635,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
         // TODO use tryrecover to consume as many rfqs as we have left at the time of throwing.
         // TODO This essentially replaces manually having to consume the flow remainder on unexpected errors (e.g. unhandled protocol errors).
     }
+
 
     protected override void OnComplete(Exception? exception)
     {
@@ -649,6 +695,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
         _context = default;
         _task = default;
         _bodyStarted = false;
+        _consumerAdvanced = false;
     }
 
     FlowCallerInteractionCoreResult IValueTaskSource<FlowCallerInteractionCoreResult>.GetResult(short token)
@@ -701,9 +748,11 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                 flow.IsAsync = false;
             }
 
-            // See MoveNextAsync: rearm only once the body has run; the first-call source is fresh.
-            if (Volatile.Read(ref flow._bodyStarted))
+            // See MoveNextAsync: rearm only on a non-first call; the first-call source is fresh and the
+            // body's first delivery lands on it.
+            if (flow._consumerAdvanced)
                 flow._enumeratorMoveNextTaskSource.Reset();
+            flow._consumerAdvanced = true;
             // Two wake reasons: a continuation was registered (drive the body forward inline)
             // or the body signaled progress (a result, completion, or fault landed on the
             // move-next task source while we were parked). In the progress-only case there is
@@ -739,26 +788,41 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                 flow.IsAsync = true;
             }
 
-            // We only set it if it's not null, as we don't want to overwrite the initial GetEnumerator token until the first result is returned.
-            if (cancellationToken is not null)
+            // Override only with a cancelable per-read token: a no-token / None MoveNext keeps the
+            // token bound at submit (or GetAsyncEnumerator) for this read, never clobbering it with
+            // None. A cancelable token also arms the concurrent completer for this tenure.
+            if (cancellationToken is { } ct && ct.CanBeCanceled)
             {
-                flow._callerCancellationToken = cancellationToken.GetValueOrDefault();
-                // Same as GetAsyncEnumerator: a cancelable token arms the concurrent
-                // completer, so completion must become thread-safe for this tenure.
-                if (flow._callerCancellationToken.CanBeCanceled)
-                    flow._enumeratorMoveNextTaskSource.CanCompleteConcurrently = true;
+                flow._callerCancellationToken = ct;
+                flow._enumeratorMoveNextTaskSource.CanCompleteConcurrently = true;
             }
 
-            // Rearm only a source the body already completed. Before the body runs the source is
-            // still fresh from OnReset, and a never-started flow can be faulted by the framework
-            // (OnComplete -> HandleException) concurrently; resetting here would be the consumer
-            // write that races that fault. Gated on _bodyStarted the framework stays the sole writer
-            // on the never-started path, and once the body runs it is the sole gate-ordered completer.
-            if (Volatile.Read(ref flow._bodyStarted))
+            // Rearm only on a non-first call. The first-call source is fresh from OnReset and the body's
+            // first delivery (a result, completion, or a teardown fault that bypasses the gate ordering)
+            // lands on it; Resetting here would rearm past that delivery, leaving the consumer parked on
+            // a generation nothing completes. A never-started flow's framework fault (OnComplete ->
+            // HandleException) also lands on this fresh generation, so the first call must not race it
+            // with a Reset either.
+            if (flow._consumerAdvanced)
                 flow._enumeratorMoveNextTaskSource.Reset();
-            // TrySet: CancelPendingWait (abort) can fault the gate concurrently. If it won the CAS,
-            // no-op here. The body observes the faulted gate and terminates with the recorded fault.
-            flow._callerInteractionCore.GateTaskSource.TrySetResult(default);
+            flow._consumerAdvanced = true;
+            // Open the gate to drive the body forward. A false return means a concurrent teardown
+            // (OnAbort/OnStopping -> CancelPendingWait) faulted the gate while the body was parked on
+            // it: the body's fault-wake races the Reset above and cannot reliably deliver to this
+            // generation (it may target the prior, already-consumed one and lose the completion).
+            // Surface the close exception to our own just-Reset generation here - on our thread,
+            // ordered after our Reset, sole completer until we park - so the body's HandleException
+            // TrySet simply no-ops. CanCompleteConcurrently is on for async (see GetAsyncEnumerator).
+            // A false TrySetResult means the gate is already completed - but not necessarily by a
+            // teardown. It can also be in a transient succeeded state the body has not yet consumed+
+            // Reset. Only self-deliver when CancelPendingWait actually faulted it (CancelException set);
+            // otherwise the body will deliver to our generation, so just await it.
+            if (!flow._callerInteractionCore.GateTaskSource.TrySetResult(default)
+                && flow._callerInteractionCore.CancelException is { } closed)
+            {
+                flow._enumeratorMoveNextTaskSource.TrySetException(closed, runContinuationsAsynchronously: true);
+                flow._enumeratorCompleted = true;
+            }
             return flow.EnumeratorMoveNextTask;
         }
 
@@ -846,10 +910,22 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
         [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
         async ValueTask DisposeAsyncCore(ValueTask<bool> task)
         {
-            await task.ConfigureAwait(false);
+            // The consumer is gone (it called DisposeAsync), so a dead wire is the expected terminal
+            // state, not an error to surface. The body's teardown drive (gate-fault self-deliver, or a
+            // read-fault rethrow) lands the close on the generation this internal drain awaits; swallow
+            // it exactly as the consumer's own read loop does (catch (PgClientClosedException) {}). This
+            // is the single chokepoint for "close arrived while DisposeAsync was draining" - only the
+            // close is swallowed, every other fault still surfaces.
+            try
+            {
+                await task.ConfigureAwait(false);
 
-            // Flow cleans up the result every time, we do the absolute minimum here.
-            while (await MoveNextAsync().ConfigureAwait(false))
+                // Flow cleans up the result every time, we do the absolute minimum here.
+                while (await MoveNextAsync().ConfigureAwait(false))
+                {
+                }
+            }
+            catch (PgClientClosedException)
             {
             }
         }

@@ -112,6 +112,11 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IThreadPoolWorkItem
         _completionState = state;
     }
 
+    // Bind the caller's cancellation token at submit so the (eager) write, and the reads by default,
+    // honor it. No-op for flows without a caller; the queue binds only a cancelable token, so the
+    // common no-token submit pays no field write.
+    internal virtual void BindCallerToken(CancellationToken cancellationToken) { }
+
     public bool IsCompleted => _completed;
     internal bool IsStarted => _started && !_completed;
     internal bool IsPending => !_started;
