@@ -163,8 +163,10 @@ public class AutoPrepareWireTests
     //     is a no-op per protocol (CloseComplete), so the probe touches no real server state.
     //
     //  2. The LRU stamp is Environment.TickCount64 ("statistical only", ~15ms resolution), so sqlA
-    //     and sqlB used back-to-back could tie and either become the approximate-LRU victim. A 50ms
-    //     gap after each group puts them in distinct ticks, making sqlA deterministically the oldest.
+    //     and sqlB used back-to-back could tie and either become the approximate-LRU victim. One 50ms
+    //     gap after sqlA puts it in an older tick than sqlB - the only thing that matters: sqlC
+    //     crossing the cap evicts the LRU of the existing pair {sqlA, sqlB}, so sqlC (the new
+    //     entrant) is never a candidate and needs no gap of its own.
     [TestMethod]
     public async Task Eviction_Drains_MaintenanceQueue_AndClearsPresence()
     {
@@ -175,13 +177,12 @@ public class AutoPrepareWireTests
         const string sqlB = "select 301 as drain_b";
         const string sqlC = "select 302 as drain_c";
 
-        // Separate the access stamps so sqlA is unambiguously the LRU victim. The gap must exceed
-        // the TickCount64 resolution; 50ms is comfortably above it.
+        // Separate sqlA's stamp from sqlB's so sqlA is unambiguously the older eviction candidate. The
+        // gap must exceed the TickCount64 resolution; 50ms is comfortably above it.
         var stampGap = TimeSpan.FromMilliseconds(50);
         await RunN(conn, sqlA, 4);
         await Task.Delay(stampGap);
         await RunN(conn, sqlB, 4);
-        await Task.Delay(stampGap);
         await RunN(conn, sqlC, 4);
 
         var pg = conn.UnderlyingPgConnection!;
