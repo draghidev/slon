@@ -93,6 +93,12 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
     // SocketException / ObjectDisposedException when our CTS aborted (or Abort closed the socket under)
     // an in-flight receive. The CTS also fires on read-timeout, hence the timeout branch. Returns rather
     // than throws so a sync caller's throw keeps definite assignment.
+    // R2 (ADO ship-blocker): _abortToken is the PROTOCOL token, captured at construction, so a scope-only
+    // abort (ADO connection-dispose = scope teardown; the protocol is pooled and must survive) cannot
+    // break a parked read here. Fix is a scope-bound decoder shell over a shared ReadChannel (read-side
+    // wire state) carrying the SCOPE's token - NOT dynamic scope-aware branching of _abortToken (taxes
+    // this hot path; re-points a shared instance per scope, reintroducing wrong-tenure translation when
+    // an exclusive-flow tenure fails). See the R2 note in BeginExclusiveScope.
     Exception TranslateReadCancellation(Exception cause, CancellationToken cancellationToken)
     {
         if (_abortToken.IsCancellationRequested && _control.ClosedException is { } closed)

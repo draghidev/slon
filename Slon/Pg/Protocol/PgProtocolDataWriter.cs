@@ -52,6 +52,13 @@ sealed class PgProtocolDataWriter(IOutputWriter<byte> writer, Encoding clientEnc
     // Abort-to-typed-exception translation shared by the sync flush catch and the resumable driver:
     // the canonical closed exception once the abort token has fired, else the original. Mirrors the
     // async flush catch so every sync seam surfaces PgClientClosedException, not a bare deadline fault.
+    // R2 (ADO ship-blocker): _abortToken is the PROTOCOL token, captured at construction. A scope-only
+    // abort (an ADO connection-dispose, which is a scope teardown - the protocol is pooled and must
+    // survive) therefore cannot break a parked write here. Fix is a scope-bound encoder shell over a
+    // shared WriteChannel (the write-side wire state) carrying the SCOPE's token - NOT dynamic scope-
+    // aware branching of _abortToken (that taxes this hot path and re-points a shared instance per
+    // scope, reintroducing wrong-tenure translation when an exclusive-flow tenure fails). See the R2
+    // note in BeginExclusiveScope.
     public Exception TranslateAbort(Exception ex)
         => _abortToken.IsCancellationRequested && _control.ClosedException is { } closed ? closed : ex;
 

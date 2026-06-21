@@ -42,7 +42,7 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
             ThrowCompleted();
 
         _state.OnEnqueue?.Invoke();
-        _state.Queue.Enqueue(flow);
+        _state.EnqueueItem(flow);
         // Release store suffices: the flag's only cross-thread reader is the handoff close-out's
         // compensation, and EnqueueResult.Execute's under-lock gate is the full fence that publishes
         // it in time. A stale TRUE costs at most a spurious compensation wake (the wait re-check peeks
@@ -173,8 +173,7 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
     // pulling (Shutdown awaits DrainSignal first) so this is the sole consumer.
     public void DrainInertItems(Action<PgClientFlow> onInert)
     {
-        while (_state.Queue.TryDequeue(out var flow))
-            onInert(flow);
+        _state.DrainInert(onInert);
         Volatile.Write(ref _state.QueueNotEmpty, false);
     }
 
@@ -192,7 +191,12 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
     internal sealed class State
     {
         public readonly FlushGate FlushGate;
-        public readonly SingleProducerSingleConsumerQueue<PgClientFlow> Queue = new();
+        // Primary storage: inline slot fast path + lazy one-way SPSC escalation (SlotEscalatingQueue).
+        // The sequential common case - one in-flight flow, or a nested exclusive scope's serial
+        // subflows - stays on the slot with no SPSC allocation; a pipelining connection escalates on
+        // first overlap. Same SPSC contract as the bare queue it replaces (single producer = Enqueue,
+        // single consumer = the executor's pull), so it is a drop-in. Non-readonly: mutated by ref this.
+        SlotEscalatingQueue<PgClientFlow> _storage;
         // The wait-protocol WakeSignal with suspension observation enabled: the executor's waits
         // arm against it (thin path, no value-task source), and EnqueueSyncWithHandoff
         // rendezvouses on WaitForSuspended. Scheduler-routed async wakes come with it.
@@ -224,20 +228,41 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
             WakeSignal = new(runContinuationsAsynchronously: true, scheduler, enableWaitForSuspended: true);
         }
 
-        public void Complete()
+        // Register Complete as the completion-token callback. Done here (not in Enumerator) so Complete
+        // can stay private: its single-writer safety depends on the CTS firing it at most once, so the
+        // sole entry point is this registration.
+        public void RegisterCompletion(CancellationToken completionToken)
+            => completionToken.UnsafeRegister(static state => ((State)state!).Complete(), this);
+
+        // Private and single-writer by construction: the ONLY caller is the CompletionToken registration
+        // above, which the CTS fires at most once however many threads race _cts.Cancel (external
+        // CompleteAsync + the executor's terminal DisposeAsync). That once-only guarantee is what lets the
+        // IsCompleted store below be a plain release write (no Interlocked) - do not add a direct caller.
+        void Complete()
         {
             Volatile.Write(ref IsCompleted, true);
             // Deferred during a sync-handoff window: an ungated completion wake steals the rendezvous,
-            // running the sync flow on the wrong thread. Gate read + claim under one wake-lock hold,
-            // same as EnqueueResult.Execute. The acquire publishes the IsCompleted store to the
-            // close-out's compensation read. No liveness lost: the handoff's inline claim wakes the
-            // executor and its next wait observes IsCompleted (the close-out re-delivers if it raced).
+            // running the sync flow on the wrong thread. No liveness lost: the handoff's inline claim
+            // wakes the executor and its next wait observes IsCompleted (the close-out re-delivers if
+            // it raced).
+            TryClaim(runContinuationsAsynchronously: true);
+        }
+
+        // Claim the executor's parked wait and dispatch its continuation, but only when no sync-handoff
+        // window is active. The HandoffActive read and the claim are one wake-lock hold: read-then-claim
+        // would let a stale gate verdict (taken just before the window opened) pair with a claim landing
+        // after the producer acked, stealing the rendezvous so the sync flow runs on the wrong thread.
+        // The acquire is also the full fence that publishes the caller's prior store (QueueNotEmpty /
+        // IsCompleted) to the close-out's compensation read, which is why those stores need no fence of
+        // their own. A claim lost to an open window is dropped on purpose: the close-out re-delivers.
+        public void TryClaim(bool runContinuationsAsynchronously)
+        {
             var wakeSignal = WakeSignal;
             wakeSignal.AcquireWakeLock();
             var claimed = !Volatile.Read(ref HandoffActive) && wakeSignal.TryClaimLocked();
             wakeSignal.ReleaseWakeLock();
             if (claimed)
-                wakeSignal.DispatchClaimed(runContinuationsAsynchronously: true);
+                wakeSignal.DispatchClaimed(runContinuationsAsynchronously);
         }
 
         // Two narrow take helpers. The HandoffActive skip-queue rule belongs at the call site
@@ -257,11 +282,19 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
             return false;
         }
 
+        public void EnqueueItem(PgClientFlow flow) => _storage.Enqueue(flow);
+
+        // Consumer-side peek used by WaitCore's authoritative not-empty test.
+        public bool HasItem() => _storage.TryPeek(out _);
+
+        // Sole consumer once the executor has stopped (Shutdown's drain).
+        public void DrainInert(Action<PgClientFlow> onInert) => _storage.DrainInert(onInert);
+
         public bool TryDequeue()
         {
-            if (Queue.TryDequeue(out Current!))
+            if (_storage.TryDequeue(out Current!))
             {
-                if (!Queue.TryPeek(out _))
+                if (!_storage.TryPeek(out _))
                     Volatile.Write(ref QueueNotEmpty, false);
                 return true;
             }
@@ -282,19 +315,7 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
         public void Execute(bool runContinuationsAsynchronously)
         {
             if (_state is null) return;
-            // Gate UNDER the wake lock: the HandoffActive read and the claim must be one atomic step
-            // against the sync-handoff rendezvous. Read-then-claim lets a stale gate verdict (taken
-            // just before the window opened) pair with a claim landing after the producer acked,
-            // stealing the rendezvous so the sync flow runs on the wrong thread. The acquire is also
-            // the full fence that publishes this thread's QueueNotEmpty store to the close-out's
-            // compensation read, which is why Enqueue's flag store needs no fence of its own.
-            var wakeSignal = _state.WakeSignal;
-            wakeSignal.AcquireWakeLock();
-            var claimed = !Volatile.Read(ref _state.HandoffActive) && wakeSignal.TryClaimLocked();
-            wakeSignal.ReleaseWakeLock();
-            // Deferred (window open): dropped on purpose - the handoff close-out re-delivers.
-            if (claimed)
-                wakeSignal.DispatchClaimed(runContinuationsAsynchronously);
+            _state.TryClaim(runContinuationsAsynchronously);
         }
     }
 
@@ -313,7 +334,7 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
                 ? CancellationTokenSource.CreateLinkedTokenSource(externalCt)
                 : new CancellationTokenSource();
             _completionToken = _cts.Token;
-            _completionToken.UnsafeRegister(static state => ((State)state!).Complete(), _state);
+            _state.RegisterCompletion(_completionToken);
         }
 
         public CancellationToken CompletionToken => _completionToken;
@@ -407,7 +428,7 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
             // is already peekable, and the flag can go STALE-TRUE (the producer's flag store landing
             // after TryDequeue's dequeue-to-empty clear), so the peek is the authoritative test.
             // Skip-queue while a handoff window is active so we don't hijack the sync caller's thread.
-            if (!Volatile.Read(ref _state.HandoffActive) && _state.Queue.TryPeek(out _))
+            if (!Volatile.Read(ref _state.HandoffActive) && _state.HasItem())
             {
                 // An item is available - arm the next TryGetNext so it can consume one (only one
                 // while the flush-threshold gate holds, so a flush round lands between items).

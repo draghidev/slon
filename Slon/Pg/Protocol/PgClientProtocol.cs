@@ -105,15 +105,24 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
     // Body is passive: catches OCE, attributes via ex.CancellationToken == AbortToken, propagates.
     // Fired immediately by Shutdown on the forceful path, or after CompletionTimeout on the
     // graceful path's escalation.
-    readonly CancellationTokenSource _abortCts;
-    readonly CancellationToken _abortToken;
-    readonly CancellationTokenSource _stoppingCts;
-    readonly CancellationToken _stoppingToken;
-    // Canonical closed exception, materialized once on Shutdown entry. Cached so all observers
-    // see the same instance with the same closeReason wrapped.
-    PgClientClosedException? _closedException;
+    // Owns the close reason + the stopping/abort tokens as one object so "materialize the reason before
+    // tripping any token" is structural. The canonical PgClientClosedException (materialized once on
+    // Shutdown entry, wrapping the closeReason) is _close.Reason.
+    readonly CloseSignal _close;
     Pipeline<PgClientFlow, Policy, PgClientFlowSource, PgClientFlowSource.Enumerator> _pipeline = null!;
     PgClientFlowSource _source;
+    // Cached exclusive-scope machinery. The inner pipeline is a flyweight (reused via Initialize) and
+    // the hosting flow is pooled with it - on the common ADO path an open connection is an exclusive
+    // scope, so allocating per scope would tax every execute. One scope at a time per connection (an
+    // exclusive scope is, by definition, not concurrent with another on the same connection).
+    Control? _exclusiveInnerControl;
+    Pipeline<PgClientFlow, Policy, PgClientFlowSource, PgClientFlowSource.Enumerator>? _exclusiveInnerPipeline;
+    Flows.ExclusiveAccessFlow? _exclusiveFlow;
+    // The active scope's linked close signal (a child of _close). Per-connection flyweight, created once
+    // with the exclusive machinery, reused across scopes (it stays untripped on the normal completion
+    // path). Inner flows read it through the inner Control so a protocol stop/abort cascades into the
+    // scope via the link, while a scope-only trip leaves the protocol token untouched.
+    CloseSignal? _exclusiveScopeClose;
     readonly Lock _syncRoot = new();
     ProtocolStatus _status = ProtocolStatus.Created;
     // Track draining count so overlapping recovery starts/ends don't signal ready too early.
@@ -123,18 +132,15 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
     PgClientProtocol(PgClientProtocolOptions options)
     {
         _options = options;
-        _abortCts = new(Timeout.InfiniteTimeSpan, options.TimeProvider);
-        _abortToken = _abortCts.Token;
-        _stoppingCts = new();
-        _stoppingToken = _stoppingCts.Token;
+        _close = CloseSignal.CreateRoot(options.TimeProvider);
         FlowControl = new Control(this, poolFacing: true);
     }
 
     public string CurrentSearchPath { get; set; } = "public";
 
     Control FlowControl { get; }
-    CancellationToken AbortToken => _abortToken;
-    CancellationToken StoppingToken => _stoppingToken;
+    CancellationToken AbortToken => _close.AbortToken;
+    CancellationToken StoppingToken => _close.StoppingToken;
     public int PipelineDepth => _pipeline.Depth;
     ProtocolStatus Status => _status;
 
@@ -153,7 +159,7 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
     // death), null for a graceful CompleteAsync or a clean forceful DisposeAsync. A null check tells
     // clean-vs-faulted and the value tells why. No separate status is needed: a faulted connection still
     // reaches Completed, so IsCompleted already evicts it.
-    internal Exception? CompletionException => _closedException?.InnerException;
+    internal Exception? CompletionException => _close.Reason?.InnerException;
     internal int CompareTo(PgClientProtocol? other)
     {
         // null instances are always better, they represent empty connection slots.
@@ -322,15 +328,20 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
 
     Enumerator GetFlows() => new(this);
 
-    public T Queue<T>(T flow) where T : PgClientFlow
+    public T Queue<T>(T flow, CancellationToken cancellationToken = default) where T : PgClientFlow
     {
-        if (!TryQueue(flow))
+        if (!TryQueue(flow, cancellationToken: cancellationToken))
             ThrowHelper.ThrowInvalidOperation("Protocol is unavailable.");
         return flow;
     }
 
-    public bool TryQueue(PgClientFlow flow, bool mustPipeline = false)
+    public bool TryQueue(PgClientFlow flow, bool mustPipeline = false, CancellationToken cancellationToken = default)
     {
+        // Bind the caller token before enqueue so the eager write reads it (published with the flow
+        // by the enqueue). Only when cancelable - the common no-token submit pays no field write.
+        if (cancellationToken.CanBeCanceled)
+            flow.BindCallerToken(cancellationToken);
+
         if (mustPipeline)
         {
             if (!TryQueueFlow(flow, static protocol => protocol.PipelineDepth > 0, this))
@@ -346,6 +357,60 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
             Interlocked.Increment(ref _pipelineStalls);
 
         return true;
+    }
+
+    // Begin an exclusive-access scope: the user-driven sibling of the startup handshake. Builds (or
+    // reuses) a nested pipeline (poolFacing:false, so no pool-unit signaling and no inner recovery)
+    // and queues the cached ExclusiveAccessFlow on the outer pipeline. The returned flow is the scope
+    // handle: await HandoffReady to acquire, Submit subflows, CompleteScopeAsync to release. One scope
+    // at a time per connection.
+    //
+    // R2 (ADO ship-blocker, scoped out of this slice). An ADO connection IS an exclusive scope (the
+    // protocol underneath is pooled and outlives the connection), so connection-dispose is scope
+    // teardown, not protocol teardown. The scope CloseSignal can be tripped independently, but the
+    // decoder/writer abort-translation sites key on the PROTOCOL token (captured at Initialize), so a
+    // scope-only abort cannot break a subflow parked on a wire read - a consumer disposing a connection
+    // over their own hung read would hang or be forced to kill the pooled protocol. Today no caller
+    // trips a scope-only abort (protocol abort is the only read-breaker), so it is latent; it must be
+    // closed before ADO ships. The fix is a scope-bound, pooled decoder/encoder shell carrying the
+    // scope's token over a SHARED per-channel wire-state object (one ReadChannel + one WriteChannel,
+    // since read and write are concurrently active on the one socket and want separate single-producer
+    // state) - NOT dynamic scope-aware token branching in the shared decoder (it taxes the read/write
+    // hot path AND re-points a shared instance per scope, reintroducing the wrong-tenure / stale-residue
+    // translation hazard when an exclusive-flow tenure fails; the same factoring serves recovery's
+    // per-channel wire takeover, so it is not single-use). Cost of the shell is just tokens + two channel
+    // references, poolable to zero via this same flyweight.
+    internal Flows.ExclusiveAccessFlow BeginExclusiveScope(bool async)
+    {
+        var innerSource = PgClientFlowSource.Create(this, _options.ExecutionScheduler);
+        if (_exclusiveInnerPipeline is null)
+        {
+            var innerControl = _exclusiveInnerControl = new Control(this, poolFacing: false);
+            // Scope signal: a child linked to the protocol's _close, so a protocol stop/abort cascades
+            // into the scope's tokens through the link. Created once with the rest of the flyweight
+            // machinery and reused across scopes (it stays untripped on the normal completion path, so
+            // its linked CTSes stay pristine - the per-execute zero-alloc invariant).
+            var scopeClose = _exclusiveScopeClose = CloseSignal.CreateLinked(_close, _options.TimeProvider);
+            innerControl.BindScopeClose(scopeClose);
+            var innerPipeline = _exclusiveInnerPipeline = Pipeline.Create<PgClientFlow, Policy, PgClientFlowSource, PgClientFlowSource.Enumerator>(
+                new Policy(this, innerControl), innerSource);
+            innerControl.BindPipeline(new PipelineFlowSlots<Policy, PgClientFlowSource, PgClientFlowSource.Enumerator>(innerPipeline));
+            _exclusiveFlow = new Flows.ExclusiveAccessFlow(innerControl, reason => _exclusiveInnerPipeline!.CompleteAsync(reason));
+        }
+        else
+        {
+            // Flyweight reuse. The cascade (OnStopping/OnAbort) is a second driver of the inner pipeline,
+            // so a prior scope that hasn't fully completed is now reachable here (it was not when only the
+            // user drove teardown). Refuse to re-init over a live prior scope - a lifecycle bug, not a
+            // recoverable state.
+            if (_exclusiveFlow is { IsCompleted: false })
+                ThrowHelper.ThrowInvalidOperation("Cannot begin an exclusive scope while the prior scope is still completing.");
+            Pipeline.Create<PgClientFlow, Policy, PgClientFlowSource, PgClientFlowSource.Enumerator>(
+                new Policy(this, _exclusiveInnerControl!), innerSource, _exclusiveInnerPipeline);
+            _exclusiveFlow!.Reset();
+        }
+        _exclusiveFlow!.PrepareScope(async, innerSource, _options.FlowActivationTimeout);
+        return Queue(_exclusiveFlow);
     }
 
     bool TryQueueFlow<TState>(PgClientFlow flow, Func<TState, bool>? predicate = null, TState state = default!)
@@ -442,10 +507,12 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
             // The transport was already released by Shutdown's completion (it's not observable state).
             // Here we release only the OBSERVABLE resources - the cancellation sources whose tokens a
             // caller may still read after a graceful CompleteAsync. That's what makes these Dispose-
-            // gated rather than completion-gated. Disposing _abortCts also drops the scheduled
-            // CancelAfter(CompletionTimeout) timer without firing it.
-            _abortCts.Dispose();
-            _stoppingCts.Dispose();
+            // gated rather than completion-gated. Disposing the abort CTS also drops the scheduled
+            // CancelAfter(CompletionTimeout) timer without firing it. The scope signal (a linked child)
+            // is disposed too, releasing its registration on _close; the scope signal must be disposed
+            // BEFORE its parent _close so the link registration is gone first.
+            _exclusiveScopeClose?.Dispose();
+            _close.Dispose();
         }
     }
 
@@ -481,10 +548,11 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
             {
                 // Materialize the canonical closed exception BEFORE any cancellation can fire (the forceful
                 // escalation below, or the body's graceful cancel). A sync read/flow faulting on the
-                // abortive close or AbortToken translates to it (PgDecoder reads _closedException); if it's
+                // abortive close or AbortToken translates to it (PgDecoder reads _close.Reason); if it's
                 // still null when the wire breaks, the raw ObjectDisposedException leaks instead. The owner
-                // sets it once; losers read the same instance. Wraps closeReason as inner.
-                _closedException = new PgClientClosedException(closeReason);
+                // sets it once; losers read the same instance. Wraps closeReason as inner. CloseSignal also
+                // re-materializes on every trip, so the invariant is structural, not just this ordering.
+                _close.MaterializeReason(closeReason);
                 _shutdownCompletion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             }
             completion = _shutdownCompletion!;
@@ -500,7 +568,7 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
         // only afterwards.
         if (forceful)
         {
-            _abortCts.Cancel();
+            _close.Abort();
             _connection?.Abort();
         }
 
@@ -529,7 +597,7 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
         SignalDraining();
 
         // Set by the Shutdown gate under _syncRoot before any cancellation fired.
-        var closedException = _closedException!;
+        var closedException = _close.Reason!;
 
         // Graceful: bound the drain with CompletionTimeout (AbortToken escalates on expiry) and fire
         // StoppingToken so the body drains to a clean RFQ. Forceful already fired AbortToken + the
@@ -538,8 +606,8 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
         // HeartbeatInterval; forceful disposal accepts that latency too).
         if (!forceful)
         {
-            _abortCts.CancelAfter(_options.CompletionTimeout);
-            await _stoppingCts.CancelAsync().ConfigureAwait(false);
+            _close.ArmAbortTimeout(_options.CompletionTimeout);
+            await _close.StopAsync().ConfigureAwait(false);
         }
 
         // Coordinate the residual drain with the executor. The source fires DrainSignal once its pull
@@ -580,7 +648,7 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
         finally
         {
             // Disarm the CTS scheduled by the graceful path.
-            _abortCts.CancelAfter(Timeout.InfiniteTimeSpan);
+            _close.DisarmAbortTimeout();
             SignalCompleted();
             // Release the transport once the drain has completed. Single-winner gating runs this body
             // exactly once, so the wire is closed exactly once at completion - NOT gated on Dispose. The
@@ -773,7 +841,20 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
                 "Recovery item routed back into TryRecoverItemFailure - recovery-on-recovery must not exist.");
 
             // Pipeline is shutting down: skip recovery and let the framework propagate the failure.
-            if (cancellationToken.IsCancellationRequested)
+            // Check BOTH the executor token AND ClosedException: a racing close materializes the reason
+            // (and faults the in-flight write with it) before the executor's token cancellation is
+            // observed here, so the token alone misses it. A deliberate close is teardown, not a
+            // recoverable wire desync - recovering it drives a resync drain over a wire that's going
+            // away, which races the close-torn buffer state into a negative-bufferedBytes assertion.
+            if (cancellationToken.IsCancellationRequested || _control.ClosedException is not null)
+            {
+                recoveryItem = null;
+                return false;
+            }
+
+            // Nested exclusive-scope pipeline: don't recover here. The failure propagates to the root
+            // pipeline, which owns the wire and performs the takeover/resync.
+            if (!_control.RecoversWireFailures)
             {
                 recoveryItem = null;
                 return false;
@@ -826,6 +907,19 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
         IFlowSlots _slots = null!;
         public void BindPipeline(IFlowSlots slots) => _slots = slots;
 
+        // The scope's linked close signal, set once for an exclusive-scope inner Control; null for the
+        // pool-facing FlowControl (which reads the protocol's _close directly). Inner flows read the
+        // scope signal's tokens so a protocol stop/abort cascades through the link, while a scope-only
+        // trip stays off the protocol token.
+        CloseSignal? _scopeClose;
+        public void BindScopeClose(CloseSignal scopeClose) => _scopeClose = scopeClose;
+
+        // Only the root (pool-facing) control owns wire recovery. A nested exclusive-scope pipeline
+        // lets an inner subflow's failure propagate to the root, which performs the wire takeover /
+        // resync - an inner recovery would fight the root for the single writer. (Exclusive = no scope
+        // recovery, yes wire recovery, mediated by the root.)
+        public bool RecoversWireFailures => poolFacing;
+
         public PgClientFlow? ExecutorFlow => _slots.ExecutingItem;
         public PgClientFlow? ActivatedFlow => _slots.ActivatedItem;
 
@@ -837,22 +931,25 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
         public int BackendProcessId => protocol._backendProcessId;
         public int BackendSecretKey => protocol._backendSecretKey;
 
-        // Tokens live on the protocol (stable across a flow's tenure), surfaced through Control so
-        // ExecutionControl and the body read them without per-flow storage.
-        public CancellationToken AbortToken => protocol._abortToken;
-        public CancellationToken StoppingToken => protocol._stoppingToken;
+        // Tokens come from the scope signal for an inner Control (so the scope cascade reaches inner
+        // flows), else the protocol's _close. Both are stable across a flow's tenure. Surfaced through
+        // Control so ExecutionControl and the body read them without per-flow storage.
+        CloseSignal Close => _scopeClose ?? protocol._close;
+        public CancellationToken AbortToken => Close.AbortToken;
+        public CancellationToken StoppingToken => Close.StoppingToken;
 
-        /// The canonical PgClientClosedException for this protocol once Shutdown has entered, null
-        /// otherwise. Single instance per lifetime, materialized before any cancellation fires so an
-        /// observer waking on AbortToken/StoppingToken sees a non-null value.
-        public PgClientClosedException? ClosedException => protocol._closedException;
+        /// The canonical PgClientClosedException once Shutdown has entered, null otherwise. Single
+        /// instance per lifetime, materialized before any cancellation fires so an observer waking on
+        /// AbortToken/StoppingToken sees a non-null value. For an inner Control a scope-only trip resolves
+        /// the scope reason; a protocol trip chains through the link to the protocol reason.
+        public PgClientClosedException? ClosedException => Close.Reason;
 
-        /// Throws PgClientClosedException if the protocol is closed, no-op otherwise. For the OCE
-        /// catch path inside existing async I/O frames, converting our abort-token OCE to the typed
-        /// exception without an extra wrapping frame.
+        /// Throws PgClientClosedException if closed, no-op otherwise. For the OCE catch path inside
+        /// existing async I/O frames, converting our abort-token OCE to the typed exception without an
+        /// extra wrapping frame.
         public void ThrowIfClosed()
         {
-            if (protocol._closedException is { } ex)
+            if (Close.Reason is { } ex)
                 throw ex;
         }
 
