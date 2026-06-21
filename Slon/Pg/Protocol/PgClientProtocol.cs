@@ -365,21 +365,12 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
     // handle: await HandoffReady to acquire, Submit subflows, CompleteScopeAsync to release. One scope
     // at a time per connection.
     //
-    // R2 (ADO ship-blocker, scoped out of this slice). An ADO connection IS an exclusive scope (the
-    // protocol underneath is pooled and outlives the connection), so connection-dispose is scope
-    // teardown, not protocol teardown. The scope CloseSignal can be tripped independently, but the
-    // decoder/writer abort-translation sites key on the PROTOCOL token (captured at Initialize), so a
-    // scope-only abort cannot break a subflow parked on a wire read - a consumer disposing a connection
-    // over their own hung read would hang or be forced to kill the pooled protocol. Today no caller
-    // trips a scope-only abort (protocol abort is the only read-breaker), so it is latent; it must be
-    // closed before ADO ships. The fix is a scope-bound, pooled decoder/encoder shell carrying the
-    // scope's token over a SHARED per-channel wire-state object (one ReadChannel + one WriteChannel,
-    // since read and write are concurrently active on the one socket and want separate single-producer
-    // state) - NOT dynamic scope-aware token branching in the shared decoder (it taxes the read/write
-    // hot path AND re-points a shared instance per scope, reintroducing the wrong-tenure / stale-residue
-    // translation hazard when an exclusive-flow tenure fails; the same factoring serves recovery's
-    // per-channel wire takeover, so it is not single-use). Cost of the shell is just tokens + two channel
-    // references, poolable to zero via this same flyweight.
+    // An ADO connection IS an exclusive scope (the protocol underneath is pooled and outlives the
+    // connection), so connection-dispose is scope teardown, not protocol teardown. The scope CloseSignal
+    // can be tripped independently (AbortActiveScope), and the per-scope decoder/writer shells over the
+    // shared Read/WriteChannel carry the scope's token, so a scope-only abort breaks a subflow parked on
+    // a wire read/write while the pooled protocol survives. The shells are created once here alongside the
+    // flyweight and reused across scopes.
     internal Flows.ExclusiveAccessFlow BeginExclusiveScope(bool async)
     {
         var innerSource = PgClientFlowSource.Create(this, _options.ExecutionScheduler);
@@ -392,6 +383,13 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
             // its linked CTSes stay pristine - the per-execute zero-alloc invariant).
             var scopeClose = _exclusiveScopeClose = CloseSignal.CreateLinked(_close, _options.TimeProvider);
             innerControl.BindScopeClose(scopeClose);
+            // Per-scope decoder/writer shells over the protocol's shared Read/WriteChannel, carrying the
+            // scope's abort token. A scope-only abort (ADO connection-dispose) trips scopeClose, breaking
+            // a subflow parked on a wire read/write through these shells, while the pooled protocol's own
+            // token (and base shells) stay untripped. Created once with the flyweight, reused across scopes.
+            var scopeDecoder = PgDecoder.CreateScopeShell(_pgDecoder, scopeClose.AbortToken, _options.ReadTimeout);
+            var scopeWriter = PgProtocolDataWriter.CreateScopeShell(_protocolDataWriter, scopeClose.AbortToken, innerControl);
+            innerControl.BindShells(scopeDecoder, scopeWriter);
             var innerPipeline = _exclusiveInnerPipeline = Pipeline.Create<PgClientFlow, Policy, PgClientFlowSource, PgClientFlowSource.Enumerator>(
                 new Policy(this, innerControl), innerSource);
             innerControl.BindPipeline(new PipelineFlowSlots<Policy, PgClientFlowSource, PgClientFlowSource.Enumerator>(innerPipeline));
@@ -412,6 +410,11 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
         _exclusiveFlow!.PrepareScope(async, innerSource, _options.FlowActivationTimeout);
         return Queue(_exclusiveFlow);
     }
+
+    // Scope-only abort: trips the active scope's CloseSignal, breaking any subflow parked on a wire
+    // read/write via the scope shells' tokens, without touching the protocol's own token (the pooled
+    // protocol survives). The future ADO connection-dispose path drives this; today it is the R2 lever.
+    internal void AbortActiveScope() => _exclusiveScopeClose?.Abort();
 
     bool TryQueueFlow<TState>(PgClientFlow flow, Func<TState, bool>? predicate = null, TState state = default!)
         => TryQueueFlow(flow, ProtocolStatus.Ready, predicate, state);
@@ -914,6 +917,21 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
         CloseSignal? _scopeClose;
         public void BindScopeClose(CloseSignal scopeClose) => _scopeClose = scopeClose;
 
+        // Per-Control decoder/writer shells over the protocol's shared Read/WriteChannel. The inner
+        // (exclusive-scope) Control binds scope shells carrying the scope token; the outer Control
+        // leaves these null and resolves to the protocol's base shells (themselves bound to this
+        // Control). The single-pump invariant keeps only one shell per direction active at a time, so
+        // both share the one physical channel safely.
+        PgDecoder? _decoder;
+        PgProtocolDataWriter? _writer;
+        public void BindShells(PgDecoder decoder, PgProtocolDataWriter writer)
+        {
+            _decoder = decoder;
+            _writer = writer;
+        }
+
+        PgDecoder Decoder => _decoder ?? protocol._pgDecoder;
+
         // Only the root (pool-facing) control owns wire recovery. A nested exclusive-scope pipeline
         // lets an inner subflow's failure propagate to the root, which performs the wire takeover /
         // resync - an inner recovery would fight the root for the single writer. (Exclusive = no scope
@@ -923,7 +941,7 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
         public PgClientFlow? ExecutorFlow => _slots.ExecutingItem;
         public PgClientFlow? ActivatedFlow => _slots.ActivatedItem;
 
-        public PgProtocolDataWriter Writer => protocol._protocolDataWriter;
+        public PgProtocolDataWriter Writer => _writer ?? protocol._protocolDataWriter;
 
         // Backend identity from BackendKeyData (pulled from StartupFlow after startup completes).
         // Process id is the diagnostic-safe value (logs, "which backend"); secret key is restricted
@@ -1070,14 +1088,14 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
             // minus it gives the head's running age for the load score.
             if (protocol._scoringEnabled)
                 protocol._currentFlowStartTick = protocol._heartbeatTick;
-            protocol._pgDecoder.Initialize(this);
+            Decoder.Initialize(this);
         }
 
         // Wake the flow's body with the bound decoder. Resumes the body inline, so async flows run this
         // off the executor via the TP dispatch. Safe to lag the flow's retirement: TrySetResult no-ops
         // on a flow the abort already faulted.
         internal void Activate(PgClientFlow flow)
-            => flow.GetExecutionControl(this).Activate(protocol._pgDecoder);
+            => flow.GetExecutionControl(this).Activate(Decoder);
 
         // Self-evict route for the flow layer's completion-callback seam (see ExecutionControl.Complete).
         internal void FailProtocol(Exception? reason) => protocol.FailProtocol(reason);

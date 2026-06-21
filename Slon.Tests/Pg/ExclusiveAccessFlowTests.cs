@@ -65,10 +65,10 @@ public class ExclusiveAccessFlowTests
     // promptly - the inner executor was woken via ExclusiveAccessFlow.OnStopping -> _completeInner - NOT
     // hang because the scope was never ended.
     //
-    // Faults the protocol, so NewIsolatedAsync (not the shared pool). R2: this exercises the protocol
+    // Faults the protocol, so NewIsolatedAsync (not the shared pool). This exercises the protocol
     // graceful stop reaching the idle inner executor; it does NOT assert that a scope abort interrupts a
-    // parked wire READ (broken only by the protocol abort - the documented R2 boundary), so the subflow
-    // is run to completion first rather than left parked on a server-side wait.
+    // parked wire READ (that is ScopeAbortBreaksParkedSubflowTests), so the subflow is run to completion
+    // first rather than left parked on a server-side wait.
     [TestMethod]
     public async Task ProtocolShutdown_WhileScopeOpen_CascadesToInnerTeardown()
     {

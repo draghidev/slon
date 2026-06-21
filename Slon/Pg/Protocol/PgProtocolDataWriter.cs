@@ -1,172 +1,95 @@
 using System.Net.Sockets;
-using System.Runtime.InteropServices;
 using System.Text;
 using Slon.Buffers;
-using Slon.Buffers.Binary;
 using Slon.Pg.Types;
 using Slon.Transport;
 
 namespace Slon.Pg.Protocol;
 
-sealed class PgProtocolDataWriter(IOutputWriter<byte> writer, Encoding clientEncoding, Action waitWritable, CancellationToken abortToken, PgClientProtocol.Control control)
+// Thin, poolable write-side shell over a shared WriteChannel. Carries the token-bearing concerns:
+// the scope/protocol abort token, its linked CTS (+ recycle), TranslateAbort, and the abort-catch
+// wrappers around Flush/FlushAsync. The physical wire state (BufferingWriter, message-length
+// tracking, Write*) lives in the channel; the shell delegates. Each exclusive scope gets its own
+// shell with the SCOPE token over the one shared channel; the single-pump invariant keeps only one
+// shell active at a time.
+sealed class PgProtocolDataWriter
 {
-    BufferingWriter _bufferingWriter = new(writer);
-    readonly CancellationToken _abortToken = abortToken;
-    readonly PgClientProtocol.Control _control = control;
-    CancellationTokenSource _cts = CancellationTokenSource.CreateLinkedTokenSource(abortToken);
+    readonly WriteChannel _channel;
+    readonly CancellationToken _abortToken;
+    readonly PgClientProtocol.Control _control;
+    CancellationTokenSource _cts;
 
-    // Current message state (npgsql NpgsqlWriteBuffer.StartMessage / AdvanceMessageBytesFlushed
-    // pattern, GHSA-x9vc-6hfv-hg8c). Validation is structural: per-write Write* methods are
-    // unchecked, the check rolls up at Flush and at the next StartMessage. `_messageBytesFlushed`
-    // is anchored at -unflushedAtStart so `unflushed + _messageBytesFlushed = bytesWrittenForCurrentMessage`
-    // across mid-message flushes too - lets multiple messages stack in the buffer and still get
-    // validated at message boundaries without forcing a flush per message.
-    int? _messageLength;
-    int _messageBytesFlushed;
-
-    // Per-connection cached signal. The flow parks this in
-    // TransportConnection.SyncNonBlockingSignal around each Resumable call, the transport
-    // returns it on WouldBlock as the pending source, the flow's driver fires it via
-    // Signal. Reused across operations thanks to auto-reset on consumption.
-    public WritableSignal WritableSignal { get; } = new();
-
-    // Maps a thrown exception to a SocketError, or null when the exception isn't recognizable
-    // as a transport-level socket error. Handles the .NET socket-stack path. NetworkStream and
-    // SslStream wrap SocketException in IOException, raw Socket throws it directly.
-    public SocketError? GetSocketError(Exception ex)
+    PgProtocolDataWriter(WriteChannel channel, CancellationToken abortToken, PgClientProtocol.Control control)
     {
-        if (ex is SocketException se)
-            return se.SocketErrorCode;
-        if (ex is IOException && ex.InnerException is SocketException ise)
-            return ise.SocketErrorCode;
-        return null;
+        _channel = channel;
+        _abortToken = abortToken;
+        _control = control;
+        _cts = CancellationTokenSource.CreateLinkedTokenSource(abortToken);
     }
 
-    // Driver hooks for the sync wrappers and higher-composition sync drivers. Signal
-    // fires the cached writable signal, releasing any coroutine awaiter that captured it on
-    // WouldBlock. WaitWritable forwards to the transport's wait callback (typically
-    // Socket.Poll on a SelectMode.SelectWrite), parking the calling thread until writable.
-    public void SignalWritable(Exception? exception = null) => WritableSignal.Signal(exception);
-    public void WaitWritable() => waitWritable();
+    public PgProtocolDataWriter(IOutputWriter<byte> writer, Encoding clientEncoding, Action waitWritable, CancellationToken abortToken, PgClientProtocol.Control control)
+        : this(new WriteChannel(writer, clientEncoding, waitWritable), abortToken, control)
+    {
+    }
+
+    // Builds a scope-bound shell over an existing channel, carrying the scope's abort token.
+    public static PgProtocolDataWriter CreateScopeShell(PgProtocolDataWriter baseShell, CancellationToken abortToken, PgClientProtocol.Control control)
+        => new(baseShell._channel, abortToken, control);
+
+    public WriteChannel Channel => _channel;
+
+    public WritableSignal WritableSignal => _channel.WritableSignal;
+
+    public SocketError? GetSocketError(Exception ex) => _channel.GetSocketError(ex);
+
+    public void SignalWritable(Exception? exception = null) => _channel.SignalWritable(exception);
+    public void WaitWritable() => _channel.WaitWritable();
 
     // Abort-to-typed-exception translation shared by the sync flush catch and the resumable driver:
     // the canonical closed exception once the abort token has fired, else the original. Mirrors the
     // async flush catch so every sync seam surfaces PgClientClosedException, not a bare deadline fault.
-    // R2 (ADO ship-blocker): _abortToken is the PROTOCOL token, captured at construction. A scope-only
-    // abort (an ADO connection-dispose, which is a scope teardown - the protocol is pooled and must
-    // survive) therefore cannot break a parked write here. Fix is a scope-bound encoder shell over a
-    // shared WriteChannel (the write-side wire state) carrying the SCOPE's token - NOT dynamic scope-
-    // aware branching of _abortToken (that taxes this hot path and re-points a shared instance per
-    // scope, reintroducing wrong-tenure translation when an exclusive-flow tenure fails). See the R2
-    // note in BeginExclusiveScope.
+    // Keyed on the SHELL's token (the scope token for a scope shell), so a scope-only abort fires here.
     public Exception TranslateAbort(Exception ex)
         => _abortToken.IsCancellationRequested && _control.ClosedException is { } closed ? closed : ex;
 
     internal void CopyFrom<TBuffer>(TBuffer buffer) where TBuffer : ICopyableBuffer<byte>
-        => buffer.CopyTo(writer);
+        => _channel.CopyFrom(buffer);
 
-    internal Func<PgTypeId, Oid> OidLookup { get; } = static pgTypeId => PgTypeCatalog.Default.GetOid(pgTypeId);
-    internal Encoding ClientEncoding { get; set; } = clientEncoding;
-
-    public long UnflushedBytes => _bufferingWriter.UnflushedBytes;
-
-    // Buffered bytes above which a flush is forced rather than deferred. Sized to ~one MTU so a forced
-    // flush maps to roughly a single segment. Single source of truth: the encoder's in-flow deferral
-    // (PgEncoder.CanDelayFlush) and the source's arm gate (PgClientFlowSource) both key off it.
-    internal const long UnflushedBytesFlushThreshold = 1000;
-
-    // Arms message-length tracking for a new message. `totalLength` is the on-wire size of the
-    // full message (type byte + length field + body, e.g. 5 + bodyLength for normal frontend
-    // messages). Validates the previous message wrote exactly its declared length before
-    // accepting the new one - the check fires at the next StartMessage boundary so per-write
-    // calls stay free. Mid-message flushes are handled by AdvanceMessageBytesFlushed maintaining
-    // _messageBytesFlushed as the "bytes already pushed past the buffer" counter for the current
-    // message, so the cross-message algebra holds without a flush per message.
-    internal void StartMessage(int totalLength)
+    internal Func<PgTypeId, Oid> OidLookup => _channel.OidLookup;
+    internal Encoding ClientEncoding
     {
-        var unflushed = checked((int)_bufferingWriter.UnflushedBytes);
-        // bytesWrittenForPrevious = unflushed + _messageBytesFlushed; the cross-flush case adds
-        // _messageBytesFlushed (negative at start, positive after advances). The previous message
-        // is fully written iff that equals _messageLength.
-        if (_messageLength is { } prev && unflushed + _messageBytesFlushed != prev)
-            ThrowUnderwritten(prev, unflushed + _messageBytesFlushed);
-        _messageBytesFlushed = -unflushed;
-        _messageLength = totalLength;
+        get => _channel.ClientEncoding;
+        set => _channel.ClientEncoding = value;
     }
 
-    // Advances the message-bytes counter as buffered bytes leave the buffer (Flush). Catches
-    // over-writes: a busted converter that emitted more bytes than its message declared trips
-    // here before the bytes reach the wire. The buffer-level check is the CVE-2024-32655
-    // defense-in-depth for converters that size incorrectly and silently write through.
-    void AdvanceMessageBytesFlushed(int count)
-    {
-        if (_messageLength is null)
-            return; // Pre-startup raw writes (e.g. StartupMessage's CopyStartupBuffer).
-        if (count < 0)
-            throw new ArgumentOutOfRangeException(nameof(count));
-        if ((long)_messageBytesFlushed + count > _messageLength)
-            ThrowOverwritten(_messageLength.Value, _messageBytesFlushed + (long)count);
-        _messageBytesFlushed += count;
-    }
+    public long UnflushedBytes => _channel.UnflushedBytes;
 
-    static void ThrowUnderwritten(int declared, int actual)
-        => throw new InvalidOperationException($"Message wrote {actual} bytes, declared length was {declared}.");
+    internal const long UnflushedBytesFlushThreshold = WriteChannel.UnflushedBytesFlushThreshold;
 
-    static void ThrowOverwritten(int declared, long projected)
-        => throw new InvalidOperationException($"Message write would exceed declared length {declared} (projected {projected}).");
+    internal void StartMessage(int totalLength) => _channel.StartMessage(totalLength);
 
-    // Recovery: pad the current torn message to its declared length with zero bytes so the
-    // server's framing reader exits the message at the declared boundary and resyncs on the
-    // subsequent Sync. Returns the byte count written (0 if no message in flight, or the
-    // declared length was already reached). After padding, the next StartMessage's validation
-    // sees a complete message and the buffer is safe to continue / flush.
-    //
-    // INVARIANT (flow-level, not enforced here): a padded message is NEVER followed by its
-    // own Execute - the zero-padded body can parse as a valid Bind whose corrupted parameter
-    // would silently corrupt data. Recovery's job is to inject Sync and drain RFQs, not to
-    // continue any pipelined work; the unexecuted portal dies at Sync.
-    internal int CompleteCurrentMessageWithPadding()
-    {
-        if (_messageLength is null)
-            return 0;
-        var unflushed = checked((int)_bufferingWriter.UnflushedBytes);
-        var remaining = _messageLength.Value - (unflushed + _messageBytesFlushed);
-        if (remaining <= 0)
-            return 0;
-        var padded = remaining;
-
-        Span<byte> zeros = stackalloc byte[256];
-        zeros.Clear();
-        while (remaining > 0)
-        {
-            var chunk = Math.Min(remaining, zeros.Length);
-            _bufferingWriter.Write(zeros.Slice(0, chunk));
-            remaining -= chunk;
-        }
-        return padded;
-    }
+    internal int CompleteCurrentMessageWithPadding() => _channel.CompleteCurrentMessageWithPadding();
 
     // TODO make a cut-off from where we start streaming the string.
     public ValueTask WriteStringWithNullTerminatorAsync(string value, Encoding encoding, int? encodedLength = null, CancellationToken cancellationToken = default)
     {
-        _bufferingWriter.WriteStringWithNullTerminator<BufferingWriter>(value, encoding, encodedLength);
+        _channel.WriteStringWithNullTerminator(value, encoding, encodedLength);
         return new();
     }
 
     public void WriteStringWithNullTerminator(string value, Encoding encoding, int? encodedLength = null)
-        => _bufferingWriter.WriteStringWithNullTerminator<BufferingWriter>(value, encoding, encodedLength);
-    public void WriteRaw(ReadOnlySpan<byte> value) => _bufferingWriter.Write(value);
-    public void WriteUShort(ushort value) => _bufferingWriter.WriteUInt16BigEndian<BufferingWriter>(value);
-    public void WriteByte(byte value) => _bufferingWriter.WriteByte<BufferingWriter>(value);
-    public void WriteUInt(uint value) => _bufferingWriter.WriteUInt32BigEndian<BufferingWriter>(value);
-    public void WriteInt(int value) => _bufferingWriter.WriteInt32BigEndian<BufferingWriter>(value);
+        => _channel.WriteStringWithNullTerminator(value, encoding, encodedLength);
+    public void WriteRaw(ReadOnlySpan<byte> value) => _channel.WriteRaw(value);
+    public void WriteUShort(ushort value) => _channel.WriteUShort(value);
+    public void WriteByte(byte value) => _channel.WriteByte(value);
+    public void WriteUInt(uint value) => _channel.WriteUInt(value);
+    public void WriteInt(int value) => _channel.WriteInt(value);
 
     public void Flush(TimeSpan timeout = default)
     {
-        AdvanceMessageBytesFlushed(checked((int)_bufferingWriter.UnflushedBytes));
         try
         {
-            _bufferingWriter.Flush(timeout);
+            _channel.Flush(timeout);
         }
         catch (Exception ex) when (_abortToken.IsCancellationRequested)
         {
@@ -183,8 +106,7 @@ sealed class PgProtocolDataWriter(IOutputWriter<byte> writer, Encoding clientEnc
     /// coordination-boundary check in connection-preserving flows.
     public ValueTask FlushAsync(CancellationToken cancellationToken)
     {
-        AdvanceMessageBytesFlushed(checked((int)_bufferingWriter.UnflushedBytes));
-        var task = _bufferingWriter.FlushAsync(_cts.Token);
+        var task = _channel.FlushAsync(_cts.Token);
         if (task.IsCompletedSuccessfully)
             return task;
         return Core(task, cancellationToken);
@@ -219,71 +141,6 @@ sealed class PgProtocolDataWriter(IOutputWriter<byte> writer, Encoding clientEnc
                 if (_cts.IsCancellationRequested && !_abortToken.IsCancellationRequested)
                     _cts = CancellationTokenSource.CreateLinkedTokenSource(_abortToken);
             }
-        }
-    }
-
-    // Wrapper to shield callers from slow writers (e.g. PipeWriter).
-    struct BufferingWriter(IOutputWriter<byte> writer) : IOutputWriter<byte>
-    {
-        Memory<byte> _memory;
-        ArraySegment<byte> _memoryArray;
-        int _remaining;
-
-        int Consumed => _memory.Length - _remaining;
-
-        public long UnflushedBytes => Consumed + writer.UnflushedBytes;
-
-        public void Advance(int count)
-        {
-            ArgumentOutOfRangeException.ThrowIfGreaterThan(count, _remaining);
-            _remaining -= count;
-        }
-
-        public Memory<byte> GetMemory(int sizeHint = 0)
-        {
-            if (_remaining < sizeHint)
-            {
-                writer.Advance(Consumed);
-                _memory = writer.GetMemory(sizeHint);
-                MemoryMarshal.TryGetArray(_memory, out _memoryArray);
-                _remaining = _memory.Length;
-            }
-
-            return _memory.Slice(Consumed);
-        }
-
-        public Span<byte> GetSpan(int sizeHint = 0)
-        {
-            if (_remaining < sizeHint)
-            {
-                writer.Advance(Consumed);
-                _memory = writer.GetMemory(sizeHint);
-                MemoryMarshal.TryGetArray(_memory, out _memoryArray);
-                _remaining = _memory.Length;
-            }
-
-            var consumed = Consumed;
-            return _memoryArray.Array is not { } array
-                ? _memory.Span.Slice(consumed)
-                : array.AsSpan(_memoryArray.Offset + consumed, _memoryArray.Count - consumed);
-        }
-
-        public void Flush(TimeSpan timeout = default)
-        {
-            writer.Advance(Consumed);
-            _memory = default;
-            _memoryArray = default;
-            _remaining = 0;
-            writer.Flush(timeout);
-        }
-
-        public ValueTask FlushAsync(CancellationToken cancellationToken = default)
-        {
-            writer.Advance(Consumed);
-            _memory = default;
-            _memoryArray = default;
-            _remaining = 0;
-            return writer.FlushAsync(cancellationToken);
         }
     }
 }

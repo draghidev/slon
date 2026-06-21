@@ -8,10 +8,15 @@ using Slon.Pipelines;
 
 namespace Slon.Pg.Protocol;
 
+// Thin, poolable read-side shell over a shared ReadChannel. Carries the token-bearing concerns:
+// the scope/protocol abort token, its linked CTS (+ recycle), TranslateReadCancellation, the
+// read-timeout countdown + OnHeartbeat, CurrentExecutionControl, and the read/handler loops that
+// drive the channel against this shell's CTS. The physical wire state lives in the channel; each
+// exclusive scope gets its own shell with the SCOPE token over the one shared channel, and the
+// single-pump invariant keeps only one shell active at a time.
 sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMessage>
 {
-    readonly PipeSegmentEnumerator<BackendMessageBatch.Segmenter, BackendMessageBatch> _messageBatchEnumerator;
-    readonly BackendMessageContext _messageContext;
+    readonly ReadChannel _channel;
     readonly CancellationToken _abortToken;
     readonly TimeSpan _defaultReadTimeout;
     readonly Action<TimeSpan> _onHeartbeatAction;
@@ -43,16 +48,26 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
         Interlocked.MemoryBarrier();
     }
 
-    internal PgDecoder(PipeSegmentEnumerator<BackendMessageBatch.Segmenter, BackendMessageBatch> messageBatchEnumerator, CancellationToken abortToken, TimeSpan defaultReadTimeout)
+    PgDecoder(ReadChannel channel, CancellationToken abortToken, TimeSpan defaultReadTimeout)
     {
-        _messageBatchEnumerator = messageBatchEnumerator;
-        _messageContext = new();
+        _channel = channel;
         _abortToken = abortToken;
         _defaultReadTimeout = defaultReadTimeout;
         _cancellationTokenSource = CancellationTokenSource.CreateLinkedTokenSource(abortToken);
         _onHeartbeatAction = OnHeartbeat;
         SetRemainingTimeout(Timeout.InfiniteTimeSpan);
     }
+
+    internal PgDecoder(PipeSegmentEnumerator<BackendMessageBatch.Segmenter, BackendMessageBatch> messageBatchEnumerator, CancellationToken abortToken, TimeSpan defaultReadTimeout)
+        : this(new ReadChannel(messageBatchEnumerator), abortToken, defaultReadTimeout)
+    {
+    }
+
+    internal ReadChannel Channel => _channel;
+
+    // Builds a scope-bound shell over an existing channel, carrying the scope's abort token.
+    internal static PgDecoder CreateScopeShell(PgDecoder baseShell, CancellationToken abortToken, TimeSpan defaultReadTimeout)
+        => new(baseShell._channel, abortToken, defaultReadTimeout);
 
     internal void Initialize(PgClientProtocol.Control control)
     {
@@ -92,13 +107,8 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
     // The cause is an OCE when the cancel landed before/at the read's start, or an IOException /
     // SocketException / ObjectDisposedException when our CTS aborted (or Abort closed the socket under)
     // an in-flight receive. The CTS also fires on read-timeout, hence the timeout branch. Returns rather
-    // than throws so a sync caller's throw keeps definite assignment.
-    // R2 (ADO ship-blocker): _abortToken is the PROTOCOL token, captured at construction, so a scope-only
-    // abort (ADO connection-dispose = scope teardown; the protocol is pooled and must survive) cannot
-    // break a parked read here. Fix is a scope-bound decoder shell over a shared ReadChannel (read-side
-    // wire state) carrying the SCOPE's token - NOT dynamic scope-aware branching of _abortToken (taxes
-    // this hot path; re-points a shared instance per scope, reintroducing wrong-tenure translation when
-    // an exclusive-flow tenure fails). See the R2 note in BeginExclusiveScope.
+    // than throws so a sync caller's throw keeps definite assignment. _abortToken is this shell's token
+    // (the scope token for a scope shell), so a scope-only abort breaks a parked read here.
     Exception TranslateReadCancellation(Exception cause, CancellationToken cancellationToken)
     {
         if (_abortToken.IsCancellationRequested && _control.ClosedException is { } closed)
@@ -116,8 +126,8 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
         EnsureUsableCts();
         while (true)
         {
-            var context = _messageContext;
-            if (!context.TryMoveNext())
+            var channel = _channel;
+            if (!channel.TryMoveNext())
             {
                 // The read can throw OCE synchronously: if the CTS (linked to AbortToken) is already
                 // cancelled at entry, it throws before returning a task, bypassing MoveNextAsyncCore's
@@ -126,7 +136,7 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
                 ValueTask<bool> task;
                 try
                 {
-                    task = _messageBatchEnumerator.MoveNextAsync(_cancellationTokenSource.Token);
+                    task = channel.MoveNextAsync(_cancellationTokenSource.Token);
                 }
                 catch (Exception ex) when (_cancellationTokenSource.IsCancellationRequested)
                 {
@@ -142,15 +152,15 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
                     return MoveNextAsyncCore(task, null, cancellationToken);
 
                 var success = task.Result;
-                context.SetBatch(_messageBatchEnumerator.Current);
+                channel.CommitBatch();
                 if (!success)
                     return new(false);
 
-                if (!context.TryMoveNext())
+                if (!channel.TryMoveNext())
                     ThrowHelper.ThrowInvalidOperation("No message in a new batch");
             }
 
-            var handleTask = CurrentExecutionControl.HandleMessageAuto(context.Current);
+            var handleTask = CurrentExecutionControl.HandleMessageAuto(channel.Current);
             if (!handleTask.IsCompletedSuccessfully)
                 return MoveNextAsyncCore(default, handleTask, cancellationToken);
 
@@ -179,9 +189,9 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
                         if (!await t.ConfigureAwait(false))
                             return true;
 
-                        while (_messageContext.TryMoveNext())
+                        while (_channel.TryMoveNext())
                         {
-                            if (!await CurrentExecutionControl.HandleMessageAuto(_messageContext.Current).ConfigureAwait(false))
+                            if (!await CurrentExecutionControl.HandleMessageAuto(_channel.Current).ConfigureAwait(false))
                                 return true;
                         }
                     }
@@ -193,20 +203,20 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
                             SetRemainingTimeout(ReadTimeout);
                             timeoutSet = true;
                             if (firstMessageHandled)
-                                task = _messageBatchEnumerator.MoveNextAsync(_cancellationTokenSource.Token);
+                                task = _channel.MoveNextAsync(_cancellationTokenSource.Token);
                             firstMessageHandled = false;
                         }
                         else
                         {
-                            task = _messageBatchEnumerator.MoveNextAsync(_cancellationTokenSource.Token);
+                            task = _channel.MoveNextAsync(_cancellationTokenSource.Token);
                         }
 
                         var success = await task.ConfigureAwait(false);
-                        _messageContext.SetBatch(_messageBatchEnumerator.Current);
+                        _channel.CommitBatch();
                         if (!success)
                             return false;
 
-                        if (!_messageContext.TryMoveNext())
+                        if (!_channel.TryMoveNext())
                             ThrowHelper.ThrowInvalidOperation("No message in a new batch");
                     }
                     catch (Exception ex) when (_cancellationTokenSource.IsCancellationRequested)
@@ -216,7 +226,7 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
                         throw TranslateReadCancellation(ex, cancellationToken);
                     }
 
-                    messageHandledTask = CurrentExecutionControl.HandleMessageAuto(_messageContext.Current);
+                    messageHandledTask = CurrentExecutionControl.HandleMessageAuto(_channel.Current);
                 }
             }
             finally
@@ -232,7 +242,7 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
     public BackendMessage Current
     {
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        get => _messageContext.Current;
+        get => _channel.Current;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -242,14 +252,14 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
         // path. Run the handler here: a body reading its terminating RFQ via TryGetNext would otherwise
         // leave _rfqCount stale and route the wrong count to recovery. TryHandleMessage returns false
         // only when the handler needs I/O, where we bail and the caller falls back to MoveNextAsync.
-        while (_messageContext.TryPeekNext(out var peeked))
+        while (_channel.TryPeekNext(out var peeked))
         {
             if (!CurrentExecutionControl.TryHandleMessage(peeked, out var handled))
                 break;
-            _messageContext.TryMoveNext();
+            _channel.TryMoveNext();
             if (handled)
                 continue;
-            message = _messageContext.Current;
+            message = _channel.Current;
             return true;
         }
 
@@ -287,8 +297,8 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
         {
             while (true)
             {
-                var context = _messageContext;
-                if (!context.TryMoveNext())
+                var channel = _channel;
+                if (!channel.TryMoveNext())
                 {
                     if (!timeoutSet)
                     {
@@ -299,7 +309,7 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
                     bool success;
                     try
                     {
-                        success = _messageBatchEnumerator.MoveNext(_remainingTimeout);
+                        success = channel.MoveNext(_remainingTimeout);
                     }
                     catch (Exception) when (_abortToken.IsCancellationRequested && _control.ClosedException is { } closed)
                     {
@@ -309,17 +319,17 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
                         // exception, mirroring the async path's TranslateReadCancellation.
                         throw closed;
                     }
-                    context.SetBatch(_messageBatchEnumerator.Current);
+                    channel.CommitBatch();
                     if (!success)
                         return false;
 
-                    if (!context.TryMoveNext())
+                    if (!channel.TryMoveNext())
                         ThrowHelper.ThrowInvalidOperation("No message in a new batch");
                 }
 
                 // HandleMessageAuto is always sync-completing (every branch returns a
                 // synchronously-constructed ValueTask). Reading .Result inline is safe.
-                if (CurrentExecutionControl.HandleMessageAuto(context.Current).Result)
+                if (CurrentExecutionControl.HandleMessageAuto(channel.Current).Result)
                     continue;
 
                 return true;
@@ -339,8 +349,8 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
         return Current;
     }
 
-    void IDisposable.Dispose() => _messageBatchEnumerator.Dispose();
-    ValueTask IAsyncDisposable.DisposeAsync() => _messageBatchEnumerator.DisposeAsync();
+    void IDisposable.Dispose() => _channel.Dispose();
+    ValueTask IAsyncDisposable.DisposeAsync() => _channel.DisposeAsync();
 
     object? IEnumerator.Current => Current;
     void IEnumerator.Reset() => throw new NotSupportedException();
