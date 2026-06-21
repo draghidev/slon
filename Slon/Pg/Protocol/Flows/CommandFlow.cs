@@ -647,6 +647,26 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
             _callerInteractionCore.SignalProgress();
     }
 
+    // Repair a version-less terminal (_enumeratorCompleted) that survived onto a fresh PENDING generation
+    // with no completer (the lost-completion shape), shared by the sync and async MoveNext short-circuits.
+    // Two distinct causes, close-first precedence:
+    //   1. CLOSE - the protocol close-latch (sticky, monotone, set out-of-band by another thread). If set
+    //      it wins: a closed protocol is terminal and authoritative, the user cancel is moot.
+    //   2. USER CANCEL - the caller's per-read token fired (e.g. a pre-fired token whose OCE delivery
+    //      landed on a prior generation, or the body drained past it). Read live on THIS (consumer)
+    //      thread - the token is the consumer's own, so no latch is needed; deliver an OCE carrying the
+    //      bound token (per-read, NOT sticky - the flow/connection is fine, the next read works).
+    // Only acts while the current generation is Pending (skips churn on an already-completed gen).
+    void RepairLostTerminal()
+    {
+        if (_enumeratorMoveNextTaskSource.GetStatus(_enumeratorMoveNextTaskSource.Version) is not ValueTaskSourceStatus.Pending)
+            return;
+        if (_callerInteractionCore.CloseException is { } latched)
+            _enumeratorMoveNextTaskSource.TrySetException(latched, runContinuationsAsynchronously: true);
+        else if (_callerCancellationToken.IsCancellationRequested)
+            _enumeratorMoveNextTaskSource.TrySetException(new OperationCanceledException(_callerCancellationToken), runContinuationsAsynchronously: true);
+    }
+
     void HandleException(Exception ex)
     {
         // A close fault must latch so a consumer that Resets past this delivery self-delivers it - the
@@ -781,16 +801,11 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                 return false;
 
             // See MoveNextAsync: a version-less terminal that survived a Reset onto a fresh pending
-            // generation needs repair only under close (self-deliver the latch); otherwise return the
-            // terminal task as before.
+            // generation needs repair for the close and user-cancel causes (see RepairLostTerminal);
+            // otherwise return the terminal task as before.
             if (flow._enumeratorCompleted)
             {
-                // Repair a version-less terminal that survived a Reset onto a fresh pending generation
-                // only under close: TrySet self-delivers the latch (idempotent, the source is concurrent
-                // for every live flow). The GetStatus check just skips needless churn on a completed gen.
-                if (flow._callerInteractionCore.CloseException is { } latched
-                    && flow._enumeratorMoveNextTaskSource.GetStatus(flow._enumeratorMoveNextTaskSource.Version) is ValueTaskSourceStatus.Pending)
-                    flow._enumeratorMoveNextTaskSource.TrySetException(latched, runContinuationsAsynchronously: true);
+                flow.RepairLostTerminal();
                 return flow.EnumeratorMoveNextTask.Result;
             }
 
@@ -839,14 +854,12 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
 
             // Terminal short-circuit. _enumeratorCompleted is version-less and survives a Reset, so a
             // terminal landed on a PRIOR generation leaves it set while the consumer is parked on a
-            // fresh, pending generation with no completer (the lost-completion). That only needs repair
-            // under CLOSE: self-deliver the latch to the current generation. In every other case keep
-            // the original behavior - return the terminal task (its GetResult replays the result/fault).
+            // fresh, pending generation with no completer (the lost-completion). Repair it for the close
+            // and user-cancel causes (see RepairLostTerminal); otherwise this returns the terminal task
+            // unchanged (its GetResult replays the result/fault).
             if (flow._enumeratorCompleted)
             {
-                if (flow._callerInteractionCore.CloseException is { } latched
-                    && flow._enumeratorMoveNextTaskSource.GetStatus(flow._enumeratorMoveNextTaskSource.Version) is ValueTaskSourceStatus.Pending)
-                    flow._enumeratorMoveNextTaskSource.TrySetException(latched, runContinuationsAsynchronously: true);
+                flow.RepairLostTerminal();
                 return flow.EnumeratorMoveNextTask;
             }
 
