@@ -20,39 +20,36 @@ public class BackendErrorRenderingTests
     [TestMethod]
     public async Task BackendSyntaxError_SurfacesRenderedPostgresException()
     {
-        var protocol = await PgTestPool.NewIsolatedAsync();
+        // An input-caused syntax error (ErrorResponse + ReadyForQuery) leaves the session fine, so this
+        // leases from the shared pool rather than burning an isolated connection.
+        await using var lease = await PgTestPool.LeaseAsync();
+        var protocol = lease.Protocol;
+
+        var flow = new CommandFlow(async: true, Command.Create("SLECT 1"));
+        Assert.IsTrue(protocol.TryQueue(flow));
+
+        PostgresException? thrown = null;
+        var e = flow.GetAsyncEnumerator();
         try
         {
-            var flow = new CommandFlow(async: true, Command.Create("SLECT 1"));
-            Assert.IsTrue(protocol.TryQueue(flow));
-
-            PostgresException? thrown = null;
-            var e = flow.GetAsyncEnumerator();
-            try
-            {
-                while (await e.MoveNextAsync())
-                    e.Current.GetCommandComplete(); // consume the result -> surfaces the captured error
-            }
-            catch (PostgresException ex)
-            {
-                thrown = ex;
-            }
-            await e.DisposeAsync();
-
-            Assert.IsNotNull(thrown, "Invalid SQL should surface a PostgresException on result consumption.");
-            // Parsed end-to-end from a real backend ErrorResponse: SQLSTATE + human-readable text,
-            // not the opaque base "Exception of type ... was thrown".
-            Assert.AreEqual(5, thrown!.SqlState.Length, "SQLSTATE is a 5-character code.");
-            StringAssert.StartsWith(thrown.SqlState, "42"); // syntax error / access rule violation class
-            Assert.IsFalse(string.IsNullOrEmpty(thrown.MessageText), "Message text should be parsed.");
-            StringAssert.Contains(thrown.Message, thrown.SqlState);
-            StringAssert.Contains(thrown.Message, thrown.MessageText);
-
-            Console.WriteLine($"Rendered: {thrown.Message}");
+            while (await e.MoveNextAsync())
+                e.Current.GetCommandComplete(); // consume the result -> surfaces the captured error
         }
-        finally
+        catch (PostgresException ex)
         {
-            await protocol.CompleteAsync();
+            thrown = ex;
         }
+        await e.DisposeAsync();
+
+        Assert.IsNotNull(thrown, "Invalid SQL should surface a PostgresException on result consumption.");
+        // Parsed end-to-end from a real backend ErrorResponse: SQLSTATE + human-readable text,
+        // not the opaque base "Exception of type ... was thrown".
+        Assert.AreEqual(5, thrown!.SqlState.Length, "SQLSTATE is a 5-character code.");
+        StringAssert.StartsWith(thrown.SqlState, "42"); // syntax error / access rule violation class
+        Assert.IsFalse(string.IsNullOrEmpty(thrown.MessageText), "Message text should be parsed.");
+        StringAssert.Contains(thrown.Message, thrown.SqlState);
+        StringAssert.Contains(thrown.Message, thrown.MessageText);
+
+        Console.WriteLine($"Rendered: {thrown.Message}");
     }
 }

@@ -126,8 +126,10 @@ public class ExclusiveAccessFlowTests
     [TestMethod]
     public async Task SqlErrorSubflow_InScope_ResyncsAndScopeStaysUsable()
     {
-        var protocol = await PgTestPool.NewIsolatedAsync();
-        try
+        // Input-caused SQL error, scope stays usable (resyncs to RFQ) - so this leases from the shared
+        // pool rather than burning an isolated connection.
+        await using var lease = await PgTestPool.LeaseAsync();
+        var protocol = lease.Protocol;
         {
             var scope = protocol.BeginExclusiveScope(async: true);
             await scope.HandoffReady;
@@ -152,10 +154,6 @@ public class ExclusiveAccessFlowTests
             await DrainAsync(scope.Queue(new CommandFlow(async: true, Command.Create("select 1"))));
 
             await scope.CompleteScopeAsync();
-        }
-        finally
-        {
-            await protocol.DisposeAsync();
         }
     }
 
