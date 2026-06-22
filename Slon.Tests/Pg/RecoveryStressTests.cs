@@ -40,19 +40,15 @@ public class RecoveryStressTests
     [TestMethod]
     public async Task Stress_RecoveryThenSequentialReads()
     {
-        var protocol = await PgTestPool.NewIsolatedAsync();
-        try
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
+        for (int i = 0; i < Iterations; i++)
         {
-            for (int i = 0; i < Iterations; i++)
-            {
-                var faulting = new RecoveryTests.FaultingFlow(async: true, RecoveryTests.FaultPhase.PreReturn, RecoveryTests.WriteShape.MultipleSyncsNoFlush);
-                Assert.IsTrue(protocol.TryQueue(faulting));
+            var faulting = new RecoveryTests.FaultingFlow(async: true, RecoveryTests.FaultPhase.PreReturn, RecoveryTests.WriteShape.MultipleSyncsNoFlush);
+            Assert.IsTrue(protocol.TryQueue(faulting));
 
-                for (int j = 0; j < 5; j++)
-                    await RunAsync(protocol, "select 1");
-            }
+            for (int j = 0; j < 5; j++)
+                await RunAsync(protocol, "select 1");
         }
-        finally { await protocol.CompleteAsync(); }
     }
 
     // Same stress without recovery in the loop - just rapid sequential pipelined reads. If this
@@ -62,13 +58,9 @@ public class RecoveryStressTests
     [TestMethod]
     public async Task Stress_SequentialReads_NoRecovery()
     {
-        var protocol = await PgTestPool.NewIsolatedAsync();
-        try
-        {
-            for (int i = 0; i < Iterations * 5; i++)
-                await RunAsync(protocol, "select 1");
-        }
-        finally { await protocol.CompleteAsync(); }
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
+        for (int i = 0; i < Iterations * 5; i++)
+            await RunAsync(protocol, "select 1");
     }
 
     // Recovery dispatch OVERLAPPING the pump's next dispatch - the execute-promise single-pump edge
@@ -84,37 +76,33 @@ public class RecoveryStressTests
     [TestMethod]
     public async Task Stress_RecoveryOverlapsNextDispatch()
     {
-        var protocol = await PgTestPool.NewIsolatedAsync();
-        try
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
+        for (int i = 0; i < Iterations; i++)
         {
-            for (int i = 0; i < Iterations; i++)
+            var faulting = new RecoveryTests.FaultingFlow(async: true, RecoveryTests.FaultPhase.PipelineTask, RecoveryTests.WriteShape.QueryNoFlush);
+            Assert.IsTrue(protocol.TryQueue(faulting));
+
+            // Queue a normal flow immediately so the pump dispatches it while the faulting flow's
+            // recovery runs on the advancer chain - the dispatch/recovery overlap on one promise.
+            var follow = new CommandFlow(async: true, Command.Create("select 1"));
+            Assert.IsTrue(protocol.TryQueue(follow));
+
+            // The follow-on must complete cleanly (no tenure collision, clean wire after resync).
+            var e = follow.GetAsyncEnumerator();
+            try
             {
-                var faulting = new RecoveryTests.FaultingFlow(async: true, RecoveryTests.FaultPhase.PipelineTask, RecoveryTests.WriteShape.QueryNoFlush);
-                Assert.IsTrue(protocol.TryQueue(faulting));
-
-                // Queue a normal flow immediately so the pump dispatches it while the faulting flow's
-                // recovery runs on the advancer chain - the dispatch/recovery overlap on one promise.
-                var follow = new CommandFlow(async: true, Command.Create("select 1"));
-                Assert.IsTrue(protocol.TryQueue(follow));
-
-                // The follow-on must complete cleanly (no tenure collision, clean wire after resync).
-                var e = follow.GetAsyncEnumerator();
-                try
-                {
-                    while (await e.MoveNextAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(10))) { }
-                }
-                catch (TimeoutException) { Assert.Fail($"iter {i}: follow-on flow hung (dispatch collided with recovery)."); }
-                finally { await e.DisposeAsync(); }
-
-                // The faulting flow completes with its injected fault; observe-and-discard.
-                try { await faulting.WaitForComplete().AsTask().WaitAsync(TimeSpan.FromSeconds(10)); }
-                catch (TimeoutException) { Assert.Fail($"iter {i}: faulting flow never completed (recovery stranded)."); }
-                catch { /* the injected fault - expected */ }
-
-                // Protocol still at RFQ and reusable after the resync.
-                await RunAsync(protocol, "select 1");
+                while (await e.MoveNextAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(10))) { }
             }
+            catch (TimeoutException) { Assert.Fail($"iter {i}: follow-on flow hung (dispatch collided with recovery)."); }
+            finally { await e.DisposeAsync(); }
+
+            // The faulting flow completes with its injected fault; observe-and-discard.
+            try { await faulting.WaitForComplete().AsTask().WaitAsync(TimeSpan.FromSeconds(10)); }
+            catch (TimeoutException) { Assert.Fail($"iter {i}: faulting flow never completed (recovery stranded)."); }
+            catch { /* the injected fault - expected */ }
+
+            // Protocol still at RFQ and reusable after the resync.
+            await RunAsync(protocol, "select 1");
         }
-        finally { await protocol.CompleteAsync(); }
     }
 }

@@ -205,15 +205,11 @@ public class RecoveryTests
     [TestMethod]
     public async Task PipelineTask_FailureRecovers_NextFlowSucceeds()
     {
-        var protocol = await ConnectAsync();
-        try
-        {
-            var faulting = new FaultingFlow(async: true, FaultPhase.PipelineTask, WriteShape.None);
-            Assert.IsTrue(protocol.TryQueue(faulting));
+        await using var protocol = await ConnectAsync();
+        var faulting = new FaultingFlow(async: true, FaultPhase.PipelineTask, WriteShape.None);
+        Assert.IsTrue(protocol.TryQueue(faulting));
 
-            await RunAsync(protocol, "select 1");
-        }
-        finally { await protocol.CompleteAsync(); }
+        await RunAsync(protocol, "select 1");
     }
 
     // Execute-item-task failure (PreReturn throw) after a Query was written but not flushed.
@@ -223,15 +219,11 @@ public class RecoveryTests
     [TestMethod]
     public async Task ExecuteItemTask_FailureRecovers_NextFlowSucceeds()
     {
-        var protocol = await ConnectAsync();
-        try
-        {
-            var faulting = new FaultingFlow(async: true, FaultPhase.PreReturn, WriteShape.QueryNoFlush);
-            Assert.IsTrue(protocol.TryQueue(faulting));
+        await using var protocol = await ConnectAsync();
+        var faulting = new FaultingFlow(async: true, FaultPhase.PreReturn, WriteShape.QueryNoFlush);
+        Assert.IsTrue(protocol.TryQueue(faulting));
 
-            await RunAsync(protocol, "select 1");
-        }
-        finally { await protocol.CompleteAsync(); }
+        await RunAsync(protocol, "select 1");
     }
 
     // Trailing-execution-task failure. The policy treats this uniformly with ExecuteItemTask:
@@ -243,15 +235,11 @@ public class RecoveryTests
     [TestMethod]
     public async Task TrailingExecutionTask_FailureRecovers_NextFlowSucceeds()
     {
-        var protocol = await ConnectAsync();
-        try
-        {
-            var faulting = new FaultingFlow(async: true, FaultPhase.TrailingTask, WriteShape.None);
-            Assert.IsTrue(protocol.TryQueue(faulting));
+        await using var protocol = await ConnectAsync();
+        var faulting = new FaultingFlow(async: true, FaultPhase.TrailingTask, WriteShape.None);
+        Assert.IsTrue(protocol.TryQueue(faulting));
 
-            await RunAsync(protocol, "select 1");
-        }
-        finally { await protocol.CompleteAsync(); }
+        await RunAsync(protocol, "select 1");
     }
 
     // Parse+Bind+Execute then throw pre-return. _rfqCount is 0, _lastMessageInducesRfq is
@@ -260,18 +248,14 @@ public class RecoveryTests
     [TestMethod]
     public async Task WriterStateRemediation_NoSyncSent_RecoveryInjectsSync()
     {
-        var protocol = await ConnectAsync();
-        try
-        {
-            var faulting = new FaultingFlow(async: true, FaultPhase.PreReturn, WriteShape.ParseBindExecuteNoSync);
-            Assert.IsTrue(protocol.TryQueue(faulting));
+        await using var protocol = await ConnectAsync();
+        var faulting = new FaultingFlow(async: true, FaultPhase.PreReturn, WriteShape.ParseBindExecuteNoSync);
+        Assert.IsTrue(protocol.TryQueue(faulting));
 
-            // Multiple subsequent flows succeed: confirms the recovery's injected Sync drained
-            // the extended-protocol sequence cleanly and no stray RFQ was left on the wire.
-            for (int i = 0; i < 3; i++)
-                await RunAsync(protocol, "select 1");
-        }
-        finally { await protocol.CompleteAsync(); }
+        // Multiple subsequent flows succeed: confirms the recovery's injected Sync drained
+        // the extended-protocol sequence cleanly and no stray RFQ was left on the wire.
+        for (int i = 0; i < 3; i++)
+            await RunAsync(protocol, "select 1");
     }
 
     // Three Syncs written without flush, then pre-return throw. _rfqCount is 3,
@@ -287,16 +271,12 @@ public class RecoveryTests
     [TestMethod]
     public async Task MultipleRfqsOutstanding_DrainsAllBeforeNext()
     {
-        var protocol = await ConnectAsync();
-        try
-        {
-            var faulting = new FaultingFlow(async: true, FaultPhase.PreReturn, WriteShape.MultipleSyncsNoFlush);
-            Assert.IsTrue(protocol.TryQueue(faulting));
+        await using var protocol = await ConnectAsync();
+        var faulting = new FaultingFlow(async: true, FaultPhase.PreReturn, WriteShape.MultipleSyncsNoFlush);
+        Assert.IsTrue(protocol.TryQueue(faulting));
 
-            for (int i = 0; i < 5; i++)
-                await RunAsync(protocol, "select 1");
-        }
-        finally { await protocol.CompleteAsync(); }
+        for (int i = 0; i < 5; i++)
+            await RunAsync(protocol, "select 1");
     }
 
     // The recovery flow's async mode is inherited from the failed flow's IsAsyncAtBind. An
@@ -306,15 +286,11 @@ public class RecoveryTests
     [TestMethod]
     public async Task AsyncFlowFailure_RecoveryUsesAsyncMode()
     {
-        var protocol = await ConnectAsync();
-        try
-        {
-            var faulting = new FaultingFlow(async: true, FaultPhase.PreReturn, WriteShape.QueryNoFlush);
-            Assert.IsTrue(protocol.TryQueue(faulting));
+        await using var protocol = await ConnectAsync();
+        var faulting = new FaultingFlow(async: true, FaultPhase.PreReturn, WriteShape.QueryNoFlush);
+        Assert.IsTrue(protocol.TryQueue(faulting));
 
-            await RunAsync(protocol, "select 1");
-        }
-        finally { await protocol.CompleteAsync(); }
+        await RunAsync(protocol, "select 1");
     }
 
     // Sync-failed flow: the recovery is constructed with async=false. The substitute is run
@@ -326,15 +302,11 @@ public class RecoveryTests
     [TestMethod]
     public async Task SyncFlowFailure_RecoveryHandoffWorks()
     {
-        var protocol = await ConnectAsync();
-        try
-        {
-            var faulting = new FaultingFlow(async: false, FaultPhase.PreReturn, WriteShape.QueryNoFlush);
-            Assert.IsTrue(protocol.TryQueue(faulting));
+        await using var protocol = await ConnectAsync();
+        var faulting = new FaultingFlow(async: false, FaultPhase.PreReturn, WriteShape.QueryNoFlush);
+        Assert.IsTrue(protocol.TryQueue(faulting));
 
-            await RunSync(protocol, "select 1");
-        }
-        finally { await protocol.CompleteAsync(); }
+        await RunSync(protocol, "select 1");
     }
 
     // Pipelined sibling behind a faulting flow. Both are queued back to back, the first
@@ -344,19 +316,15 @@ public class RecoveryTests
     [TestMethod]
     public async Task FaultingFlow_WithPipelinedSibling_SiblingCompletes()
     {
-        var protocol = await ConnectAsync();
-        try
-        {
-            var faulting = new FaultingFlow(async: true, FaultPhase.PreReturn, WriteShape.QueryNoFlush);
-            var sibling = new CommandFlow(async: true, Command.Create("select 1"));
-            Assert.IsTrue(protocol.TryQueue(faulting));
-            Assert.IsTrue(protocol.TryQueue(sibling));
+        await using var protocol = await ConnectAsync();
+        var faulting = new FaultingFlow(async: true, FaultPhase.PreReturn, WriteShape.QueryNoFlush);
+        var sibling = new CommandFlow(async: true, Command.Create("select 1"));
+        Assert.IsTrue(protocol.TryQueue(faulting));
+        Assert.IsTrue(protocol.TryQueue(sibling));
 
-            var e = sibling.GetAsyncEnumerator();
-            while (await e.MoveNextAsync()) { }
-            await e.DisposeAsync();
-        }
-        finally { await protocol.CompleteAsync(); }
+        var e = sibling.GetAsyncEnumerator();
+        while (await e.MoveNextAsync()) { }
+        await e.DisposeAsync();
     }
 
     // Two faulting flows back to back. The first fails, the second is enqueued behind, also
@@ -365,17 +333,13 @@ public class RecoveryTests
     [TestMethod]
     public async Task BackToBackFailures_RecoveryComposes()
     {
-        var protocol = await ConnectAsync();
-        try
-        {
-            var f1 = new FaultingFlow(async: true, FaultPhase.PreReturn, WriteShape.QueryNoFlush);
-            var f2 = new FaultingFlow(async: true, FaultPhase.PreReturn, WriteShape.QueryNoFlush);
-            Assert.IsTrue(protocol.TryQueue(f1));
-            Assert.IsTrue(protocol.TryQueue(f2));
+        await using var protocol = await ConnectAsync();
+        var f1 = new FaultingFlow(async: true, FaultPhase.PreReturn, WriteShape.QueryNoFlush);
+        var f2 = new FaultingFlow(async: true, FaultPhase.PreReturn, WriteShape.QueryNoFlush);
+        Assert.IsTrue(protocol.TryQueue(f1));
+        Assert.IsTrue(protocol.TryQueue(f2));
 
-            await RunAsync(protocol, "select 1");
-        }
-        finally { await protocol.CompleteAsync(); }
+        await RunAsync(protocol, "select 1");
     }
 
     // Multi-command CommandFlow that succeeds after recovery clears a prior failed flow.
@@ -384,19 +348,15 @@ public class RecoveryTests
     [TestMethod]
     public async Task MultiCommandFlow_AfterRecovery_Completes()
     {
-        var protocol = await ConnectAsync();
-        try
-        {
-            var faulting = new FaultingFlow(async: true, FaultPhase.PreReturn, WriteShape.ParseBindExecuteNoSync);
-            Assert.IsTrue(protocol.TryQueue(faulting));
+        await using var protocol = await ConnectAsync();
+        var faulting = new FaultingFlow(async: true, FaultPhase.PreReturn, WriteShape.ParseBindExecuteNoSync);
+        Assert.IsTrue(protocol.TryQueue(faulting));
 
-            var multi = new CommandFlow(async: true, Command.Create("select 1"), Command.Create("select 2"), Command.Create("select 3"));
-            Assert.IsTrue(protocol.TryQueue(multi));
-            var e = multi.GetAsyncEnumerator();
-            while (await e.MoveNextAsync()) { }
-            await e.DisposeAsync();
-        }
-        finally { await protocol.CompleteAsync(); }
+        var multi = new CommandFlow(async: true, Command.Create("select 1"), Command.Create("select 2"), Command.Create("select 3"));
+        Assert.IsTrue(protocol.TryQueue(multi));
+        var e = multi.GetAsyncEnumerator();
+        while (await e.MoveNextAsync()) { }
+        await e.DisposeAsync();
     }
 
     // The recovery itself failing: the transport is dead by the time the recovery drain tries

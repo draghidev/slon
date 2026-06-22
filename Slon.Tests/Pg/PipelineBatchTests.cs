@@ -81,53 +81,46 @@ public class PipelineBatchTests
     public async Task ConcurrentSyncAndAsync_NoSharedPromiseCollision()
     {
         var iters = StressIters;
-        var protocol = await PgTestPool.NewIsolatedAsync();
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
         var failure = new Exception?[1];
         void Capture(Exception ex) => Interlocked.CompareExchange(ref failure[0], ex, null);
 
-        try
+        var asyncLoop = Task.Run(async () =>
         {
-            var asyncLoop = Task.Run(async () =>
+            try
             {
-                try
-                {
-                    for (int i = 0; i < iters && Volatile.Read(ref failure[0]) is null; i++)
-                        await PgTestPool.RunAsync(protocol, "select 1");
-                }
-                catch (Exception ex) { Capture(ex); }
-            });
+                for (int i = 0; i < iters && Volatile.Read(ref failure[0]) is null; i++)
+                    await PgTestPool.RunAsync(protocol, "select 1");
+            }
+            catch (Exception ex) { Capture(ex); }
+        });
 
-            // Sync flows want the caller's own thread for the handoff, so drive them off a dedicated
-            // OS thread, not the pool (and never the async loop's thread - that is the deadlock above).
-            var syncThread = new Thread(() =>
-            {
-                try
-                {
-                    for (int i = 0; i < iters && Volatile.Read(ref failure[0]) is null; i++)
-                    {
-                        var flow = new CommandFlow(async: false, Command.Create("select 1"));
-                        if (!protocol.TryQueue(flow))
-                            break;
-                        var e = flow.GetEnumerator();
-                        while (e.MoveNext()) { }
-                        e.DisposeAsync().AsTask().GetAwaiter().GetResult();
-                    }
-                }
-                catch (Exception ex) { Capture(ex); }
-            })
-            { IsBackground = true, Name = "batch-sync-loop" };
-            syncThread.Start();
-
-            await asyncLoop;
-            syncThread.Join(TimeSpan.FromSeconds(120));
-
-            if (failure[0] is { } ex)
-                Assert.Fail($"concurrent sync/async raised {ex.GetType().Name}: {ex.Message}");
-        }
-        finally
+        // Sync flows want the caller's own thread for the handoff, so drive them off a dedicated
+        // OS thread, not the pool (and never the async loop's thread - that is the deadlock above).
+        var syncThread = new Thread(() =>
         {
-            await protocol.CompleteAsync();
-        }
+            try
+            {
+                for (int i = 0; i < iters && Volatile.Read(ref failure[0]) is null; i++)
+                {
+                    var flow = new CommandFlow(async: false, Command.Create("select 1"));
+                    if (!protocol.TryQueue(flow))
+                        break;
+                    var e = flow.GetEnumerator();
+                    while (e.MoveNext()) { }
+                    e.DisposeAsync().AsTask().GetAwaiter().GetResult();
+                }
+            }
+            catch (Exception ex) { Capture(ex); }
+        })
+        { IsBackground = true, Name = "batch-sync-loop" };
+        syncThread.Start();
+
+        await asyncLoop;
+        syncThread.Join(TimeSpan.FromSeconds(120));
+
+        if (failure[0] is { } ex)
+            Assert.Fail($"concurrent sync/async raised {ex.GetType().Name}: {ex.Message}");
     }
 
     // Each queued flow carries multiple commands, so the batch holds the shared read baton across a
@@ -180,19 +173,12 @@ public class PipelineBatchTests
         // Secondary guard overlapping ConcurrentSyncAndAsync's free-running coverage, so it runs a
         // quarter of the iterations; SLON_STRESS_ITERATIONS still scales it for a heavy soak.
         var iters = StressIters / 4;
-        var protocol = await PgTestPool.NewIsolatedAsync();
-        try
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
+        for (int i = 0; i < iters; i++)
         {
-            for (int i = 0; i < iters; i++)
-            {
-                var a = Task.Run(() => PgTestPool.RunAsync(protocol, "select 1"));
-                var s = Task.Run(() => PgTestPool.RunSync(protocol, "select 1"));
-                await Task.WhenAll(a, s);
-            }
-        }
-        finally
-        {
-            await protocol.CompleteAsync();
+            var a = Task.Run(() => PgTestPool.RunAsync(protocol, "select 1"));
+            var s = Task.Run(() => PgTestPool.RunSync(protocol, "select 1"));
+            await Task.WhenAll(a, s);
         }
     }
 }
