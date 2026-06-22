@@ -169,9 +169,9 @@ public class CommandUserCancellationStressTests
         }
     }
 
-    // Opt-in await-drain: WaitForDrainOnDispose=true makes DisposeAsync PARK on the body's completion (no poll
-    // loop, no spin) so the wire is drained to RFQ before it returns. Dispose mid-batch after result 1,
-    // then immediately reuse the protocol - if the drain hadn't completed, the next op would desync.
+    // DEFAULT await-drain: WaitForDrainOnDispose defaults true, so DisposeAsync PARKS on the body's completion
+    // (no poll loop, no spin) so the wire is drained to RFQ before it returns. Dispose mid-batch after result
+    // 1, then immediately reuse the protocol - if the drain hadn't completed, the next op would desync.
     [TestMethod]
     public async Task WaitForDrainOnDispose_MidBatch_AwaitsDrain_ConnectionUsable()
     {
@@ -184,7 +184,6 @@ public class CommandUserCancellationStressTests
                 Command.Create("select generate_series(1, 50)"),
                 Command.Create("select 'two'"),
                 Command.Create("select 'three'"));
-            flow.WaitForDrainOnDispose = true;
             Assert.IsTrue(protocol.TryQueue(flow));
 
             var e = flow.GetAsyncEnumerator();
@@ -199,6 +198,41 @@ public class CommandUserCancellationStressTests
             try { await PgTestPool.RunAsync(protocol, "select 1").WaitAsync(HangCap); }
             catch (TimeoutException) { Assert.Fail($"iter {i}: protocol unusable after WaitForDrainOnDispose (wire not at RFQ)."); }
             catch (Exception ex) { Assert.Fail($"iter {i}: reuse after WaitForDrainOnDispose threw {ex.GetType().Name}: {ex.Message}"); }
+        }
+    }
+
+    // Opt-OUT (WaitForDrainOnDispose=false): DisposeAsync faults + wakes the body and returns immediately
+    // WITHOUT parking on the drain. The body drains autonomously in the background; the next op on the
+    // protocol may briefly wait on item retirement but must succeed. Guards the fast-return (MarkConsumerGone)
+    // path now that wait-for-drain is the default.
+    [TestMethod]
+    public async Task DisposeFastReturn_OptOut_BodyDrainsInBackground_ConnectionUsable()
+    {
+        var protocols = await Pool(8);
+        var iters = Math.Min(Iters, 3000);
+        for (var i = 0; i < iters; i++)
+        {
+            var protocol = protocols[i % protocols.Length];
+            var flow = new CommandFlow(async: true,
+                Command.Create("select generate_series(1, 50)"),
+                Command.Create("select 'two'"),
+                Command.Create("select 'three'"));
+            flow.WaitForDrainOnDispose = false;
+            Assert.IsTrue(protocol.TryQueue(flow));
+
+            var e = flow.GetAsyncEnumerator();
+            try { Assert.IsTrue(await e.MoveNextAsync().AsTask().WaitAsync(HangCap), $"iter {i}: result 1"); }
+            catch (TimeoutException) { Assert.Fail($"iter {i}: first MoveNextAsync hung"); }
+
+            // Fault-and-return: must complete immediately, not park on the full drain.
+            try { await e.DisposeAsync().AsTask().WaitAsync(HangCap); }
+            catch (TimeoutException) { Assert.Fail($"iter {i}: opt-out DisposeAsync did not fast-return."); }
+            catch (Exception ex) { Assert.Fail($"iter {i}: opt-out DisposeAsync threw {ex.GetType().Name}: {ex.Message}"); }
+
+            // Background drain + item retirement must still hand the next op a clean wire.
+            try { await PgTestPool.RunAsync(protocol, "select 1").WaitAsync(HangCap); }
+            catch (TimeoutException) { Assert.Fail($"iter {i}: protocol unusable after opt-out dispose (background drain stuck)."); }
+            catch (Exception ex) { Assert.Fail($"iter {i}: reuse after opt-out dispose threw {ex.GetType().Name}: {ex.Message}"); }
         }
     }
 
@@ -219,7 +253,6 @@ public class CommandUserCancellationStressTests
             var flow = new CommandFlow(async: true,
                 Command.Create("select generate_series(1, 50)"),
                 Command.Create("select 'two'"));
-            flow.WaitForDrainOnDispose = true;
             Assert.IsTrue(protocol.TryQueue(flow, cancellationToken: cts.Token));
 
             var e = flow.GetAsyncEnumerator(cts.Token);
@@ -254,7 +287,6 @@ public class CommandUserCancellationStressTests
             Command.Create("select 1"),
             Command.Create("select * from no_such_table_xyz"));
         Assert.IsTrue(protocol.TryQueue(flow));
-        flow.WaitForDrainOnDispose = true;
 
         var e = flow.GetAsyncEnumerator();
         Assert.IsTrue(await e.MoveNextAsync(), "first result not delivered");
@@ -277,7 +309,6 @@ public class CommandUserCancellationStressTests
         var bad2 = Command.Create("select * from no_such_table_b") with { PreferSimple = true, WithSync = true };
         var flow = new CommandFlow(async: true, Command.Create("select 1") with { PreferSimple = true, WithSync = true }, bad1, bad2);
         Assert.IsTrue(protocol.TryQueue(flow));
-        flow.WaitForDrainOnDispose = true;
 
         var e = flow.GetAsyncEnumerator();
         Assert.IsTrue(await e.MoveNextAsync(), "first result not delivered");

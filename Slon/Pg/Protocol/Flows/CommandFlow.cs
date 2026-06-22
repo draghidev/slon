@@ -73,12 +73,15 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
     // body opting the consumer out on its own cancel/close drain. The terminal suppresses a user-cancel
     // OCE once the consumer itself disposed (it asked to stop; deliver a clean end instead).
     bool _consumerDisposed;
-    // Caller opt-in (ADO sets it before dispose): of the two consumer departure paths, pick WAIT-FOR-DRAIN.
-    // The consumer disposed but wants DisposeAsync to park on the body's drain (WaitForComplete) before
-    // returning, so the wire is at RFQ on return (next ExecuteReader immediate; ADO semantics). The body
-    // drains either way - this only controls whether DisposeAsync WAITS (parked on a TCS), never whether
-    // the drain happens, never by driving it (a polling drive busy-spins). Hence "WaitForDrain", not "Drain".
-    internal bool WaitForDrainOnDispose { get; set; }
+    // DEFAULT: of the two consumer departure paths, pick WAIT-FOR-DRAIN. DisposeAsync parks on the body's
+    // drain (WaitForComplete) before returning, so the wire is at RFQ on return (next ExecuteReader
+    // immediate; ADO semantics). The body drains either way - this only controls whether DisposeAsync WAITS
+    // (parked on a TCS), never whether the drain happens, never by driving it (a polling drive busy-spins).
+    // Hence "WaitForDrain", not "Drain". The wait is bounded for everyone by the read timeout / AbortToken /
+    // CompletionTimeout (the same bounds every read already has); a flow/enumerator token just makes it
+    // PROMPTLY bounded (fired => unwind fast). Set false to skip the wait (fault + return; the body drains in
+    // the background and item retirement hands the next flow a clean wire).
+    internal bool WaitForDrainOnDispose { get; set; } = true;
 
     // ---- The three departure paths that flip the body to autonomous-drain mode ----
 
@@ -992,6 +995,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
         _drainErrors = null;
         _consumerDisposed = false;
         _consumerGone = false;
+        WaitForDrainOnDispose = true;
         // Dispatch state is per-tenure.
         _pipelinePromise = null;
         _context = default;
