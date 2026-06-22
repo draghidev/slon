@@ -64,6 +64,14 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
     // itself disposed (it asked to stop; DisposeAsyncCore would not swallow an OCE), delivering a clean
     // end instead. Set only by the enumerator's Dispose/DisposeAsync.
     bool _consumerGoneByDispose;
+    // Opt-in: when set, async DisposeAsync PARKS on the body's completion (WaitForComplete) before
+    // returning, so the caller is guaranteed the wire is drained to RFQ the instant `await DisposeAsync()`
+    // returns (connection synchronously reusable). The BODY drains either way - this ONLY controls whether
+    // Dispose WAITS for that drain (parked on a TCS), never whether the drain happens and never by driving
+    // it (a polling drive busy-spins under contention). Hence "WaitForDrain", not "Drain". Default false =
+    // fault-and-return: Dispose faults + wakes the body and returns immediately; the body drains in the
+    // background and the pipeline's item retirement gives the next flow a clean wire.
+    internal bool WaitForDrainOnDispose { get; set; }
     void MarkConsumerGoneByDispose()
     {
         Volatile.Write(ref _consumerGoneByDispose, true);
@@ -1143,6 +1151,12 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
             flow.MarkConsumerGoneByDispose();
             flow._callerInteractionCore.GateTaskSource.TrySetResult(default);
             flow._callerInteractionCore.RequestWake();
+            // Opt-in await-drain: PARK on the body's completion signal (TCS-backed WaitForComplete), so
+            // the wire is drained to RFQ before this returns. This WAITS on the body, it does not DRIVE
+            // it - no poll loop, so no busy-spin. Default (false) returns immediately and lets the body
+            // drain in the background.
+            if (flow.WaitForDrainOnDispose)
+                return flow.WaitForComplete();
             return new();
         }
 

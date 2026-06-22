@@ -168,5 +168,38 @@ public class CommandUserCancellationStressTests
             catch (PgClientClosedException) { }
         }
     }
+
+    // Opt-in await-drain: WaitForDrainOnDispose=true makes DisposeAsync PARK on the body's completion (no poll
+    // loop, no spin) so the wire is drained to RFQ before it returns. Dispose mid-batch after result 1,
+    // then immediately reuse the protocol - if the drain hadn't completed, the next op would desync.
+    [TestMethod]
+    public async Task WaitForDrainOnDispose_MidBatch_AwaitsDrain_ConnectionUsable()
+    {
+        var protocols = await Pool(8);
+        var iters = Math.Min(Iters, 3000);
+        for (var i = 0; i < iters; i++)
+        {
+            var protocol = protocols[i % protocols.Length];
+            var flow = new CommandFlow(async: true,
+                Command.Create("select generate_series(1, 50)"),
+                Command.Create("select 'two'"),
+                Command.Create("select 'three'"));
+            flow.WaitForDrainOnDispose = true;
+            Assert.IsTrue(protocol.TryQueue(flow));
+
+            var e = flow.GetAsyncEnumerator();
+            try { Assert.IsTrue(await e.MoveNextAsync().AsTask().WaitAsync(HangCap), $"iter {i}: result 1"); }
+            catch (TimeoutException) { Assert.Fail($"iter {i}: first MoveNextAsync hung"); }
+
+            // Dispose mid-batch; with WaitForDrainOnDispose it must not return until the body drained to RFQ.
+            try { await e.DisposeAsync().AsTask().WaitAsync(HangCap); }
+            catch (TimeoutException) { Assert.Fail($"iter {i}: WaitForDrainOnDispose DisposeAsync never completed (drain spin/hang)."); }
+
+            // Immediately reuse - synchronously after the awaited drain, the wire must be at RFQ.
+            try { await PgTestPool.RunAsync(protocol, "select 1").WaitAsync(HangCap); }
+            catch (TimeoutException) { Assert.Fail($"iter {i}: protocol unusable after WaitForDrainOnDispose (wire not at RFQ)."); }
+            catch (Exception ex) { Assert.Fail($"iter {i}: reuse after WaitForDrainOnDispose threw {ex.GetType().Name}: {ex.Message}"); }
+        }
+    }
 }
 
