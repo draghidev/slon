@@ -62,37 +62,48 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
     // CancellationToken (which may just mean "skip this result"). The body reads it at handoff
     // boundaries. Not exposed as a CancellationToken: that would invite I/O ops to register and
     // throw OCE, breaking the drain-to-clean-state guarantee.
+    // The body's mode switch: once set, the body skips the user-handoff gates and drains the wire to RFQ
+    // autonomously (it no longer waits to be driven by MoveNextAsync). Set by exactly one of the three
+    // departure paths below. Not exposed as a CancellationToken: that would invite I/O ops to register and
+    // throw OCE, breaking the drain-to-clean-state guarantee.
     bool _consumerGone;
     internal bool IsConsumerGone => Volatile.Read(ref _consumerGone);
-    void MarkConsumerGone() => Volatile.Write(ref _consumerGone, true);
-    // Consumer-gone specifically because the consumer DISPOSED the enumerator (vs the body opting the
-    // consumer out on a cancel drain). Lets the terminal suppress a user-cancel OCE once the consumer
-    // itself disposed (it asked to stop; DisposeAsyncCore would not swallow an OCE), delivering a clean
-    // end instead. Set only by the enumerator's Dispose/DisposeAsync.
-    bool _consumerGoneByDispose;
-    // Opt-in: when set, async DisposeAsync PARKS on the body's completion (WaitForComplete) before
-    // returning, so the caller is guaranteed the wire is drained to RFQ the instant `await DisposeAsync()`
-    // returns (connection synchronously reusable). The BODY drains either way - this ONLY controls whether
-    // Dispose WAITS for that drain (parked on a TCS), never whether the drain happens and never by driving
-    // it (a polling drive busy-spins under contention). Hence "WaitForDrain", not "Drain". Default false =
-    // fault-and-return: Dispose faults + wakes the body and returns immediately; the body drains in the
-    // background and the pipeline's item retirement gives the next flow a clean wire.
+
+    // The consumer DISPOSED the enumerator (the two consumer departure paths below), as opposed to the
+    // body opting the consumer out on its own cancel/close drain. The terminal suppresses a user-cancel
+    // OCE once the consumer itself disposed (it asked to stop; deliver a clean end instead).
+    bool _consumerDisposed;
+    // Caller opt-in (ADO sets it before dispose): of the two consumer departure paths, pick WAIT-FOR-DRAIN.
+    // The consumer disposed but wants DisposeAsync to park on the body's drain (WaitForComplete) before
+    // returning, so the wire is at RFQ on return (next ExecuteReader immediate; ADO semantics). The body
+    // drains either way - this only controls whether DisposeAsync WAITS (parked on a TCS), never whether
+    // the drain happens, never by driving it (a polling drive busy-spins). Hence "WaitForDrain", not "Drain".
     internal bool WaitForDrainOnDispose { get; set; }
-    void MarkConsumerGoneByDispose()
+
+    // ---- The three departure paths that flip the body to autonomous-drain mode ----
+
+    // Consumer departure path 1 of 2: GONE. The consumer disposed and does NOT want to wait - DisposeAsync
+    // faults + wakes the body and returns immediately; the body drains in the background and the pipeline's
+    // item retirement gives the next flow a clean wire.
+    void MarkConsumerGone()
     {
-        Volatile.Write(ref _consumerGoneByDispose, true);
+        Volatile.Write(ref _consumerDisposed, true);
         Volatile.Write(ref _consumerGone, true);
     }
 
-    // Async-dispose specific wake: drives a sync-suspended body forward via the TP-queued
-    // continuation. Async DisposeAsync has no sync caller to rendezvous with via
-    // WaitForContinuation.
-    void MarkConsumerGoneAndWake()
+    // Consumer departure path 2 of 2: WAIT-FOR-DRAIN. The consumer disposed and wants DisposeAsync to park
+    // on the drain before returning. Records the wait intent; the dispose path reads it to route through
+    // AwaitDrainOnDispose.
+    void MarkConsumerWaitForDrain()
     {
-        Volatile.Write(ref _consumerGoneByDispose, true);
+        Volatile.Write(ref _consumerDisposed, true);
         Volatile.Write(ref _consumerGone, true);
-        _callerInteractionCore.RequestWake();
     }
+
+    // NOT a consumer departure: the BODY itself opts the consumer out during its own cancel/StoppingToken
+    // drain (the consumer is still live and gets the OCE/close at the terminal - so this does NOT set
+    // _consumerDisposed, which would suppress that OCE).
+    void MarkConsumerGoneByBody() => Volatile.Write(ref _consumerGone, true);
 
     // Set TRUE around SetResult(result) when delivery runs the caller's await continuation INLINE
     // on the body's thread. A Dispose/DisposeAsync from that continuation short-circuits
@@ -498,7 +509,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                     _cancelDeliverToken = EffectiveCancellationToken.IsCancellationRequested ? EffectiveCancellationToken : _cancelDeliverToken;
                     _deliverCancelOce = true;
                     _enumeratorCompleted = true;
-                    MarkConsumerGone();
+                    MarkConsumerGoneByBody();
                 }
 
                 ref readonly var state = ref context.GetProtocolStatic<ReadState>();
@@ -531,7 +542,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                     // parked consumer, then drain.
                     _callerInteractionCore.SetCloseLatch(context.ClosedException!);
                     DeliverClose(context.ClosedException!);
-                    MarkConsumerGone();
+                    MarkConsumerGoneByBody();
                 }
                 if (!IsConsumerGone)
                 {
@@ -801,7 +812,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
             Exception fault = errors.Count == 1 ? errors[0] : new AggregateException(errors);
             _enumeratorMoveNextTaskSource.TrySetException(fault, runContinuationsAsynchronously: true);
         }
-        else if (_deliverCancelOce && !_consumerGoneByDispose)
+        else if (_deliverCancelOce && !_consumerDisposed)
             _enumeratorMoveNextTaskSource.TrySetException(new OperationCanceledException(_cancelDeliverToken), runContinuationsAsynchronously: true);
         else
             _enumeratorMoveNextTaskSource.TrySetResult(false, runContinuationsAsynchronously: true);
@@ -979,7 +990,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
         _onInlineDispatchStack = false;
         _pendingInlineTerminal = false;
         _drainErrors = null;
-        _consumerGoneByDispose = false;
+        _consumerDisposed = false;
         _consumerGone = false;
         // Dispatch state is per-tenure.
         _pipelinePromise = null;
@@ -1151,7 +1162,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
             // awaiting so the body's terminal SetResult(null) doesn't hit a non-awaiting source.
             if (flow.IsInlineResultDelivery)
             {
-                flow.MarkConsumerGoneByDispose();
+                flow.MarkConsumerGone();
                 flow._enumeratorMoveNextTaskSource.Reset();
                 return;
             }
@@ -1168,7 +1179,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
             // via WaitForContinuation drives it forward - MoveNext invokes the body's stored
             // continuation, the body observes IsConsumerGone and drains, and its terminal
             // SetResult(null) wakes the final WaitForContinuation via SignalProgress.
-            flow.MarkConsumerGoneByDispose();
+            flow.MarkConsumerGone();
             while (MoveNext())
                 Current.Dispose();
         }
@@ -1190,7 +1201,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
             // on this same thread before unwinding.
             if (flow.IsInlineResultDelivery)
             {
-                flow.MarkConsumerGoneByDispose();
+                if (flow.WaitForDrainOnDispose) flow.MarkConsumerWaitForDrain(); else flow.MarkConsumerGone();
                 // See sync Dispose: Reset returns the move-next source to awaiting so the body's
                 // terminal SetResult(null) doesn't throw and trigger recovery on the next flow's bytes.
                 flow._enumeratorMoveNextTaskSource.Reset();
@@ -1213,7 +1224,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
             //   3. RequestWake to wake a sync-suspended body (TP-queues its stored continuation).
             // The body's autonomous terminal completes the move-next source (clean end), waking any
             // consumer still mid-await. No drive loop, no DisposeAsyncCore await.
-            flow.MarkConsumerGoneByDispose();
+            if (flow.WaitForDrainOnDispose) flow.MarkConsumerWaitForDrain(); else flow.MarkConsumerGone();
             flow._callerInteractionCore.GateTaskSource.TrySetResult(default);
             flow._callerInteractionCore.RequestWake();
             // Opt-in await-drain: PARK on the body's completion signal (TCS-backed WaitForComplete), so
