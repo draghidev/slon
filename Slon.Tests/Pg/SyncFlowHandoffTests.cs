@@ -115,9 +115,8 @@ public class SyncFlowHandoffTests
             {
                 leases[i] = await PgTestPool.LeaseAsync();
                 leased++;
-                await PgTestPool.RunSync(leases[i].Protocol, "select 1"); // warm
+                await PgTestPool.RunSync(leases[i].Protocol, "select 1"); // warm (awaited => protocols quiescent)
             }
-            await Task.Delay(100);
 
             var threads = new Thread[concurrency];
             var exceptions = new Exception?[concurrency];

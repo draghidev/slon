@@ -79,7 +79,7 @@ public class CommandUserCancellationTests
         var moveNextTask = e.MoveNextAsync(cts.Token).AsTask();
 
         // Give the body a moment to park on the read.
-        await Task.Delay(50);
+        await Task.Delay(20);
         cts.Cancel();
 
         var oce = await Assert.ThrowsExactlyAsync<OperationCanceledException>(
