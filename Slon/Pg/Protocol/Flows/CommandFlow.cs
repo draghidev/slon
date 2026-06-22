@@ -21,13 +21,36 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
     // Flow state
     CommandFlowOptions _options;
     FlowCallerInteractionCore<FlowCallerInteractionCoreResult> _callerInteractionCore;
+    // Per-read caller token: overlaid by MoveNextAsync(ct) for a single read.
     CancellationToken _callerCancellationToken;
+    // Flow-scoped caller token: bound at submit (BindCallerToken) or GetAsyncEnumerator; cancels the
+    // ENTIRE flow. Bound at submit it is honored from the eager write (whole-flow cancel is then
+    // deterministic); bound at GetAsyncEnumerator it is bound after the eager dispatch, so the first
+    // result may race. Not cleared per result.
+    CancellationToken _flowCancellationToken;
     CancellationTokenRegistration _callerCancellationTokenRegistration;
-    // The move-next generation (source Version) the cancellation registration is armed against. The
-    // callback faults ONLY this generation: a late fire (the body advanced to the next command, or the
-    // consumer Reset to a fresh generation) must not fault a generation it was not armed for - that is
-    // the wrong-generation double-fire / stale-wake. Captured at arm, checked in the callback.
-    short _callerCancellationArmedVersion;
+    CancellationTokenRegistration _flowCancellationTokenRegistration;
+    // Cancel intent latches set by the (non-completing) registration callbacks. The callback NEVER
+    // completes the move-next source: completing it mid-body, while this flow holds the shared pipeline
+    // promise (or a concurrent pipelined flow does), drives ExecuteSource into a TryStart over a tenured
+    // promise. The callback only latches intent + RequestWake; the body delivers the OCE at its OWN
+    // TERMINAL (sequenced with the body's return, after tenure is released). Consumer-thread reads, so
+    // Volatile.
+    bool _cancelRequested;
+    // The token to carry on the terminal OCE, captured when the body observes the cancel.
+    CancellationToken _cancelDeliverToken;
+    // Set by the body's cancel drain transition; the terminal SetResult delivers OCE (not a clean end).
+    bool _deliverCancelOce;
+    // TRUE while the body runs SYNCHRONOUSLY on an inline dispatch stack (inside DispatchPipelinedRead's
+    // `ExecutePipelined(context)` call, on either the fast path or the activation callback), where the
+    // shared ReadPromise is tenured on that frame. A TERMINAL move-next completion taken here would
+    // overstay the tenure and drive ExecuteSource into a TryStart over the live promise. While set, the
+    // terminal records its outcome in _pendingInlineTerminal instead of completing; the dispatch site
+    // lands it right after ExecutePipelined returns - by which point, for a fully-synchronous body, the
+    // builder's task-get has released the tenure (_started=false) - so completion is tenure-free with no
+    // ThreadPool hop. Cleared the instant the body suspends (it then resumes on a continuation stack).
+    bool _onInlineDispatchStack;
+    bool _pendingInlineTerminal;
 
     // Consumer-gone signal: set only by the enumerator's Dispose/DisposeAsync, NOT the caller's
     // CancellationToken (which may just mean "skip this result"). The body reads it at handoff
@@ -36,12 +59,23 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
     bool _consumerGone;
     internal bool IsConsumerGone => Volatile.Read(ref _consumerGone);
     void MarkConsumerGone() => Volatile.Write(ref _consumerGone, true);
+    // Consumer-gone specifically because the consumer DISPOSED the enumerator (vs the body opting the
+    // consumer out on a cancel drain). Lets the terminal suppress a user-cancel OCE once the consumer
+    // itself disposed (it asked to stop; DisposeAsyncCore would not swallow an OCE), delivering a clean
+    // end instead. Set only by the enumerator's Dispose/DisposeAsync.
+    bool _consumerGoneByDispose;
+    void MarkConsumerGoneByDispose()
+    {
+        Volatile.Write(ref _consumerGoneByDispose, true);
+        Volatile.Write(ref _consumerGone, true);
+    }
 
     // Async-dispose specific wake: drives a sync-suspended body forward via the TP-queued
     // continuation. Async DisposeAsync has no sync caller to rendezvous with via
     // WaitForContinuation.
     void MarkConsumerGoneAndWake()
     {
+        Volatile.Write(ref _consumerGoneByDispose, true);
         Volatile.Write(ref _consumerGone, true);
         _callerInteractionCore.RequestWake();
     }
@@ -114,6 +148,13 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
         return this;
     }
 
+    // The token in force for the current read: the flow token once fired (whole-flow cancel), else the
+    // per-read token if cancelable, else the flow token.
+    CancellationToken EffectiveCancellationToken
+        => _flowCancellationToken.IsCancellationRequested ? _flowCancellationToken
+            : _callerCancellationToken.CanBeCanceled ? _callerCancellationToken
+            : _flowCancellationToken;
+
     public int CommandCount => _options.Commands.Count;
     public bool IsResultReady => _isResultReady;
 
@@ -124,7 +165,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
 
     // Bind the caller token at submit so the eager write honors it (the pre-write consumer gate is
     // gone, so the write no longer borrows the token from the first MoveNextAsync).
-    internal override void BindCallerToken(CancellationToken cancellationToken) => _callerCancellationToken = cancellationToken;
+    internal override void BindCallerToken(CancellationToken cancellationToken) => _flowCancellationToken = cancellationToken;
 
     public Enumerator GetAsyncEnumerator(CancellationToken cancellationToken = default)
     {
@@ -136,7 +177,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
         // bound token with None. Never disarm mid-tenure - a fired registration may still be in flight.
         _enumeratorMoveNextTaskSource.CanCompleteConcurrently = true;
         if (cancellationToken.CanBeCanceled)
-            _callerCancellationToken = cancellationToken;
+            _flowCancellationToken = cancellationToken;
         return new(this);
     }
 
@@ -189,6 +230,18 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
             else if (!IsAsync)
                 writeTask = encoder.RunResumableTask(writeTask);
         }
+        catch (OperationCanceledException ex) when (ex.CancellationToken == _flowCancellationToken)
+        {
+            // Flow-scoped cancel observed by the EAGER WRITE (a pre-fired submit-bound token). The command
+            // bytes may already be on the wire, so the read must still drain to RFQ. Do NOT route through
+            // HandleException: that both faults the move-next source from this (write-phase) stack and
+            // tears the connection. Latch the cancel; the read body observes it, drains consumer-gone, and
+            // delivers the OCE at its terminal - tenure-safe. The write happens before any in-body
+            // registration arms, so this catch is the only place to capture a write-phase flow-cancel.
+            RequestCancel(_flowCancellationToken);
+            // The write faulted; no trailing write task to observe. The read drains to RFQ.
+            writeTask = default;
+        }
         catch (Exception ex)
         {
             HandleException(ex);
@@ -210,14 +263,14 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
         {
             var encoder = context.GetEncoder();
             for (var i = 0; i < CommandCount; i++)
-                await _options.Commands[i].WriteAsync(encoder, _callerCancellationToken).ConfigureAwait(false);
+                await _options.Commands[i].WriteAsync(encoder, _flowCancellationToken).ConfigureAwait(false);
 
             if (!encoder.LastMessageInducesRfq)
             {
                 _readFlowRfq = true;
                 encoder.WriteSync();
             }
-            await encoder.FlushAsync(_callerCancellationToken).ConfigureAwait(false);
+            await encoder.FlushAsync(_flowCancellationToken).ConfigureAwait(false);
         }
 
         async ValueTask WriteAllCommandsResumable()
@@ -254,14 +307,23 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
             // the waiter is consumed (releasing the promise tenure via GetResult's Reset) before the
             // item's position is republished, so a successor's dispatch always finds the tenure released.
             PromiseAsyncValueTaskMethodBuilder.Promise = promise;
+            ValueTask fastTask;
+            _onInlineDispatchStack = true;
             try
             {
-                return ExecutePipelined(context);
+                fastTask = ExecutePipelined(context);
             }
             finally
             {
+                _onInlineDispatchStack = false;
                 PromiseAsyncValueTaskMethodBuilder.Promise = null;
             }
+            // The body ran (and, if fully synchronous, completed) inline above. If it deferred its
+            // terminal (reached while still on this tenured frame), land it now: ExecutePipelined has
+            // returned, so for a sync-completed body the builder's task-get already released the tenure
+            // (_started=false). Deterministic, tenure-free, no ThreadPool.
+            LandPendingInlineTerminal();
+            return fastTask;
         }
 
         _context = context;
@@ -282,9 +344,21 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
             }
             var promise = flow._pipelinePromise!;
             PromiseAsyncValueTaskMethodBuilder.Promise = promise;
+            flow._onInlineDispatchStack = true;
+            ValueTask task;
             try
             {
-                var task = flow.ExecutePipelined(ctx);
+                task = flow.ExecutePipelined(ctx);
+            }
+            finally
+            {
+                flow._onInlineDispatchStack = false;
+            }
+            // Same deterministic landing as the fast path: a fully-synchronous body on THIS activation
+            // stack also tenures the promise on this frame; land its deferred terminal after the call.
+            flow.LandPendingInlineTerminal();
+            try
+            {
                 if (!task.IsCompleted)
                 {
                     flow._task = task;
@@ -338,7 +412,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
             // GetDecoderAuto adapts to flow mode internally. Activation has already been gated
             // by DispatchPipelinedRead's waiter.IsCompleted check, so the fast path returns
             // sync-immediately in both modes. The await is free when sync-completed.
-            _decoder = await context.GetDecoderAuto(_callerCancellationToken).ConfigureAwait(false);
+            _decoder = await context.GetDecoderAuto(EffectiveCancellationToken).ConfigureAwait(false);
             while (++_commandIndex < CommandCount)
             {
                 _isResultReady = false;
@@ -352,20 +426,25 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                 // Only arm while there is a consumer to deliver OCE to. Once consumer-gone, arming a
                 // still-cancelled token would re-fire TrySetException into the move-next source
                 // DisposeAsync just reset, leaking the OCE past its one wait.
+                // Arm NON-COMPLETING cancel registrations for this read. The callbacks never touch the
+                // move-next source (completing it mid-body races ExecuteSource into a TryStart over a
+                // tenured promise); they latch intent + RequestWake, and the body delivers the OCE at its
+                // terminal. Both tokens are honored: the per-read token (MoveNextAsync(ct)) and the
+                // flow-scoped token (submit / GetAsyncEnumerator). A pre-fired token fires the callback
+                // INLINE here, which is now harmless (it only latches). Both registrations are disposed
+                // below via the awaited DisposeAsync BEFORE the body returns and releases the promise, so
+                // no callback can fire after the next flow takes the promise.
                 if (_callerCancellationToken.CanBeCanceled && !IsConsumerGone)
                 {
                     Debug.Assert(IsAsync);
-                    // Bind the registration to THIS read's move-next generation. The callback faults only
-                    // while the source is still on the armed generation (and pending): a fire that lands
-                    // after the body advanced past this command, or after the consumer Reset to its next
-                    // generation, no-ops instead of faulting the wrong/stale generation.
-                    _callerCancellationArmedVersion = _enumeratorMoveNextTaskSource.Version;
-                    _callerCancellationTokenRegistration = _callerCancellationToken.UnsafeRegister(static (state, token) =>
-                    {
-                        var f = (CommandFlow)state!;
-                        if (f._enumeratorMoveNextTaskSource.Version == f._callerCancellationArmedVersion)
-                            f._enumeratorMoveNextTaskSource.TrySetException(new OperationCanceledException(token), runContinuationsAsynchronously: true);
-                    }, this);
+                    _callerCancellationTokenRegistration = _callerCancellationToken.UnsafeRegister(static (state, token)
+                        => ((CommandFlow)state!).RequestCancel(token), this);
+                }
+                if (_flowCancellationToken.CanBeCanceled && !IsConsumerGone)
+                {
+                    Debug.Assert(IsAsync);
+                    _flowCancellationTokenRegistration = _flowCancellationToken.UnsafeRegister(static (state, token)
+                        => ((CommandFlow)state!).RequestCancel(token), this);
                 }
 
                 if (IsAsync)
@@ -373,20 +452,27 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                 else
                     (_pgError, _requestedRowDescription) = command.ReadUntilExecute(_decoder);
 
+                // Dispose the registrations BEFORE the body returns (the awaited DisposeAsync sequences
+                // this strictly before tenure release; it also waits out any in-flight callback). After
+                // this, no callback can fire, so the next flow taking the shared promise never races one.
                 if (_callerCancellationToken.CanBeCanceled)
-                {
                     await _callerCancellationTokenRegistration.DisposeAsync().ConfigureAwait(false);
-                    // The registration already faulted the consumer's awaiting MoveNextAsync with
-                    // OCE, so do NOT throw here: a throw would leak that OCE into the next consumer
-                    // interaction via GetResult when DisposeAsync drives the drain. Mirror the
-                    // StoppingToken transition below: mark the enumerator done + consumer-gone and
-                    // drain the wire to RFQ, so the cancel stays contained to its one wait and the
-                    // protocol stays usable. A future per-command backend CancelRequest would arm here.
-                    if (_callerCancellationToken.IsCancellationRequested && !IsConsumerGone && !_enumeratorCompleted)
-                    {
-                        _enumeratorCompleted = true;
-                        MarkConsumerGone();
-                    }
+                if (_flowCancellationToken.CanBeCanceled)
+                    await _flowCancellationTokenRegistration.DisposeAsync().ConfigureAwait(false);
+
+                // Cancel drain transition. The cancel was latched (by a registration callback, the eager-
+                // write catch, or a token already fired at this point). Do NOT throw and do NOT complete
+                // the source here (mid-body, tenured). Mirror the consumer-gone / StoppingToken drain:
+                // mark terminal + consumer-gone, latch the OCE for terminal delivery, and fall through to
+                // the wire drain to RFQ so the protocol stays usable. The terminal SetResult delivers the
+                // OCE, sequenced with the body's return.
+                if ((Volatile.Read(ref _cancelRequested) || EffectiveCancellationToken.IsCancellationRequested)
+                    && !IsConsumerGone && !_enumeratorCompleted)
+                {
+                    _cancelDeliverToken = EffectiveCancellationToken.IsCancellationRequested ? EffectiveCancellationToken : _cancelDeliverToken;
+                    _deliverCancelOce = true;
+                    _enumeratorCompleted = true;
+                    MarkConsumerGone();
                 }
 
                 ref readonly var state = ref context.GetProtocolStatic<ReadState>();
@@ -536,7 +622,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
             HandleException(ex);
             throw;
         }
-        catch (OperationCanceledException ex) when (ex.CancellationToken == _callerCancellationToken)
+        catch (OperationCanceledException ex) when (ex.CancellationToken == _callerCancellationToken || ex.CancellationToken == _flowCancellationToken)
         {
 
             // All of what happens below is complicated by the fact PG cancellation is not deterministic.
@@ -607,15 +693,25 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
             }
             if (completed)
             {
-                // Version-aware terminal. _enumeratorCompleted is version-less: a DisposeAsync drain (or
-                // any rearm) Resets the source onto a fresh PENDING generation AFTER a prior generation
-                // went terminal, and parks awaiting THAT generation. A blanket no-op on the flag strands
-                // it. TrySetResult lands a clean end on a pending generation (waking a parked drain) and
-                // no-ops an already-completed one (idempotent against the registration's OCE / a close).
+                // Version-aware terminal, sequenced with the body's return (tenure released right after).
+                // _enumeratorCompleted is version-less: a DisposeAsync drain (or any rearm) Resets the
+                // source onto a fresh PENDING generation after a prior generation went terminal, and parks
+                // awaiting THAT generation. TrySet lands on a pending generation (waking a parked drain)
+                // and no-ops an already-completed one. runContinuationsAsynchronously keeps the consumer
+                // continuation / pipeline advance off this stack. When the body observed a user-cancel,
+                // THIS is the sole tenure-safe point to deliver the OCE; otherwise a clean end. A
+                // consumer-gone DisposeAsync drain gets the clean end, never an OCE (DisposeAsyncCore only
+                // swallows close), so the cancel OCE is suppressed once the consumer itself disposed.
                 _enumeratorCompleted = true;
-                _enumeratorMoveNextTaskSource.TrySetResult(false, runContinuationsAsynchronously: true);
-                if (!IsAsync)
-                    _callerInteractionCore.SignalProgress();
+                if (_onInlineDispatchStack)
+                {
+                    // Still synchronous on the inline dispatch frame (promise tenured here). Record the
+                    // terminal; the dispatch site lands it after ExecutePipelined returns and the tenure
+                    // is released. No completion (and so no ExecuteSource drive) happens on this frame.
+                    _pendingInlineTerminal = true;
+                    return;
+                }
+                DeliverTerminal();
                 return;
             }
             _enumeratorMoveNextTaskSource.SetResult(true, runContinuationsAsynchronously: false);
@@ -650,6 +746,44 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
     // against the consumer's own latch self-deliver). The source is in concurrent mode for every live
     // flow (Initialize, sync and async), so TrySet is the safe completer for both - teardown faults from
     // a different thread than the consumer regardless of mode. Marks terminal; signals the sync rendezvous.
+    // Latch a user-cancel WITHOUT completing the move-next source. Called from the (non-completing)
+    // cancellation registration callbacks and the eager-write catch. Completing the source here would do
+    // it from a context that may hold (or race) the shared pipeline promise, driving ExecuteSource into a
+    // TryStart over a tenured promise. Instead we latch intent + the token to carry, and RequestWake so a
+    // parked body advances to its terminal, where it delivers the OCE tenure-safely (after its return).
+    void RequestCancel(CancellationToken token)
+    {
+        _cancelDeliverToken = token;
+        Volatile.Write(ref _cancelRequested, true);
+        _callerInteractionCore.RequestWake();
+    }
+
+    // The terminal move-next completion (clean end, or user-cancel OCE), factored so it can run either
+    // inline (when the body suspended at least once - off the dispatch frame) or be deferred to the
+    // dispatch site (when the body ran fully synchronously on the inline frame, where the promise is
+    // tenured). Every completer here is runContinuationsAsynchronously: true so the consumer continuation
+    // / pipeline advance never runs inline on the completing stack.
+    void DeliverTerminal()
+    {
+        if (_deliverCancelOce && !_consumerGoneByDispose)
+            _enumeratorMoveNextTaskSource.TrySetException(new OperationCanceledException(_cancelDeliverToken), runContinuationsAsynchronously: true);
+        else
+            _enumeratorMoveNextTaskSource.TrySetResult(false, runContinuationsAsynchronously: true);
+        if (!IsAsync)
+            _callerInteractionCore.SignalProgress();
+    }
+
+    // Land a terminal the body deferred while it was on the inline dispatch frame. Called from the
+    // dispatch site right after ExecutePipelined returns - for a fully-synchronous body the promise
+    // tenure has already been released by the builder's task-get, so this completes tenure-free.
+    void LandPendingInlineTerminal()
+    {
+        if (!_pendingInlineTerminal)
+            return;
+        _pendingInlineTerminal = false;
+        DeliverTerminal();
+    }
+
     void DeliverClose(Exception closeException)
     {
         _enumeratorMoveNextTaskSource.TrySetException(closeException, runContinuationsAsynchronously: true);
@@ -674,8 +808,17 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
             return;
         if (_callerInteractionCore.CloseException is { } latched)
             _enumeratorMoveNextTaskSource.TrySetException(latched, runContinuationsAsynchronously: true);
-        else if (_callerCancellationToken.IsCancellationRequested)
-            _enumeratorMoveNextTaskSource.TrySetException(new OperationCanceledException(_callerCancellationToken), runContinuationsAsynchronously: true);
+        else if (Volatile.Read(ref _cancelRequested) || EffectiveCancellationToken.IsCancellationRequested)
+            _enumeratorMoveNextTaskSource.TrySetException(
+                new OperationCanceledException(EffectiveCancellationToken.IsCancellationRequested ? EffectiveCancellationToken : _cancelDeliverToken),
+                runContinuationsAsynchronously: true);
+        // Clean-end fallback. The body ran its ONE terminal onto a prior generation and returned; a
+        // disposer (or any rearm) then Reset onto this fresh PENDING generation with no remaining
+        // completer. With _enumeratorCompleted set and neither a close nor a live cancel, the terminal was
+        // a clean end (false) - deliver it here so the parked drain always completes. Guarded by
+        // _enumeratorCompleted so it never fabricates a false on a still-running flow.
+        else if (_enumeratorCompleted)
+            _enumeratorMoveNextTaskSource.TrySetResult(false, runContinuationsAsynchronously: true);
     }
 
     void HandleException(Exception ex)
@@ -761,9 +904,17 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
         _isResultReady = false;
         _callerInteractionCore.Reset();
         _callerCancellationToken = default;
+        _flowCancellationToken = default;
         _callerCancellationTokenRegistration.Dispose();
         _callerCancellationTokenRegistration = default;
-        _callerCancellationArmedVersion = 0;
+        _flowCancellationTokenRegistration.Dispose();
+        _flowCancellationTokenRegistration = default;
+        _cancelRequested = false;
+        _cancelDeliverToken = default;
+        _deliverCancelOce = false;
+        _onInlineDispatchStack = false;
+        _pendingInlineTerminal = false;
+        _consumerGoneByDispose = false;
         _consumerGone = false;
         // Dispatch state is per-tenure.
         _pipelinePromise = null;
@@ -892,12 +1043,13 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
             }
 
             // Rearm only on a non-first call. The first-call source is fresh from OnReset and the body's
-            // first delivery (a result, completion, or a teardown fault that bypasses the gate ordering)
-            // lands on it; Resetting here would rearm past that delivery, leaving the consumer parked on
-            // a generation nothing completes. A never-started flow's framework fault (OnComplete ->
-            // HandleException) also lands on this fresh generation, so the first call must not race it
-            // with a Reset either.
-            if (flow._consumerAdvanced)
+            // first delivery lands on it; Resetting here would rearm past that delivery. ALSO skip the
+            // rearm once consumer-gone (DisposeAsync drives the drain): the body's terminal is ONE-SHOT
+            // and completes the CURRENT generation; resetting to a fresh one parks the disposer on a
+            // generation the terminal can never reach (the disposer-reset-vs-one-shot-terminal hang). The
+            // drain only needs to drive the body (gate-open below) and observe its terminal on the
+            // generation it is already awaiting.
+            if (flow._consumerAdvanced && !flow.IsConsumerGone)
                 flow._enumeratorMoveNextTaskSource.Reset();
             flow._consumerAdvanced = true;
             // Open the gate to drive the body forward, OR self-deliver the close under close. Under close
@@ -934,7 +1086,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
             // awaiting so the body's terminal SetResult(null) doesn't hit a non-awaiting source.
             if (flow.IsInlineResultDelivery)
             {
-                flow.MarkConsumerGone();
+                flow.MarkConsumerGoneByDispose();
                 flow._enumeratorMoveNextTaskSource.Reset();
                 return;
             }
@@ -951,7 +1103,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
             // via WaitForContinuation drives it forward - MoveNext invokes the body's stored
             // continuation, the body observes IsConsumerGone and drains, and its terminal
             // SetResult(null) wakes the final WaitForContinuation via SignalProgress.
-            flow.MarkConsumerGone();
+            flow.MarkConsumerGoneByDispose();
             while (MoveNext())
                 Current.Dispose();
         }
@@ -970,51 +1122,28 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
             // on this same thread before unwinding.
             if (flow.IsInlineResultDelivery)
             {
-                flow.MarkConsumerGone();
+                flow.MarkConsumerGoneByDispose();
                 // See sync Dispose: Reset returns the move-next source to awaiting so the body's
                 // terminal SetResult(null) doesn't throw and trigger recovery on the next flow's bytes.
                 flow._enumeratorMoveNextTaskSource.Reset();
                 return new();
             }
 
-            // Order matters: mark consumer-gone (flag only), then MoveNextAsync (resets the move-next
-            // source and wakes an async-parked body), then RequestWake (TP-queues a sync-parked body).
-            // RequestWake must follow MoveNextAsync - reversed, a sync-parked body can drain and call
-            // SetResult(null) before the Reset, wiping the final signal so DisposeAsync's await hangs.
-            flow.MarkConsumerGone();
-            ValueTask<bool> task = MoveNextAsync();
-            flow.MarkConsumerGoneAndWake();
-            while (task.IsCompletedSuccessfully)
-            {
-                if (!task.Result)
-                    return new();
-                task = MoveNextAsync();
-            }
-
-            return DisposeAsyncCore(task);
-        }
-
-        [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
-        async ValueTask DisposeAsyncCore(ValueTask<bool> task)
-        {
-            // The consumer is gone (it called DisposeAsync), so a dead wire is the expected terminal
-            // state, not an error to surface. The body's teardown drive (gate-fault self-deliver, or a
-            // read-fault rethrow) lands the close on the generation this internal drain awaits; swallow
-            // it exactly as the consumer's own read loop does (catch (PgClientClosedException) {}). This
-            // is the single chokepoint for "close arrived while DisposeAsync was draining" - only the
-            // close is swallowed, every other fault still surfaces.
-            try
-            {
-                await task.ConfigureAwait(false);
-
-                // Flow cleans up the result every time, we do the absolute minimum here.
-                while (await MoveNextAsync().ConfigureAwait(false))
-                {
-                }
-            }
-            catch (PgClientClosedException)
-            {
-            }
+            // Fault and RETURN - do NOT drive or await the wire drain. The body drains autonomously:
+            // a read-parked body resumes on bytes; a gate-parked body, once woken, sees IsConsumerGone
+            // and skips the handoff to drain to RFQ. The pipeline retires the item only after the body's
+            // read settles, so the next flow still finds RFQ - that guarantee comes from item lifetime,
+            // not from Dispose blocking on it.
+            //   1. mark consumer-gone (the body's !IsConsumerGone guards then skip the handoff gates),
+            //   2. open the async gate - the SOLE async-gate waker; RequestWake cannot reach GateTaskSource,
+            //      so a body parked on the inter-result gate hangs without this,
+            //   3. RequestWake to wake a sync-suspended body (TP-queues its stored continuation).
+            // The body's autonomous terminal completes the move-next source (clean end), waking any
+            // consumer still mid-await. No drive loop, no DisposeAsyncCore await.
+            flow.MarkConsumerGoneByDispose();
+            flow._callerInteractionCore.GateTaskSource.TrySetResult(default);
+            flow._callerInteractionCore.RequestWake();
+            return new();
         }
 
         /// <inheritdoc />
