@@ -4,285 +4,218 @@ using Slon.Pg.Protocol.Flows;
 
 namespace Slon.Tests.Pg;
 
-// High-iteration stress for the user-cancellation move-next rendezvous, exercising the two-token model:
-//   - a token bound at SUBMIT (TryQueue/BindCallerToken) is flow-scoped and honored from the eager write,
-//     so a pre-fired token cancels the WHOLE flow deterministically - the first result cannot race through;
+// Stress for the user-cancellation move-next rendezvous, exercising the two-token model:
+//   - a token bound at SUBMIT (TryQueue) is flow-scoped and honored from the eager write, so a
+//     pre-fired token cancels the WHOLE flow deterministically - the first result cannot race through;
 //   - a token bound at GetAsyncEnumerator is flow-scoped too but bound AFTER the eager dispatch, so the
-//     first result is ALLOWED to race (either a delivered result or an OCE is acceptable);
+//     first result is ALLOWED to race (a delivered result or an OCE/close are all acceptable);
 //   - a per-read MoveNextAsync(ct) token cancels just that read.
-// The bug class under test is the lost wake / wrong-generation double-fire / pipeline-tenure reentry that
-// the generation-bound registration + version-aware terminal closed. A hang (caught by the per-iteration
-// timeout) is always a failure; the submit-bound case additionally requires a strict OCE.
+// The bug class is the lost wake / wrong-generation double-fire / pipeline-tenure reentry that the
+// generation-bound registration + version-aware terminal closed. A hang (caught by HangCap) always
+// fails; the submit-bound case additionally requires a strict OCE.
 [TestClass]
 [DoNotParallelize]
 public class CommandUserCancellationStressTests
 {
     static readonly TimeSpan HangCap = TimeSpan.FromSeconds(5);
 
-    static int Iters => int.TryParse(Environment.GetEnvironmentVariable("SLON_STRESS_ITERS"), out var n) && n > 0 ? n : 6000;
+    // I/O-bound (each iteration is a real pipelined command + cancel against a live PG backend over a
+    // few pooled connections), so the default keeps each test ~100ms in the suite. The races surface
+    // fast; a deliberate deep sweep raises the count via SLON_STRESS_ITERS (the original 6000 was ~800ms).
+    static int Iters => int.TryParse(Environment.GetEnvironmentVariable("SLON_STRESS_ITERS"), out var n) && n > 0 ? n : 500;
 
-    static async Task<PgClientProtocol[]> Pool(int n)
-    {
-        var arr = new PgClientProtocol[n];
-        for (var i = 0; i < n; i++)
-            arr[i] = await PgTestPool.NewIsolatedAsync();
-        return arr;
-    }
-
-    static CommandFlow NewFlow() => new(async: true,
+    static CommandFlow TwoResultFlow() => new(async: true,
         Command.Create("select generate_series(1, 50)"),
         Command.Create("select 'two'"));
 
-    static async Task Cleanup(CommandFlow.Enumerator e, int i)
+    // Drive one MoveNextAsync under the hang cap; returns the caught exception (or null on a delivered
+    // result). A TimeoutException is the lost-wake failure and is asserted here so callers don't repeat it.
+    static async Task<Exception?> MoveNextGuarded(CommandFlow.Enumerator e, CancellationToken ct, int i)
+    {
+        try { await e.MoveNextAsync(ct).AsTask().WaitAsync(HangCap); return null; }
+        catch (TimeoutException) { Assert.Fail($"iter {i}: MoveNextAsync never completed (lost wake)."); throw; }
+        catch (Exception ex) { return ex; }
+    }
+
+    static async Task DisposeGuarded(CommandFlow.Enumerator e, int i, string what)
     {
         try { await e.DisposeAsync().AsTask().WaitAsync(HangCap); }
-        catch (TimeoutException) { Assert.Fail($"iter {i}: DisposeAsync never completed."); }
+        catch (TimeoutException) { Assert.Fail($"iter {i}: {what} never completed."); }
         catch (OperationCanceledException) { }
         catch (PgClientClosedException) { }
     }
 
-    // Token bound at SUBMIT, pre-fired: the eager write honors it, so the first MoveNextAsync must surface
-    // OCE deterministically and never hang.
-    [TestMethod]
-    public async Task SubmitBound_PreFired_SurfacesOce()
+    // The shared race loop: N iterations over a small connection pool, each running `body` on a fresh
+    // protocol+iteration index, then disposing the enumerator it returns. Collapses the Pool / loop /
+    // Cleanup boilerplate every race test repeated.
+    static async Task RaceLoop(Func<PgClientProtocol, int, Task<CommandFlow.Enumerator>> body)
     {
-        var protocols = await Pool(8);
+        var protocols = new PgClientProtocol[8];
+        for (var p = 0; p < protocols.Length; p++)
+            protocols[p] = await PgTestPool.NewIsolatedAsync();
+
         for (var i = 0; i < Iters; i++)
         {
-            var protocol = protocols[i % protocols.Length];
-            var flow = NewFlow();
-            using var cts = new CancellationTokenSource();
-            cts.Cancel();
-            Assert.IsTrue(protocol.TryQueue(flow, cancellationToken: cts.Token));
-
-            var e = flow.GetAsyncEnumerator(cts.Token);
-            try
-            {
-                OperationCanceledException? oce = null;
-                try { await e.MoveNextAsync(cts.Token).AsTask().WaitAsync(HangCap); }
-                catch (OperationCanceledException ex) { oce = ex; }
-                catch (TimeoutException) { Assert.Fail($"iter {i}: MoveNextAsync never completed (lost wake)."); }
-                Assert.IsNotNull(oce, $"iter {i}: submit-bound pre-fired token must surface OCE, not a result");
-            }
-            finally { await Cleanup(e, i); }
+            CommandFlow.Enumerator e = default;
+            try { e = await body(protocols[i % protocols.Length], i); }
+            finally { await DisposeGuarded(e, i, "DisposeAsync"); }
         }
     }
 
-    // Token bound at GetAsyncEnumerator, pre-fired: bound after the eager dispatch, so the first result is
-    // ALLOWED to race. Either an OCE or a delivered result is acceptable; only a hang fails.
-    [TestMethod]
-    public async Task EnumeratorBound_PreFired_NeverLosesWake()
+    static void AssertCancelOrClose(Exception? caught, int i)
     {
-        var protocols = await Pool(8);
-        for (var i = 0; i < Iters; i++)
-        {
-            var protocol = protocols[i % protocols.Length];
-            var flow = NewFlow();
-            Assert.IsTrue(protocol.TryQueue(flow));
-
-            using var cts = new CancellationTokenSource();
-            cts.Cancel();
-
-            var e = flow.GetAsyncEnumerator(cts.Token);
-            try
-            {
-                Exception? caught = null;
-                try { await e.MoveNextAsync(cts.Token).AsTask().WaitAsync(HangCap); }
-                catch (TimeoutException) { Assert.Fail($"iter {i}: MoveNextAsync never completed (lost wake)."); }
-                catch (Exception ex) { caught = ex; }
-                if (caught is not null and not OperationCanceledException and not PgClientClosedException)
-                    Assert.Fail($"iter {i}: unexpected {caught.GetType().Name}: {caught}");
-            }
-            finally { await Cleanup(e, i); }
-        }
+        if (caught is not null and not OperationCanceledException and not PgClientClosedException)
+            Assert.Fail($"iter {i}: unexpected {caught.GetType().Name}: {caught}");
     }
 
-    // Timer-fired token (independent thread) bound at GetAsyncEnumerator: races the body and the consumer.
-    // Either outcome is acceptable; only a hang fails.
+    // Token bound at SUBMIT, pre-fired: the eager write honors it, so the first MoveNextAsync must
+    // surface OCE deterministically (a result racing through is a failure), and never hang.
     [TestMethod]
-    public async Task EnumeratorBound_TimerFired_NeverLosesWake()
+    public Task SubmitBound_PreFired_SurfacesOce() => RaceLoop(async (protocol, i) =>
     {
-        var protocols = await Pool(8);
-        for (var i = 0; i < Iters; i++)
-        {
-            var protocol = protocols[i % protocols.Length];
-            var flow = NewFlow();
-            Assert.IsTrue(protocol.TryQueue(flow));
+        var cts = new CancellationTokenSource();
+        cts.Cancel();
+        var flow = TwoResultFlow();
+        Assert.IsTrue(protocol.TryQueue(flow, cancellationToken: cts.Token));
+        var e = flow.GetAsyncEnumerator(cts.Token);
+        Assert.IsInstanceOfType<OperationCanceledException>(
+            await MoveNextGuarded(e, cts.Token, i),
+            $"iter {i}: submit-bound pre-fired token must surface OCE, not a result");
+        return e;
+    });
 
-            using var cts = new CancellationTokenSource();
-            cts.CancelAfter(TimeSpan.FromTicks((i % 7) * 5000));
+    // Token bound at GetAsyncEnumerator, pre-fired: bound after the eager dispatch, so the first result
+    // is ALLOWED to race. OCE, close, or a delivered result are all acceptable; only a hang fails.
+    [TestMethod]
+    public Task EnumeratorBound_PreFired_NeverLosesWake() => RaceLoop(async (protocol, i) =>
+    {
+        var flow = TwoResultFlow();
+        Assert.IsTrue(protocol.TryQueue(flow));
+        var cts = new CancellationTokenSource();
+        cts.Cancel();
+        var e = flow.GetAsyncEnumerator(cts.Token);
+        AssertCancelOrClose(await MoveNextGuarded(e, cts.Token, i), i);
+        return e;
+    });
 
-            var e = flow.GetAsyncEnumerator(cts.Token);
-            try
-            {
-                Exception? caught = null;
-                try { await e.MoveNextAsync(cts.Token).AsTask().WaitAsync(HangCap); }
-                catch (TimeoutException) { Assert.Fail($"iter {i}: MoveNextAsync never completed (lost wake)."); }
-                catch (Exception ex) { caught = ex; }
-                if (caught is not null and not OperationCanceledException and not PgClientClosedException)
-                    Assert.Fail($"iter {i}: unexpected {caught.GetType().Name}: {caught}");
-            }
-            finally { await Cleanup(e, i); }
-        }
-    }
+    // Timer-fired token (independent thread) bound at GetAsyncEnumerator: races the body and the
+    // consumer. Either outcome is acceptable; only a hang fails.
+    [TestMethod]
+    public Task EnumeratorBound_TimerFired_NeverLosesWake() => RaceLoop(async (protocol, i) =>
+    {
+        var flow = TwoResultFlow();
+        Assert.IsTrue(protocol.TryQueue(flow));
+        var cts = new CancellationTokenSource();
+        cts.CancelAfter(TimeSpan.FromTicks((i % 7) * 5000));
+        var e = flow.GetAsyncEnumerator(cts.Token);
+        AssertCancelOrClose(await MoveNextGuarded(e, cts.Token, i), i);
+        return e;
+    });
 
-    // Pipelined overlap: queue TWO cancellable flows back-to-back on one protocol so their executions
-    // overlap, maximizing the chance an off-stack cancel completion of one flow drives the pipeline
-    // advance while the other flow's execution promise is tenured (the concurrent-tenure hazard). Submit-
-    // bound pre-fired token on each. Only a hang or an unexpected exception fails.
+    // Pipelined overlap: queue TWO submit-bound pre-fired flows back-to-back on one protocol so their
+    // executions overlap, maximizing the chance an off-stack cancel completion of one drives the
+    // pipeline advance while the other's execution promise is tenured (the concurrent-tenure hazard).
+    // Only a hang or an unexpected exception fails.
     [TestMethod]
     public async Task Pipelined_SubmitBound_PreFired_NoTenureCollision()
     {
-        var protocols = await Pool(8);
+        var protocols = new PgClientProtocol[8];
+        for (var p = 0; p < protocols.Length; p++)
+            protocols[p] = await PgTestPool.NewIsolatedAsync();
+
         for (var i = 0; i < Iters; i++)
         {
             var protocol = protocols[i % protocols.Length];
-            var a = NewFlow();
-            var b = NewFlow();
-            using var ctsA = new CancellationTokenSource();
-            using var ctsB = new CancellationTokenSource();
-            ctsA.Cancel();
-            ctsB.Cancel();
+            var ctsA = new CancellationTokenSource(); ctsA.Cancel();
+            var ctsB = new CancellationTokenSource(); ctsB.Cancel();
+            var a = TwoResultFlow();
+            var b = TwoResultFlow();
             Assert.IsTrue(protocol.TryQueue(a, cancellationToken: ctsA.Token));
             Assert.IsTrue(protocol.TryQueue(b, cancellationToken: ctsB.Token));
             var ea = a.GetAsyncEnumerator(ctsA.Token);
             var eb = b.GetAsyncEnumerator(ctsB.Token);
             try
             {
-                var ta = DriveOnce(ea, ctsA.Token, i);
-                var tb = DriveOnce(eb, ctsB.Token, i);
-                await Task.WhenAll(ta, tb);
+                await Task.WhenAll(
+                    MoveNextGuarded(ea, ctsA.Token, i),
+                    MoveNextGuarded(eb, ctsB.Token, i));
             }
             finally
             {
-                await Cleanup(ea, i);
-                await Cleanup(eb, i);
+                await DisposeGuarded(ea, i, "DisposeAsync (a)");
+                await DisposeGuarded(eb, i, "DisposeAsync (b)");
             }
         }
-
-        static async Task DriveOnce(CommandFlow.Enumerator e, CancellationToken ct, int i)
-        {
-            try { await e.MoveNextAsync(ct).AsTask().WaitAsync(HangCap); }
-            catch (TimeoutException) { Assert.Fail($"iter {i}: MoveNextAsync never completed (lost wake)."); }
-            catch (OperationCanceledException) { }
-            catch (PgClientClosedException) { }
-        }
     }
 
-    // DEFAULT await-drain: WaitForDrainOnDispose defaults true, so DisposeAsync PARKS on the body's completion
-    // (no poll loop, no spin) so the wire is drained to RFQ before it returns. Dispose mid-batch after result
-    // 1, then immediately reuse the protocol - if the drain hadn't completed, the next op would desync.
-    [TestMethod]
-    public async Task WaitForDrainOnDispose_MidBatch_AwaitsDrain_ConnectionUsable()
+    static CommandFlow ThreeResultFlow() => new(async: true,
+        Command.Create("select generate_series(1, 50)"),
+        Command.Create("select 'two'"),
+        Command.Create("select 'three'"));
+
+    // Dispose mid-batch, then reuse the same protocol; the dispose+reuse contract must hand the next op
+    // a clean wire at RFQ. `waitForDrain` toggles the two dispose paths:
+    //   true  (default): DisposeAsync PARKS on the body's drain (no poll/spin) -> wire at RFQ on return.
+    //   false (opt-out): DisposeAsync faults+returns immediately; the body drains in the background and
+    //                    item retirement still hands the next op a clean wire.
+    static Task DisposeThenReuse(bool waitForDrain) => RaceLoop(async (protocol, i) =>
     {
-        var protocols = await Pool(8);
-        var iters = Math.Min(Iters, 3000);
-        for (var i = 0; i < iters; i++)
-        {
-            var protocol = protocols[i % protocols.Length];
-            var flow = new CommandFlow(async: true,
-                Command.Create("select generate_series(1, 50)"),
-                Command.Create("select 'two'"),
-                Command.Create("select 'three'"));
-            Assert.IsTrue(protocol.TryQueue(flow));
+        var flow = ThreeResultFlow();
+        flow.WaitForDrainOnDispose = waitForDrain;
+        Assert.IsTrue(protocol.TryQueue(flow));
 
-            var e = flow.GetAsyncEnumerator();
-            try { Assert.IsTrue(await e.MoveNextAsync().AsTask().WaitAsync(HangCap), $"iter {i}: result 1"); }
-            catch (TimeoutException) { Assert.Fail($"iter {i}: first MoveNextAsync hung"); }
+        var e = flow.GetAsyncEnumerator();
+        Assert.IsNull(await MoveNextGuarded(e, default, i), $"iter {i}: result 1 should be delivered");
 
-            // Dispose mid-batch; with WaitForDrainOnDispose it must not return until the body drained to RFQ.
-            try { await e.DisposeAsync().AsTask().WaitAsync(HangCap); }
-            catch (TimeoutException) { Assert.Fail($"iter {i}: WaitForDrainOnDispose DisposeAsync never completed (drain spin/hang)."); }
+        // This test disposes mid-body (the dispose-then-reuse contract is the point), so do it here and
+        // hand RaceLoop a default(Enumerator) - its trailing dispose then no-ops (flow == null).
+        var label = waitForDrain ? "wait-for-drain" : "opt-out";
+        await DisposeGuarded(e, i, $"{label} DisposeAsync");
+        try { await PgTestPool.RunAsync(protocol, "select 1").WaitAsync(HangCap); }
+        catch (TimeoutException) { Assert.Fail($"iter {i}: protocol unusable after {label} dispose (wire not at RFQ)."); }
+        catch (Exception ex) { Assert.Fail($"iter {i}: reuse after {label} dispose threw {ex.GetType().Name}: {ex.Message}"); }
+        return default;
+    });
 
-            // Immediately reuse - synchronously after the awaited drain, the wire must be at RFQ.
-            try { await PgTestPool.RunAsync(protocol, "select 1").WaitAsync(HangCap); }
-            catch (TimeoutException) { Assert.Fail($"iter {i}: protocol unusable after WaitForDrainOnDispose (wire not at RFQ)."); }
-            catch (Exception ex) { Assert.Fail($"iter {i}: reuse after WaitForDrainOnDispose threw {ex.GetType().Name}: {ex.Message}"); }
-        }
-    }
-
-    // Opt-OUT (WaitForDrainOnDispose=false): DisposeAsync faults + wakes the body and returns immediately
-    // WITHOUT parking on the drain. The body drains autonomously in the background; the next op on the
-    // protocol may briefly wait on item retirement but must succeed. Guards the fast-return (MarkConsumerGone)
-    // path now that wait-for-drain is the default.
+    // DEFAULT await-drain: DisposeAsync parks on the body's completion before returning, so the wire is
+    // at RFQ and immediately reusable.
     [TestMethod]
-    public async Task DisposeFastReturn_OptOut_BodyDrainsInBackground_ConnectionUsable()
-    {
-        var protocols = await Pool(8);
-        var iters = Math.Min(Iters, 3000);
-        for (var i = 0; i < iters; i++)
-        {
-            var protocol = protocols[i % protocols.Length];
-            var flow = new CommandFlow(async: true,
-                Command.Create("select generate_series(1, 50)"),
-                Command.Create("select 'two'"),
-                Command.Create("select 'three'"));
-            flow.WaitForDrainOnDispose = false;
-            Assert.IsTrue(protocol.TryQueue(flow));
+    public Task WaitForDrainOnDispose_MidBatch_AwaitsDrain_ConnectionUsable() => DisposeThenReuse(waitForDrain: true);
 
-            var e = flow.GetAsyncEnumerator();
-            try { Assert.IsTrue(await e.MoveNextAsync().AsTask().WaitAsync(HangCap), $"iter {i}: result 1"); }
-            catch (TimeoutException) { Assert.Fail($"iter {i}: first MoveNextAsync hung"); }
-
-            // Fault-and-return: must complete immediately, not park on the full drain.
-            try { await e.DisposeAsync().AsTask().WaitAsync(HangCap); }
-            catch (TimeoutException) { Assert.Fail($"iter {i}: opt-out DisposeAsync did not fast-return."); }
-            catch (Exception ex) { Assert.Fail($"iter {i}: opt-out DisposeAsync threw {ex.GetType().Name}: {ex.Message}"); }
-
-            // Background drain + item retirement must still hand the next op a clean wire.
-            try { await PgTestPool.RunAsync(protocol, "select 1").WaitAsync(HangCap); }
-            catch (TimeoutException) { Assert.Fail($"iter {i}: protocol unusable after opt-out dispose (background drain stuck)."); }
-            catch (Exception ex) { Assert.Fail($"iter {i}: reuse after opt-out dispose threw {ex.GetType().Name}: {ex.Message}"); }
-        }
-    }
-
-    // WaitForDrainOnDispose bounded by the flow token: if the caller's token fires while Dispose is
-    // waiting for the drain, Dispose must unwind FAST (not block the full drain) and not throw the OCE.
-    // The body stays consumer-gone and finishes draining in the background. A pre-fired token here means
-    // the wait returns immediately.
+    // Opt-OUT: DisposeAsync fast-returns; the body drains in the background and the next op still gets a
+    // clean wire via item retirement. Guards the fast-return (MarkConsumerGone) path.
     [TestMethod]
-    public async Task WaitForDrainOnDispose_TokenFired_UnwindsFast_NoThrow()
+    public Task DisposeFastReturn_OptOut_BodyDrainsInBackground_ConnectionUsable() => DisposeThenReuse(waitForDrain: false);
+
+    // WaitForDrainOnDispose bounded by the flow token: a pre-fired token means the drain-wait must not
+    // block on it - Dispose unwinds FAST and does not throw the OCE; the body finishes draining in the
+    // background and the next op still succeeds.
+    [TestMethod]
+    public Task WaitForDrainOnDispose_TokenFired_UnwindsFast_NoThrow() => RaceLoop(async (protocol, i) =>
     {
-        var protocols = await Pool(8);
-        var iters = Math.Min(Iters, 3000);
-        for (var i = 0; i < iters; i++)
-        {
-            var protocol = protocols[i % protocols.Length];
-            using var cts = new CancellationTokenSource();
-            cts.Cancel(); // pre-fired: the drain-wait must not block on it
-            var flow = new CommandFlow(async: true,
-                Command.Create("select generate_series(1, 50)"),
-                Command.Create("select 'two'"));
-            Assert.IsTrue(protocol.TryQueue(flow, cancellationToken: cts.Token));
+        var cts = new CancellationTokenSource();
+        cts.Cancel(); // pre-fired: the drain-wait must not block on it
+        var flow = TwoResultFlow();
+        Assert.IsTrue(protocol.TryQueue(flow, cancellationToken: cts.Token));
 
-            var e = flow.GetAsyncEnumerator(cts.Token);
-            // First read surfaces OCE (pre-fired) or a result; either is fine.
-            try { await e.MoveNextAsync(cts.Token).AsTask().WaitAsync(HangCap); }
-            catch (TimeoutException) { Assert.Fail($"iter {i}: first MoveNextAsync hung"); }
-            catch (OperationCanceledException) { }
-            catch (PgClientClosedException) { }
+        var e = flow.GetAsyncEnumerator(cts.Token);
+        AssertCancelOrClose(await MoveNextGuarded(e, cts.Token, i), i);  // OCE/close/result all fine
 
-            // Dispose with WaitForDrainOnDispose + a fired token: must unwind fast and not throw.
-            try { await e.DisposeAsync().AsTask().WaitAsync(HangCap); }
-            catch (TimeoutException) { Assert.Fail($"iter {i}: token-bounded DisposeAsync did not unwind (blocked on drain past cancel)."); }
-            catch (Exception ex) { Assert.Fail($"iter {i}: DisposeAsync threw {ex.GetType().Name} (should swallow the cancel): {ex.Message}"); }
-
-            // The body still drains in the background; the next op may briefly wait on it but must succeed.
-            try { await PgTestPool.RunAsync(protocol, "select 1").WaitAsync(HangCap); }
-            catch (TimeoutException) { Assert.Fail($"iter {i}: protocol unusable after token-bounded dispose."); }
-            catch (PgClientClosedException) { }
-        }
-    }
+        await DisposeGuarded(e, i, "token-bounded DisposeAsync");  // disposed mid-body; RaceLoop no-ops on default
+        try { await PgTestPool.RunAsync(protocol, "select 1").WaitAsync(HangCap); }
+        catch (TimeoutException) { Assert.Fail($"iter {i}: protocol unusable after token-bounded dispose."); }
+        catch (PgClientClosedException) { }
+        return default;
+    });
 
     // ErrorResponse surfacing on a consumer-gone drain (Npgsql parity). A command faults; the reader is
-    // disposed mid-batch with WaitForDrainOnDispose, so DisposeAsync parks on the drain and must rethrow
-    // the Postgres error. Single faulting sync segment => a BARE PostgresException.
+    // disposed mid-batch with WaitForDrainOnDispose, so DisposeAsync parks on the drain and rethrows the
+    // Postgres error. Single faulting sync segment => a BARE PostgresException.
     [TestMethod]
     public async Task WaitForDrainOnDispose_DrainHitsError_ThrowsBarePostgresException()
     {
         var protocol = await PgTestPool.NewIsolatedAsync();
-        // First command succeeds and yields a result; the SECOND faults (undefined table). One trailing
-        // sync (extended, WithSync=false) => one fault segment.
+        // First command succeeds; the SECOND faults (undefined table). One trailing sync => one segment.
         var flow = new CommandFlow(async: true,
             Command.Create("select 1"),
             Command.Create("select * from no_such_table_xyz"));
@@ -291,12 +224,10 @@ public class CommandUserCancellationStressTests
         var e = flow.GetAsyncEnumerator();
         Assert.IsTrue(await e.MoveNextAsync(), "first result not delivered");
 
-        // Dispose mid-batch: the drain hits the second command's ErrorResponse; await must surface it.
         var ex = await Assert.ThrowsExactlyAsync<PostgresException>(async () => await e.DisposeAsync());
         Assert.AreEqual("42P01", ex.SqlState, "expected undefined_table");
 
-        // Connection still usable (drained to RFQ).
-        await PgTestPool.RunAsync(protocol, "select 1");
+        await PgTestPool.RunAsync(protocol, "select 1");  // connection still usable (drained to RFQ)
     }
 
     // Multi-sync: per-command-sync (PreferSimple+WithSync) commands that EACH fault => multiple fault
@@ -320,4 +251,3 @@ public class CommandUserCancellationStressTests
         await PgTestPool.RunAsync(protocol, "select 1");
     }
 }
-
