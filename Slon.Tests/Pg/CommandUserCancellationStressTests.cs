@@ -240,5 +240,53 @@ public class CommandUserCancellationStressTests
             catch (PgClientClosedException) { }
         }
     }
+
+    // ErrorResponse surfacing on a consumer-gone drain (Npgsql parity). A command faults; the reader is
+    // disposed mid-batch with WaitForDrainOnDispose, so DisposeAsync parks on the drain and must rethrow
+    // the Postgres error. Single faulting sync segment => a BARE PostgresException.
+    [TestMethod]
+    public async Task WaitForDrainOnDispose_DrainHitsError_ThrowsBarePostgresException()
+    {
+        var protocol = await PgTestPool.NewIsolatedAsync();
+        // First command succeeds and yields a result; the SECOND faults (undefined table). One trailing
+        // sync (extended, WithSync=false) => one fault segment.
+        var flow = new CommandFlow(async: true,
+            Command.Create("select 1"),
+            Command.Create("select * from no_such_table_xyz"));
+        Assert.IsTrue(protocol.TryQueue(flow));
+        flow.WaitForDrainOnDispose = true;
+
+        var e = flow.GetAsyncEnumerator();
+        Assert.IsTrue(await e.MoveNextAsync(), "first result not delivered");
+
+        // Dispose mid-batch: the drain hits the second command's ErrorResponse; await must surface it.
+        var ex = await Assert.ThrowsExactlyAsync<PostgresException>(async () => await e.DisposeAsync());
+        Assert.AreEqual("42P01", ex.SqlState, "expected undefined_table");
+
+        // Connection still usable (drained to RFQ).
+        await PgTestPool.RunAsync(protocol, "select 1");
+    }
+
+    // Multi-sync: per-command-sync (PreferSimple+WithSync) commands that EACH fault => multiple fault
+    // segments => DisposeAsync throws an AggregateException of PostgresExceptions (full fidelity).
+    [TestMethod]
+    public async Task WaitForDrainOnDispose_MultiSyncErrors_ThrowsAggregate()
+    {
+        var protocol = await PgTestPool.NewIsolatedAsync();
+        var bad1 = Command.Create("select * from no_such_table_a") with { PreferSimple = true, WithSync = true };
+        var bad2 = Command.Create("select * from no_such_table_b") with { PreferSimple = true, WithSync = true };
+        var flow = new CommandFlow(async: true, Command.Create("select 1") with { PreferSimple = true, WithSync = true }, bad1, bad2);
+        Assert.IsTrue(protocol.TryQueue(flow));
+        flow.WaitForDrainOnDispose = true;
+
+        var e = flow.GetAsyncEnumerator();
+        Assert.IsTrue(await e.MoveNextAsync(), "first result not delivered");
+
+        var agg = await Assert.ThrowsExactlyAsync<AggregateException>(async () => await e.DisposeAsync());
+        Assert.IsTrue(agg.InnerExceptions.Count >= 2, $"expected >=2 errors, got {agg.InnerExceptions.Count}");
+        Assert.IsTrue(agg.InnerExceptions[0] is PostgresException, "inner should be PostgresException");
+
+        await PgTestPool.RunAsync(protocol, "select 1");
+    }
 }
 

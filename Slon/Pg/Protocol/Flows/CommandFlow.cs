@@ -51,6 +51,12 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
     // ThreadPool hop. Cleared the instant the body suspends (it then resumes on a continuation stack).
     bool _onInlineDispatchStack;
     bool _pendingInlineTerminal;
+    // Fresh ErrorResponses captured while draining a consumer-gone flow (one per faulting sync segment).
+    // Surfaced at the terminal so an await-drain DisposeAsync (WaitForDrainOnDispose) rethrows them - Npgsql
+    // parity: a Postgres error hit while draining a disposed reader must not be swallowed. Lazily allocated;
+    // null in the common no-error path (zero alloc). Only populated when IsConsumerGone (the drain); on the
+    // live path the active consumer observes errors per-result, so we do not double-surface.
+    System.Collections.Generic.List<PostgresException>? _drainErrors;
 
     // Consumer-gone signal: set only by the enumerator's Dispose/DisposeAsync, NOT the caller's
     // CancellationToken (which may just mean "skip this result"). The body reads it at handoff
@@ -460,6 +466,18 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                 else
                     (_pgError, _requestedRowDescription) = command.ReadUntilExecute(_decoder);
 
+                // On a consumer-gone drain, a command's ErrorResponse surfaces here (the response read hit
+                // an ErrorResponse instead of the expected message) rather than via a CommandResult the
+                // gone consumer would have enumerated. Capture it (Preserve()d) so the terminal surfaces it.
+                // A command error lands in EITHER _pgError (read phase) OR CompleteError (completion phase),
+                // never both, so capturing in both places does not double-count a single command's error.
+                var capturedThisCommand = false;
+                if (IsConsumerGone && _pgError is { } readError)
+                {
+                    (_drainErrors ??= new()).Add(new PostgresException(readError));
+                    capturedThisCommand = true;
+                }
+
                 // Dispose the registrations BEFORE the body returns (the awaited DisposeAsync sequences
                 // this strictly before tenure release; it also waits out any in-flight callback). After
                 // this, no callback can fire, so the next flow taking the shared promise never races one.
@@ -568,20 +586,18 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
 
                 {
                     state = ref context.GetProtocolStatic<ReadState>();
-                    if (state.ResultMessageEnumerator.CompleteError is { } err)
-                    {
-                        if (err.TransactionStatus is TransactionStatus.Error)
-                        {
-                            // Complete commands with the error until we reach a sync.
-                            // If we still read TransactionStatus.Error we complete until the next sync, and so on.
-                            // If we end up at TransactionStatus.Idle we reached a rollback and can resume from there.
-                            // If not we completed our flow, the protocol will see the last transaction status and handle it from there.
-                        }
-                        else
-                        {
-                            // Here we just have to complete commands with the error until we reach a sync, we can continue from there.
-                        }
-                    }
+                    // CompleteError is non-null only for a FRESHLY-faulted command (a real ErrorResponse on
+                    // this command's segment); a command skipped-to-sync by a prior fault returns null. On a
+                    // consumer-gone DRAIN, accumulate each fresh error so the terminal can surface them
+                    // (the active-consumer path instead observes errors per CommandResult, so skip it there).
+                    // The loop keeps draining remaining commands/segments to the final RFQ regardless, so the
+                    // wire is left clean; we only collect, never throw mid-drain. A WithSync=false batch yields
+                    // at most one such error (one trailing sync); per-command-sync flows can yield several.
+                    // Capture a completion-phase error only if the read phase did not already capture this
+                    // command's error (a single command's ErrorResponse can appear in both _pgError and
+                    // CompleteError - dedupe so one fault is one entry).
+                    if (IsConsumerGone && !capturedThisCommand && state.ResultMessageEnumerator.CompleteError is { } err)
+                        (_drainErrors ??= new()).Add(new PostgresException(err.Error));
                 }
             }
 
@@ -773,7 +789,19 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
     // / pipeline advance never runs inline on the completing stack.
     void DeliverTerminal()
     {
-        if (_deliverCancelOce && !_consumerGoneByDispose)
+        // Drained ErrorResponses win: a Postgres error hit while draining is connection-state truth that
+        // must surface (Npgsql parity), over a clean end or a user-cancel OCE. One error => a bare
+        // PostgresException (the common case); several (a per-command-sync batch that faulted in multiple
+        // segments) => an AggregateException, lossless - the ADO layer can take InnerExceptions[0] if it
+        // only wants the first. An await-drain DisposeAsync (WaitForDrainOnDispose) rethrows this via
+        // WaitForComplete; a fault-and-return dispose returns before this, so the error is observed by the
+        // flow's completion rather than out of dispose.
+        if (_drainErrors is { Count: > 0 } errors)
+        {
+            Exception fault = errors.Count == 1 ? errors[0] : new AggregateException(errors);
+            _enumeratorMoveNextTaskSource.TrySetException(fault, runContinuationsAsynchronously: true);
+        }
+        else if (_deliverCancelOce && !_consumerGoneByDispose)
             _enumeratorMoveNextTaskSource.TrySetException(new OperationCanceledException(_cancelDeliverToken), runContinuationsAsynchronously: true);
         else
             _enumeratorMoveNextTaskSource.TrySetResult(false, runContinuationsAsynchronously: true);
@@ -809,7 +837,15 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
         catch (PgClientClosedException)
         {
             // The flow completed via a protocol close; that is a clean terminal for a disposing consumer.
+            return;
         }
+        // The drain reached RFQ. Surface any ErrorResponses hit while draining (Npgsql parity): one => a
+        // bare PostgresException, several (multi-sync) => an AggregateException (ADO takes InnerExceptions[0]
+        // if it only wants the first). WaitForComplete keys off the completion signal, which resolves
+        // successfully even when the drain saw command errors - those are accumulated separately, surfaced
+        // here so they escape await DisposeAsync().
+        if (_drainErrors is { Count: > 0 } errors)
+            throw errors.Count == 1 ? errors[0] : new AggregateException(errors);
     }
 
     void DeliverClose(Exception closeException)
@@ -942,6 +978,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
         _deliverCancelOce = false;
         _onInlineDispatchStack = false;
         _pendingInlineTerminal = false;
+        _drainErrors = null;
         _consumerGoneByDispose = false;
         _consumerGone = false;
         // Dispatch state is per-tenure.
@@ -1143,7 +1180,10 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                 return new();
 
             if (flow._enumeratorCompleted)
-                return new();
+                // Already terminal. Under WaitForDrainOnDispose, the drain may have completed WITH errors
+                // before the consumer got here; surface them (WaitForComplete returns immediately, then
+                // AwaitDrainOnDispose throws the accumulated error). Otherwise nothing to do.
+                return flow.WaitForDrainOnDispose ? flow.AwaitDrainOnDispose() : new();
 
             // Inline result-delivery: caller's await continuation is running on the body's
             // thread inside SetResult. MarkConsumerGone and return; body's re-check drains
@@ -1154,7 +1194,12 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                 // See sync Dispose: Reset returns the move-next source to awaiting so the body's
                 // terminal SetResult(null) doesn't throw and trigger recovery on the next flow's bytes.
                 flow._enumeratorMoveNextTaskSource.Reset();
-                return new();
+                // Under WaitForDrainOnDispose, still surface drain errors / wait for the drain - but do it
+                // ASYNC (AwaitDrainOnDispose awaits WaitForComplete, it does not block), so we don't dead-
+                // lock the body thread we're currently on inside its inline SetResult. The body's
+                // post-SetResult re-check drains (consumer-gone) and completes; AwaitDrainOnDispose then
+                // throws any accumulated ErrorResponse.
+                return flow.WaitForDrainOnDispose ? flow.AwaitDrainOnDispose() : new();
             }
 
             // Fault and RETURN - do NOT drive or await the wire drain. The body drains autonomously:
