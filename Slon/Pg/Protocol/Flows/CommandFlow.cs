@@ -23,6 +23,11 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
     FlowCallerInteractionCore<FlowCallerInteractionCoreResult> _callerInteractionCore;
     CancellationToken _callerCancellationToken;
     CancellationTokenRegistration _callerCancellationTokenRegistration;
+    // The move-next generation (source Version) the cancellation registration is armed against. The
+    // callback faults ONLY this generation: a late fire (the body advanced to the next command, or the
+    // consumer Reset to a fresh generation) must not fault a generation it was not armed for - that is
+    // the wrong-generation double-fire / stale-wake. Captured at arm, checked in the callback.
+    short _callerCancellationArmedVersion;
 
     // Consumer-gone signal: set only by the enumerator's Dispose/DisposeAsync, NOT the caller's
     // CancellationToken (which may just mean "skip this result"). The body reads it at handoff
@@ -350,8 +355,17 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                 if (_callerCancellationToken.CanBeCanceled && !IsConsumerGone)
                 {
                     Debug.Assert(IsAsync);
-                    _callerCancellationTokenRegistration = _callerCancellationToken.UnsafeRegister(static (state, token)
-                        => ((CommandFlow)state!)._enumeratorMoveNextTaskSource.TrySetException(new OperationCanceledException(token)), this);
+                    // Bind the registration to THIS read's move-next generation. The callback faults only
+                    // while the source is still on the armed generation (and pending): a fire that lands
+                    // after the body advanced past this command, or after the consumer Reset to its next
+                    // generation, no-ops instead of faulting the wrong/stale generation.
+                    _callerCancellationArmedVersion = _enumeratorMoveNextTaskSource.Version;
+                    _callerCancellationTokenRegistration = _callerCancellationToken.UnsafeRegister(static (state, token) =>
+                    {
+                        var f = (CommandFlow)state!;
+                        if (f._enumeratorMoveNextTaskSource.Version == f._callerCancellationArmedVersion)
+                            f._enumeratorMoveNextTaskSource.TrySetException(new OperationCanceledException(token), runContinuationsAsynchronously: true);
+                    }, this);
                 }
 
                 if (IsAsync)
@@ -591,23 +605,20 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                 DeliverClose(_callerInteractionCore.CloseException);
                 return;
             }
-            // If the move-next source is already terminal (a pre-deliver path faulted it and
-            // marked _enumeratorCompleted), the body's natural SetResult(null) would hit an
-            // already-completed source and throw. The cancel is already communicated, so no-op.
-            if (_enumeratorCompleted && completed)
+            if (completed)
             {
+                // Version-aware terminal. _enumeratorCompleted is version-less: a DisposeAsync drain (or
+                // any rearm) Resets the source onto a fresh PENDING generation AFTER a prior generation
+                // went terminal, and parks awaiting THAT generation. A blanket no-op on the flag strands
+                // it. TrySetResult lands a clean end on a pending generation (waking a parked drain) and
+                // no-ops an already-completed one (idempotent against the registration's OCE / a close).
+                _enumeratorCompleted = true;
+                _enumeratorMoveNextTaskSource.TrySetResult(false, runContinuationsAsynchronously: true);
                 if (!IsAsync)
                     _callerInteractionCore.SignalProgress();
                 return;
             }
-            _enumeratorCompleted = completed;
-            _enumeratorMoveNextTaskSource.SetResult(!completed, runContinuationsAsynchronously: completed);
-            // On completion the body registers no follow-up continuation, so wake any parked sync
-            // MoveNext directly. On result delivery the body's next statement stores a continuation
-            // and signals the mres itself; signaling here would race ahead and surface a
-            // "no continuation" wake.
-            if (!IsAsync && completed)
-                _callerInteractionCore.SignalProgress();
+            _enumeratorMoveNextTaskSource.SetResult(true, runContinuationsAsynchronously: false);
         }
 
         async ValueTask ReadRfqAsync(PgDecoder decoder)
@@ -752,6 +763,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
         _callerCancellationToken = default;
         _callerCancellationTokenRegistration.Dispose();
         _callerCancellationTokenRegistration = default;
+        _callerCancellationArmedVersion = 0;
         _consumerGone = false;
         // Dispatch state is per-tenure.
         _pipelinePromise = null;
