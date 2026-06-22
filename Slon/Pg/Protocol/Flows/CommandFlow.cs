@@ -441,13 +441,14 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
             // by DispatchPipelinedRead's waiter.IsCompleted check, so the fast path returns
             // sync-immediately in both modes. The await is free when sync-completed.
             //
-            // Do NOT pass the user cancel token here. A pre-fired user token would make GetResult's
-            // ThrowIfCancellationRequested throw OCE out of the body, faulting the pipeline task and
-            // triggering wire RECOVERY (a recovery substitute's ExecuteCore then races the main
-            // executor's next dispatch on the shared promise => "already executing"). A user cancel is
-            // not a wire fault: the body must activate, then the cancel-drain transition below drains
-            // to RFQ and delivers the OCE at the terminal. I/O is never cancelled by the user token
-            // (only the read timeout / wire abort), so activation must not be either.
+            // Do NOT pass the user cancel token here. With the token at the gate, a cancel fired before
+            // activation makes GetResult throw OCE out of the body, faulting the pipeline task - so the
+            // framework RESYNCS this flow via a recovery substitute (inject Sync, drain inherited RFQs).
+            // That is the wrong tool: a user cancel is not a wire fault, and the flow can resync itself.
+            // Activate unconditionally; the cancel-drain transition below observes the latched cancel,
+            // MarkConsumerGoneByBody, drains to RFQ, and delivers the OCE at the terminal - the same
+            // self-drain a consumer-gone dispose uses, no recovery flow. I/O is never cancelled by the
+            // user token (only the read timeout / wire abort), so activation must not be either.
             _decoder = await context.GetDecoderAuto().ConfigureAwait(false);
             while (++_commandIndex < CommandCount)
             {

@@ -738,9 +738,24 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public ValueTask<PipelineItemResult> ExecuteItemAsync(PgClientFlow item, CancellationToken cancellationToken)
+        public ValueTask<PipelineItemResult> ExecuteItemAsync(PgClientFlow item, bool waiterExecution, CancellationToken cancellationToken)
         {
             item.GetExecutionControl(_control).Start();
+
+            // The pooled execute promise is SINGLE-PUMPED: the executor pump serializes its dispatches,
+            // so one ExecuteCore releases the promise before the next Starts, and reusing one instance is
+            // safe. A waiter execution (the waiter-drain recovery, off the advancer chain) can run
+            // alongside an in-flight executor dispatch; routing it through the pooled promise would let
+            // the two TryStart the one promise at once -> "already executing". The framework tells us
+            // which side issued this, so we read it off waiterExecution, not off item type: most recovery
+            // dispatches run INLINE on the executor thread (serialized) and DO use the pooled promise;
+            // only the waiter-side one overlaps. A waiter execution takes the stock async builder so it
+            // never touches the shared promise - the two sides become independent by construction. Free:
+            // that path's ExecuteAuto (recovery's) completes synchronously, so the stock builder never
+            // suspends and never boxes a state machine.
+            if (waiterExecution)
+                return ExecuteWaiter(_control, item, cancellationToken);
+
             PromiseAsyncValueTaskMethodBuilder<PipelineItemResult>.Promise = _promise;
             try
             {
@@ -760,6 +775,14 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
                 // shared, cumulative UnflushedBytes), and any sub-threshold remainder is drained by the
                 // source's arm gate / idle flush before the executor parks. A pre-flush here would
                 // re-check the same cumulative bound the source and the flows already enforce.
+                var tasks = await control.Execute(item).ConfigureAwait(false);
+                return new PipelineItemResult(tasks.TrailingExecutionTask, tasks.PipelineTask);
+            }
+
+            // Stock builder (no shared promise) for a waiter-side dispatch. Body identical to ExecuteCore.
+            static async ValueTask<PipelineItemResult> ExecuteWaiter(
+                Control control, PgClientFlow item, CancellationToken cancellationToken)
+            {
                 var tasks = await control.Execute(item).ConfigureAwait(false);
                 return new PipelineItemResult(tasks.TrailingExecutionTask, tasks.PipelineTask);
             }
