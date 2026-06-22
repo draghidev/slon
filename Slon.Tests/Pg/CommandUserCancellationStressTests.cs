@@ -201,5 +201,44 @@ public class CommandUserCancellationStressTests
             catch (Exception ex) { Assert.Fail($"iter {i}: reuse after WaitForDrainOnDispose threw {ex.GetType().Name}: {ex.Message}"); }
         }
     }
+
+    // WaitForDrainOnDispose bounded by the flow token: if the caller's token fires while Dispose is
+    // waiting for the drain, Dispose must unwind FAST (not block the full drain) and not throw the OCE.
+    // The body stays consumer-gone and finishes draining in the background. A pre-fired token here means
+    // the wait returns immediately.
+    [TestMethod]
+    public async Task WaitForDrainOnDispose_TokenFired_UnwindsFast_NoThrow()
+    {
+        var protocols = await Pool(8);
+        var iters = Math.Min(Iters, 3000);
+        for (var i = 0; i < iters; i++)
+        {
+            var protocol = protocols[i % protocols.Length];
+            using var cts = new CancellationTokenSource();
+            cts.Cancel(); // pre-fired: the drain-wait must not block on it
+            var flow = new CommandFlow(async: true,
+                Command.Create("select generate_series(1, 50)"),
+                Command.Create("select 'two'"));
+            flow.WaitForDrainOnDispose = true;
+            Assert.IsTrue(protocol.TryQueue(flow, cancellationToken: cts.Token));
+
+            var e = flow.GetAsyncEnumerator(cts.Token);
+            // First read surfaces OCE (pre-fired) or a result; either is fine.
+            try { await e.MoveNextAsync(cts.Token).AsTask().WaitAsync(HangCap); }
+            catch (TimeoutException) { Assert.Fail($"iter {i}: first MoveNextAsync hung"); }
+            catch (OperationCanceledException) { }
+            catch (PgClientClosedException) { }
+
+            // Dispose with WaitForDrainOnDispose + a fired token: must unwind fast and not throw.
+            try { await e.DisposeAsync().AsTask().WaitAsync(HangCap); }
+            catch (TimeoutException) { Assert.Fail($"iter {i}: token-bounded DisposeAsync did not unwind (blocked on drain past cancel)."); }
+            catch (Exception ex) { Assert.Fail($"iter {i}: DisposeAsync threw {ex.GetType().Name} (should swallow the cancel): {ex.Message}"); }
+
+            // The body still drains in the background; the next op may briefly wait on it but must succeed.
+            try { await PgTestPool.RunAsync(protocol, "select 1").WaitAsync(HangCap); }
+            catch (TimeoutException) { Assert.Fail($"iter {i}: protocol unusable after token-bounded dispose."); }
+            catch (PgClientClosedException) { }
+        }
+    }
 }
 

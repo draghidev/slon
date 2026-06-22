@@ -792,6 +792,26 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
         DeliverTerminal();
     }
 
+    // Token-bounded await-drain for WaitForDrainOnDispose. Parks on the body's completion until it
+    // drains to RFQ, OR the flow/enumerator token fires - then unwind fast (the body stays consumer-gone
+    // and finishes draining on its own; we just stop waiting). The cancel is swallowed: DisposeAsync must
+    // not throw the caller's own token out of a dispose.
+    async ValueTask AwaitDrainOnDispose()
+    {
+        try
+        {
+            await WaitForComplete(_flowCancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (_flowCancellationToken.IsCancellationRequested)
+        {
+            // Caller cancelled the wait; unwind. The body drains autonomously in the background.
+        }
+        catch (PgClientClosedException)
+        {
+            // The flow completed via a protocol close; that is a clean terminal for a disposing consumer.
+        }
+    }
+
     void DeliverClose(Exception closeException)
     {
         _enumeratorMoveNextTaskSource.TrySetException(closeException, runContinuationsAsynchronously: true);
@@ -1153,10 +1173,12 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
             flow._callerInteractionCore.RequestWake();
             // Opt-in await-drain: PARK on the body's completion signal (TCS-backed WaitForComplete), so
             // the wire is drained to RFQ before this returns. This WAITS on the body, it does not DRIVE
-            // it - no poll loop, so no busy-spin. Default (false) returns immediately and lets the body
-            // drain in the background.
+            // it - no poll loop, so no busy-spin. Bounded by the flow/enumerator token: if the caller's
+            // token has fired they no longer want to wait, so we unwind FAST. The body stays consumer-gone
+            // and keeps draining autonomously in the background regardless - we just stop waiting on it.
+            // Default (false) returns immediately and lets the body drain in the background.
             if (flow.WaitForDrainOnDispose)
-                return flow.WaitForComplete();
+                return flow.AwaitDrainOnDispose();
             return new();
         }
 
