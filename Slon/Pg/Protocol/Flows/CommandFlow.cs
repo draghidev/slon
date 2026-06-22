@@ -440,7 +440,15 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
             // GetDecoderAuto adapts to flow mode internally. Activation has already been gated
             // by DispatchPipelinedRead's waiter.IsCompleted check, so the fast path returns
             // sync-immediately in both modes. The await is free when sync-completed.
-            _decoder = await context.GetDecoderAuto(EffectiveCancellationToken).ConfigureAwait(false);
+            //
+            // Do NOT pass the user cancel token here. A pre-fired user token would make GetResult's
+            // ThrowIfCancellationRequested throw OCE out of the body, faulting the pipeline task and
+            // triggering wire RECOVERY (a recovery substitute's ExecuteCore then races the main
+            // executor's next dispatch on the shared promise => "already executing"). A user cancel is
+            // not a wire fault: the body must activate, then the cancel-drain transition below drains
+            // to RFQ and delivers the OCE at the terminal. I/O is never cancelled by the user token
+            // (only the read timeout / wire abort), so activation must not be either.
+            _decoder = await context.GetDecoderAuto().ConfigureAwait(false);
             while (++_commandIndex < CommandCount)
             {
                 _isResultReady = false;
@@ -609,8 +617,11 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                     // at most one such error (one trailing sync); per-command-sync flows can yield several.
                     // Capture a completion-phase error only if the read phase did not already capture this
                     // command's error (a single command's ErrorResponse can appear in both _pgError and
-                    // CompleteError - dedupe so one fault is one entry).
-                    if (IsConsumerGone && !capturedThisCommand && state.ResultMessageEnumerator.CompleteError is { } err)
+                    // CompleteError - dedupe so one fault is one entry). Also skip a command whose result
+                    // was DELIVERED to a live consumer (_isResultReady): the consumer owns that error (it
+                    // throws on GetCommandComplete), so a drain-collect here would double-surface it once
+                    // the consumer consumes-then-disposes (IsConsumerGone flips true after delivery).
+                    if (IsConsumerGone && !_isResultReady && !capturedThisCommand && state.ResultMessageEnumerator.CompleteError is { } err)
                         (_drainErrors ??= new()).Add(new PostgresException(err.Error));
                 }
             }
