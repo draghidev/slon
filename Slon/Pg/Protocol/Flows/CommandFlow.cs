@@ -939,8 +939,11 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
         // move-next task source.
         if (!IsAsync)
             _callerInteractionCore.SignalProgress();
-        // TODO use tryrecover to consume as many rfqs as we have left at the time of throwing.
-        // TODO This essentially replaces manually having to consume the flow remainder on unexpected errors (e.g. unhandled protocol errors).
+        // The remainder (leftover RFQs) is NOT consumed here. When a consumer is truly gone the body
+        // rethrows and the framework's ResyncRecoveryFlow inherits this flow's live RfqCount and blind-
+        // drains it. When a consumer is present (live or wait-for-drain) the body drains it ITSELF
+        // (MarkConsumerGoneByBody + the _drainErrors / per-result surfacing) - recovery must not take it,
+        // it is a blind read-drain and cannot publish ErrorResponses to a waiting consumer.
     }
 
 
