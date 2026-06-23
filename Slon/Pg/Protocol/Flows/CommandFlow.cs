@@ -54,20 +54,20 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
     // Fresh ErrorResponses captured while draining a consumer-gone flow (one per faulting sync segment).
     // Surfaced at the terminal so an await-drain DisposeAsync (WaitForDrainOnDispose) rethrows them - Npgsql
     // parity: a Postgres error hit while draining a disposed reader must not be swallowed. Lazily allocated;
-    // null in the common no-error path (zero alloc). Only populated when IsConsumerGone (the drain); on the
+    // null in the common no-error path (zero alloc). Only populated when IsDraining (the drain); on the
     // live path the active consumer observes errors per-result, so we do not double-surface.
     System.Collections.Generic.List<PostgresException>? _drainErrors;
 
-    // Consumer-gone signal: set only by the enumerator's Dispose/DisposeAsync, NOT the caller's
-    // CancellationToken (which may just mean "skip this result"). The body reads it at handoff
-    // boundaries. Not exposed as a CancellationToken: that would invite I/O ops to register and
-    // throw OCE, breaking the drain-to-clean-state guarantee.
-    // The body's mode switch: once set, the body skips the user-handoff gates and drains the wire to RFQ
-    // autonomously (it no longer waits to be driven by MoveNextAsync). Set by exactly one of the three
-    // departure paths below. Not exposed as a CancellationToken: that would invite I/O ops to register and
-    // throw OCE, breaking the drain-to-clean-state guarantee.
-    bool _consumerGone;
-    internal bool IsConsumerGone => Volatile.Read(ref _consumerGone);
+    // The body's drain-mode switch: once set, the body skips the user-handoff gates and drains the wire to
+    // RFQ autonomously (it no longer waits to be driven by MoveNextAsync). Named for the body MODE, not a
+    // consumer event, because it is set by ALL three departure paths below - including the body opting the
+    // consumer out on its own cancel/stopping drain, where the consumer is still live and did NOT depart
+    // ("consumer-gone" / "detached" would be false for that path; _consumerDisposed is the narrower
+    // consumer-only fact). NOT the caller's CancellationToken (which may just mean "skip this result"), and
+    // not exposed AS a CancellationToken: that would invite I/O ops to register and throw OCE, breaking the
+    // drain-to-clean-state guarantee.
+    bool _draining;
+    internal bool IsDraining => Volatile.Read(ref _draining);
 
     // The consumer DISPOSED the enumerator (the two consumer departure paths below), as opposed to the
     // body opting the consumer out on its own cancel/close drain. The terminal suppresses a user-cancel
@@ -91,7 +91,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
     void MarkConsumerGone()
     {
         Volatile.Write(ref _consumerDisposed, true);
-        Volatile.Write(ref _consumerGone, true);
+        Volatile.Write(ref _draining, true);
     }
 
     // Consumer departure path 2 of 2: WAIT-FOR-DRAIN. The consumer disposed and wants DisposeAsync to park
@@ -100,13 +100,13 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
     void MarkConsumerWaitForDrain()
     {
         Volatile.Write(ref _consumerDisposed, true);
-        Volatile.Write(ref _consumerGone, true);
+        Volatile.Write(ref _draining, true);
     }
 
     // NOT a consumer departure: the BODY itself opts the consumer out during its own cancel/StoppingToken
     // drain (the consumer is still live and gets the OCE/close at the terminal - so this does NOT set
     // _consumerDisposed, which would suppress that OCE).
-    void MarkConsumerGoneByBody() => Volatile.Write(ref _consumerGone, true);
+    void MarkConsumerGoneByBody() => Volatile.Write(ref _draining, true);
 
     // Set TRUE around SetResult(result) when delivery runs the caller's await continuation INLINE
     // on the body's thread. A Dispose/DisposeAsync from that continuation short-circuits
@@ -479,13 +479,13 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                 // INLINE here, which is now harmless (it only latches). Both registrations are disposed
                 // below via the awaited DisposeAsync BEFORE the body returns and releases the promise, so
                 // no callback can fire after the next flow takes the promise.
-                if (_callerCancellationToken.CanBeCanceled && !IsConsumerGone)
+                if (_callerCancellationToken.CanBeCanceled && !IsDraining)
                 {
                     Debug.Assert(IsAsync);
                     _callerCancellationTokenRegistration = _callerCancellationToken.UnsafeRegister(static (state, token)
                         => ((CommandFlow)state!).RequestCancel(token), this);
                 }
-                if (_flowCancellationToken.CanBeCanceled && !IsConsumerGone)
+                if (_flowCancellationToken.CanBeCanceled && !IsDraining)
                 {
                     Debug.Assert(IsAsync);
                     _flowCancellationTokenRegistration = _flowCancellationToken.UnsafeRegister(static (state, token)
@@ -503,7 +503,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                 // A command error lands in EITHER _pgError (read phase) OR CompleteError (completion phase),
                 // never both, so capturing in both places does not double-count a single command's error.
                 var capturedThisCommand = false;
-                if (IsConsumerGone && _pgError is { } readError)
+                if (IsDraining && _pgError is { } readError)
                 {
                     (_drainErrors ??= new()).Add(new PostgresException(readError));
                     capturedThisCommand = true;
@@ -524,7 +524,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                 // the wire drain to RFQ so the protocol stays usable. The terminal SetResult delivers the
                 // OCE, sequenced with the body's return.
                 if ((Volatile.Read(ref _cancelRequested) || EffectiveCancellationToken.IsCancellationRequested)
-                    && !IsConsumerGone && !_enumeratorCompleted)
+                    && !IsDraining && !_enumeratorCompleted)
                 {
                     _cancelDeliverToken = EffectiveCancellationToken.IsCancellationRequested ? EffectiveCancellationToken : _cancelDeliverToken;
                     _deliverCancelOce = true;
@@ -548,7 +548,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                 }
                 result.Initialize(_commandIndex, descriptor, _requestedRowDescription, !command.DescribeOnly, command.IsSimple());
 
-                // Drain transition. IsConsumerGone (Enumerator.Dispose) is the consumer's opt-out:
+                // Drain transition. IsDraining (Enumerator.Dispose) is the consumer's opt-out:
                 // skip the user-handoff and drain the wire to RFQ ourselves, no fault on the source.
                 // StoppingToken (graceful shutdown) is the protocol-close signal: the input-commands-
                 // equals-output-results rule means we can't silently drop CommandResults while a
@@ -556,7 +556,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                 // PgClientClosedException (OCE is reserved for the caller's own token), then fall
                 // through to the same wire drain. No throw in the body. ErrorResponse failures are
                 // NOT handled here; they flow through as failing CommandResults normally.
-                if (context.StoppingToken.IsCancellationRequested && !IsConsumerGone && !_enumeratorCompleted)
+                if (context.StoppingToken.IsCancellationRequested && !IsDraining && !_enumeratorCompleted)
                 {
                     // Latch the close (a consumer that Resets past this point self-delivers it), wake a
                     // parked consumer, then drain.
@@ -564,7 +564,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                     DeliverClose(context.ClosedException!);
                     MarkConsumerGoneByBody();
                 }
-                if (!IsConsumerGone)
+                if (!IsDraining)
                 {
                     // First result, ASYNC ONLY: re-establish the gate-ordered rendezvous the eager
                     // write removed. The write is now eager (so a batch's deferred flush is not stranded
@@ -580,7 +580,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                     if (_commandIndex is 0 && IsAsync)
                         await _callerInteractionCore.GetGateTask(this).ConfigureAwait(false);
 
-                    if (!IsConsumerGone)
+                    if (!IsDraining)
                     {
                         _isResultReady = true;
                         Volatile.Write(ref _inlineResultDelivery, true);
@@ -593,7 +593,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                             Volatile.Write(ref _inlineResultDelivery, false);
                         }
 
-                        if (!IsConsumerGone)
+                        if (!IsDraining)
                         {
                             if (IsAsync)
                                 await _callerInteractionCore.GetGateTask(this).ConfigureAwait(false);
@@ -629,8 +629,8 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                     // CompleteError - dedupe so one fault is one entry). Also skip a command whose result
                     // was DELIVERED to a live consumer (_isResultReady): the consumer owns that error (it
                     // throws on GetCommandComplete), so a drain-collect here would double-surface it once
-                    // the consumer consumes-then-disposes (IsConsumerGone flips true after delivery).
-                    if (IsConsumerGone && !_isResultReady && !capturedThisCommand && state.ResultMessageEnumerator.CompleteError is { } err)
+                    // the consumer consumes-then-disposes (IsDraining flips true after delivery).
+                    if (IsDraining && !_isResultReady && !capturedThisCommand && state.ResultMessageEnumerator.CompleteError is { } err)
                         (_drainErrors ??= new()).Add(new PostgresException(err.Error));
                 }
             }
@@ -671,7 +671,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
             // close from propagating as an exception through the pipeline drain only to be swallowed by
             // DisposeAsyncCore / the sync Dispose loop. A live consumer instead gets the close on its
             // move-next source and we rethrow so it surfaces (and the framework runs recovery).
-            if (IsConsumerGone)
+            if (IsDraining)
             {
                 if (!_enumeratorCompleted)
                     SetResult(null);
@@ -1036,7 +1036,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
         _pendingInlineTerminal = false;
         _drainErrors = null;
         _consumerDisposed = false;
-        _consumerGone = false;
+        _draining = false;
         WaitForDrainOnDispose = true;
         // Dispatch state is per-tenure.
         _pipelinePromise = null;
@@ -1183,7 +1183,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                 // generation the terminal can never reach (the disposer-reset-vs-one-shot-terminal hang). The
                 // drain only needs to drive the body (gate-open below) and observe its terminal on the
                 // generation it is already awaiting.
-                if (flow._consumerAdvanced && !flow.IsConsumerGone)
+                if (flow._consumerAdvanced && !flow.IsDraining)
                     flow._enumeratorMoveNextTaskSource.Reset();
                 flow._consumerAdvanced = true;
             }
@@ -1236,7 +1236,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
 
             // Consumer-gone: the body stops yielding and drains the wire itself. The sync rendezvous
             // via WaitForContinuation drives it forward - MoveNext invokes the body's stored
-            // continuation, the body observes IsConsumerGone and drains, and its terminal
+            // continuation, the body observes IsDraining and drains, and its terminal
             // SetResult(null) wakes the final WaitForContinuation via SignalProgress.
             flow.MarkConsumerGone();
             while (MoveNext())
@@ -1273,11 +1273,11 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
             }
 
             // Fault and RETURN - do NOT drive or await the wire drain. The body drains autonomously:
-            // a read-parked body resumes on bytes; a gate-parked body, once woken, sees IsConsumerGone
+            // a read-parked body resumes on bytes; a gate-parked body, once woken, sees IsDraining
             // and skips the handoff to drain to RFQ. The pipeline retires the item only after the body's
             // read settles, so the next flow still finds RFQ - that guarantee comes from item lifetime,
             // not from Dispose blocking on it.
-            //   1. mark consumer-gone (the body's !IsConsumerGone guards then skip the handoff gates),
+            //   1. mark consumer-gone (the body's !IsDraining guards then skip the handoff gates),
             //   2. open the async gate - the SOLE async-gate waker; RequestWake cannot reach GateTaskSource,
             //      so a body parked on the inter-result gate hangs without this,
             //   3. RequestWake to wake a sync-suspended body (TP-queues its stored continuation).
