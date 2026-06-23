@@ -116,6 +116,14 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
 
     // Result state
     Slon.Threading.Tasks.Sources.ManualResetValueTaskSourceCore<bool> _enumeratorMoveNextTaskSource;
+    // Serializes the consumer's guard-decide-rearm (the _enumeratorCompleted read through the move-next
+    // Reset) against the body's terminal (its _enumeratorCompleted set). Under pipelined escalation the
+    // body's terminal can run on a wire-I/O completion thread, off the consumer thread, so the two
+    // straddle the move-next source's generation: without exclusion the consumer can Reset onto a fresh
+    // generation in the window after reading _enumeratorCompleted=false but before the body's terminal
+    // lands, wiping the body's completion and stranding the consumer (spec: MoveNextRearm.tla). NOT held
+    // over the gate dispatch (it runs the body inline and would re-enter this non-reentrant lock).
+    Slon.Threading.SpinLock _rearmLock;
     CommandResult<ResultMessageEnumerator>? _enumeratorCurrent;
     RowDescription? _requestedRowDescription;
     PgError? _pgError;
@@ -752,16 +760,25 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                 // THIS is the sole tenure-safe point to deliver the OCE; otherwise a clean end. A
                 // consumer-gone DisposeAsync drain gets the clean end, never an OCE (DisposeAsyncCore only
                 // swallows close), so the cancel OCE is suppressed once the consumer itself disposed.
-                _enumeratorCompleted = true;
-                if (_onInlineDispatchStack)
+                //
+                // The _enumeratorCompleted set and the move-next completion are the body's half of the
+                // guard-decide-rearm straddle (see _rearmLock): held together so the consumer can't read
+                // _enumeratorCompleted=false and then Reset away THIS completion. DeliverTerminal completes
+                // the source with runContinuationsAsynchronously:true, so the dispatch stays off this
+                // locked stack - no inline re-entry of the non-reentrant lock.
+                using (_rearmLock.EnterScope())
                 {
-                    // Still synchronous on the inline dispatch frame (promise tenured here). Record the
-                    // terminal; the dispatch site lands it after ExecutePipelined returns and the tenure
-                    // is released. No completion (and so no ExecuteSource drive) happens on this frame.
-                    _pendingInlineTerminal = true;
-                    return;
+                    _enumeratorCompleted = true;
+                    if (_onInlineDispatchStack)
+                    {
+                        // Still synchronous on the inline dispatch frame (promise tenured here). Record the
+                        // terminal; the dispatch site lands it after ExecutePipelined returns and the tenure
+                        // is released. No completion (and so no ExecuteSource drive) happens on this frame.
+                        _pendingInlineTerminal = true;
+                        return;
+                    }
+                    DeliverTerminal();
                 }
-                DeliverTerminal();
                 return;
             }
             _enumeratorMoveNextTaskSource.SetResult(true, runContinuationsAsynchronously: false);
@@ -932,6 +949,16 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
         // alike), so this is an atomic, idempotent CAS. A plain SetException would throw on an already-
         // completed source and a status-check guard is TOCTOU. (Recovery used to swallow the resulting
         // InvalidOperationException, masking the race.)
+        //
+        // Deliberately UNLOCKED, even though the body's clean-end terminal writes _enumeratorCompleted
+        // under _rearmLock. _rearmLock orders ONLY consumer-rearm vs the body's clean-end terminal; it
+        // does not - and need not - cover teardown. This write is safe unlocked because _enumeratorCompleted
+        // is a FOLLOWER of the CAS above (set only when TrySetException landed), never the authority: a
+        // torn/stale read just degrades to "do the CAS and let it decide". The authority against teardown
+        // is the CAS (single-completer) plus the close-latch (SetCloseLatch, Interlocked + Volatile,
+        // independent of _rearmLock), which the consumer self-delivers on its next rearm. So do NOT treat
+        // _enumeratorCompleted as lock-consistent across the body/teardown boundary. Verified safe with the
+        // unlocked teardown racing the locked consumer/body in MoveNextRearm.tla (Lock + WithTeardown).
         if (_enumeratorMoveNextTaskSource.TrySetException(ex, runContinuationsAsynchronously: true))
             _enumeratorCompleted = true;
         // Wake any sync MoveNext parked in WaitForContinuation. The body just faulted, so no
@@ -1058,27 +1085,33 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
             if (flow is null)
                 return false;
 
-            // See MoveNextAsync: a version-less terminal that survived a Reset onto a fresh pending
-            // generation needs repair for the close and user-cancel causes (see RepairLostTerminal);
-            // otherwise return the terminal task as before.
-            if (flow._enumeratorCompleted)
+            // Guard-decide-rearm serialized against the body's terminal (see _rearmLock). The using scope
+            // ends before the WaitForContinuation drive below (which runs the body inline and would
+            // re-enter this non-reentrant lock); try/finally release keeps it lock-safe on any throw.
+            using (flow._rearmLock.EnterScope())
             {
-                flow.RepairLostTerminal();
-                return flow.EnumeratorMoveNextTask.Result;
-            }
+                // See MoveNextAsync: a version-less terminal that survived a Reset onto a fresh pending
+                // generation needs repair for the close and user-cancel causes (see RepairLostTerminal);
+                // otherwise return the terminal task as before.
+                if (flow._enumeratorCompleted)
+                {
+                    flow.RepairLostTerminal();
+                    return flow.EnumeratorMoveNextTask.Result;
+                }
 
-            if (flow.IsAsync)
-            {
-                if (flow._enumeratorCurrent is null)
-                    ThrowHelper.ThrowInvalidOperation("No immediate sync/async mixing is allowed, the first MoveNext{Async} call has to match the async argument passed during initialize.");
-                flow.IsAsync = false;
-            }
+                if (flow.IsAsync)
+                {
+                    if (flow._enumeratorCurrent is null)
+                        ThrowHelper.ThrowInvalidOperation("No immediate sync/async mixing is allowed, the first MoveNext{Async} call has to match the async argument passed during initialize.");
+                    flow.IsAsync = false;
+                }
 
-            // See MoveNextAsync: rearm only on a non-first call; the first-call source is fresh and the
-            // body's first delivery lands on it.
-            if (flow._consumerAdvanced)
-                flow._enumeratorMoveNextTaskSource.Reset();
-            flow._consumerAdvanced = true;
+                // See MoveNextAsync: rearm only on a non-first call; the first-call source is fresh and the
+                // body's first delivery lands on it.
+                if (flow._consumerAdvanced)
+                    flow._enumeratorMoveNextTaskSource.Reset();
+                flow._consumerAdvanced = true;
+            }
             // Close-latch self-deliver (sync): under close this call completes the generation it just
             // armed, on its own thread.
             if (flow._callerInteractionCore.CloseException is { } syncClosed)
@@ -1110,43 +1143,50 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
             if (flow is null)
                 return new(false);
 
-            // Terminal short-circuit. _enumeratorCompleted is version-less and survives a Reset, so a
-            // terminal landed on a PRIOR generation leaves it set while the consumer is parked on a
-            // fresh, pending generation with no completer (the lost-completion). Repair it for the close
-            // and user-cancel causes (see RepairLostTerminal); otherwise this returns the terminal task
-            // unchanged (its GetResult replays the result/fault).
-            if (flow._enumeratorCompleted)
+            // The guard-decide-rearm is serialized against the body's terminal (see _rearmLock): the using
+            // scope covers the _enumeratorCompleted read through the move-next Reset, and ends before the
+            // gate dispatch below (which runs the body inline and would re-enter this non-reentrant lock).
+            // try/finally release keeps it lock-safe on any throw.
+            using (flow._rearmLock.EnterScope())
             {
-                flow.RepairLostTerminal();
-                return flow.EnumeratorMoveNextTask;
-            }
+                // Terminal short-circuit. _enumeratorCompleted is version-less and survives a Reset, so a
+                // terminal landed on a PRIOR generation leaves it set while the consumer is parked on a
+                // fresh, pending generation with no completer (the lost-completion). Repair it for the close
+                // and user-cancel causes (see RepairLostTerminal); otherwise this returns the terminal task
+                // unchanged (its GetResult replays the result/fault).
+                if (flow._enumeratorCompleted)
+                {
+                    flow.RepairLostTerminal();
+                    return flow.EnumeratorMoveNextTask;
+                }
 
-            if (!flow.IsAsync)
-            {
-                if (flow._enumeratorCurrent is null)
-                    ThrowHelper.ThrowInvalidOperation("No immediate sync/async mixing is allowed, the first MoveNext{Async} call has to match the async argument passed during initialize.");
-                flow.IsAsync = true;
-            }
+                if (!flow.IsAsync)
+                {
+                    if (flow._enumeratorCurrent is null)
+                        ThrowHelper.ThrowInvalidOperation("No immediate sync/async mixing is allowed, the first MoveNext{Async} call has to match the async argument passed during initialize.");
+                    flow.IsAsync = true;
+                }
 
-            // Override only with a cancelable per-read token: a no-token / None MoveNext keeps the
-            // token bound at submit (or GetAsyncEnumerator) for this read, never clobbering it with
-            // None. A cancelable token also arms the concurrent completer for this tenure.
-            if (cancellationToken is { } ct && ct.CanBeCanceled)
-            {
-                flow._callerCancellationToken = ct;
-                flow._enumeratorMoveNextTaskSource.CanCompleteConcurrently = true;
-            }
+                // Override only with a cancelable per-read token: a no-token / None MoveNext keeps the
+                // token bound at submit (or GetAsyncEnumerator) for this read, never clobbering it with
+                // None. A cancelable token also arms the concurrent completer for this tenure.
+                if (cancellationToken is { } ct && ct.CanBeCanceled)
+                {
+                    flow._callerCancellationToken = ct;
+                    flow._enumeratorMoveNextTaskSource.CanCompleteConcurrently = true;
+                }
 
-            // Rearm only on a non-first call. The first-call source is fresh from OnReset and the body's
-            // first delivery lands on it; Resetting here would rearm past that delivery. ALSO skip the
-            // rearm once consumer-gone (DisposeAsync drives the drain): the body's terminal is ONE-SHOT
-            // and completes the CURRENT generation; resetting to a fresh one parks the disposer on a
-            // generation the terminal can never reach (the disposer-reset-vs-one-shot-terminal hang). The
-            // drain only needs to drive the body (gate-open below) and observe its terminal on the
-            // generation it is already awaiting.
-            if (flow._consumerAdvanced && !flow.IsConsumerGone)
-                flow._enumeratorMoveNextTaskSource.Reset();
-            flow._consumerAdvanced = true;
+                // Rearm only on a non-first call. The first-call source is fresh from OnReset and the body's
+                // first delivery lands on it; Resetting here would rearm past that delivery. ALSO skip the
+                // rearm once consumer-gone (DisposeAsync drives the drain): the body's terminal is ONE-SHOT
+                // and completes the CURRENT generation; resetting to a fresh one parks the disposer on a
+                // generation the terminal can never reach (the disposer-reset-vs-one-shot-terminal hang). The
+                // drain only needs to drive the body (gate-open below) and observe its terminal on the
+                // generation it is already awaiting.
+                if (flow._consumerAdvanced && !flow.IsConsumerGone)
+                    flow._enumeratorMoveNextTaskSource.Reset();
+                flow._consumerAdvanced = true;
+            }
             // Open the gate to drive the body forward, OR self-deliver the close under close. Under close
             // the body parked on the inter-result gate is woken by the consumer's gate-open (the always-
             // present, heartbeat-independent waker - the heartbeat's CancelPendingWait is an optimization
