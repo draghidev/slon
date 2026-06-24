@@ -173,17 +173,30 @@ abstract class StreamPipeWriter : PipeWriter
             var didWrite = false;
             var nextSegment = Segments.HeadInfo.Head;
             BufferSegment? segment = null;
-            while (nextSegment != null)
+            // Bulk-advance on success; on a partial multi-segment fault advance past the segments that
+            // already reached the wire so UnflushedBytes stays truthful (see the async path).
+            BufferSegment? lastWritten = null;
+            try
             {
-                nextSegment = nextSegment.NextSegment;
-                segment = Segments.HeadInfo.Head!;
-
-                // TODO all these writes could become one vectored write.
-                if (writeToStream && segment.WrittenBytes > 0)
+                while (nextSegment != null)
                 {
-                    var buffer = segment.Memory.Span;
-                    Stream.Write(buffer);
+                    segment = nextSegment;
+                    nextSegment = nextSegment.NextSegment;
+
+                    // TODO all these writes could become one vectored write.
+                    if (writeToStream && segment.WrittenBytes > 0)
+                    {
+                        var buffer = segment.Memory.Span;
+                        Stream.Write(buffer);
+                    }
+                    lastWritten = segment;
                 }
+            }
+            catch
+            {
+                if (lastWritten is not null)
+                    Segments.AdvanceTo(new SequencePosition(lastWritten, lastWritten.End));
+                throw;
             }
 
             if (segment is not null)
@@ -274,16 +287,35 @@ abstract class StreamPipeWriter : PipeWriter
                 var didWrite = false;
                 var nextSegment = Segments.HeadInfo.Head;
                 BufferSegment? segment = null;
-                while (nextSegment != null)
+                // The last segment whose write to the stream COMPLETED. On the success path the bulk
+                // AdvanceTo below covers everything (one advance, fastest). On the FAILURE path the
+                // segments before the faulting one already reached the wire, so we must advance past
+                // them - else UnflushedBytes still reports them and a re-flush (shutdown drain) would
+                // re-send them (write-twice / wire corruption). The flush layer's byte accounting reads
+                // UnflushedBytes to know what actually drained, so it must be truthful after a partial
+                // multi-segment write.
+                BufferSegment? lastWritten = null;
+                try
                 {
-                    segment = nextSegment;
-                    nextSegment = nextSegment.NextSegment;
-
-                    // TODO all these writes could become one vectored write.
-                    if (writeToStream && segment.WrittenBytes > 0)
+                    while (nextSegment != null)
                     {
-                        await Stream.WriteAsync(segment.Memory, token).ConfigureAwait(false);
+                        segment = nextSegment;
+                        nextSegment = nextSegment.NextSegment;
+
+                        // TODO all these writes could become one vectored write.
+                        if (writeToStream && segment.WrittenBytes > 0)
+                        {
+                            await Stream.WriteAsync(segment.Memory, token).ConfigureAwait(false);
+                        }
+                        lastWritten = segment;
                     }
+                }
+                catch
+                {
+                    // Advance past the segments that fully wrote before the fault, then rethrow.
+                    if (lastWritten is not null)
+                        Segments.AdvanceTo(new SequencePosition(lastWritten, lastWritten.End));
+                    throw;
                 }
 
                 if (segment is not null)
