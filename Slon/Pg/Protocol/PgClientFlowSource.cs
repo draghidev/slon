@@ -51,25 +51,18 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
 
     /// Synchronously enqueues a sync-mode flow and blocks until the executor processes it on the
     /// caller's thread, which drives the rendezvous and the body. No TP work item at any point.
-    /// 1: take the handoff slot (FIFO-serializes concurrent sync callers) and gate async signals via
-    /// HandoffActive. 2: publish the flow and claim the executor's parked wait under the wake lock,
-    /// acking the slot only on a winning claim so a racing async wake can't snipe it; re-wait and
-    /// retry if the executor was busy. The claim dispatches the executor's continuation inline here
-    /// to pull the flow and process it. If async producers deferred items during the window, wake
-    /// the executor on TP afterward, else zero TP.
+    /// Single producer per source (serialized by the protocol's submission lock). 1: open the handoff
+    /// window (HandoffActive) and publish the flow into the slot, gating async signals. 2: claim the
+    /// executor's parked wait under the wake lock, acking the slot only on a winning claim so a racing
+    /// async wake can't snipe it; re-wait and retry if the executor was busy. The claim dispatches the
+    /// executor's continuation inline here to pull the flow and process it. If async producers deferred
+    /// items during the window, wake the executor on TP afterward, else zero TP.
     public void EnqueueSyncWithHandoff(PgClientFlow flow)
     {
         if (Volatile.Read(ref _state.IsCompleted))
             ThrowCompleted();
 
         _state.EnqueueSyncWithHandoff(flow);
-    }
-
-    internal sealed class SyncHandoffEntry(PgClientFlow flow)
-    {
-        public readonly PgClientFlow Flow = flow;
-        public readonly ManualResetEventSlim WakeMres = new(false);
-        public SyncHandoffEntry? Next;
     }
 
     // Drain the inert head of the source: items enqueued but never picked up by the executor.
@@ -125,10 +118,6 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
         // flow on its own thread, defeating the inline-on-caller's-thread guarantee.
         public bool HandoffAcked;
         public bool IsCompleted;
-
-        public readonly Lock SyncWaiterLock = new();
-        public SyncHandoffEntry? SyncHead;
-        public SyncHandoffEntry? SyncTail;
 
         public State(PgClientProtocol protocol, PipelineScheduler scheduler)
         {
@@ -190,48 +179,30 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
             return false;
         }
 
-        // Sync-handoff producer rendezvous. The IsCompleted guard is the outer handle's; this runs
-        // the baton chain and the inline claim. See the outer EnqueueSyncWithHandoff doc.
+        // Sync-handoff producer rendezvous. The IsCompleted guard is the outer handle's. Single producer
+        // per source (the protocol's _syncRoot serializes submission and a connection is single-threaded),
+        // so there is no waiter queue: open the window, publish the slot, claim the parked wait inline.
         public void EnqueueSyncWithHandoff(PgClientFlow flow)
         {
-            // FIFO baton-passing for concurrent sync producers. Each waiter is an intrusive linked-list
-            // node blocking on its own MRES. The running head (always at SyncHead) signals the next
-            // when it finishes. HandoffActive stays true across the entire chain so async producers
-            // defer signaling for the whole run.
-            var entry = new SyncHandoffEntry(flow);
-            bool isHead;
-            lock (SyncWaiterLock)
-            {
-                isHead = SyncHead is null && !HandoffActive;
-                if (SyncTail is null)
-                    SyncHead = entry;
-                else
-                    SyncTail.Next = entry;
-                SyncTail = entry;
-                if (isHead)
-                    // Full-fence open (Interlocked, not Volatile.Write), symmetric with the close-out's
-                    // clear. A release-only open sits in this thread's store buffer past a concurrent
-                    // Complete/Execute's HandoffActive read: that reader sees the window stale-closed, skips
-                    // its defer, and claims the wait this handoff is rendezvousing on - the executor resolves
-                    // completed or wakes on the wrong thread, stranding the sync caller.
-                    Interlocked.Exchange(ref HandoffActive, true);
-            }
+            // Full-fence open (Interlocked, not Volatile.Write), symmetric with the close-out's clear. A
+            // release-only open sits in this thread's store buffer past a concurrent Complete/Execute's
+            // HandoffActive read: that reader sees the window stale-closed, skips its defer, and claims the
+            // wait this handoff is rendezvousing on - the executor resolves completed or wakes on the wrong
+            // thread, stranding the sync caller.
+            Interlocked.Exchange(ref HandoffActive, true);
 
-            if (!isHead)
-                entry.WakeMres.Wait();
-
-            // Publish the slot, then claim the executor's parked wait inline so its continuation runs
-            // on this thread and pulls the flow. The claim and the HandoffAcked store are one wake-lock
-            // hold: acking only once we own the parked wait (_pending observed true under the lock means
-            // the executor is parked, not mid-pull) is what stops a racing async wake from sniping the
-            // slot. HandoffActive is set under SyncWaiterLock, not the wake lock, so an async Execute can
-            // read it stale-false (no StoreLoad ordering across the two locks), pass its gate, and claim
-            // the parked wait we expected. That is no longer fatal: if our claim loses, the executor
-            // re-arms under HandoffActive (skip-queue, so it parks without taking the unacked slot);
-            // WaitForSuspended blocks until that re-arm and we retry. The common idle case claims on the
-            // first try with no WaitForSuspended round.
+            // Publish the slot, then claim the executor's parked wait inline so its continuation runs on
+            // this thread and pulls the flow. The claim and the HandoffAcked store are one wake-lock hold:
+            // acking only once we own the parked wait (_pending observed true under the lock means the
+            // executor is parked, not mid-pull) is what stops a racing async wake from sniping the slot.
+            // HandoffActive is opened with a plain Interlocked.Exchange, not the wake lock, so an async
+            // Execute can read it stale-false (no StoreLoad ordering between the open and that read), pass
+            // its gate, and claim the parked wait we expected. That is no longer fatal: if our claim loses,
+            // the executor re-arms under HandoffActive (skip-queue, so it parks without taking the unacked
+            // slot); WaitForSuspended blocks until that re-arm and we retry. The common idle case claims on
+            // the first try with no WaitForSuspended round.
             var wakeSignal = WakeSignal;
-            Volatile.Write(ref HandoffSlot, entry.Flow);
+            Volatile.Write(ref HandoffSlot, flow);
             while (true)
             {
                 wakeSignal.AcquireWakeLock();
@@ -249,34 +220,16 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
                 wakeSignal.WaitForSuspended();
             }
 
-            // Baton hand-off: pop self from head, peek next. If a next waiter exists, signal it.
-            // Otherwise close out the chain.
-            SyncHandoffEntry? next;
-            bool postHandoffWakeNeeded = false;
-            lock (SyncWaiterLock)
-            {
-                SyncHead = entry.Next;
-                if (SyncHead is null)
-                {
-                    SyncTail = null;
-                    // Full-fence clear (not Volatile.Write): the close-out half of the Dekker pairs with
-                    // Enqueue's flag store and Complete's IsCompleted store. A release-only clear lets both
-                    // sides observe stale values at once (producer defers against a stale-open window while
-                    // this close-out reads the stale-false flag), losing the deferred wake - a queued item
-                    // never drains, or a deferred completion never re-delivers, hanging drain.
-                    Interlocked.Exchange(ref HandoffActive, false);
-                    // Deliver wakes deferred during the window: async enqueues and a deferred completion.
-                    // The executor's inline run can re-arm before this close-out clears HandoffActive, so
-                    // without this a completion arriving mid-window strands it.
-                    postHandoffWakeNeeded = Volatile.Read(ref QueueNotEmpty)
-                        || Volatile.Read(ref IsCompleted);
-                }
-                next = SyncHead;
-            }
-
-            if (next is not null)
-                next.WakeMres.Set();
-            else if (postHandoffWakeNeeded)
+            // Close the window. Full-fence clear (not Volatile.Write): the close-out half of the Dekker
+            // pairs with Enqueue's flag store and Complete's IsCompleted store. A release-only clear lets
+            // both sides observe stale values at once (producer defers against a stale-open window while
+            // this close-out reads the stale-false flag), losing the deferred wake - a queued item never
+            // drains, or a deferred completion never re-delivers, hanging drain.
+            Interlocked.Exchange(ref HandoffActive, false);
+            // Deliver wakes deferred during the window: async enqueues and a deferred completion. The
+            // executor's inline run can re-arm before this clears HandoffActive, so without this a
+            // completion arriving mid-window strands it.
+            if (Volatile.Read(ref QueueNotEmpty) || Volatile.Read(ref IsCompleted))
                 WakeSignal.Signal(runContinuationsAsynchronously: true);
         }
 
