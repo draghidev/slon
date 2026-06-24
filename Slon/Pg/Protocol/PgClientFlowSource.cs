@@ -57,13 +57,22 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
     /// async wake can't snipe it; re-wait and retry if the executor was busy. The claim dispatches the
     /// executor's continuation inline here to pull the flow and process it. If async producers deferred
     /// items during the window, wake the executor on TP afterward, else zero TP.
+    // Combined sync handoff for callers without an outer enqueue lock (the exclusive scope's inner
+    // source, a single sync producer): append at the FIFO tail and run the blocking rendezvous.
     public void EnqueueSyncWithHandoff(PgClientFlow flow)
+        => WaitForExecutor(EnqueueSyncWaiter(flow));
+
+    // Two-phase split for callers that enqueue under an outer lock (TryQueueFlow under _syncRoot):
+    // EnqueueSyncWaiter appends the flow + its wait-node under the lock (node order == queue order),
+    // WaitForExecutor runs the blocking rendezvous OUTSIDE it.
+    public State.SyncWaitNode EnqueueSyncWaiter(PgClientFlow flow)
     {
         if (Volatile.Read(ref _state.IsCompleted))
             ThrowCompleted();
-
-        _state.EnqueueSyncWithHandoff(flow);
+        return _state.EnqueueSyncWaiter(flow);
     }
+
+    public void WaitForExecutor(State.SyncWaitNode node) => _state.WaitForExecutor(node);
 
     // Drain the inert head of the source: items enqueued but never picked up by the executor.
     // CompleteAsync only sees dispatched flows, so anything still in the SPSC queue needs separate
@@ -111,18 +120,107 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
         // dequeue would tear the read). Set before Complete.
         public TaskCompletionSource? DrainSignal;
 
-        public PgClientFlow? HandoffSlot;
-        public bool HandoffActive;
-        // Gates MoveNextAsync from taking the handoff slot before the sync caller has issued
-        // SetResult. Without it the executor could loop back, observe HandoffSlot, and take the
-        // flow on its own thread, defeating the inline-on-caller's-thread guarantee.
-        public bool HandoffAcked;
+        // Sync-handoff wait-list: a lock-free intrusive SPSC FIFO of parked sync callers, in queue
+        // order. A node is linked atomically with its flow's enqueue under the protocol's _syncRoot
+        // (node-at-head == sync-flow-at-head). Producer = the _syncRoot-serialized sync enqueue;
+        // single consumer = the head caller's close-out. Only the head caller drives the rendezvous;
+        // the rest park on their own MRES until baton-passed. Linked list, not array - this is the rare
+        // contended-sync path, not a hot queue.
+        SyncWaitNode? _syncHead;
+        SyncWaitNode? _syncTail;
+        // One-shot takeover. The head caller's inline claim re-enters the pump on the caller's thread:
+        // _takeoverPending makes that pull dequeue the head sync flow (its own), then _takeoverActive
+        // makes the NEXT pull fake-miss so the pump parks (hands back to TP) instead of draining the
+        // following flow on the caller's thread.
+        public bool TakeoverPending;
+        public bool TakeoverActive;
         public bool IsCompleted;
+
+        // Set under the wake lock by OnExecutorSuspended when the executor parks AT a sync head: that
+        // park is reserved for the head sync caller's takeover, so TryClaim (async / Complete) must NOT
+        // steal it. Set to false on any non-sync-head park (idle / async head). A producer-readable
+        // substitute for the SPSC-illegal queue peek a producer can't do itself.
+        public bool ParkedAtSyncHead;
+
+        internal sealed class SyncWaitNode
+        {
+            public readonly ManualResetEventSlim Mres = new(false);
+            public SyncWaitNode? Next;
+        }
+
+        // Append a fresh waiter to the tail. Called under the protocol's _syncRoot (serialized
+        // producer), atomically with the flow's enqueue, so node order == queue order. The
+        // Interlocked.Exchange on the tail synchronizes with the consumer's empty-transition CAS.
+        public SyncWaitNode AppendSyncWaiter()
+        {
+            var node = new SyncWaitNode();
+            var prev = Interlocked.Exchange(ref _syncTail, node);
+            if (prev is null)
+                Volatile.Write(ref _syncHead, node);   // list was empty: publish the head
+            else
+                prev.Next = node;
+            return node;
+        }
+
+        // True iff this node is the current head (the caller's turn to drive the rendezvous).
+        public bool IsSyncHead(SyncWaitNode node) => ReferenceEquals(Volatile.Read(ref _syncHead), node);
+
+        // Pop the head (the caller that just finished its takeover) and return the successor to wake,
+        // or null when the list drained. Single consumer. Order matters: clear _syncHead BEFORE the
+        // tail CAS so a producer whose Exchange returns null (sees us empty) publishes its own head
+        // without racing a lagging clear.
+        public SyncWaitNode? PopSyncHeadAndPeek(SyncWaitNode node)
+        {
+            var next = Volatile.Read(ref node.Next);
+            if (next is not null)
+            {
+                Volatile.Write(ref _syncHead, next);
+                return next;
+            }
+            // No linked successor: either genuinely empty, or a producer is mid-append (it Exchanged
+            // the tail but hasn't linked node.Next yet). Clear head first, then try to retire the tail.
+            Volatile.Write(ref _syncHead, null);
+            if (Interlocked.CompareExchange(ref _syncTail, null, node) == node)
+                return null;   // tail was still us: genuinely empty
+            // Producer raced in: spin until it links node.Next, then that node is the new head.
+            var spin = new SpinWait();
+            while ((next = Volatile.Read(ref node.Next)) is null)
+                spin.SpinOnce();
+            Volatile.Write(ref _syncHead, next);
+            return next;
+        }
 
         public State(PgClientProtocol protocol, PipelineScheduler scheduler)
         {
             FlushGate = new(protocol);
             WakeSignal = new(runContinuationsAsynchronously: true, scheduler, enableWaitForSuspended: true);
+            WakeSignal.OnSuspended = OnExecutorSuspended;
+        }
+
+        // Invoked under the wake lock when the executor parks. If it dequeued a sync flow and is HOLDING
+        // it (HeldSyncFlow) for that flow's caller, signal the wait-list head so it takes over and runs
+        // the held flow on its own thread. Idle / async-drained parks are not a sync rendezvous.
+        void OnExecutorSuspended()
+        {
+            var atSyncHead = HeldSyncFlow is not null;
+            // Reserve this park for the head sync caller (TryClaim reads this under the same lock) BEFORE
+            // signalling, so a producer's TryClaim can't steal the park between the signal and the gate.
+            Volatile.Write(ref ParkedAtSyncHead, atSyncHead);
+            if (atSyncHead)
+            {
+                Volatile.Read(ref _syncHead)?.Mres.Set();
+                return;
+            }
+            // Parking idle / async-headed with work still queued: re-drive the pump on TP rather than
+            // idle-park on pending work. The close-out re-signal and a producer's kick are both lost when
+            // they land while the pump is OFF the wake-park - which happens when a sync flow takes the
+            // executor INLINE on its caller's thread and then faults: RecoverItem awaits the trailing,
+            // suspending the pump off-park, and resumes it on the trailing's TP thread, so the one-shot
+            // hand-back arms here with the next caller's flow already queued but unsignalled. Self-healing
+            // here keeps all of that contained in the source. Claim the park we just armed and dispatch
+            // its continuation on TP; an async dispatch only schedules, so it is safe under this wake lock.
+            if (HasItem() && WakeSignal.TryClaimLocked())
+                WakeSignal.DispatchClaimed(runContinuationsAsynchronously: true);
         }
 
         // Register Complete as the completion-token callback. Done here (not in Enumerator) so Complete
@@ -138,109 +236,149 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
         void Complete()
         {
             Volatile.Write(ref IsCompleted, true);
-            // Deferred during a sync-handoff window: an ungated completion wake steals the rendezvous,
-            // running the sync flow on the wrong thread. No liveness lost: the handoff's inline claim
-            // wakes the executor and its next wait observes IsCompleted (the close-out re-delivers if
-            // it raced).
+            // Wake the executor so its next wait resolves Completed. During completion TryClaim is allowed
+            // to claim a sync-head park too (see below): if the executor is parked at a sync head whose
+            // caller is about to bail, that park must be un-parked here or it strands (DrainSignal never
+            // fires).
             TryClaim(runContinuationsAsynchronously: true);
+            // Wake a blocked sync caller so it bails (its flow drains inert) instead of stranding on its
+            // node. Under the wake lock to serialize with the caller's Reset: IsCompleted is already
+            // published, so a caller that observes this Set re-reads IsCompleted == true and bails.
+            WakeSignal.AcquireWakeLock();
+            Volatile.Read(ref _syncHead)?.Mres.Set();
+            WakeSignal.ReleaseWakeLock();
         }
 
-        // Claim the executor's parked wait and dispatch its continuation, but only when no sync-handoff
-        // window is active. The HandoffActive read and the claim are one wake-lock hold: read-then-claim
-        // would let a stale gate verdict (taken just before the window opened) pair with a claim landing
-        // after the producer acked, stealing the rendezvous so the sync flow runs on the wrong thread.
-        // The acquire is also the full fence that publishes the caller's prior store (QueueNotEmpty /
-        // IsCompleted) to the close-out's compensation read, which is why those stores need no fence of
-        // their own. A claim lost to an open window is dropped on purpose: the close-out re-delivers.
+        // Claim the executor's parked wait and dispatch its continuation. Gated on ParkedAtSyncHead so an
+        // async/Complete claim never STEALS a park the executor is holding at a sync head (reserved for
+        // that head sync caller's takeover): stealing it makes the sync caller's own claim lose, and the
+        // claim-loss Reset can eat the executor's re-park signal -> lost wake. The read and the claim are
+        // one wake-lock hold, paired with OnExecutorSuspended's under-lock write. A claim dropped to a
+        // sync-head park is intentional: the sync caller takes over, and its close-out re-signal re-drives
+        // the executor for any async deferred during the window. Other parks (idle / async head) are not
+        // reserved, so async drains freely - no FIFO misroute. EXCEPTION: once completing, the reservation
+        // is lifted - there are no more takeovers, so Complete must be able to claim a sync-head park to
+        // un-park an executor whose caller is bailing (else it strands and DrainSignal never fires). Only
+        // Complete reaches here post-completion (the async Execute path throws at Enqueue first).
         public void TryClaim(bool runContinuationsAsynchronously)
         {
             var wakeSignal = WakeSignal;
             wakeSignal.AcquireWakeLock();
-            var claimed = !Volatile.Read(ref HandoffActive) && wakeSignal.TryClaimLocked();
+            var reserved = ParkedAtSyncHead && !Volatile.Read(ref IsCompleted);
+            var claimed = !reserved && wakeSignal.TryClaimLocked();
             wakeSignal.ReleaseWakeLock();
             if (claimed)
                 wakeSignal.DispatchClaimed(runContinuationsAsynchronously);
         }
 
-        // Two narrow take helpers. The HandoffActive skip-queue rule belongs at the call site
-        // (MoveNextAsync applies it to avoid hijacking the sync caller's thread. GetResult does
-        // not, because at wake time the executor must take whatever the producer signalled).
-        public bool TryTakeHandoff()
+        // Phase 1 of the sync handoff, under the protocol's _syncRoot: enqueue the sync flow at its real
+        // FIFO position in the one queue (no priority slot) and append its wait-node atomically, so the
+        // node order matches the queue order. Returns the node for the out-of-lock rendezvous.
+        public SyncWaitNode EnqueueSyncWaiter(PgClientFlow flow)
         {
-            if (!Volatile.Read(ref HandoffAcked))
-                return false;
-            if (Volatile.Read(ref HandoffSlot) is { } handoff)
-            {
-                HandoffSlot = null;
-                Volatile.Write(ref HandoffAcked, false);
-                Current = handoff;
-                return true;
-            }
-            return false;
+            // Append the wait-node BEFORE the flow so the node (read via _syncHead) is published ahead
+            // of the flow becoming dequeuable: a concurrent executor that fake-misses on this flow then
+            // always sees a non-null head in OnExecutorSuspended (HeadIsSyncHandoff implies head set).
+            var node = AppendSyncWaiter();
+            // Capture the routing async-mode (sync here) as the flow's stable bind snapshot BEFORE it is
+            // published to the executor's pull, so the pull's dequeue-then-check sees a value that agrees
+            // with this routing and stays put even if the body later flips IsAsync. By routing, not the
+            // mutable IsAsync: a flow on the sync path is a sync handoff regardless of its IsAsync state.
+            flow.CaptureAsyncRoutingSnapshot(isAsync: false);
+            _storage.Enqueue(flow);
+            Volatile.Write(ref QueueNotEmpty, true);
+            return node;
         }
 
-        // Sync-handoff producer rendezvous. The IsCompleted guard is the outer handle's. Single producer
-        // per source (the protocol's _syncRoot serializes submission and a connection is single-threaded),
-        // so there is no waiter queue: open the window, publish the slot, claim the parked wait inline.
-        public void EnqueueSyncWithHandoff(PgClientFlow flow)
+        // Phase 2, OUTSIDE the lock (blocks): drive the executor to this flow's FIFO turn and take it
+        // over so the body runs on the caller's thread.
+        public void WaitForExecutor(SyncWaitNode node)
         {
-            // Full-fence open (Interlocked, not Volatile.Write), symmetric with the close-out's clear. A
-            // release-only open sits in this thread's store buffer past a concurrent Complete/Execute's
-            // HandoffActive read: that reader sees the window stale-closed, skips its defer, and claims the
-            // wait this handoff is rendezvousing on - the executor resolves completed or wakes on the wrong
-            // thread, stranding the sync caller.
-            Interlocked.Exchange(ref HandoffActive, true);
-
-            // Publish the slot, then claim the executor's parked wait inline so its continuation runs on
-            // this thread and pulls the flow. The claim and the HandoffAcked store are one wake-lock hold:
-            // acking only once we own the parked wait (_pending observed true under the lock means the
-            // executor is parked, not mid-pull) is what stops a racing async wake from sniping the slot.
-            // HandoffActive is opened with a plain Interlocked.Exchange, not the wake lock, so an async
-            // Execute can read it stale-false (no StoreLoad ordering between the open and that read), pass
-            // its gate, and claim the parked wait we expected. That is no longer fatal: if our claim loses,
-            // the executor re-arms under HandoffActive (skip-queue, so it parks without taking the unacked
-            // slot); WaitForSuspended blocks until that re-arm and we retry. The common idle case claims on
-            // the first try with no WaitForSuspended round.
             var wakeSignal = WakeSignal;
-            Volatile.Write(ref HandoffSlot, flow);
+            // Kick the executor so it pulls and drains earlier flows in FIFO order, fake-missing on the
+            // first sync head and parking there - OnExecutorSuspended then signals THAT head's node. A
+            // no-op if the executor is already running (it reaches our flow on its own).
+            wakeSignal.Signal(runContinuationsAsynchronously: true);
+
             while (true)
             {
+                node.Mres.Wait();
                 wakeSignal.AcquireWakeLock();
-                if (wakeSignal.TryClaimLocked())
+                if (IsSyncHead(node) && wakeSignal.TryClaimLocked())
                 {
-                    Volatile.Write(ref HandoffAcked, true);
+                    TakeoverPending = true;   // our inline pull dequeues our own (now head) flow
                     wakeSignal.ReleaseWakeLock();
+                    // Inline: the pump continuation runs on this thread, dequeues our flow, runs its body,
+                    // then one-shot fake-misses and re-parks (pump back to TP) so this returns.
                     wakeSignal.DispatchClaimed(runContinuationsAsynchronously: false);
                     break;
                 }
+                // Completion bail: the source completed and we did not claim a park to take our flow over.
+                // It (and anything ahead of it) drains inert; its fault surfaces via the flow. Stop waiting
+                // - the executor resolves Completed and will not signal us again.
+                if (Volatile.Read(ref IsCompleted))
+                {
+                    wakeSignal.ReleaseWakeLock();
+                    break;
+                }
+                node.Mres.Reset();
                 wakeSignal.ReleaseWakeLock();
-                // Executor busy: it drains to its park point and re-arms (reset of the suspension
-                // observation by whatever claim made _pending false means this blocks rather than
-                // spinning on a stale TRUE), then we retry the claim.
-                wakeSignal.WaitForSuspended();
             }
 
-            // Close the window. Full-fence clear (not Volatile.Write): the close-out half of the Dekker
-            // pairs with Enqueue's flag store and Complete's IsCompleted store. A release-only clear lets
-            // both sides observe stale values at once (producer defers against a stale-open window while
-            // this close-out reads the stale-false flag), losing the deferred wake - a queued item never
-            // drains, or a deferred completion never re-delivers, hanging drain.
-            Interlocked.Exchange(ref HandoffActive, false);
-            // Deliver wakes deferred during the window: async enqueues and a deferred completion. The
-            // executor's inline run can re-arm before this clears HandoffActive, so without this a
-            // completion arriving mid-window strands it.
-            if (Volatile.Read(ref QueueNotEmpty) || Volatile.Read(ref IsCompleted))
-                WakeSignal.Signal(runContinuationsAsynchronously: true);
+            // Close-out: pop ourselves and hand the baton to the successor. Normally that goes through the
+            // executor (re-signal -> it drains async deferred during our window and re-parks at the next
+            // sync head, where OnExecutorSuspended signals it). During completion the executor resolves
+            // Completed instead of re-parking, so wake the successor directly so it bails too.
+            var next = PopSyncHeadAndPeek(node);
+            if (Volatile.Read(ref IsCompleted))
+                next?.Mres.Set();
+            else
+                wakeSignal.Signal(runContinuationsAsynchronously: true);
         }
 
-        public void EnqueueItem(PgClientFlow flow) => _storage.Enqueue(flow);
+        // Async enqueue (the EnqueueResult / Execute path). Capture the routing async-mode (async here)
+        // before publishing - the executor dispatches it rather than holding it for a caller takeover.
+        public void EnqueueItem(PgClientFlow flow) { flow.CaptureAsyncRoutingSnapshot(isAsync: true); _storage.Enqueue(flow); }
         public int Backlog => _storage.Count;
 
         // Consumer-side peek used by WaitCore's authoritative not-empty test.
         public bool HasItem() => _storage.TryPeek(out _);
 
-        // Sole consumer once the executor has stopped (Shutdown's drain).
-        public void DrainInert(Action<PgClientFlow> onInert) => _storage.DrainInert(onInert);
+        // Sole consumer once the executor has stopped (Shutdown's drain). A sync flow the executor
+        // dequeued and HELD (HeldSyncFlow) is no longer in _storage but is the FIFO head, so drain it
+        // first - else it is lost (its caller, if any, never took it over before the executor stopped).
+        public void DrainInert(Action<PgClientFlow> onInert)
+        {
+            if (HeldSyncFlow is { } held)
+            {
+                HeldSyncFlow = null;
+                onInert(held);
+            }
+            _storage.DrainInert(onInert);
+        }
+
+        // Dispatch the head on the executor ONLY if it is an async flow; a sync head is dequeued and HELD
+        // for its caller's takeover. Dequeue-then-check (one SPSC op) rather than peek-then-dequeue (two
+        // ops, a per-item cost on the hot async path): checking the head and dequeuing separately is a
+        // TOCTOU race - the queue can be empty at the check and a producer can enqueue a SYNC flow before
+        // the dequeue, normal-dispatching it (misroute) and stranding its caller. We dequeue once; if the
+        // dequeued flow is sync it was a mis-take, so hold it in HeldSyncFlow and fake-miss so its caller
+        // takes it over. Reads IsAsyncAtBind (the STABLE routing snapshot captured at enqueue), not the
+        // mutable IsAsync a body flips mid-execution.
+        public PgClientFlow? HeldSyncFlow;
+        public bool TryDispatchAsyncOrHoldSync()
+        {
+            if (HeldSyncFlow is not null)
+                return false;   // a sync flow is held, waiting for its caller: do not dispatch behind it
+            if (!_storage.TryDequeue(out Current!))
+                return false;   // empty
+            if (!_storage.TryPeek(out _))
+                Volatile.Write(ref QueueNotEmpty, false);
+            if (Current.IsAsyncAtBind)
+                return true;    // async: dispatch on the executor
+            HeldSyncFlow = Current;   // sync: hold for its caller's takeover, fake-miss
+            return false;
+        }
 
         public bool TryDequeue()
         {
@@ -291,22 +429,39 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
 
         public void Complete() => _cts.Cancel();
 
-        /// Synchronous pull: handoff slot first (HandoffAcked-gated so a between-items pull can't
-        /// snipe a slot before its sync producer's inline claim), then the primary queue when no
-        /// handoff window is active. Items route through State.Current.
+        /// Synchronous pull. A sync flow's caller takes it over inline (the two takeover flags); a sync
+        /// flow it is NOT taking over is fake-missed so the executor parks for that caller; otherwise the
+        /// primary queue. Items route through State.Current.
         public bool TryGetNext([System.Diagnostics.CodeAnalysis.MaybeNullWhen(false)] out PgClientFlow item)
         {
-            // Completion suppresses queue dispatch: once completed, the primary queue is reclaimed by
-            // WaitCore's completed-resolution as the sole consumer, so taking a queued item here would
-            // race that reclaim. An acked sync-handoff slot is exempt - its rendezvous must still
-            // resolve on the producer's thread during shutdown.
+            // Sync takeover: the head sync caller's inline pull on its own thread. The first pull dequeues
+            // its own flow - now the queue head, every earlier flow drained - then the next pull one-shot
+            // fake-misses so the pump parks and hands back to TP rather than draining a later flow here.
+            if (_state.TakeoverPending)
+            {
+                _state.TakeoverPending = false;
+                _state.TakeoverActive = true;
+                // Take the flow the executor dequeued and HELD for us. Its caller (this thread) runs its
+                // body; the next pull one-shot fake-misses (TakeoverActive) so the pump re-parks.
+                item = _state.HeldSyncFlow;
+                _state.HeldSyncFlow = null;
+                _state.Current = item!;
+                return item is not null;
+            }
+            if (_state.TakeoverActive)
+            {
+                item = null;
+                return false;
+            }
+
+            // Completion suppresses queue dispatch: once completed, NOTHING is dispatched or held for a
+            // takeover - the whole queue drains inert (async flows rebind onto a new protocol; a sync
+            // flow faults and its blocked caller bails). WaitCore resolves Completed (the !HasSyncWaiter
+            // gate is gone) and Shutdown's DrainInert is the sole consumer, so taking a queued item here
+            // would race that reclaim. (A flow already taken over runs via the TakeoverPending branch
+            // above - that path predates completion.)
             if (Volatile.Read(ref _state.IsCompleted))
             {
-                if (_state.TryTakeHandoff())
-                {
-                    item = _state.Current;
-                    return true;
-                }
                 item = null;
                 return false;
             }
@@ -321,7 +476,10 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
                 item = null;
                 return false;
             }
-            if (_state.TryTakeHandoff() || (!Volatile.Read(ref _state.HandoffActive) && _state.TryDequeue()))
+            // Dispatch an ASYNC head on the executor; a SYNC head is dequeued-and-held for its caller's
+            // takeover (fake-miss here). One dequeue, check after - see TryDispatchAsyncOrHoldSync for why
+            // a peek-then-dequeue would race a producer into a misroute.
+            if (_state.TryDispatchAsyncOrHoldSync())
             {
                 if (needsArm)
                     gate.ConsumeArm();
@@ -349,36 +507,34 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
             var wakeSignal = _state.WakeSignal;
             wakeSignal.AcquireWakeLock();
 
-            // The acked sync-handoff slot always wins: the sync producer has observed the
-            // suspension and issued its inline claim, so the executor's continuation must retry to
-            // take it on the producer's thread. This beats completion so a shutdown racing a live
-            // rendezvous can't strand the sync caller.
-            if (Volatile.Read(ref _state.HandoffAcked))
+            // One-shot takeover hand-back: the sync caller's pull just fake-missed (TakeoverActive).
+            // Reset it and Arm so the pump parks here - the caller's inline DispatchClaimed returns and
+            // the pump is back on TP. The caller's close-out re-signal resumes it for any trailing work.
+            if (_state.TakeoverActive)
             {
-                _state.FlushGate.Rearm();
-                wakeSignal.ReleaseWakeLock();
-                return WaitForNextAwaitable.Retry();
+                _state.TakeoverActive = false;
+                return wakeSignal.Arm();
             }
 
-            // Completion BEATS the primary queue: resolve completed even with items still queued
-            // (the source reclaims its residual instead of draining it through the executor). Fire
-            // DrainSignal so Shutdown drains the residual as the sole consumer. Deferred during a
-            // handoff window - resolving out from under a waiting sync producer would strand its
-            // rendezvous, so the close-out re-delivers once the window clears.
-            if ((Volatile.Read(ref _state.IsCompleted) || _completionToken.IsCancellationRequested)
-                && !Volatile.Read(ref _state.HandoffActive))
+            // Completion BEATS the primary queue, including any queued sync flow: once completing, the
+            // whole queue drains inert and blocked sync callers bail (Complete wakes them; WaitForExecutor
+            // sees IsCompleted and returns). No takeover during shutdown - an async flow ahead of a sync
+            // waiter can't be skipped to reach it (it must drain inert / rebind, not run), so takeover
+            // can't be done consistently; draining everything inert is the uniform model (previously this
+            // was gated on a queued sync waiter to keep the executor alive for a takeover - that gate is
+            // gone). Fire DrainSignal so Shutdown drains the residual as the sole consumer.
+            if (Volatile.Read(ref _state.IsCompleted) || _completionToken.IsCancellationRequested)
             {
                 wakeSignal.ReleaseWakeLock();
                 _state.DrainSignal?.TrySetResult();
                 return WaitForNextAwaitable.Completed();
             }
 
-            // Not completed - dispatch a queued item. The queue test PEEKS (consumer-side, SPSC-legal)
-            // instead of reading QueueNotEmpty: under publish-then-flag a TRUE flag implies the item
-            // is already peekable, and the flag can go STALE-TRUE (the producer's flag store landing
-            // after TryDequeue's dequeue-to-empty clear), so the peek is the authoritative test.
-            // Skip-queue while a handoff window is active so we don't hijack the sync caller's thread.
-            if (!Volatile.Read(ref _state.HandoffActive) && _state.HasItem())
+            // A dispatchable item is available - retry to consume it - UNLESS a sync flow is already held
+            // for its caller's takeover, in which case we park here and let that caller take it (we must
+            // not dispatch behind it). HasItem is the authoritative not-empty peek (QueueNotEmpty can go
+            // stale-true). A sync head still in the queue gets dequeued-and-held on the retry's next pull.
+            if (_state.HeldSyncFlow is null && _state.HasItem())
             {
                 // An item is available - arm the next TryGetNext so it can consume one (only one
                 // while the flush-threshold gate holds, so a flush round lands between items).

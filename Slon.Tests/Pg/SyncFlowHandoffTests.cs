@@ -1,3 +1,6 @@
+using Slon.Pg;
+using Slon.Pg.Protocol.Flows;
+
 namespace Slon.Tests.Pg;
 
 // Focus: the guarantees PgClientFlowSource's sync handoff promises that the basic completion
@@ -146,5 +149,318 @@ public class SyncFlowHandoffTests
             for (int i = 0; i < leased; i++)
                 await leases[i].DisposeAsync();
         }
+    }
+
+
+    // The core guarantee of the unified-queue handoff: N threads driving sync flows on the SAME
+    // protocol concurrently each get woken back on the thread they submitted from. They contend on
+    // the one source's wait-list (the executor pops its head and signals the matching caller's node
+    // as it reaches each sync-tagged flow's turn in the single queue), so a misrouted wake - the
+    // executor running a flow itself, or signalling the wrong caller's node - would surface as a
+    // wrong-thread return or a deadlock. Distinct from ConcurrentSync_AcrossProtocols (which never
+    // shares a source's wait-list).
+    [TestMethod]
+    public async Task ConcurrentSync_SameProtocol_EachReturnsOnItsOwnThread()
+    {
+        await using var lease = await PgTestPool.LeaseAsync();
+        await PgTestPool.RunSync(lease.Protocol, "select 1"); // warm
+
+        const int concurrency = 8;
+        const int iterations = 25;
+        var threads = new Thread[concurrency];
+        var mismatches = new int[concurrency];
+        var exceptions = new Exception?[concurrency];
+        // Release all threads together so their submits genuinely overlap on the one protocol.
+        using var start = new Barrier(concurrency);
+
+        for (int i = 0; i < concurrency; i++)
+        {
+            int idx = i;
+            threads[i] = new Thread(() =>
+            {
+                try
+                {
+                    var ownThread = Environment.CurrentManagedThreadId;
+                    start.SignalAndWait();
+                    for (int j = 0; j < iterations; j++)
+                    {
+                        // Drive the synchronous handoff inline on THIS thread. RunSync's MoveNext
+                        // loop is the takeover; it must return on the thread that called it.
+                        PgTestPool.RunSync(lease.Protocol, "select 1").GetAwaiter().GetResult();
+                        if (Environment.CurrentManagedThreadId != ownThread)
+                            mismatches[idx]++;
+                    }
+                }
+                catch (Exception ex) { exceptions[idx] = ex; }
+            })
+            { IsBackground = true };
+        }
+
+        foreach (var t in threads) t.Start();
+        foreach (var t in threads) Assert.IsTrue(t.Join(TimeSpan.FromSeconds(30)), "a sync caller thread timed out (possible misrouted wake / deadlock)");
+
+        for (int i = 0; i < concurrency; i++)
+        {
+            Assert.IsNull(exceptions[i], $"thread {i} threw: {exceptions[i]}");
+            Assert.AreEqual(0, mismatches[i],
+                $"thread {i} returned from a sync handoff on a different thread {mismatches[i]} time(s); " +
+                "the executor must wake each sync caller back on its own submitting thread");
+        }
+    }
+
+    // Mixed sync + async enqueues on the SAME protocol, concurrently. This is the case the unified
+    // queue exists for: sync flows take their FIFO position in the one queue interleaved with async
+    // ones, and the executor must still route each sync-tagged flow's wake to its own caller's thread
+    // while draining the async flows itself. A sync flow landing on the wrong side of the interleave
+    // (the old priority-slot / skip-queue model) or a wake routed to the wrong caller surfaces here as
+    // a wrong-thread return, a hang, or an incomplete async flow. A sync caller blocks until its own
+    // flow completes, so a thread can't itself mix modes; half the threads drive sync, half async.
+    //
+    // Witnessed mixing via observable queue index: this test is the ONLY submitter to this protocol,
+    // so a test-side gate around just the (grab-index + TryQueue) instant makes each caller's index
+    // equal to its real queue position - without distorting the concurrency the redesign must handle
+    // (the blocking sync handoff / async drive both run OUTSIDE the gate, on the caller's own thread).
+    // Recording the mode per queue index lets the test PROVE the queue order genuinely interleaved
+    // sync and async (adjacent indices of differing modes), so a run that was effectively sequential
+    // fails as inconclusive rather than passing vacuously.
+    [TestMethod]
+    public async Task MixedSyncAsync_SameProtocol_SyncReturnsOnOwnThreadAndAllComplete()
+    {
+        await using var lease = await PgTestPool.LeaseAsync();
+        var protocol = lease.Protocol;
+        await PgTestPool.RunSync(protocol, "select 1"); // warm
+
+        const int syncThreads = 4;
+        const int asyncThreads = 4;
+        const int iterations = 100;
+        var threads = new Thread[syncThreads + asyncThreads];
+        var mismatches = new int[syncThreads];
+        var exceptions = new Exception?[syncThreads + asyncThreads];
+        using var start = new Barrier(syncThreads + asyncThreads);
+
+        // Submit gate: serializes ONLY the index-grab + enqueue, so index == queue position. 's'/'a'
+        // per submit.
+        var submitGate = new object();
+        var nextIndex = 0;
+        var order = new char[(syncThreads + asyncThreads) * iterations];
+
+        // Enqueue under the gate (assigning the queue-position index), then return the queued flow for
+        // the caller to drive OUTSIDE the gate. Mirrors PgTestPool.RunSync/RunAsync split into submit
+        // (gated) + drive (ungated).
+        CommandFlow Submit(bool async, char mode)
+        {
+            lock (submitGate)
+            {
+                var flow = new CommandFlow(async, Command.Create("select 1"));
+                Assert.IsTrue(protocol.TryQueue(flow), "TryQueue failed");
+                order[nextIndex++] = mode;
+                return flow;
+            }
+        }
+
+        for (int i = 0; i < syncThreads; i++)
+        {
+            int idx = i;
+            threads[i] = new Thread(() =>
+            {
+                try
+                {
+                    var ownThread = Environment.CurrentManagedThreadId;
+                    start.SignalAndWait();
+                    for (int j = 0; j < iterations; j++)
+                    {
+                        var flow = Submit(async: false, 's');
+                        var e = flow.GetEnumerator();
+                        while (e.MoveNext()) { }          // sync handoff + body run inline on THIS thread
+                        e.DisposeAsync().AsTask().GetAwaiter().GetResult();
+                        if (Environment.CurrentManagedThreadId != ownThread)
+                            mismatches[idx]++;
+                    }
+                }
+                catch (Exception ex) { exceptions[idx] = ex; }
+            })
+            { IsBackground = true };
+        }
+
+        for (int i = 0; i < asyncThreads; i++)
+        {
+            int slot = syncThreads + i;
+            threads[slot] = new Thread(() =>
+            {
+                try
+                {
+                    start.SignalAndWait();
+                    for (int j = 0; j < iterations; j++)
+                    {
+                        var flow = Submit(async: true, 'a');
+                        var e = flow.GetAsyncEnumerator();
+                        while (e.MoveNextAsync().AsTask().GetAwaiter().GetResult()) { }
+                        e.DisposeAsync().AsTask().GetAwaiter().GetResult();
+                    }
+                }
+                catch (Exception ex) { exceptions[slot] = ex; }
+            })
+            { IsBackground = true };
+        }
+
+        foreach (var t in threads) t.Start();
+        foreach (var t in threads) Assert.IsTrue(t.Join(TimeSpan.FromSeconds(30)), "a mixed-flow caller thread timed out (possible misrouted wake / deadlock)");
+
+        for (int i = 0; i < threads.Length; i++)
+            Assert.IsNull(exceptions[i], $"thread {i} threw: {exceptions[i]}");
+        for (int i = 0; i < syncThreads; i++)
+            Assert.AreEqual(0, mismatches[i],
+                $"sync thread {i} returned on a different thread {mismatches[i]} time(s) under mixed load; " +
+                "a sync flow interleaved with async work must still wake its own submitting thread");
+
+        // Prove the queue order genuinely interleaved the modes: at least one adjacent pair of queued
+        // flows has differing modes (a sync flow took a FIFO slot directly next to an async one). A
+        // run that grouped all-sync-then-all-async would have no such adjacency and is inconclusive.
+        var interleaved = false;
+        for (int k = 1; k < order.Length; k++)
+            if (order[k] != order[k - 1]) { interleaved = true; break; }
+        Assert.IsTrue(interleaved,
+            "the queue order never placed a sync flow adjacent to an async flow - the modes did not " +
+            "actually interleave on the shared queue, so this run did not exercise mixed enqueuing");
+    }
+
+    // DIFFERENTIAL test for execution-order FIFO across sync and async. RED on the current design,
+    // GREEN on the unified-queue design - it asserts the property the redesign exists to provide: a
+    // sync flow takes its real FIFO position and does NOT jump ahead of earlier-submitted async work.
+    //
+    // The server records execution order directly: each flow runs `SELECT nextval(seq)::int` against a
+    // shared sequence, so the value it reads back IS the rank the server assigned when it processed
+    // that command (= the executor's wire/dispatch order). No client-side bookkeeping needed - the
+    // rank rides in the result row. Submit a block (async, async, SYNC, async, async) with all flows
+    // queued before any is driven, so the sync flow is genuinely submitted after a0/a1 while they are
+    // still queued. Current design: the sync flow's priority HandoffSlot + skip-queue window run its
+    // nextval BEFORE the earlier async ones, so its rank is lower than a0's/a1's - RED. Unified design:
+    // FIFO, so its rank is higher - GREEN.
+    [TestMethod]
+    public async Task SyncFlow_DoesNotJumpAheadOfEarlierAsync_ExecutionOrderIsFifo()
+    {
+        await using var lease = await PgTestPool.LeaseAsync();
+        var protocol = lease.Protocol;
+        await PgTestPool.RunSync(protocol, "create temp sequence exec_rank");
+
+        const int blocks = 50;
+        var jumpAheadCount = 0;
+
+        for (int b = 0; b < blocks; b++)
+        {
+            // Submit the whole block before driving any, so the flows co-reside in the queue.
+            // Submission order: a0, a1, sync, a2, a3.
+            var flows = new (CommandFlow flow, bool async)[5];
+            for (int k = 0; k < 5; k++)
+            {
+                bool async = k != 2;             // position 2 is the sync flow
+                flows[k] = (new CommandFlow(async, Command.Create("select nextval('exec_rank')::int")), async);
+                Assert.IsTrue(protocol.TryQueue(flows[k].flow), "TryQueue failed");
+            }
+
+            // Drive each flow and read its assigned rank.
+            var ranks = new int[5];
+            var driveTasks = new Task<int>[5];
+            for (int k = 0; k < 5; k++)
+            {
+                var (flow, async) = flows[k];
+                driveTasks[k] = async ? Task.Run(() => DriveAsyncReadRank(flow)) : Task.Run(() => DriveSyncReadRank(flow));
+            }
+            ranks = await Task.WhenAll(driveTasks).WaitAsync(TimeSpan.FromSeconds(30));
+
+            // The sync flow (index 2) must have a HIGHER rank than the earlier-submitted async flows
+            // (index 0, 1): the server processed it after them. A lower rank means it jumped ahead.
+            if (ranks[2] < ranks[0] || ranks[2] < ranks[1])
+                jumpAheadCount++;
+        }
+
+        Assert.AreEqual(0, jumpAheadCount,
+            $"the sync flow's execution rank was lower than an earlier-submitted async flow's in {jumpAheadCount}/{blocks} blocks; " +
+            "under the unified queue a sync flow must take its FIFO position, not jump ahead via a priority slot");
+    }
+
+    // Misrouted-wake guard. When several sync callers contend on the one protocol's wait-list, the
+    // executor reaching a queued sync flow's turn must wake THAT flow's submitting caller - not some
+    // other parked caller. If node-order and flow-order ever desynchronize (the wait-list node and the
+    // queued flow must be stamped together so node-at-head == flow-at-head), the executor could wake
+    // caller X's thread to take over caller Y's flow at the head. That misroute is INVISIBLE when the
+    // wire payloads are identical (everyone runs `select 1`, gets a correct result, returns on their
+    // own thread). It is made visible here by giving each caller a DISTINCT payload: caller K submits
+    // `select K`, and asserts it reads back K. A thread that drove a foreign flow reads the wrong value.
+    //
+    // Run on the current design this is a probe: green = the HandoffSlot / SyncHead coordination is
+    // sound (a misroute is not a live bug); a red would have found one. On the unified design it guards
+    // the atomic node+flow append against a future edit that splits them.
+    [TestMethod]
+    public async Task ConcurrentSync_SameProtocol_EachThreadDrivesItsOwnFlow()
+    {
+        await using var lease = await PgTestPool.LeaseAsync();
+        var protocol = lease.Protocol;
+        await PgTestPool.RunSync(protocol, "select 1"); // warm
+
+        const int concurrency = 8;
+        const int iterations = 100;
+        var threads = new Thread[concurrency];
+        var misroutes = new int[concurrency];   // times a caller read back a value it did not submit
+        var exceptions = new Exception?[concurrency];
+        using var start = new Barrier(concurrency);
+
+        for (int i = 0; i < concurrency; i++)
+        {
+            int idx = i;
+            threads[i] = new Thread(() =>
+            {
+                try
+                {
+                    start.SignalAndWait();
+                    for (int j = 0; j < iterations; j++)
+                    {
+                        // A value unique to this caller-iteration. If the executor woke this thread to
+                        // drive a different caller's flow, the read-back value won't match.
+                        int payload = (idx + 1) * 100_000 + j;
+                        var flow = new CommandFlow(async: false, Command.Create($"select {payload}"));
+                        Assert.IsTrue(protocol.TryQueue(flow), "TryQueue failed");
+                        var got = DriveSyncReadRank(flow);
+                        if (got != payload)
+                            misroutes[idx]++;
+                    }
+                }
+                catch (Exception ex) { exceptions[idx] = ex; }
+            })
+            { IsBackground = true };
+        }
+
+        foreach (var t in threads) t.Start();
+        foreach (var t in threads) Assert.IsTrue(t.Join(TimeSpan.FromSeconds(30)), "a sync caller thread timed out (possible misrouted wake / deadlock)");
+
+        for (int i = 0; i < concurrency; i++)
+        {
+            Assert.IsNull(exceptions[i], $"thread {i} threw: {exceptions[i]}");
+            Assert.AreEqual(0, misroutes[i],
+                $"thread {i} read back a value it did not submit {misroutes[i]} time(s) - the executor woke this " +
+                "thread to drive a different caller's flow (a misrouted sync handoff: node-order vs flow-order desync)");
+        }
+    }
+
+    static int DriveSyncReadRank(CommandFlow flow)
+    {
+        var rank = -1;
+        var e = flow.GetEnumerator();
+        while (e.MoveNext())
+            foreach (var row in e.Current)
+                rank = row.GetValue<int>(0);
+        e.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        return rank;
+    }
+
+    static async Task<int> DriveAsyncReadRank(CommandFlow flow)
+    {
+        var rank = -1;
+        var e = flow.GetAsyncEnumerator();
+        while (await e.MoveNextAsync())
+            await foreach (var row in e.Current)
+                rank = row.GetValue<int>(0);
+        await e.DisposeAsync();
+        return rank;
     }
 }

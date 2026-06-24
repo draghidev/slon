@@ -74,8 +74,16 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IThreadPoolWorkItem
 
 
     // The bind-time async snapshot, stable across the flow's tenure (unlike IsAsync, which a body
-    // may mutate). The policy uses it to decide inline vs TP activation.
+    // may mutate). The policy uses it to decide inline vs TP activation, and the executor's
+    // HeadIsSyncHandoff peek to fake-miss sync flows for caller takeover.
     internal bool IsAsyncAtBind => _isAsyncAtBind;
+
+    // Capture the routing async-mode as the stable snapshot at ENQUEUE, before the flow is published
+    // to the executor's pull. Bind sets the same field, but for a sync flow Bind runs only AFTER its
+    // blocking takeover - too late for the executor's pre-dispatch HeadIsSyncHandoff peek, which would
+    // then read the mutable IsAsync and could mistake a sync flow for async. Set with the value the
+    // enqueue already read so the peek and the routing agree.
+    internal void CaptureAsyncRoutingSnapshot(bool isAsync) => _isAsyncAtBind = isAsync;
 
     // Pre-bind read of IsAsync for the enqueue path: the protocol routes sync flows through an
     // inline wake-signal dispatch so the producer's thread takes over the executor for that flow.
