@@ -81,18 +81,22 @@ public class ProtocolCompletionTests
         // Graceful close while a consumer is mid-iteration: the move-next source faults with
         // PgClientClosedException so the consumer's MoveNextAsync surfaces it (input-commands-
         // equals-output-results coherence rule). The consumer disposes on the exception path.
+        // reading fires once the consumer is scheduled and about to pull, so CompleteAsync lands on a
+        // live consumer rather than racing a 10ms guess that it has started.
+        var reading = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var runTask = Task.Run(async () =>
         {
             var e = flow.GetAsyncEnumerator();
             try
             {
+                reading.TrySetResult();
                 while (await e.MoveNextAsync()) { }
             }
             catch (PgClientClosedException) { }
             await e.DisposeAsync();
         });
 
-        await Task.Delay(10);
+        await reading.Task;
         var completeTask = protocol.CompleteAsync();
 
         await runTask;
@@ -108,14 +112,19 @@ public class ProtocolCompletionTests
         var flow = new CommandFlow(async: true, Command.Create("select pg_sleep(0.5)"));
         Assert.IsTrue(protocol.TryQueue(flow));
 
-        var runTask = Task.Run(async () =>
+        // reading fires once the consumer is scheduled and about to pull, so DisposeAsync lands on a
+        // live consumer rather than racing a 10ms guess. The forceful abort cascades through the
+        // in-flight read either way (single command, 0.5s server-side window).
+        var reading = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var runTask = Task.Run<Exception?>(async () =>
         {
             var e = flow.GetAsyncEnumerator();
             try
             {
+                reading.TrySetResult();
                 while (await e.MoveNextAsync()) { }
                 await e.DisposeAsync();
-                return (Exception?)null;
+                return null;
             }
             catch (Exception ex)
             {
@@ -123,7 +132,7 @@ public class ProtocolCompletionTests
             }
         });
 
-        await Task.Delay(10);
+        await reading.Task;
         await protocol.DisposeAsync();
 
         var observed = await runTask;
@@ -323,18 +332,24 @@ public class ProtocolCompletionTests
             }
         });
 
+        // The blocking flow holds the single executor (parked on pg_sleep) so parked stays
+        // enqueued-not-activated. reading fires once its consumer is scheduled and about to pull, so
+        // DisposeAsync fires against a live holder rather than racing a 10ms head start - and since
+        // parked was queued second it can never activate ahead of the blocking flow regardless.
+        var reading = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var runBlocking = Task.Run(async () =>
         {
             var e = blockingFlow.GetAsyncEnumerator();
             try
             {
+                reading.TrySetResult();
                 while (await e.MoveNextAsync()) { }
                 await e.DisposeAsync();
             }
             catch { }
         });
 
-        await Task.Delay(10);
+        await reading.Task;
         await protocol.DisposeAsync();
         await runBlocking;
 

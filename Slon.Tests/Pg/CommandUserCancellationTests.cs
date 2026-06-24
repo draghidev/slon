@@ -58,9 +58,9 @@ public class CommandUserCancellationTests
         await e.DisposeAsync();
     }
 
-    // CT fires while the body is mid-read: the parked MoveNextAsync surfaces OCE, the body finishes the
-    // in-flight read and drains the rest to RFQ, and the follow-up command confirms the protocol stays
-    // usable.
+    // CT fires while an outstanding MoveNextAsync is parked on a slow read: the parked pull surfaces
+    // OCE, the body finishes the in-flight read and drains the rest to RFQ, and the follow-up command
+    // confirms the protocol stays usable.
     [TestMethod]
     [DoNotParallelize]
     public async Task UserCt_FiresMidRead_SurfacesOce_ProtocolUsable()
@@ -69,17 +69,24 @@ public class CommandUserCancellationTests
         var protocol = lease.Protocol;
 
         var flow = new CommandFlow(async: true,
+            Command.Create("select 1"),
             Command.Create("select pg_sleep(0.1)"),
-            Command.Create("select 'two'"));
+            Command.Create("select 'three'"));
         Assert.IsTrue(protocol.TryQueue(flow));
 
         using var cts = new CancellationTokenSource();
         var e = flow.GetAsyncEnumerator(cts.Token);
 
-        var moveNextTask = e.MoveNextAsync(cts.Token).AsTask();
+        // Consuming the first result is the deterministic park signal. The body has finished command
+        // one, and the next pull reads toward pg_sleep, which cannot deliver for ~100ms, so there is no
+        // sleep-and-hope window racing the cancel.
+        Assert.IsTrue(await e.MoveNextAsync(cts.Token), "first command result not delivered");
 
-        // Give the body a moment to park on the read.
-        await Task.Delay(20);
+        // The pull that parks on the slow read. Cancel hits it while it is outstanding. Whether or not
+        // it has reached the wire read, the cancel is never lost (see the *_NeverLosesWake stress
+        // tests), so the outcome is OCE, and the ~100ms-away result cannot preempt the synchronous
+        // Cancel below.
+        var moveNextTask = e.MoveNextAsync(cts.Token).AsTask();
         cts.Cancel();
 
         var oce = await Assert.ThrowsExactlyAsync<OperationCanceledException>(

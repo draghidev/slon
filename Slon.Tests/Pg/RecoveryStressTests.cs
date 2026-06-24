@@ -25,6 +25,16 @@ public class RecoveryStressTests
         }
     }
 
+    static readonly TimeSpan Cap = TimeSpan.FromSeconds(10);
+
+    // Fail fast on a deadlock instead of hanging the whole suite. where carries the iteration so a
+    // rare stress failure points at the attempt that wedged.
+    static async Task Capped(Task work, string where)
+    {
+        try { await work.WaitAsync(Cap); }
+        catch (TimeoutException) { Assert.Fail($"{where}: hung (deadlock under stress)."); }
+    }
+
     static async Task RunAsync(PgClientProtocol protocol, string sql)
     {
         var flow = new CommandFlow(async: true, Command.Create(sql));
@@ -47,7 +57,7 @@ public class RecoveryStressTests
             Assert.IsTrue(protocol.TryQueue(faulting));
 
             for (int j = 0; j < 5; j++)
-                await RunAsync(protocol, "select 1");
+                await Capped(RunAsync(protocol, "select 1"), $"RecoveryThenSequential iter {i}.{j}");
         }
     }
 
@@ -60,7 +70,7 @@ public class RecoveryStressTests
     {
         await using var protocol = await PgTestPool.NewIsolatedAsync();
         for (int i = 0; i < Iterations * 5; i++)
-            await RunAsync(protocol, "select 1");
+            await Capped(RunAsync(protocol, "select 1"), $"SequentialReads iter {i}");
     }
 
     // Recovery dispatch OVERLAPPING the pump's next dispatch - the execute-promise single-pump edge
@@ -91,13 +101,13 @@ public class RecoveryStressTests
             var e = follow.GetAsyncEnumerator();
             try
             {
-                while (await e.MoveNextAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(10))) { }
+                while (await e.MoveNextAsync().AsTask().WaitAsync(Cap)) { }
             }
             catch (TimeoutException) { Assert.Fail($"iter {i}: follow-on flow hung (dispatch collided with recovery)."); }
             finally { await e.DisposeAsync(); }
 
             // The faulting flow completes with its injected fault; observe-and-discard.
-            try { await faulting.WaitForComplete().AsTask().WaitAsync(TimeSpan.FromSeconds(10)); }
+            try { await faulting.WaitForComplete().AsTask().WaitAsync(Cap); }
             catch (TimeoutException) { Assert.Fail($"iter {i}: faulting flow never completed (recovery stranded)."); }
             catch { /* the injected fault - expected */ }
 

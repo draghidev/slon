@@ -20,6 +20,16 @@ public class ExclusiveAccessFlowStressTests
         }
     }
 
+    static readonly TimeSpan Cap = TimeSpan.FromSeconds(10);
+
+    // Fail fast on a deadlock instead of hanging the whole suite. where carries the iteration so a
+    // rare stress failure points at the attempt that wedged.
+    static async Task Capped(Task work, string where)
+    {
+        try { await work.WaitAsync(Cap); }
+        catch (TimeoutException) { Assert.Fail($"{where}: hung (deadlock under stress)."); }
+    }
+
     static async Task DrainAsync(CommandFlow flow)
     {
         var e = flow.GetAsyncEnumerator();
@@ -35,6 +45,26 @@ public class ExclusiveAccessFlowStressTests
         await scope.CompleteScopeAsync();
     }
 
+    static async Task RunManyCommandsScopeAsync(PgClientProtocol protocol)
+    {
+        var scope = protocol.BeginExclusiveScope(async: true);
+        await scope.HandoffReady;
+        for (int k = 0; k < 8; k++)
+            await DrainAsync(scope.Queue(new CommandFlow(async: true, Command.Create("select 1"))));
+        await scope.CompleteScopeAsync();
+    }
+
+    static async Task RunSyncSubflowScopeAsync(PgClientProtocol protocol)
+    {
+        var scope = protocol.BeginExclusiveScope(async: true);
+        await scope.HandoffReady;
+        var cmd = scope.Queue(new CommandFlow(async: false, Command.Create("select 1")));
+        var e = cmd.GetEnumerator();
+        while (e.MoveNext()) { }
+        await e.DisposeAsync();
+        await scope.CompleteScopeAsync();
+    }
+
     // Many sequential scopes on one protocol: hammers flyweight reuse (re-Initialize) + the
     // outer->inner decoder rebind each scope.
     [TestMethod]
@@ -42,7 +72,7 @@ public class ExclusiveAccessFlowStressTests
     {
         await using var lease = await PgTestPool.LeaseAsync();
         for (int i = 0; i < Iterations; i++)
-            await RunScopeAsync(lease.Protocol);
+            await Capped(RunScopeAsync(lease.Protocol), $"RepeatedScopes iter {i}");
     }
 
     // Many commands within one scope, drained one-at-a-time (the consumer-driven read contract):
@@ -53,13 +83,7 @@ public class ExclusiveAccessFlowStressTests
         await using var lease = await PgTestPool.LeaseAsync();
         var iters = Math.Max(1, Iterations / 10);
         for (int i = 0; i < iters; i++)
-        {
-            var scope = lease.Protocol.BeginExclusiveScope(async: true);
-            await scope.HandoffReady;
-            for (int k = 0; k < 8; k++)
-                await DrainAsync(scope.Queue(new CommandFlow(async: true, Command.Create("select 1"))));
-            await scope.CompleteScopeAsync();
-        }
+            await Capped(RunManyCommandsScopeAsync(lease.Protocol), $"ManyCommands iter {i}");
     }
 
     // Sync subflow inside a scope: fires the RECURSIVE handoff (EnqueueSyncWithHandoff on the inner
@@ -70,15 +94,7 @@ public class ExclusiveAccessFlowStressTests
         await using var lease = await PgTestPool.LeaseAsync();
         var iters = Math.Max(1, Iterations / 2);
         for (int i = 0; i < iters; i++)
-        {
-            var scope = lease.Protocol.BeginExclusiveScope(async: true);
-            await scope.HandoffReady;
-            var cmd = scope.Queue(new CommandFlow(async: false, Command.Create("select 1")));
-            var e = cmd.GetEnumerator();
-            while (e.MoveNext()) { }
-            await e.DisposeAsync();
-            await scope.CompleteScopeAsync();
-        }
+            await Capped(RunSyncSubflowScopeAsync(lease.Protocol), $"SyncSubflow iter {i}");
     }
 
     // N protocols each running scopes concurrently: per-protocol isolation + concurrent takeovers.
@@ -96,10 +112,11 @@ public class ExclusiveAccessFlowStressTests
             for (int i = 0; i < concurrency; i++)
             {
                 var protocol = leases[i].Protocol;
+                var p = i;
                 tasks[i] = Task.Run(async () =>
                 {
                     for (int j = 0; j < perThread; j++)
-                        await RunScopeAsync(protocol);
+                        await Capped(RunScopeAsync(protocol), $"ConcurrentScopes p{p} iter {j}");
                 });
             }
             await Task.WhenAll(tasks);
