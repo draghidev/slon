@@ -95,11 +95,14 @@ sealed class WriteChannel
         _messageLength = totalLength;
     }
 
-    // Advances the message-bytes counter as buffered bytes leave the buffer (Flush). Catches
-    // over-writes: a busted converter that emitted more bytes than its message declared trips
-    // here before the bytes reach the wire. The buffer-level check is the CVE-2024-32655
-    // defense-in-depth for converters that size incorrectly and silently write through.
-    void AdvanceMessageBytesFlushed(int count)
+    // Validate the about-to-flush bytes against the declared length, WITHOUT mutating the counter.
+    // Catches over-writes: a busted converter that emitted more bytes than its message declared trips
+    // here BEFORE the bytes reach the wire. The buffer-level check is the CVE-2024-32655 defense-in-
+    // depth for converters that size incorrectly and silently write through. The counter is committed
+    // separately, only after the flush actually drained the bytes (CommitMessageBytesFlushed), so a
+    // faulted flush leaves the counter untouched and the bytes still buffered - the next flush
+    // re-validates and commits exactly the bytes that remain.
+    void CheckMessageBytesFlushed(int count)
     {
         if (_messageLength is null)
             return; // Pre-startup raw writes (e.g. StartupMessage's CopyStartupBuffer).
@@ -107,7 +110,15 @@ sealed class WriteChannel
             throw new ArgumentOutOfRangeException(nameof(count));
         if ((long)_messageBytesFlushed + count > _messageLength)
             ThrowOverwritten(_messageLength.Value, _messageBytesFlushed + (long)count);
-        _messageBytesFlushed += count;
+    }
+
+    // Commit the counter for bytes that actually left the buffer (the drained delta: before-after
+    // UnflushedBytes). Zero on a fault that drained nothing - a harmless no-op.
+    void CommitMessageBytesFlushed(int drained)
+    {
+        if (_messageLength is null)
+            return;
+        _messageBytesFlushed += drained;
     }
 
     static void ThrowUnderwritten(int declared, int actual)
@@ -156,17 +167,53 @@ sealed class WriteChannel
     public void WriteInt(int value) => _bufferingWriter.WriteInt32BigEndian<BufferingWriter>(value);
 
     // Token-free flush primitives. The shell wraps these with the abort-catch translation; the
-    // message-bytes advance must run before the bytes leave the buffer so the over-write check fires.
+    // message-bytes CHECK runs BEFORE the bytes leave the buffer so the over-write check fires before
+    // anything reaches the wire (CVE-2024-32655 defense). The counter then commits ONLY the bytes that
+    // actually drained, measured as (before - UnflushedBytes-after): a clean flush drains all `count`,
+    // a faulted or partial flush leaves the un-sent remainder in UnflushedBytes, so the commit is the
+    // prefix that left and the remainder stays buffered for the next flush to re-check and commit. This
+    // is correct whether the flush wrote nothing, wrote part-then-faulted, or wrote all - no
+    // assumption about all-or-nothing. (The old advance-before-flush over-counted on the shutdown-drain
+    // reflush of still-buffered bytes: spurious "exceed declared length".) Committed in finally so it
+    // runs on the fault path too, before the exception propagates to the shell's abort translation.
     public void Flush(TimeSpan timeout = default)
     {
-        AdvanceMessageBytesFlushed(checked((int)_bufferingWriter.UnflushedBytes));
-        _bufferingWriter.Flush(timeout);
+        var before = checked((int)_bufferingWriter.UnflushedBytes);
+        CheckMessageBytesFlushed(before);
+        try
+        {
+            _bufferingWriter.Flush(timeout);
+        }
+        finally
+        {
+            CommitMessageBytesFlushed(before - checked((int)_bufferingWriter.UnflushedBytes));
+        }
     }
 
     public ValueTask FlushAsync(CancellationToken cancellationToken)
     {
-        AdvanceMessageBytesFlushed(checked((int)_bufferingWriter.UnflushedBytes));
-        return _bufferingWriter.FlushAsync(cancellationToken);
+        var before = checked((int)_bufferingWriter.UnflushedBytes);
+        CheckMessageBytesFlushed(before);
+        var task = _bufferingWriter.FlushAsync(cancellationToken);
+        if (task.IsCompletedSuccessfully)
+        {
+            task.GetAwaiter().GetResult();
+            CommitMessageBytesFlushed(before - checked((int)_bufferingWriter.UnflushedBytes));
+            return ValueTask.CompletedTask;
+        }
+        return Awaited(this, task, before);
+
+        static async ValueTask Awaited(WriteChannel self, ValueTask task, int before)
+        {
+            try
+            {
+                await task.ConfigureAwait(false);
+            }
+            finally
+            {
+                self.CommitMessageBytesFlushed(before - checked((int)self._bufferingWriter.UnflushedBytes));
+            }
+        }
     }
 
     // Wrapper to shield callers from slow writers (e.g. PipeWriter).
