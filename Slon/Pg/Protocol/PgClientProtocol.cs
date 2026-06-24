@@ -136,6 +136,11 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
     CancellationToken AbortToken => _close.AbortToken;
     CancellationToken StoppingToken => _close.StoppingToken;
     public int PipelineDepth => _pipeline.Depth;
+    // Flows enqueued but not yet dispatched (the source's queue). PipelineDepth + Backlog is the total
+    // outstanding work on this protocol - the load-scoring L and a diagnostics gauge. Stale-tolerant
+    // lock-free reads, same post-Initialize contract as PipelineDepth.
+    public int Backlog => _source.Backlog;
+    public int Outstanding => _pipeline.Depth + _source.Backlog;
     ProtocolStatus Status => _status;
 
     // Source-side accessors. The PgClientFlowSource's pre-park hook reads these to decide whether
@@ -146,7 +151,9 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
 
     // Pool-unit accessors. PgConnection forwards its IPoolConnection<PgConnection> implementation
     // to these. Keeps the protocol package decoupled from Slon.Pools' typed context.
-    internal bool IsIdle => PipelineDepth is 0;
+    // Outstanding, not just in-flight: a connection sitting on undispatched backlog is not idle (the
+    // pool's idle fast path must not grab it as free while LoadScore counts that backlog as load).
+    internal bool IsIdle => Outstanding is 0;
     internal bool IsCompleted => Status is ProtocolStatus.Completed;
     // The cause that closed the protocol, or null if it completed cleanly. _closedException wraps the
     // shutdown's closeReason as its inner; the inner is the raw cause (a fault from FailProtocol / wire
@@ -165,23 +172,24 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         return score < otherScore ? -1 : score == otherScore ? 0 : 1;
     }
 
-    // Estimated backlog in ticks (lower = better target). Little's Law core: expected wait = depth /
-    // throughput (W = L/λ), so a deep-but-fast connection scores lower than a shallow-but-stuck one. The
+    // Estimated wait in ticks (lower = better target). Little's Law core: expected wait = outstanding /
+    // throughput (W = L/λ), where L is in-flight depth PLUS undispatched backlog - all the work that has
+    // to run on this wire - so a deep-but-fast connection scores lower than a shallow-but-stuck one. The
     // throughput floor turns a zero-rate-with-work connection into a large W (correctly "stuck"); an idle
     // connection short-circuits to 0. Stalls (non-pipelined flows serialize the wire) and a head flow
     // running past the age threshold (stuck on a long op) add tick-equivalent penalties on top. All knobs
     // are deliberately rough - power-of-two selection only needs the comparison to be directionally right.
     double LoadScore()
     {
-        var depth = PipelineDepth;
-        if (depth == 0)
+        var outstanding = Outstanding;
+        if (outstanding == 0)
             return 0;
 
         const double RateFloor = 0.5, StallWeight = 2, AgePenalty = 5;
         const int AgeThresholdTicks = 3;
 
         var rate = Math.Max(_throughputPerTick, RateFloor);
-        var score = depth / rate + _pipelineStalls * StallWeight;
+        var score = outstanding / rate + _pipelineStalls * StallWeight;
         if (_heartbeatTick - _currentFlowStartTick > AgeThresholdTicks)
             score += AgePenalty;
         return score;
