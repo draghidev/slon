@@ -284,6 +284,12 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         _source = PgClientFlowSource.Create(this, _options.ExecutionScheduler);
         _pipeline = Pipeline.Create<PgClientFlow, Policy, PgClientFlowSource, PgClientFlowSource.Enumerator>(new Policy(this, FlowControl), _source);
         FlowControl.BindPipeline(new PipelineFlowSlots<Policy, PgClientFlowSource, PgClientFlowSource.Enumerator>(_pipeline));
+        // Seed the wire's transaction status to Idle before the startup flow is queued. A fresh
+        // connection holds no transaction, and StartupFlow's terminating RFQ doesn't route through
+        // OnFlowRfq (it never arms _rfqCount - see CopyStartupBuffer), so without this seed the
+        // startup flow's own CompleteItem would hit GuardWireIdleOnHandoff with the Unknown default
+        // and fail a healthy connection. Set before TryQueueFlow so it precedes that flow's completion.
+        _transactionStatus = TransactionStatus.Idle;
         if (!TryQueueFlow(flow, ProtocolStatus.Created))
             throw new InvalidOperationException("Could not enqueue starting flow, protocol is not in a valid state to start.");
         try
@@ -732,6 +738,10 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
 
             _control.OnCompleted(item, remainingDepth);
             item.GetExecutionControl(_control).Complete(exception);
+            // No recovery in play here (recovered flows take the branch above), so the wire state is final:
+            // an outer flow that left a transaction open is unscoped poison. Inner-scope / failed flows are
+            // exempt (handled in GuardWireIdleOnHandoff).
+            _control.GuardWireIdleOnHandoff(exception);
         }
 
         [MethodImpl(MethodImplOptions.NoInlining)]
@@ -1080,6 +1090,27 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         // per-Control copy) so inner-scope and outer flows keep one consistent view of the one wire.
         public void OnFlowRfq(BackendMessage message)
             => protocol._transactionStatus = ReadyForQueryMessage.Create(message).TransactionStatus;
+
+        // Wire-handoff guard, called from Policy.CompleteItem when a flow retires. The OUTER multiplexed
+        // pipeline (poolFacing) hands the wire between INDEPENDENT flows, so a flow must leave it Idle -
+        // a left-open transaction would run the next interleaved flow inside it (corruption). The inner-
+        // scope Control holds a transaction across its OWN subflows and is exempt (poolFacing=false). And
+        // we only guard a CLEAN completion: a failed flow is recovery's domain (resync -> status-gated
+        // ROLLBACK -> Idle), and a recovered flow takes the ResyncRecoveryFlow branch anyway, so by the
+        // time the normal branch runs there is no recovery in play. (An autocommit error rolls back to
+        // Idle on its own, so this trips only on a genuinely unscoped transaction left open by a success.)
+        public void GuardWireIdleOnHandoff(Exception? completionException)
+        {
+            // A cleanly-completed outer flow must leave the wire at Idle; anything else means it left a
+            // transaction open. StartupFlow's terminating RFQ doesn't route through OnFlowRfq (it never
+            // arms _rfqCount - see CopyStartupBuffer), so the wire status is seeded to Idle before that
+            // flow is queued (StartAsync); every other flow's own RFQ is read by ExecutePipelined before
+            // its CompleteItem, so the status here is always this flow's own final state.
+            if (poolFacing && completionException is null && protocol._transactionStatus is not TransactionStatus.Idle)
+                protocol.FailProtocol(new InvalidOperationException(
+                    $"A multiplexed flow completed leaving the connection in transaction status '{protocol._transactionStatus}'. " +
+                    "Transactions must run inside an exclusive scope; failing the connection to avoid corrupting subsequent flows."));
+        }
 
         [AsyncMethodBuilder(typeof(NonContextRestoringPoolingValueTaskMethodBuilder<>))]
         internal ValueTask<FlowTasks> Execute(PgClientFlow flow)

@@ -34,6 +34,33 @@ public class ProtocolCompletionTests
         await e.DisposeAsync();
     }
 
+    // The wire-handoff guard (GuardWireIdleOnHandoff): a cleanly-completed flow on the multiplexed
+    // outer pipeline that leaves the wire in a transaction - an unscoped BEGIN - must fail the
+    // protocol rather than let the next interleaved flow run inside the open transaction. A real
+    // transaction has to be held in an exclusive scope; this is the poison check for one that isn't.
+    [TestMethod]
+    public async Task UnscopedTransaction_OnOuterPipeline_FailsProtocol()
+    {
+        var protocol = await ConnectAsync();
+        try
+        {
+            // BEGIN drains cleanly (CommandComplete + RFQ=Transaction); the guard fires on completion.
+            // The fire-and-forget FailProtocol can race the drain's dispose, so tolerate a closed
+            // exception here - the assertion is on the resulting protocol state.
+            try { await RunAsync(protocol, "BEGIN"); }
+            catch (PgClientClosedException) { }
+
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            while (!protocol.IsCompleted && sw.Elapsed < TimeSpan.FromSeconds(5))
+                await Task.Delay(10);
+            Assert.IsTrue(protocol.IsCompleted, "the unscoped BEGIN did not trip the wire-handoff guard");
+        }
+        finally
+        {
+            await protocol.DisposeAsync();
+        }
+    }
+
     // Graceful CompleteAsync after a normal flow finishes. Tests teardown lands; pool eviction
     // status flips to Completed cleanly.
     [TestMethod]
