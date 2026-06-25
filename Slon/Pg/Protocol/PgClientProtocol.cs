@@ -426,12 +426,14 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         return true;
     }
 
-    /// Graceful shutdown. Gives flows up to CompletionTimeout to drain, then escalates to
-    /// forceful by firing AbortToken. Returns when the pipeline has fully drained and all
-    /// in-flight flows have completed. This is the only entry point that observes the drain;
-    /// <see cref="DisposeAsync"/> / <see cref="Dispose"/> fire-and-forget.
+    /// Awaitable teardown, keyed on <paramref name="closeReason"/> the way Pipe/Channel Complete is: a
+    /// NULL reason is a GRACEFUL close (drain in-flight up to CompletionTimeout, then escalate to RST); a
+    /// NON-NULL reason is a FORCEFUL abort (RST immediately, the reason being the in-flight flows' fault).
+    /// Either way returns only once the pipeline has fully drained - the awaitable counterpart to the
+    /// fire-and-forget <see cref="DisposeAsync"/> / <see cref="Dispose"/> / <see cref="FailProtocol"/>.
+    /// So forceful-and-await is just CompleteAsync(reason); graceful-and-await is CompleteAsync().
     public ValueTask CompleteAsync(Exception? closeReason = null)
-        => Shutdown(closeReason, forceful: false);
+        => Shutdown(closeReason, forceful: closeReason is not null);
 
     /// Async forceful tear-down. Fires AbortToken immediately, fails activations for pipelined
     /// flows. The pipeline drain unwinds in the background; this method does NOT await it (the
