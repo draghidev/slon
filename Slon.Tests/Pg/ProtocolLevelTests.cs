@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using Slon.Pg;
+using Slon.Pg.Protocol;
 using Slon.Pg.Protocol.Flows;
 
 namespace Slon.Tests.Pg;
@@ -23,6 +24,46 @@ public class ProtocolLevelTests
     {
         await using var lease = await PgTestPool.LeaseAsync();
         await PgTestPool.RunAsync(lease.Protocol, "select 1");
+    }
+
+    // OnFlowRfq bookkeeping: the wire's transaction status is tracked on a SINGLE protocol field, routed
+    // from every flow's terminating ReadyForQuery - from both the outer protocol Control (the autocommit
+    // select) AND the inner-scope Control (the BEGIN/COMMIT subflows), proving no per-Control duplication.
+    // A transaction MUST be scoped in an exclusive flow (holding the wire); running BEGIN/COMMIT as
+    // separate flows on the multiplexed protocol would poison the pipeline.
+    [TestMethod]
+    [DoNotParallelize]
+    public async Task TransactionStatus_TrackedAcrossOuterFlowAndExclusiveScope()
+    {
+        await using var lease = await PgTestPool.LeaseAsync();
+        var p = lease.Protocol;
+
+        // Outer Control: an autocommit command's RFQ is Idle.
+        await PgTestPool.RunAsync(p, "select 1");
+        Assert.AreEqual(TransactionStatus.Idle, p.TransactionStatus, "after autocommit select (outer Control)");
+
+        // Inner Control: a transaction held exclusively, BEGIN/COMMIT as subflows on the inner pipeline.
+        var scope = p.BeginExclusiveScope(async: true);
+        await scope.HandoffReady;
+        try
+        {
+            await Drain(scope.Queue(new CommandFlow(async: true, Command.Create("BEGIN"))));
+            Assert.AreEqual(TransactionStatus.Transaction, p.TransactionStatus, "after BEGIN (inner Control)");
+
+            await Drain(scope.Queue(new CommandFlow(async: true, Command.Create("COMMIT"))));
+            Assert.AreEqual(TransactionStatus.Idle, p.TransactionStatus, "after COMMIT (inner Control)");
+        }
+        finally
+        {
+            await scope.CompleteScopeAsync();
+        }
+
+        static async Task Drain(CommandFlow cmd)
+        {
+            var e = cmd.GetAsyncEnumerator();
+            while (await e.MoveNextAsync()) { }
+            await e.DisposeAsync();
+        }
     }
 
     // Many sync flows in a tight loop. Exercises the handoff state machine across repeated

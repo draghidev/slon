@@ -97,6 +97,12 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
     int _backendProcessId;
     int _backendSecretKey;
 
+    // The wire's last-seen transaction status (from every flow's terminating ReadyForQuery). Connection-
+    // wide: one wire, one transaction state, so it lives here (single) - inner-scope and outer flows both
+    // route their RFQ through Control.OnFlowRfq to this field, never a per-Control copy. Surfaced via
+    // Control.TransactionStatus. Unknown until the first RFQ (startup sets it Idle).
+    TransactionStatus _transactionStatus;
+
     // Two-token cancellation cascade:
     // StoppingToken = graceful drain signal. Body polls at handoff/coordination boundaries and
     // switches to drain mode. I/O keeps running so the wire reaches a clean state. Fired by
@@ -155,6 +161,9 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
     // pool's idle fast path must not grab it as free while LoadScore counts that backlog as load).
     internal bool IsIdle => Outstanding is 0;
     internal bool IsCompleted => Status is ProtocolStatus.Completed;
+    // The wire's last-seen transaction status (Idle / Transaction / Error). For connection-state queries,
+    // recovery's status-gated ROLLBACK, and pool steering (an open-transaction wire is a hard-skip).
+    internal TransactionStatus TransactionStatus => _transactionStatus;
     // The cause that closed the protocol, or null if it completed cleanly. _closedException wraps the
     // shutdown's closeReason as its inner; the inner is the raw cause (a fault from FailProtocol / wire
     // death), null for a graceful CompleteAsync or a clean forceful DisposeAsync. A null check tells
@@ -947,6 +956,10 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         public int BackendProcessId => protocol._backendProcessId;
         public int BackendSecretKey => protocol._backendSecretKey;
 
+        // The wire's last-seen transaction status. Connection-wide (single field on the protocol); the
+        // inner-scope Control reads the same one. Idle / Transaction / Error, or Unknown pre-first-RFQ.
+        public TransactionStatus TransactionStatus => protocol._transactionStatus;
+
         // Tokens come from the scope signal for an inner Control (so the scope cascade reaches inner
         // flows), else the protocol's _close. Both are stable across a flow's tenure. Surfaced through
         // Control so ExecutionControl and the body read them without per-flow storage.
@@ -1063,11 +1076,10 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
             }
         }
 
-        // Allows the protocol to do any bookkeeping of transaction state and any cleanup.
+        // Connection-wide transaction-state bookkeeping. Routes to the single protocol field (NOT a
+        // per-Control copy) so inner-scope and outer flows keep one consistent view of the one wire.
         public void OnFlowRfq(BackendMessage message)
-        {
-            var rfq = ReadyForQueryMessage.Create(message);
-        }
+            => protocol._transactionStatus = ReadyForQueryMessage.Create(message).TransactionStatus;
 
         [AsyncMethodBuilder(typeof(NonContextRestoringPoolingValueTaskMethodBuilder<>))]
         internal ValueTask<FlowTasks> Execute(PgClientFlow flow)
