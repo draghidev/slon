@@ -95,12 +95,14 @@ abstract class CommandResult : IDisposable, IAsyncDisposable, IEnumerable<Row>, 
         return false;
     }
 
-    public CommandCompleteMessage? GetCommandComplete()
+    // Non-nullable: it never returns null - it throws when the result isn't complete. Pair with IsComplete
+    // (or TryGetCommandComplete) to check first. Consistent with RecordsAffected's throw-on-incomplete.
+    public CommandCompleteMessage GetCommandComplete()
     {
         if (TryGetCommandComplete(out var value))
-            return value;
+            return value.Value;
 
-        ThrowHelper.ThrowInvalidOperation("CommandResult rows are not enumerated yet.");
+        ThrowHelper.ThrowInvalidOperation("CommandResult rows are not enumerated yet (check IsComplete first).");
         return default;
     }
 
@@ -110,7 +112,25 @@ abstract class CommandResult : IDisposable, IAsyncDisposable, IEnumerable<Row>, 
     // We have rows if we requested execution, can have rows and read one, or the command isn't yet completed (this means rows must be coming).
     // This distinction is important for result-set based readers (e.g. DbDataReader) which must always enumerate commands that have a row description.
     public bool HasRows => _requestedExecution && CanHaveRows && (_firstRowEnumerated || !TryGetCommandComplete(out _));
-    public long RecordsAffected => _recordsAffected;
+    // True once the command has run to its terminal (CommandComplete / EmptyQueryResponse / ErrorResponse)
+    // - i.e. all rows have been read. The completion-dependent members (RecordsAffected, GetCommandComplete)
+    // throw until this is true; check it first to avoid the throw. NOTE: a result completes by being
+    // CONSUMED (enumerated to the end / GetCommandComplete), not on its own - this is the "have I read it
+    // through" state, not a "wait for it to flip" signal.
+    public bool IsComplete => _commandCompleteMessage is not null || _errorMessage is not null;
+
+    // RecordsAffected is only known once the command has run to its CommandComplete / ErrorResponse.
+    // Reading it on a not-yet-drained result is a consumer bug - surface it loudly instead of silently
+    // handing back 0 (which is what hid the un-drained ExecuteNonQuery path). Gate with IsComplete.
+    public long RecordsAffected
+    {
+        get
+        {
+            if (!IsComplete)
+                ThrowHelper.ThrowInvalidOperation("RecordsAffected is unavailable until the command result has been read to its CommandComplete (check IsComplete first).");
+            return _recordsAffected;
+        }
+    }
     public int FieldCount => _rowDescription?.FieldCount ?? 0;
 
     // Disposing the CommandResult skips going through our enumerator, the results won't be accessed anyway.
@@ -125,9 +145,18 @@ abstract class CommandResult : IDisposable, IAsyncDisposable, IEnumerable<Row>, 
         {
             case PgTypes.BackendType.EmptyQueryResponse:
             case PgTypes.BackendType.CommandComplete:
-                var commandCompleteMessage = _commandCompleteMessage = CommandCompleteMessage.Create(message);
-                // TODO pull this info from the message.
-                // _recordsAffected = commandCompleteMessage.RecordsAffected;
+                // Create parses the tag into value scalars while we're on this message (zero alloc, no
+                // buffer view kept). Only data-modifying statements count toward RecordsAffected;
+                // SELECT/Call/Other/EmptyQuery don't.
+                var ccm = CommandCompleteMessage.Create(message);
+                _commandCompleteMessage = ccm;
+                _recordsAffected = ccm.StatementType switch
+                {
+                    StatementType.Insert or StatementType.Update or StatementType.Delete or StatementType.Merge
+                        or StatementType.Copy or StatementType.Move or StatementType.Fetch or StatementType.CreateTableAs
+                        => (long)ccm.Rows,
+                    _ => 0,
+                };
                 break;
             case PgTypes.BackendType.ErrorResponse:
                 // TODO fill out expected types.

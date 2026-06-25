@@ -515,7 +515,12 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
         ThrowIfDisposed();
         var recordsAffected = 0L;
         foreach (var result in Enqueue(parameters, CommandBehavior.Default))
+        {
+            // Drive the result to its CommandComplete so RecordsAffected is populated (we discard any
+            // rows - this is ExecuteNonQuery). Only data-modifying statements contribute a non-zero count.
+            foreach (var _ in result) { }
             recordsAffected = checked(recordsAffected + result.RecordsAffected);
+        }
         return checked((int)recordsAffected);
     }
 
@@ -530,7 +535,14 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
             var recordsAffected = 0L;
             enumerator = (await thisRef.EnqueueAsync(parameters, CommandBehavior.Default, cancellationToken).ConfigureAwait(false)).GetAsyncEnumerator(cancellationToken);
             while (await enumerator.MoveNextAsync().ConfigureAwait(false))
-                recordsAffected = checked(recordsAffected + enumerator.Current.RecordsAffected);
+            {
+                var result = enumerator.Current;
+                // Drive the result to its CommandComplete so RecordsAffected is populated (we discard any
+                // rows - this is ExecuteNonQuery). Only data-modifying statements contribute a non-zero count.
+                var rows = result.GetAsyncEnumerator(cancellationToken);
+                while (await rows.MoveNextAsync().ConfigureAwait(false)) { }
+                recordsAffected = checked(recordsAffected + result.RecordsAffected);
+            }
             return checked((int)recordsAffected);
         }
         finally
