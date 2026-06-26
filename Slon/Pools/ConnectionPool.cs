@@ -428,21 +428,30 @@ public sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     static bool TryGetConnection(ref object? item, [NotNullWhen(true)]out T? connection)
     {
+        // A slot holds null (empty), a T (open connection), or a ConnectionFuture (open in progress).
+        // Hot path: a live connection is one type test with no cast. `is T` also defuses the original
+        // EntryPointNotFound hazard - a ConnectionFuture can never satisfy it, so it cannot reach the
+        // caller as a connection the way the old Unsafe.As reinterpret let an incomplete future do.
         var value = item;
-        if (value?.GetType() == typeof(ConnectionFuture) && (ConnectionFuture)value is { IsCompleted: true } future)
+        if (value is T conn)
         {
-            // We unwrap any previously completed future onto the array element to remove the indirection for future uses.
-            // When a connecion open fails the future is completed with a null result.
-            // As such the item will be made null and the caller is free to try and open a connection again.
-            item = connection = future.Result;
-        }
-        else
-        {
-            Debug.Assert(value is null or T);
-            connection = Unsafe.As<T?>(value);
+            connection = conn;
+            return true;
         }
 
-        return connection is not null;
+        // Cold path. A completed future unwraps onto the slot to drop the indirection for later reads
+        // (a failed open completes with a null result, nulling the slot so the caller can retry). An
+        // incomplete future is another thread mid-open, and null is an empty slot - neither is a usable
+        // connection, so skip.
+        if (value is ConnectionFuture { IsCompleted: true } future)
+        {
+            item = connection = future.Result;
+            return connection is not null;
+        }
+
+        Debug.Assert(value is null or ConnectionFuture);
+        connection = null;
+        return false;
     }
 
     [ThreadStatic]
