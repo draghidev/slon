@@ -888,8 +888,13 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
             //   - The wire isn't already RFQ-terminated. If the last write was Query/Sync the server
             //     emits the inherited RFQs and recovery is pure read-drain; if it ended mid extended-
             //     query, recovery's Sync brings the wire back to a defined state.
-            var canWriteSync = context.Kind is not PipelineItemFailureKind.PipelineTaskWaiter
-                && !failedItemControl.LastMessageInducesRfq;
+            // canWrite: the failure didn't close the write window (PipelineTaskWaiter = closed-window,
+            // identity already released from the writer). Recovery writes a ROLLBACK whenever it can,
+            // to close any transaction the failed flow left open (including an exclusive scope's, on
+            // abort-to-root). canWriteSync additionally injects a Sync to realign the wire when the last
+            // write was mid extended-query (no RFQ induced); a Query/Sync last message realigns itself.
+            var canWrite = context.Kind is not PipelineItemFailureKind.PipelineTaskWaiter;
+            var canWriteSync = canWrite && !failedItemControl.LastMessageInducesRfq;
 
             // The outstanding phase task to sequence against, by failure kind:
             //   - PipelineTask: the failed flow's in-flight WRITE (trailing). Recovery's TrailingPhase
@@ -909,7 +914,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
             // far as the recovery, so its dispatch state, RFQ bookkeeping, and registrations release
             // before the instance can be reused.
             recoveryItem = ResyncRecoveryFlow.Create(
-                _control, failedItem, context.Exception, outstandingPhase, outstandingIsRead, failedItemControl.RfqCount, canWriteSync);
+                _control, failedItem, context.Exception, outstandingPhase, outstandingIsRead, failedItemControl.RfqCount, canWriteSync, canWrite);
             return true;
         }
 

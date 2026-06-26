@@ -52,6 +52,24 @@ public class RecoveryTests
         await e.DisposeAsync();
     }
 
+    // Row count over the raw protocol. The flow enumerator yields CommandResults, each of which is
+    // itself enumerable over its Rows - so count the inner rows.
+    static async Task<int> CountRows(PgClientProtocol protocol, string sql)
+    {
+        var flow = new CommandFlow(async: true, Command.Create(sql));
+        Assert.IsTrue(protocol.TryQueue(flow));
+        var e = flow.GetAsyncEnumerator();
+        var rows = 0;
+        while (await e.MoveNextAsync())
+        {
+            var r = e.Current.GetAsyncEnumerator();
+            while (await r.MoveNextAsync()) rows++;
+            await r.DisposeAsync();
+        }
+        await e.DisposeAsync();
+        return rows;
+    }
+
     // Where the FaultingFlow's body throws. PreReturn = before returning FlowTasks (surfaces
     // as PipelineItemFailureKind.ExecuteItemTask). PipelineTask = the returned pipeline task
     // faults (PipelineItemFailureKind.PipelineTask or PipelineTaskWaiter). TrailingTask = the
@@ -73,7 +91,9 @@ public class RecoveryTests
         MultipleSyncsNoFlush,
         // Two simple queries: two inherited RFQs, each with a real result (so a held read has a
         // non-auto message to return and terminate on, unlike MultipleSyncsNoFlush's bare Syncs).
-        TwoQueriesNoFlush
+        TwoQueriesNoFlush,
+        // Each PipelinedStatements entry as its own Parse/Bind/Execute, no Sync - one implicit block.
+        PipelinedParseBindExecuteNoSync
     }
 
     // Test flow that lets each test pick its failure phase and write shape. Recovery's input
@@ -114,6 +134,16 @@ public class RecoveryTests
         /// cross post-snapshot (the drain-count reconciliation probe).
         public int HeldReadConsumeCount { get; init; } = 1;
 
+        /// SQL for the QueryNoFlush / ParseBindExecuteNoSync shapes (defaults to a trivial select).
+        /// Lets a test run a side-effecting statement (e.g. BEGIN + CREATE TEMP TABLE) to observe
+        /// whether recovery closed the transaction the failed flow left open.
+        public string QueryText { get; init; } = "select 1";
+
+        /// For WriteShape.PipelinedParseBindExecuteNoSync: each statement is written as its own
+        /// Parse/Bind/Execute with NO Sync between them - one extended-protocol implicit block. Lets a
+        /// test observe whether recovery commits or rolls back uncommitted spanning work.
+        public string[]? PipelinedStatements { get; init; }
+
         public FaultingFlow(bool async, FaultPhase phase, WriteShape shape)
             : base(supportsPipelining: true)
         {
@@ -130,10 +160,10 @@ public class RecoveryTests
                 case WriteShape.None:
                     break;
                 case WriteShape.QueryNoFlush:
-                    encoder.WriteQuery("select 1");
+                    encoder.WriteQuery(QueryText);
                     break;
                 case WriteShape.ParseBindExecuteNoSync:
-                    encoder.WriteParse("select 1");
+                    encoder.WriteParse(QueryText);
                     encoder.WriteBind();
                     encoder.WriteExecute();
                     break;
@@ -145,6 +175,14 @@ public class RecoveryTests
                 case WriteShape.TwoQueriesNoFlush:
                     encoder.WriteQuery("select 1");
                     encoder.WriteQuery("select 2");
+                    break;
+                case WriteShape.PipelinedParseBindExecuteNoSync:
+                    foreach (var stmt in PipelinedStatements!)
+                    {
+                        encoder.WriteParse(stmt);
+                        encoder.WriteBind();
+                        encoder.WriteExecute();
+                    }
                     break;
             }
 
@@ -256,6 +294,77 @@ public class RecoveryTests
         // the extended-protocol sequence cleanly and no stray RFQ was left on the wire.
         for (int i = 0; i < 3; i++)
             await RunAsync(protocol, "select 1");
+    }
+
+    // Recovery closes a transaction the failed flow left OPEN, landing the wire Idle. The faulting flow
+    // opens a transaction (BEGIN) and faults with it still open ('T'). Its last write is a Query (it
+    // induces its own RFQ, canWriteSync=false), so the realign path injects no Sync - the always-written
+    // ROLLBACK is what closes the block. Without it the next flow inherits the open transaction, its own
+    // RFQ comes back non-Idle, and the wire-handoff guard fails the protocol; so a clean subsequent flow
+    // is the proof recovery rolled the transaction back. (This is also the exclusive-scope-abort shape:
+    // an open transaction propagated to the root that recovery must close.)
+    [TestMethod]
+    public async Task Recovery_ClosesOpenTransaction_NextFlowIdle()
+    {
+        await using var protocol = await ConnectAsync();
+        var faulting = new FaultingFlow(async: true, FaultPhase.PreReturn, WriteShape.QueryNoFlush)
+        {
+            QueryText = "BEGIN"
+        };
+        Assert.IsTrue(protocol.TryQueue(faulting));
+
+        // Throws PgClientClosedException (the wire-handoff guard) if recovery left the transaction open;
+        // a clean completion means recovery's ROLLBACK landed the wire Idle.
+        await RunAsync(protocol, "select 1");
+        await RunAsync(protocol, "select 1");
+    }
+
+    // VERIFICATION: does PG hold pipelined extended-protocol Executes (no Sync, no BEGIN) in one
+    // implicit block that a Sync commits - so recovery's realigning Sync would COMMIT a faulted flow's
+    // partial work? Two INSERTs are pipelined into a REAL table (visible cross-connection) with no Sync,
+    // then the flow faults and recovery runs. A separate connection counts survivors: 2 = the Sync
+    // committed the uncommitted block (the hazard - abort-before-Sync is needed), 0 = rolled back.
+    // Two INSERTs are pipelined into a real table with no Sync between them - one implicit block - then
+    // the flow faults and recovery runs. All on one connection: a real (non-temp) table is visible to a
+    // later flow on the same connection once committed, so the survivor count tells the tale. 2 = the
+    // realigning Sync committed the faulted flow's uncommitted block (the hazard); 0 = rolled back.
+    [TestMethod]
+    public async Task Recovery_PipelinedImplicitBlock_SurvivorCount()
+    {
+        await Recovery_PipelinedSurvivors(["INSERT INTO {0} VALUES (1)", "INSERT INTO {0} VALUES (2)"]);
+    }
+
+    // Same, but the failed flow opened an EXPLICIT transaction itself (BEGIN via extended), so recovery's
+    // BEGIN-upgrade lands BEGIN-inside-BEGIN - a harmless WARNING (not an error), a no-op that leaves the
+    // open transaction for the ROLLBACK to unwind. Both INSERTs must still roll back.
+    [TestMethod]
+    public async Task Recovery_PipelinedExplicitBegin_RollsBackAll()
+    {
+        await Recovery_PipelinedSurvivors(["BEGIN", "INSERT INTO {0} VALUES (1)", "INSERT INTO {0} VALUES (2)"]);
+    }
+
+    static async Task Recovery_PipelinedSurvivors(string[] statementTemplates)
+    {
+        await using var protocol = await ConnectAsync();
+        var table = "recovery_span_" + Guid.NewGuid().ToString("N");
+        await RunAsync(protocol, $"CREATE TABLE {table} (x int)");
+        try
+        {
+            var faulting = new FaultingFlow(async: true, FaultPhase.PreReturn, WriteShape.PipelinedParseBindExecuteNoSync)
+            {
+                PipelinedStatements = [.. statementTemplates.Select(t => string.Format(t, table))]
+            };
+            Assert.IsTrue(protocol.TryQueue(faulting));
+            await RunAsync(protocol, "select 1"); // drive recovery to completion (and prove the wire is Idle)
+
+            var survived = await CountRows(protocol, $"SELECT x FROM {table}");
+            Assert.AreEqual(0, survived,
+                $"{survived} of 2 pipelined INSERTs survived recovery - the resync committed the faulted flow's uncommitted work instead of rolling it back.");
+        }
+        finally
+        {
+            await RunAsync(protocol, $"DROP TABLE {table}");
+        }
     }
 
     // Three Syncs written without flush, then pre-return throw. _rfqCount is 3,
@@ -680,6 +789,10 @@ public class RecoveryTests
             await Task.Delay(50);
 
             transport.ReleaseSegment(ReadyForQuery());
+            transport.ReleaseSegment(CommandComplete());
+            transport.ReleaseSegment(ReadyForQuery());
+            // Recovery appends a ROLLBACK (closes any open transaction) whose RFQ it also drains, so the
+            // scripted server answers it - otherwise recovery parks waiting on an RFQ that never comes.
             transport.ReleaseSegment(CommandComplete());
             transport.ReleaseSegment(ReadyForQuery());
 

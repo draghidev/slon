@@ -4,8 +4,9 @@ namespace Slon.Pg.Protocol.Flows;
 
 // Substitute item returned by PgClientProtocol.Control.TryRecoverItemFailure to resync the wire
 // after a flow fails (decode, write, or execute fault). Inherits the failed flow's outstanding RFQ
-// obligation, injects a terminating Sync, flushes the failed flow's buffered work plus the Sync,
-// then drains the resulting RFQs (inherited + 1).
+// obligation, pads any torn outgoing frame, then runs the resync move (realigning Sync when needed +
+// a ROLLBACK to close any open transaction; see WriteResync), flushing it with the failed flow's
+// buffered work and draining the resulting RFQs (inherited + the resync move's, 0-2).
 //
 // Substitution-substrate contract: recovery REPLACES the failed flow's executor slot, but the
 // failed flow's lifetime extends through this substitute via FailedFlow and the gate permissivity
@@ -14,14 +15,16 @@ namespace Slon.Pg.Protocol.Flows;
 // it before touching the encoder, so recovery's writes don't collide with the trailing flush on
 // the single-producer writer.
 //
-// Scope: resyncs non-COPY, non-torn wire state. COPY terminators and torn-frame repair are future
-// work; see the markers in ExecuteAuto.
+// Scope: write-side torn frames are padded (WriteResync step 1); COPY-mode terminators
+// (CopyDone/CopyFail) are future work - see the TODO(copy) marker in ExecuteAuto. COPY isn't
+// implemented, so the wire can't be in copy-mode at recovery time.
 sealed class ResyncRecoveryFlow : PgClientFlow
 {
     int _drainCount;
     ValueTask _outstandingTrailing;
     bool _outstandingIsRead;
     bool _canWriteSync;
+    bool _canWrite;
     PgClientProtocol.Control? _control;
 
     /// The flow this recovery supplanted, carried so the policy can complete it when the
@@ -33,8 +36,9 @@ sealed class ResyncRecoveryFlow : PgClientFlow
     public PgClientFlow? FailedFlow { get; private set; }
     public Exception? FailureException { get; private set; }
 
-    /// Whether recovery may write a terminating Sync. True only while the failed flow's write
-    /// window is still open. When closed, ExecuteAuto skips the Sync and drainCount drops its +1.
+    /// Whether recovery injects a realigning Sync. True only when the failed flow ended mid extended-
+    /// query (no RFQ induced) AND the write window is open. Distinct from _canWrite, which gates the
+    /// always-written ROLLBACK on just the write window being open.
     public bool CanWriteSync => _canWriteSync;
 
     /// True while the failed flow still has an in-flight read. The decoder permit resolves to
@@ -42,8 +46,7 @@ sealed class ResyncRecoveryFlow : PgClientFlow
     /// The read-side inverse of ThrowIfCannotWrite. DrainPhase awaits it before taking the read turn.
     public bool FailedReadOutstanding => _outstandingIsRead && !_outstandingTrailing.IsCompleted;
 
-    // A recovery is always bound to a failed flow. drainCount = inheritedRfqCount plus the
-    // recovery's own Sync when canWriteSync. The rfq transfer routes through ExecutionControl.
+    // A recovery is always bound to a failed flow. The rfq transfer routes through ExecutionControl.
     public static ResyncRecoveryFlow Create(
         PgClientProtocol.Control control,
         PgClientFlow failedFlow,
@@ -51,7 +54,8 @@ sealed class ResyncRecoveryFlow : PgClientFlow
         ValueTask outstandingTrailing,
         bool outstandingIsRead,
         int inheritedRfqCount,
-        bool canWriteSync)
+        bool canWriteSync,
+        bool canWrite)
     {
         var recovery = new ResyncRecoveryFlow(supportsPipelining: true) { IsAsync = failedFlow.IsAsyncAtBind };
         recovery.GetExecutionControl(control).TransferInheritedRfqCount(inheritedRfqCount);
@@ -61,7 +65,10 @@ sealed class ResyncRecoveryFlow : PgClientFlow
         recovery._outstandingTrailing = outstandingTrailing;
         recovery._outstandingIsRead = outstandingIsRead;
         recovery._canWriteSync = canWriteSync;
-        recovery._drainCount = inheritedRfqCount + (canWriteSync ? 1 : 0);
+        recovery._canWrite = canWrite;
+        // drainCount = inheritedRfqCount + the resync move's RFQs (WriteResync): the realigning Sync
+        // when canWriteSync, plus the always-written ROLLBACK when canWrite.
+        recovery._drainCount = inheritedRfqCount + (canWriteSync ? 1 : 0) + (canWrite ? 1 : 0);
         return recovery;
     }
 
@@ -74,6 +81,7 @@ sealed class ResyncRecoveryFlow : PgClientFlow
         _outstandingTrailing = default;
         _outstandingIsRead = false;
         _canWriteSync = false;
+        _canWrite = false;
         _control = null;
         FailedFlow = null;
         FailureException = null;
@@ -81,16 +89,14 @@ sealed class ResyncRecoveryFlow : PgClientFlow
 
     protected override ValueTask<FlowTasks> ExecuteAuto(Context context)
     {
-        // Resync unconditionally: inject a terminating Sync, flush it with the failed flow's
-        // buffered work, and drain to the RFQ it induces plus the inherited RFQs. Worst case is
-        // one harmless extra RFQ on an idle wire.
-        //
-        // Torn-frame defense: if the failed flow faulted mid-message, pad with zero bytes so the
-        // server reads exactly the declared body and exits at the framing boundary, leaving the
-        // following Sync on a clean RFQ state.
+        // Resync with WriteResync: pad any torn frame, then BEGIN (mid extended-query only) + ROLLBACK to
+        // discard whatever the failed flow left uncommitted. Mid extended-query its executed commands sit
+        // in an OPEN implicit block that PG holds to the Sync (NOT per-statement commit), so a BEGIN
+        // upgrades that block to explicit and the ROLLBACK unwinds it; otherwise the ROLLBACK just closes
+        // an open explicit transaction (an unfinished BEGIN, or an exclusive scope's, propagated to root).
         //
         // TODO(copy): COPY needs CopyFail/CopyDone handling instead of a bare Sync. COPY isn't
-        // implemented, so the wire can't be in copy-mode at recovery time and a bare Sync is correct.
+        // implemented, so the wire can't be in copy-mode at recovery time and this is correct.
         //
         // Sequencing against the failed flow's in-flight trailing (it owns the single-producer
         // writer): if outstanding already completed, write inline. Otherwise move the writes to our
@@ -102,9 +108,10 @@ sealed class ResyncRecoveryFlow : PgClientFlow
         //       the cycle. Trailing-phase await runs the drain concurrently and unblocks the flush.
         //   (b) Inline-blocking wedges the executor pump half-committed; trailing-phase await keeps
         //       the ExecutingItem invariant intact and recoverable via TrailingExecutionTask.
-        // Write window closed: pure read-drain of the failed flow's inherited RFQs. No Sync is
-        // written, so drainCount is inheritedRfqCount with no +1.
-        if (!_canWriteSync)
+        // Write window closed (PipelineTaskWaiter: identity released from the writer): pure read-drain
+        // of the failed flow's inherited RFQs, no resync write. An open transaction left here is
+        // backstopped by the next flow's wire-handoff guard.
+        if (!_canWrite)
             return new(new FlowTasks(trailingExecutionTask: default, pipelineTask: DrainPhase()));
 
         // Read-outstanding or write-already-finished: write inline. For read-outstanding the failed
@@ -113,8 +120,7 @@ sealed class ResyncRecoveryFlow : PgClientFlow
         if (_outstandingIsRead || _outstandingTrailing.IsCompletedSuccessfully)
         {
             var encoder = context.GetEncoder();
-            encoder.PadCurrentMessage();
-            encoder.WriteSync();
+            WriteResync(encoder);
             var flushTask = encoder.FlushAsync();
             return new(new FlowTasks(trailingExecutionTask: flushTask, pipelineTask: DrainPhase()));
         }
@@ -131,8 +137,7 @@ sealed class ResyncRecoveryFlow : PgClientFlow
             // tail, so GetEncoder's gate accepts our writes here, sequential with the now-completed
             // trailing and single-producer-preserved.
             var encoder = context.GetEncoder();
-            encoder.PadCurrentMessage();
-            encoder.WriteSync();
+            WriteResync(encoder);
             await encoder.FlushAsync().ConfigureAwait(false);
         }
 
@@ -148,7 +153,7 @@ sealed class ResyncRecoveryFlow : PgClientFlow
                 // The read may have crossed inherited RFQs after Create snapshotted the count,
                 // decrementing the failed flow's own counter. Reconcile against its now-final live
                 // count so we drain only what remains, not what the read already consumed.
-                _drainCount = FailedFlow!.GetExecutionControl(_control!).RfqCount + (_canWriteSync ? 1 : 0);
+                _drainCount = FailedFlow!.GetExecutionControl(_control!).RfqCount + (_canWriteSync ? 1 : 0) + (_canWrite ? 1 : 0);
             }
             var decoder = await context.GetDecoderAsync().ConfigureAwait(false);
             int remaining = _drainCount;
@@ -161,5 +166,32 @@ sealed class ResyncRecoveryFlow : PgClientFlow
                     remaining--;
             }
         }
+    }
+
+    // Realign the wire and discard whatever the failed flow left uncommitted (taken whenever the write
+    // window is open):
+    //   1. PadCurrentMessage - complete any torn outgoing frame so the server exits at a framing boundary.
+    //   2. Query("BEGIN") (only when canWriteSync) - the failed flow ended mid extended-query, so its
+    //      executed commands sit in an OPEN implicit block PG holds to the Sync (verified: a bare Sync
+    //      COMMITS them - see Recovery_PipelinedImplicitBlock_SurvivorCount). BEGIN upgrades that block to
+    //      an explicit transaction so the ROLLBACK can unwind it. It also lands the realigning RFQ. When
+    //      the flow already opened an explicit transaction, BEGIN-in-transaction is a harmless WARNING
+    //      (NOT an error), a no-op that leaves the open transaction for the ROLLBACK.
+    //   3. Query("ROLLBACK") - rolls back the now-explicit (or already-explicit) transaction; a
+    //      no-op-with-notice when already Idle. When canWriteSync is false the flow's own Query/Sync
+    //      already terminated its block, so this is the only message - closing any open BEGIN it left.
+    // BEGIN/ROLLBACK notices and CommandCompletes are non-RFQ and discarded by DrainPhase (counts RFQs).
+    void WriteResync(PgEncoder encoder)
+    {
+        encoder.PadCurrentMessage();
+        if (_canWriteSync)
+            // The failed flow ended mid extended-query: its executed commands sit in an OPEN implicit
+            // block that a bare Sync would COMMIT - PG holds pipelined Executes to the Sync, it does NOT
+            // commit per statement. BEGIN upgrades that implicit block into an explicit transaction, so
+            // the ROLLBACK below unwinds the whole thing. (When canWriteSync is false the flow's own
+            // Query/Sync already terminated its block - nothing to upgrade, just close any open BEGIN.)
+            encoder.WriteQuery("BEGIN");
+        // Closes the now-explicit (or already-explicit) transaction; a no-op-with-notice when Idle.
+        encoder.WriteQuery("ROLLBACK");
     }
 }
