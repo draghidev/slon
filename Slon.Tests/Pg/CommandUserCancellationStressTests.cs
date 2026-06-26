@@ -61,12 +61,27 @@ public class CommandUserCancellationStressTests
             leases[p] = await PgTestPool.LeaseAsync();
         try
         {
-            for (var i = 0; i < Iters; i++)
+            // One worker per lease, each draining a strided slice of the iteration space. The full Iters
+            // attempt count (the coverage) is preserved; we just stop idling 7 of the 8 leased protocols.
+            // These are I/O-bound cancellation races, so overlapping the round-trips collapses wall-clock,
+            // and running every lease at once is a STRONGER concurrency stress, not a weaker one. Each
+            // protocol is still touched by a single worker, so per-protocol behavior is unchanged.
+            var workers = new Task[leases.Length];
+            for (var p = 0; p < leases.Length; p++)
             {
-                CommandFlow.Enumerator e = default;
-                try { e = await body(leases[i % leases.Length].Protocol, i); }
-                finally { await DisposeGuarded(e, i, "DisposeAsync"); }
+                var protocol = leases[p].Protocol;
+                var start = p;
+                workers[p] = Task.Run(async () =>
+                {
+                    for (var i = start; i < Iters; i += leases.Length)
+                    {
+                        CommandFlow.Enumerator e = default;
+                        try { e = await body(protocol, i); }
+                        finally { await DisposeGuarded(e, i, "DisposeAsync"); }
+                    }
+                });
             }
+            await Task.WhenAll(workers);
         }
         finally
         {
@@ -137,29 +152,40 @@ public class CommandUserCancellationStressTests
             leases[p] = await PgTestPool.LeaseAsync();
         try
         {
-            for (var i = 0; i < Iters; i++)
+            // One worker per lease over a strided slice - same Iters of concurrent-tenure attempts, with
+            // the 8 protocols overlapped instead of idled (each protocol still runs its a/b pairs in order).
+            var workers = new Task[leases.Length];
+            for (var p = 0; p < leases.Length; p++)
             {
-                var protocol = leases[i % leases.Length].Protocol;
-                var ctsA = new CancellationTokenSource(); ctsA.Cancel();
-                var ctsB = new CancellationTokenSource(); ctsB.Cancel();
-                var a = TwoResultFlow();
-                var b = TwoResultFlow();
-                Assert.IsTrue(protocol.TryQueue(a, cancellationToken: ctsA.Token));
-                Assert.IsTrue(protocol.TryQueue(b, cancellationToken: ctsB.Token));
-                var ea = a.GetAsyncEnumerator(ctsA.Token);
-                var eb = b.GetAsyncEnumerator(ctsB.Token);
-                try
+                var protocol = leases[p].Protocol;
+                var start = p;
+                workers[p] = Task.Run(async () =>
                 {
-                    await Task.WhenAll(
-                        MoveNextGuarded(ea, ctsA.Token, i),
-                        MoveNextGuarded(eb, ctsB.Token, i));
-                }
-                finally
-                {
-                    await DisposeGuarded(ea, i, "DisposeAsync (a)");
-                    await DisposeGuarded(eb, i, "DisposeAsync (b)");
-                }
+                    for (var i = start; i < Iters; i += leases.Length)
+                    {
+                        var ctsA = new CancellationTokenSource(); ctsA.Cancel();
+                        var ctsB = new CancellationTokenSource(); ctsB.Cancel();
+                        var a = TwoResultFlow();
+                        var b = TwoResultFlow();
+                        Assert.IsTrue(protocol.TryQueue(a, cancellationToken: ctsA.Token));
+                        Assert.IsTrue(protocol.TryQueue(b, cancellationToken: ctsB.Token));
+                        var ea = a.GetAsyncEnumerator(ctsA.Token);
+                        var eb = b.GetAsyncEnumerator(ctsB.Token);
+                        try
+                        {
+                            await Task.WhenAll(
+                                MoveNextGuarded(ea, ctsA.Token, i),
+                                MoveNextGuarded(eb, ctsB.Token, i));
+                        }
+                        finally
+                        {
+                            await DisposeGuarded(ea, i, "DisposeAsync (a)");
+                            await DisposeGuarded(eb, i, "DisposeAsync (b)");
+                        }
+                    }
+                });
             }
+            await Task.WhenAll(workers);
         }
         finally
         {
