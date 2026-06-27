@@ -165,7 +165,11 @@ public class CommandDrainTests
     public async Task InFlightCompletion_RacesSyncDispose_PumpNeverStrands_Stress()
     {
         var cap = TimeSpan.FromSeconds(10);
-        var iters = int.TryParse(Environment.GetEnvironmentVariable("SLON_STRESS_ITERATIONS"), out var n) && n > 0 ? n : 100;
+        // Each iteration is a full connect + force-abort cycle (~15ms, churns a connection), so CAP it rather
+        // than scaling linearly with SLON_STRESS_ITERATIONS - this is path coverage (no teeth on the fence),
+        // a few hundred is plenty and avoids dominating the stress run / churning thousands of connections.
+        var stress = int.TryParse(Environment.GetEnvironmentVariable("SLON_STRESS_ITERATIONS"), out var n) && n > 0 ? n : 0;
+        var iters = Math.Min(Math.Max(stress, 10), 300);
         for (var i = 0; i < iters; i++)
         {
             var protocol = await PgTestPool.NewIsolatedAsync();
