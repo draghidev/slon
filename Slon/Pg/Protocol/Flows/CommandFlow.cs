@@ -508,6 +508,17 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                         => ((CommandFlow)state!).RequestCancel(token), this);
                 }
 
+                // A flow reading a FRESH command response after the protocol has already CLOSED would consume
+                // a prior flow's leftover wire bytes (a desync: "Unexpected backend message: DataRow, expected
+                // ParseComplete"). When a flow faults under a graceful close it retires WITHOUT draining (an
+                // expected dirty retire); the next flow legitimately activates (tenure is intact - it IS the
+                // ActivatedFlow), but its own command can no longer be answered, so it must NOT read - it must
+                // fault with the close. Draining flows are exempt: they consume their OWN already-received
+                // bytes to leave the wire clean. The per-CommandResult StoppingToken check below is too late -
+                // it runs AFTER this read - so the close must be observed HERE, before the read.
+                if (!IsDraining && context.IsProtocolClosed && context.ClosedException is { } preReadClose)
+                    throw preReadClose;
+
                 if (IsAsync)
                     (_pgError, _requestedRowDescription) = await command.ReadUntilExecuteAsync(_decoder).ConfigureAwait(false);
                 else
