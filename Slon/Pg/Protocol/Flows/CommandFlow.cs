@@ -68,6 +68,11 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
     // drain-to-clean-state guarantee.
     bool _draining;
     internal bool IsDraining => Volatile.Read(ref _draining);
+    // One-time guard for the FIRST drain transition (switching to drain is a single event). Body-thread
+    // only - the body's execution is serialized, so no Volatile. Records that the drive mode for this drain
+    // is already settled, so a sync-takeover's later commands (which re-skip the gate every command) don't
+    // re-run the skip-gate IsAsync restore and flip a genuine sync drain back to async mid-batch.
+    bool _drainModeEntered;
 
     // The consumer DISPOSED the enumerator (the two consumer departure paths below), as opposed to the
     // body opting the consumer out on its own cancel/close drain. The terminal suppresses a user-cancel
@@ -604,6 +609,20 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                         }
                     }
                 }
+                else if (!_drainModeEntered)
+                {
+                    // Skip-gate drain entry: we reached the drain already draining, so we never parked on
+                    // the gate this transition and were NOT inline-taken-over by a sync disposer. A sync
+                    // Dispose's IsAsync=false presentation leaked here; restore the bound mode so the drain
+                    // below runs ASYNC, not sync socket I/O on this (pool) thread (the double-block). The
+                    // gate-resume entry skips this branch and keeps IsAsync as-is: false=takeover stays sync,
+                    // or the gate's OnCompleted recheck already restored true=recovery.
+                    IsAsync = IsAsyncAtBind;
+                }
+                // Switching to drain is a one-time transition - record it (covers BOTH the gate-resume entry
+                // above and this skip-gate entry). A genuine takeover re-skips the gate on every later
+                // command; the guard then keeps those from re-running the restore and flipping it async.
+                _drainModeEntered = _drainModeEntered || IsDraining;
 
                 // We check IsAsync again as it can change after every resumption.
                 // Current is disposed here, something the user might have done, but if not we'll do it here.
@@ -1037,6 +1056,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
         _drainErrors = null;
         _consumerDisposed = false;
         _draining = false;
+        _drainModeEntered = false;
         WaitForDrainOnDispose = true;
         // Dispatch state is per-tenure.
         _pipelinePromise = null;
@@ -1057,7 +1077,30 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
         => _callerInteractionCore.GateTaskSource.GetStatus(token);
 
     void IValueTaskSource<FlowCallerInteractionCoreResult>.OnCompleted(Action<object?> continuation, object? state, short token, ValueTaskSourceOnCompletedFlags flags)
-        => _callerInteractionCore.GateTaskSource.OnCompleted(continuation, state, token, flags);
+    {
+        _callerInteractionCore.GateTaskSource.OnCompleted(continuation, state, token, flags);
+        // Recheck-after-register. The drain signal is a sticky LEVEL (IsDraining); the gate open is a
+        // one-shot EDGE (the consumer's TrySetResult, fired OUTSIDE _rearmLock). If the consumer set
+        // draining and opened the gate before we registered here, that edge was buffered and then wiped by
+        // the body's next gate Reset: the open-before-park lost-wake (the body parks forever and pins the
+        // pipeline's activated slot, see ConsumerDispose_MidBatch). Re-read the level now the continuation
+        // is registered and complete the gate ourselves if draining, so the parked body drains. Force
+        // runContinuationsAsynchronously because we are on the body's own suspending stack and must not run
+        // the continuation inline. Idempotent against the consumer's own TrySetResult. The move-next source
+        // avoids the same hazard with a _rearmLock-serialized !IsDraining rearm skip, but the gate is
+        // unlocked (opening it runs the body inline) so it recovers via this level recheck instead.
+        if (IsDraining)
+        {
+            // Driver identity, decided on the body side at the hand-off: we are only NOW parking, so a
+            // synchronous disposer (which presented IsAsync=false for an inline takeover) could not have
+            // caught us - the takeover did not engage. Recover on async reads: restore IsAsync=true before
+            // the async wake, ordered before the schedule so the resumed body reads true and does NOT do
+            // sync socket I/O on this pool thread (the double-block). A real inline takeover never reaches
+            // here - it resumes the already-parked body directly, leaving IsAsync=false for sync drain.
+            IsAsync = true;
+            _callerInteractionCore.GateTaskSource.TrySetResult(default, runContinuationsAsynchronously: true);
+        }
+    }
 
     bool IValueTaskSource<bool>.GetResult(short token) => _enumeratorMoveNextTaskSource.GetResult(token);
     ValueTaskSourceStatus IValueTaskSource<bool>.GetStatus(short token) => _enumeratorMoveNextTaskSource.GetStatus(token);
@@ -1226,10 +1269,18 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                 return;
             }
 
-            // Async-mode body: parked on the async gate; sync MoveNext's WaitForContinuation
-            // can't wake it. Route through DisposeAsync to signal the gate.
+            // Async-mode body: parked on the async gate, where sync MoveNext's WaitForContinuation can't
+            // wake it. Route through DisposeAsync to signal the gate - but first present as a SYNCHRONOUS
+            // driver (IsAsync=false). If the body is parked, DisposeAsync's inline TrySetResult resumes it
+            // ON THIS THREAD, and it re-reads IsAsync at its drain (the "IsAsync can change per resumption"
+            // point) to drain with sync reads, inline, here - the real takeover, no async tail, no second
+            // thread pinned. If the body is NOT parked (open-before-park) the takeover can't engage, and the
+            // gate's OnCompleted recheck restores IsAsync=true so the body recovers on async reads instead of
+            // doing sync socket I/O on its own pool thread (the double-block). The drive mode is thus decided
+            // on the BODY side at its hand-off, not pre-committed here where we cannot see if it parked.
             if (flow.IsAsync)
             {
+                flow.IsAsync = false;
                 DisposeAsync().AsTask().GetAwaiter().GetResult();
                 return;
             }

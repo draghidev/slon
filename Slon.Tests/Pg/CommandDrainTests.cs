@@ -74,6 +74,34 @@ public class CommandDrainTests
         await PgTestPool.RunAsync(protocol, "select 1");
     }
 
+    // Open-before-park lost-wake regression. Sync mid-batch dispose of an async flow opens the inter-result
+    // gate (DisposeAsync sets draining + TrySetResult, OUTSIDE _rearmLock) while the body is still arming
+    // that gate. Pre-fix this hung intermittently: the buffered gate edge was wiped by the body's gate
+    // Reset and the parked body never re-read the draining level, so it never drained and pinned the
+    // pipeline's activated slot - the next flow never activated. The fix re-checks the draining level at
+    // the gate OnCompleted. Hammer the raced path on one reusable protocol; each iteration must leave the
+    // wire usable (a hang shows as the "select 1" WaitAsync timing out, not a suite hang).
+    [TestMethod]
+    [DoNotParallelize]
+    public async Task ConsumerDispose_MidBatch_SyncDispose_OpenBeforePark_Stress()
+    {
+        var iters = int.TryParse(Environment.GetEnvironmentVariable("SLON_STRESS_ITERATIONS"), out var n) && n > 0 ? n : 500;
+        await using var lease = await PgTestPool.LeaseAsync();
+        var protocol = lease.Protocol;
+        for (var i = 0; i < iters; i++)
+        {
+            var flow = new CommandFlow(async: true,
+                Command.Create("select generate_series(1, 50)"),
+                Command.Create("select 'two'"),
+                Command.Create("select 'three'"));
+            Assert.IsTrue(protocol.TryQueue(flow));
+            var e = flow.GetAsyncEnumerator();
+            Assert.IsTrue(await e.MoveNextAsync(), $"iter {i}: first result not delivered");
+            e.Dispose(); // SYNC dispose of an async flow, mid-batch - the raced path.
+            await PgTestPool.RunAsync(protocol, "select 1").WaitAsync(TimeSpan.FromSeconds(10));
+        }
+    }
+
     [TestMethod]
     [DataRow(true, DisplayName = "async flow")]
     [DataRow(false, DisplayName = "sync flow")]
