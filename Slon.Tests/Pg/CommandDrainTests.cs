@@ -151,6 +151,46 @@ public class CommandDrainTests
             $"drain ran on [{string.Join(",", drainThreads.Keys)}], not the disposer thread {disposeThread}");
     }
 
+    // PATH coverage for the sync-dispose pump's cross-thread completion (the WakeHandshake -
+    // CommandFlow.WakePumpOnCompletion). The pump parks in WaitForContinuation on an in-flight body; here a
+    // forceful abort closes the socket so the in-flight read faults ON ITS POOL THREAD (SetResult(null)->
+    // DeliverTerminal, or HandleException), completing the body cross-thread while the pump is parked - the
+    // handshake must wake it. No other test reaches this interleaving (pump parked + completion off-thread).
+    // NOTE: this does NOT reliably redden if the fence is removed - the actual lost-wake is a sub-microsecond
+    // visibility window (a stale IsAsync read), and the abort->completion chain always lands microseconds
+    // AFTER the disposer's IsAsync=false write, so the completion observes it and signals regardless (locally
+    // it stays green even with the handshake fully neutered, 1200+ iters). The fence's correctness rests on
+    // the model (WakeHandshake.tla) + reasoning; this guards the surrounding logic and documents the scenario.
+    [TestMethod]
+    public async Task InFlightCompletion_RacesSyncDispose_PumpNeverStrands_Stress()
+    {
+        var cap = TimeSpan.FromSeconds(10);
+        var iters = int.TryParse(Environment.GetEnvironmentVariable("SLON_STRESS_ITERATIONS"), out var n) && n > 0 ? n : 100;
+        for (var i = 0; i < iters; i++)
+        {
+            var protocol = await PgTestPool.NewIsolatedAsync();
+            // pg_sleep withholds its response, so the body's read is genuinely in-flight (async, on a pool
+            // thread), not handed off, when the dispose + abort race below. Keep it SHORT: a force-aborted
+            // backend lingers until the sleep ends (it doesn't notice the RST mid-sleep), so a long sleep
+            // piles up connections (max_clients) as iterations open fresh ones - 0.2s bounds the overlap.
+            var flow = new CommandFlow(async: true, Command.Create("select pg_sleep(0.2)"));
+            Assert.IsTrue(protocol.TryQueue(flow));
+            var e = flow.GetAsyncEnumerator();
+            var moveNext = e.MoveNextAsync().AsTask(); // in-flight on the withheld response
+
+            await Task.Delay(10); // let the read reach the wire and park
+
+            // Race the sync-dispose pump against a forceful abort (closes the socket -> in-flight read faults
+            // cross-thread, completing the body off the disposer's thread while it is parked in the pump).
+            var disposeTask = Task.Run(() => { try { e.Dispose(); } catch { /* abort surfaces; we assert no-hang */ } });
+            var abortTask = Task.Run(async () => { try { await protocol.DisposeAsync(); } catch { } });
+
+            try { await Task.WhenAll(disposeTask, abortTask).WaitAsync(cap); }
+            catch (TimeoutException) { Assert.Fail($"iter {i}: sync-dispose pump stranded - WakeHandshake lost-wake."); }
+            try { await moveNext.WaitAsync(cap); } catch { }
+        }
+    }
+
     [TestMethod]
     [DataRow(true, DisplayName = "async flow")]
     [DataRow(false, DisplayName = "sync flow")]

@@ -894,8 +894,8 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
             _enumeratorMoveNextTaskSource.TrySetException(new OperationCanceledException(_cancelDeliverToken), runContinuationsAsynchronously: true);
         else
             _enumeratorMoveNextTaskSource.TrySetResult(false, runContinuationsAsynchronously: true);
-        if (!IsAsync)
-            _callerInteractionCore.SignalProgress();
+        // _enumeratorCompleted was set by the caller (SetResult's completed branch) before this runs.
+        WakePumpOnCompletion();
     }
 
     // Land a terminal the body deferred while it was on the inline dispatch frame. Called from the
@@ -941,7 +941,24 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
     {
         _enumeratorMoveNextTaskSource.TrySetException(closeException, runContinuationsAsynchronously: true);
         _enumeratorCompleted = true;
-        if (!IsAsync)
+        WakePumpOnCompletion();
+    }
+
+    // Wake a sync caller parked in WaitForContinuation once the body's completion is recorded
+    // (_enumeratorCompleted set by the caller). TWO waiters: a genuine sync flow (!IsAsync), and a sync
+    // DISPOSER PUMPING the rendezvous for an async flow - it set _consumerDisposed before it parked. The
+    // full fence pairs with the disposer's fence before it reads _enumeratorCompleted (the WakeHandshake,
+    // machine-checked in WakeHandshake.tla): if it didn't see our completion it WILL see its own arm here,
+    // so neither misses the other. Reached cross-thread when the body COMPLETES on its own pool thread
+    // without handing off - an in-flight read that faults (HandleException) or, under a concurrent protocol
+    // close, takes the IsProtocolClosed catch -> SetResult(null) -> DeliverTerminal. LOAD-BEARING and
+    // effectively UNTESTABLE: the trigger is a sub-microsecond visibility window (a stale IsAsync read
+    // racing the disposer's IsAsync=false), so no test reliably reddens if the fence is dropped - do NOT
+    // remove it.
+    void WakePumpOnCompletion()
+    {
+        Interlocked.MemoryBarrier();
+        if (!IsAsync || Volatile.Read(ref _consumerDisposed))
             _callerInteractionCore.SignalProgress();
     }
 
@@ -1007,11 +1024,9 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
         // unlocked teardown racing the locked consumer/body in MoveNextRearm.tla (Lock + WithTeardown).
         if (_enumeratorMoveNextTaskSource.TrySetException(ex, runContinuationsAsynchronously: true))
             _enumeratorCompleted = true;
-        // Wake any sync MoveNext parked in WaitForContinuation. The body just faulted, so no
-        // continuation will be registered. The caller needs to observe the exception via the
-        // move-next task source.
-        if (!IsAsync)
-            _callerInteractionCore.SignalProgress();
+        // Wake a sync caller / a sync disposer pumping the rendezvous (the WakeHandshake - see
+        // WakePumpOnCompletion). The body just faulted in-flight, so no continuation will register.
+        WakePumpOnCompletion();
         // The remainder (leftover RFQs) is NOT consumed here. When a consumer is truly gone the body
         // rethrows and the framework's ResyncRecoveryFlow inherits this flow's live RfqCount and blind-
         // drains it. When a consumer is present (live or wait-for-drain) the body drains it ITSELF
@@ -1320,9 +1335,13 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                 {
                     // Pump the rendezvous: take each continuation the body hands off and run it inline, until
                     // the body completes (terminal sets _enumeratorCompleted inline during the Invoke below;
-                    // the null return is the cross-thread safety - a terminal SignalProgress wakes us with no
-                    // continuation). No task.GetResult anywhere = no sync-over-async deadlock.
-                    while (!flow._enumeratorCompleted)
+                    // the null return is the cross-thread safety - a terminal/fault SignalProgress wakes us
+                    // with no continuation). No task.GetResult anywhere = no sync-over-async deadlock.
+                    // Fence the consumer-gone arm (MarkConsumerWaitForDrain above) against the completion read,
+                    // paired with HandleException's fence: if the body already faulted before we got here we
+                    // see _enumeratorCompleted and never park; otherwise the body sees our arm and signals us.
+                    Interlocked.MemoryBarrier();
+                    while (!Volatile.Read(ref flow._enumeratorCompleted))
                     {
                         var continuation = flow._callerInteractionCore.WaitForContinuation();
                         if (continuation is null)

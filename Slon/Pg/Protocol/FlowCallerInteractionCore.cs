@@ -87,9 +87,17 @@ struct FlowCallerInteractionCore<TResult>
         IsWaiting = true;
         try
         {
+            // Check progress BEFORE blocking. A SignalProgress that ran before this GetMres (e.g. a body
+            // that faulted while _mres was still null) left the mres unset but _progressSignaled true; without
+            // this pre-check mres.Wait would block forever waiting for a Set that already (no-op) happened.
+            if (Volatile.Read(ref _progressSignaled))
+            {
+                _progressSignaled = false;
+                return null;
+            }
             mres.Wait();
             mres.Reset();
-            if (_progressSignaled)
+            if (Volatile.Read(ref _progressSignaled))
             {
                 _progressSignaled = false;
                 return null;
@@ -126,7 +134,8 @@ struct FlowCallerInteractionCore<TResult>
     // routing through SetContinuationAndUnblockWaiter.
     public void SignalProgress()
     {
-        _progressSignaled = true;
+        // Volatile so WaitForContinuation's pre-block check sees it even when _mres is null (the Set no-ops).
+        Volatile.Write(ref _progressSignaled, true);
         _mres?.Set();
     }
 
