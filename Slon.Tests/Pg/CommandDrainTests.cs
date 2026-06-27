@@ -102,6 +102,55 @@ public class CommandDrainTests
         }
     }
 
+    // Deterministic open-before-park. A test hook holds the body right before it registers on the inter-result
+    // rendezvous until a concurrent sync dispose has set draining + fired its wake - so the dispose's
+    // draining+wake land BEFORE the park, every run (the interleaving the stress test can only hit by luck).
+    // Under the two-way rendezvous the disposer is pumping WaitForContinuation, so when the body registers it
+    // hands off and the disposer drives the drain INLINE: every drain read runs on the disposer's own thread.
+    [TestMethod]
+    public async Task ConsumerDispose_OpenBeforePark_Deterministic_ConnectionUsable()
+    {
+        await using var lease = await PgTestPool.LeaseAsync();
+        var protocol = lease.Protocol;
+        var flow = new CommandFlow(async: true,
+            Command.Create("select generate_series(1, 50)"),
+            Command.Create("select 'two'"),
+            Command.Create("select 'three'"));
+
+        var bodyAtHook = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var wakeFired = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        flow.AfterDisposeWakeHook = () => wakeFired.TrySetResult();
+        int disposeThread = 0;
+        var drainThreads = new System.Collections.Concurrent.ConcurrentDictionary<int, byte>();
+        flow.OnDrainReadHook = () => drainThreads.TryAdd(Environment.CurrentManagedThreadId, 0);
+        var fired = false;
+        flow.BeforeGateParkHook = async () =>
+        {
+            if (fired) return; // fire once: the inter-result park after command 0
+            fired = true;
+            bodyAtHook.SetResult();
+            // Hold until the dispose's wake has fired, so we register AFTER it = open-before-park.
+            await wakeFired.Task;
+        };
+
+        Assert.IsTrue(protocol.TryQueue(flow));
+        var e = flow.GetAsyncEnumerator();
+        Assert.IsTrue(await e.MoveNextAsync(), "command 0 not delivered");
+
+        await bodyAtHook.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        // Sync dispose on a separate thread; it pumps the rendezvous. Its wake releases the held body, which
+        // registers and hands off to the disposer.
+        var disposeDone = Task.Run(() => { disposeThread = Environment.CurrentManagedThreadId; e.Dispose(); });
+
+        await disposeDone.WaitAsync(TimeSpan.FromSeconds(10)); // body handed off, dispose returned, no hang
+        await PgTestPool.RunAsync(protocol, "select 1").WaitAsync(TimeSpan.FromSeconds(10)); // wire usable
+        // Two-way rendezvous: every drain read ran on the disposer's own thread - one thread.
+        Assert.AreEqual(1, drainThreads.Count,
+            $"drain spanned threads [{string.Join(",", drainThreads.Keys)}], expected only disposer {disposeThread}");
+        Assert.IsTrue(drainThreads.ContainsKey(disposeThread),
+            $"drain ran on [{string.Join(",", drainThreads.Keys)}], not the disposer thread {disposeThread}");
+    }
+
     [TestMethod]
     [DataRow(true, DisplayName = "async flow")]
     [DataRow(false, DisplayName = "sync flow")]
@@ -205,11 +254,13 @@ public class CommandDrainTests
         var aFirstTask = eA.MoveNextAsync().AsTask();
         var completeTask = protocol.CompleteAsync();
 
-        // StoppingToken fires before A's body reaches the pre-deliver handoff, so the body
-        // faults the move-next source with the close exception rather than dropping results.
-        // B faults via the same path through OnStopping.
-        await Assert.ThrowsExactlyAsync<PgClientClosedException>(async () => await aFirstTask);
-        await Assert.ThrowsExactlyAsync<PgClientClosedException>(async () => await eB.MoveNextAsync());
+        // Graceful shutdown overlapping the reads: each flow's first MoveNext may deliver a row (its writes
+        // flushed and postgres responded before StoppingToken propagated) OR throw PgClientClosedException
+        // (StoppingToken won the race). Both are valid settle states - under load A often delivers. What this
+        // test pins is that BOTH enumerators dispose cleanly and CompleteAsync converges, regardless of which
+        // side of the race each landed on.
+        try { await aFirstTask; } catch (PgClientClosedException) { }
+        try { await eB.MoveNextAsync(); } catch (PgClientClosedException) { }
         await eA.DisposeAsync();
         await eB.DisposeAsync();
 

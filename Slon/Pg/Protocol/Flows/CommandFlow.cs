@@ -68,11 +68,22 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
     // drain-to-clean-state guarantee.
     bool _draining;
     internal bool IsDraining => Volatile.Read(ref _draining);
-    // One-time guard for the FIRST drain transition (switching to drain is a single event). Body-thread
-    // only - the body's execution is serialized, so no Volatile. Records that the drive mode for this drain
-    // is already settled, so a sync-takeover's later commands (which re-skip the gate every command) don't
-    // re-run the skip-gate IsAsync restore and flip a genuine sync drain back to async mid-batch.
+    // One-shot guard for the FIRST drain transition. Body-thread only (serialized, no Volatile). Records
+    // that the drain's drive mode is settled, so a sync takeover's later commands don't re-run the skip-gate
+    // IsAsync restore and flip a genuine sync drain back to async mid-batch.
     bool _drainModeEntered;
+
+    // Test seam (null in production - the null-check short-circuits with no await on the hot path). Invoked
+    // right before the body registers on the inter-result gate, so a test can deterministically force
+    // open-before-park: land a dispose's draining+signal BEFORE this park, the race that is otherwise rare.
+    internal Func<System.Threading.Tasks.ValueTask>? BeforeGateParkHook;
+    // Test-only: fired on the dispose path right after the wake (TrySetResult + RequestWake) has fully run,
+    // so a harness can release the held body only then - the body registers AFTER the wake (and its
+    // continuation-read), the deterministic open-before-park the single gate-park hook can't pin.
+    internal Action? AfterDisposeWakeHook;
+    // Test-only: fired on each drain read, so a harness can capture the thread the drain runs on (the
+    // disposer's own thread under the two-way rendezvous; a pool thread under the autonomous fallback).
+    internal Action? OnDrainReadHook;
 
     // The consumer DISPOSED the enumerator (the two consumer departure paths below), as opposed to the
     // body opting the consumer out on its own cancel/close drain. The terminal suppresses a user-cancel
@@ -600,6 +611,10 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
 
                         if (!IsDraining)
                         {
+                            // Test seam (null in production): a hook point right before the inter-result gate
+                            // park, so a test can deterministically drive an open-before-park dispose.
+                            if (BeforeGateParkHook is { } parkHook)
+                                await parkHook().ConfigureAwait(false);
                             if (IsAsync)
                                 await _callerInteractionCore.GetGateTask(this).ConfigureAwait(false);
                             else
@@ -609,19 +624,29 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                         }
                     }
                 }
-                else if (!_drainModeEntered)
+                else if (!_drainModeEntered && IsAsyncAtBind && !IsAsync)
                 {
-                    // Skip-gate drain entry: we reached the drain already draining, so we never parked on
-                    // the gate this transition and were NOT inline-taken-over by a sync disposer. A sync
-                    // Dispose's IsAsync=false presentation leaked here; restore the bound mode so the drain
-                    // below runs ASYNC, not sync socket I/O on this (pool) thread (the double-block). The
-                    // gate-resume entry skips this branch and keeps IsAsync as-is: false=takeover stays sync,
-                    // or the gate's OnCompleted recheck already restored true=recovery.
-                    IsAsync = IsAsyncAtBind;
+                    // Reached the drain already draining without parking this transition = an in-flight body
+                    // (resumed on a pool thread via async I/O) under a SYNC disposer (it set IsAsync=false).
+                    if (WaitForDrainOnDispose)
+                    {
+                        // The disposer is PUMPING the rendezvous (await-drain). Hand off our continuation so it
+                        // resumes us on ITS thread and the rest of the drain runs synchronously there - one
+                        // thread. Safe: the disposer waits on the rendezvous mres, not the move-next task, so
+                        // this suspend can't sync-over-async deadlock it. One-shot (_drainModeEntered below),
+                        // so later commands drain straight through on the disposer's thread.
+                        await SetContinuationAndUnblockWaiter().ConfigureAwait(false);
+                    }
+                    else
+                    {
+                        // Fast-return dispose: no disposer waiting to take us over. Restore the bound async mode
+                        // so we drain AUTONOMOUSLY in the background, reading async (releasing the pool thread
+                        // between reads) instead of blocking it on sync socket I/O (the double-block).
+                        IsAsync = IsAsyncAtBind;
+                    }
                 }
-                // Switching to drain is a one-time transition - record it (covers BOTH the gate-resume entry
-                // above and this skip-gate entry). A genuine takeover re-skips the gate on every later
-                // command; the guard then keeps those from re-running the restore and flipping it async.
+                // One-shot: record the drain transition so a sync takeover's later commands keep their
+                // sync (IsAsync=false) drain instead of re-running the restore above and flipping to async.
                 _drainModeEntered = _drainModeEntered || IsDraining;
 
                 // We check IsAsync again as it can change after every resumption.
@@ -629,6 +654,8 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                 // This also causes us to pick up any I/O exception thrown during user code that was stored on the resultmessage enumerator.
                 // In drain mode this dispose IS the drain: it reads remaining DataRows + CommandComplete for the current command.
                 state = ref context.GetProtocolStatic<ReadState>();
+                if (IsDraining)
+                    OnDrainReadHook?.Invoke();
                 if (IsAsync)
                     await state.ResultMessageEnumerator.DisposeAsync().ConfigureAwait(false);
                 else
@@ -1269,19 +1296,47 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                 return;
             }
 
-            // Async-mode body: parked on the async gate, where sync MoveNext's WaitForContinuation can't
-            // wake it. Route through DisposeAsync to signal the gate - but first present as a SYNCHRONOUS
-            // driver (IsAsync=false). If the body is parked, DisposeAsync's inline TrySetResult resumes it
-            // ON THIS THREAD, and it re-reads IsAsync at its drain (the "IsAsync can change per resumption"
-            // point) to drain with sync reads, inline, here - the real takeover, no async tail, no second
-            // thread pinned. If the body is NOT parked (open-before-park) the takeover can't engage, and the
-            // gate's OnCompleted recheck restores IsAsync=true so the body recovers on async reads instead of
-            // doing sync socket I/O on its own pool thread (the double-block). The drive mode is thus decided
-            // on the BODY side at its hand-off, not pre-committed here where we cannot see if it parked.
+            // Async-mode body, sync teardown - a TWO-WAY RENDEZVOUS that drains on THIS (the disposer's)
+            // thread. Present as a synchronous driver (IsAsync=false), then:
+            //   - park-before-open: a body PARKED at the inter-result gate is taken over INLINE by the gate's
+            //     synchronous completion below; it re-reads IsAsync=false and drains straight through, here.
+            //   - open-before-park / in-flight: the body hands off its continuation at a drain rendezvous
+            //     point (the sync-rendezvous park, or the skip-gate once its in-flight async read completes);
+            //     we pump those handoffs below and run each INLINE, on this thread.
+            // The pump waits on the RENDEZVOUS mres (WaitForContinuation), NOT the move-next task. That is the
+            // whole trick: a MoveNext drive blocks on task.GetResult (sync-over-async) and deadlocks against
+            // the body's own in-flight await - the body completes the rendezvous, not the task, so the disposer
+            // must wait on the same signal the body raises. A fast-return (non-await-drain) dispose has no
+            // pump; it wakes the body to drain autonomously in the background and returns.
             if (flow.IsAsync)
             {
                 flow.IsAsync = false;
-                DisposeAsync().AsTask().GetAwaiter().GetResult();
+                if (flow.WaitForDrainOnDispose) flow.MarkConsumerWaitForDrain(); else flow.MarkConsumerGone();
+                // INLINE (runContinuationsAsynchronously: false): a gate-parked body resumes + drains here.
+                // Buffered (no-op) if the body isn't gate-parked.
+                flow._callerInteractionCore.GateTaskSource.TrySetResult(default, runContinuationsAsynchronously: false);
+                flow.AfterDisposeWakeHook?.Invoke();
+                if (flow.WaitForDrainOnDispose)
+                {
+                    // Pump the rendezvous: take each continuation the body hands off and run it inline, until
+                    // the body completes (terminal sets _enumeratorCompleted inline during the Invoke below;
+                    // the null return is the cross-thread safety - a terminal SignalProgress wakes us with no
+                    // continuation). No task.GetResult anywhere = no sync-over-async deadlock.
+                    while (!flow._enumeratorCompleted)
+                    {
+                        var continuation = flow._callerInteractionCore.WaitForContinuation();
+                        if (continuation is null)
+                            break;
+                        continuation.Invoke();
+                    }
+                    // Drain ran on this thread; surface accumulated drain errors (completes immediately).
+                    flow.AwaitDrainOnDispose().AsTask().GetAwaiter().GetResult();
+                }
+                else
+                {
+                    // Fast-return: wake the body to drain autonomously in the background, then return.
+                    flow._callerInteractionCore.RequestWake();
+                }
                 return;
             }
 
@@ -1337,6 +1392,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
             if (flow.WaitForDrainOnDispose) flow.MarkConsumerWaitForDrain(); else flow.MarkConsumerGone();
             flow._callerInteractionCore.GateTaskSource.TrySetResult(default);
             flow._callerInteractionCore.RequestWake();
+            flow.AfterDisposeWakeHook?.Invoke();
             // Opt-in await-drain: PARK on the body's completion signal (TCS-backed WaitForComplete), so
             // the wire is drained to RFQ before this returns. This WAITS on the body, it does not DRIVE
             // it - no poll loop, so no busy-spin. Bounded by the flow/enumerator token: if the caller's
