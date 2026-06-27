@@ -605,7 +605,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                     // to the caller before result1 exists (Sync_Completes hang). A consumer that disposes
                     // without consuming drives this gate via MoveNextAsync, so the body still drains.
                     if (_commandIndex is 0 && IsAsync)
-                        await _callerInteractionCore.GetGateTask(this).ConfigureAwait(false);
+                        await AwaitResultGate(context).ConfigureAwait(false);
 
                     if (!IsDraining)
                     {
@@ -627,7 +627,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                             if (BeforeGateParkHook is { } parkHook)
                                 await parkHook().ConfigureAwait(false);
                             if (IsAsync)
-                                await _callerInteractionCore.GetGateTask(this).ConfigureAwait(false);
+                                await AwaitResultGate(context).ConfigureAwait(false);
                             else
                                 await SetContinuationAndUnblockWaiter().ConfigureAwait(false);
 
@@ -955,6 +955,30 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
         WakePumpOnCompletion();
     }
 
+    // A body parked on a result gate is woken either by the consumer's next MoveNext (which opens the gate)
+    // or, when the consumer can't drive it, by the heartbeat faulting the gate (OnStopping/OnAbort ->
+    // CancelPendingWait). On a GRACEFUL StoppingToken gate-fault the parked body must DRAIN to RFQ - exactly
+    // like the actively-looping 586 check - rather than fault out of the body: otherwise it retires with its
+    // response still on the wire and the next pipelined flow reads OUR leftover (the pipelined-shutdown
+    // desync). We do the SAME consumer-side handling as the 720 throw path (HandleException, NOT DeliverClose:
+    // it latches the close and faults the LIVE generation but no-ops WITHOUT setting _enumeratorCompleted when
+    // our generation was already CONSUMED - so the consumer self-delivers the close on its next rearm and
+    // never re-yields a stale result), then switch to drain instead of throwing. A consumer DISPOSE does not
+    // fire StoppingToken, so its gate-fault stays on the throw->self-deliver path. An ABORT-only gate-fault
+    // likewise falls through to the throw (the wire is torn).
+    async ValueTask AwaitResultGate(Context context)
+    {
+        try
+        {
+            await _callerInteractionCore.GetGateTask(this).ConfigureAwait(false);
+        }
+        catch (PgClientClosedException close) when (context.StoppingToken.IsCancellationRequested && !IsDraining && !_enumeratorCompleted)
+        {
+            HandleException(close);
+            MarkConsumerGoneByBody();
+        }
+    }
+
     // Wake a sync caller parked in WaitForContinuation once the body's completion is recorded
     // (_enumeratorCompleted set by the caller). TWO waiters: a genuine sync flow (!IsAsync), and a sync
     // DISPOSER PUMPING the rendezvous for an async flow - it set _consumerDisposed before it parked. The
@@ -1270,12 +1294,15 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
 
                 // Rearm only on a non-first call. The first-call source is fresh from OnReset and the body's
                 // first delivery lands on it; Resetting here would rearm past that delivery. ALSO skip the
-                // rearm once consumer-gone (DisposeAsync drives the drain): the body's terminal is ONE-SHOT
-                // and completes the CURRENT generation; resetting to a fresh one parks the disposer on a
-                // generation the terminal can never reach (the disposer-reset-vs-one-shot-terminal hang). The
+                // rearm once the CONSUMER DISPOSED (DisposeAsync drives the drain): the body's terminal is
+                // ONE-SHOT and completes the CURRENT generation; resetting to a fresh one parks the disposer on
+                // a generation the terminal can never reach (the disposer-reset-vs-one-shot-terminal hang). The
                 // drain only needs to drive the body (gate-open below) and observe its terminal on the
-                // generation it is already awaiting.
-                if (flow._consumerAdvanced && !flow.IsDraining)
+                // generation it is already awaiting. Gate on _consumerDisposed, NOT the broader IsDraining: a
+                // BODY-initiated drain (MarkConsumerGoneByBody, e.g. a graceful gate-fault) leaves the consumer
+                // LIVE and looping - it MUST rearm to a fresh generation so the close-latch self-deliver below
+                // has a pending generation to complete, else it re-yields the consumed generation (hang).
+                if (flow._consumerAdvanced && !Volatile.Read(ref flow._consumerDisposed))
                     flow._enumeratorMoveNextTaskSource.Reset();
                 flow._consumerAdvanced = true;
             }

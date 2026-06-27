@@ -762,10 +762,23 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
                 // A resyncRecovery's completion ends its supplanted flow's extended lifetime: the wire is
                 // resynced (or dead) and nothing references the failed tenure. The supplanted flow
                 // completes on EVERY exit (including the resyncRecovery's own fault), or its caller strands.
-                // A resyncRecovery that also died attaches its fault behind the original failure as inner.
+                // A resyncRecovery that also died attaches its fault behind the original failure as inner -
+                // but ONLY when both are independent bugs. THE canonical shutdown close (Close.Reason) on
+                // EITHER side is the one shutdown, not a distinct fault: the failed flow may already carry it
+                // (we started shut down), and/or recovery's own resync drain may have been torn by a
+                // graceful->abort escalation and died with it (we got another one). Surfacing an
+                // AggregateException of that one redundant close only confuses the consumer, so fold it.
+                // Keyed by IDENTITY, not type: only the canonical Close.Reason instance folds - any OTHER
+                // PgClientClosedException (e.g. the never-started dispatch fallback) is a genuine independent
+                // fault and still aggregates. shutdownClose is null outside a shutdown, so a normal mid-op
+                // recovery always aggregates two real faults.
                 // Single-level by construction: TryRecoverItemFailure refuses ResyncRecoveryFlow items.
-                failedFlow.GetExecutionControl(_control).Complete(
-                    exception is null ? failureException : new AggregateException(failureException, exception));
+                var shutdownClose = _control.ClosedException;
+                var combined = exception is null
+                    || (shutdownClose is not null && (ReferenceEquals(exception, shutdownClose) || ReferenceEquals(failureException, shutdownClose)))
+                    ? failureException
+                    : new AggregateException(failureException, exception);
+                failedFlow.GetExecutionControl(_control).Complete(combined);
             }
         }
 
@@ -860,13 +873,16 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
             System.Diagnostics.Debug.Assert(failedItem is not ResyncRecoveryFlow,
                 "Recovery item routed back into TryRecoverItemFailure - recovery-on-recovery must not exist.");
 
-            // Pipeline is shutting down: skip recovery and let the framework propagate the failure.
-            // Check BOTH the executor token AND ClosedException: a racing close materializes the reason
-            // (and faults the in-flight write with it) before the executor's token cancellation is
-            // observed here, so the token alone misses it. A deliberate close is teardown, not a
-            // recoverable wire desync - recovering it drives a resync drain over a wire that's going
-            // away, which races the close-torn buffer state into a negative-bufferedBytes assertion.
-            if (cancellationToken.IsCancellationRequested || _control.ClosedException is not null)
+            // Pipeline is ABORTING: skip recovery and let the framework propagate the failure. Gate on the
+            // ABORT token specifically, NOT ClosedException - which a GRACEFUL close also sets. A forceful
+            // abort is teardown over a torn wire: recovering it drives a resync drain over a dead/RST'd
+            // socket, racing the close-torn buffer into a negative-bufferedBytes assertion. A GRACEFUL close
+            // is NOT teardown - the wire stays live (the close waits for the drain), so recovery MUST run: it
+            // resyncs the failed flow's leftover to RFQ, keeping the wire clean for the next pipelined flow,
+            // which must read ITS OWN bytes rather than the leftover (the pipelined-shutdown desync). The
+            // abort token fires together with the abortive close reason (_close.Abort), so it has no lag
+            // here. The graceful StoppingToken/close does NOT fire it.
+            if (_control.AbortToken.IsCancellationRequested)
             {
                 recoveryItem = null;
                 return false;

@@ -282,11 +282,12 @@ public class RacingDisposeInMemoryRace
             $"ordering 1: PgClientClosedException escaped DisposeAsync: {escaped?.GetType().Name}");
     }
 
-    // Ordering 2 - GATE-FIRST THROW. Body parked on the inter-result gate; graceful CompleteAsync sets
-    // StoppingToken; a heartbeat tick faults the gate; the body resumes and throws through the pipeline
-    // drain into DisposeAsync's drive. Pre-fix: escaped DisposeAsync (the body catch's consumer-gone
-    // branch does not cover this path - the throw comes from the gate, not the read-fault catch). Now:
-    // DisposeAsyncCore swallows it.
+    // Ordering 2 - GATE-FIRST GRACEFUL DRAIN. Body parked on the inter-result gate, graceful CompleteAsync
+    // sets StoppingToken, a heartbeat tick faults the gate. The body switches to a graceful wire-drain
+    // (AwaitResultGate) rather than throwing, so the next pipelined flow would read a clean wire. DisposeAsync
+    // then waits for that drain (WaitForDrainOnDispose). The held bytes never arrive in-memory, so it is
+    // bounded exactly as production bounds it - advance past CompletionTimeout (30s) so the graceful->abort
+    // escalation faults the parked drain read and DisposeAsync converges, swallowing the close.
     [TestMethod]
     public async Task Ordering2_GateFirstThrow_DisposeConverges()
     {
@@ -298,7 +299,10 @@ public class RacingDisposeInMemoryRace
         s.Heartbeat();
         await SettleAsync();
 
-        var escaped = await consumer.RunDispose().WaitAsync(Cap);
+        var dispose = consumer.RunDispose();
+        await SettleAsync();
+        s.Clock.Advance(TimeSpan.FromSeconds(120));
+        var escaped = await dispose.WaitAsync(Cap);
         await complete.WaitAsync(Cap);
 
         Assert.IsNull(escaped,
