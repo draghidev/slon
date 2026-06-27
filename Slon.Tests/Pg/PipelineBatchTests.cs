@@ -57,14 +57,8 @@ public class PipelineBatchTests
     // Backstop iteration count for the handoff/shared-promise race guards. The race is structurally
     // fixed (the Interlocked HandoffActive open), so the default is sized for a per-commit backstop, not
     // to reliably reproduce the original bug; SLON_STRESS_ITERATIONS scales it up for a soak.
-    static int StressIters
-    {
-        get
-        {
-            var raw = Environment.GetEnvironmentVariable("SLON_STRESS_ITERATIONS");
-            return int.TryParse(raw, out var n) && n > 0 ? n : 2000;
-        }
-    }
+    // Real pipelined batches per iteration. Capped; SLON_UNCAPPED=1 drives the raw value for a soak.
+    static int StressIters => StressEnv.Iterations(fallback: 2_000, cap: 8_000);
 
     // The sync read-side (GetDecoderAuto) collision guard. sync and async flows only coexist on one
     // protocol across THREADS - a single caller is wholly sync or wholly async, but TryQueueFlow takes

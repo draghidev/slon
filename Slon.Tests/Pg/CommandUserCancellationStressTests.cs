@@ -22,7 +22,7 @@ public class CommandUserCancellationStressTests
     // I/O-bound (each iteration is a real pipelined command + cancel against a live PG backend over a
     // few pooled connections), so the default keeps each test ~100ms in the suite. The races surface
     // fast; a deliberate deep sweep raises the count via SLON_STRESS_ITERATIONS (the original 6000 was ~800ms).
-    static int Iters => int.TryParse(Environment.GetEnvironmentVariable("SLON_STRESS_ITERATIONS"), out var n) && n > 0 ? n : 500;
+    static int Iters => StressEnv.Iterations(fallback: 500, cap: 8_000);
 
     static CommandFlow TwoResultFlow() => new(async: true,
         Command.Create("select generate_series(1, 50)"),

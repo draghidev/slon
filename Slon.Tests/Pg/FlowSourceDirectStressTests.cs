@@ -14,14 +14,10 @@ namespace Slon.Tests.Pg;
 [DoNotParallelize]
 public class FlowSourceDirectStressTests
 {
-    static int Iterations
-    {
-        get
-        {
-            var raw = Environment.GetEnvironmentVariable("SLON_STRESS_ITERATIONS");
-            return int.TryParse(raw, out var n) && n > 0 ? n : 5000;
-        }
-    }
+    // In-memory, but exercises the source's spin/Mres wait points (PgClientFlowSource), which escalate to
+    // Sleep(1) once the threadpool is saturated - so a blanket high count goes super-linear. Cap; the raw
+    // value still flows under SLON_UNCAPPED=1 for a deliberate soak.
+    static int Iterations => StressEnv.Iterations(fallback: 5_000, cap: 20_000);
 
     [TestMethod]
     public async Task Stress_SourceDispatchVsDrain_SingleConsumerHolds()

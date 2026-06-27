@@ -16,14 +16,9 @@ namespace Slon.Tests.Pg;
 [TestClass]
 public class RecoveryStressTests
 {
-    static int Iterations
-    {
-        get
-        {
-            var raw = Environment.GetEnvironmentVariable("SLON_STRESS_ITERATIONS");
-            return int.TryParse(raw, out var n) && n > 0 ? n : 50;
-        }
-    }
+    // Real recovery (and connection) per iteration. Capped at the documented heavy-soak value; set
+    // SLON_UNCAPPED=1 to drive the raw SLON_STRESS_ITERATIONS for a deeper soak.
+    static int Iterations => StressEnv.Iterations(fallback: 50, cap: 2_000);
 
     static readonly TimeSpan Cap = TimeSpan.FromSeconds(10);
 

@@ -85,7 +85,7 @@ public class CommandDrainTests
     [DoNotParallelize]
     public async Task ConsumerDispose_MidBatch_SyncDispose_OpenBeforePark_Stress()
     {
-        var iters = int.TryParse(Environment.GetEnvironmentVariable("SLON_STRESS_ITERATIONS"), out var n) && n > 0 ? n : 500;
+        var iters = StressEnv.Iterations(fallback: 500, cap: 8_000);
         await using var lease = await PgTestPool.LeaseAsync();
         var protocol = lease.Protocol;
         for (var i = 0; i < iters; i++)
@@ -165,10 +165,12 @@ public class CommandDrainTests
     public async Task InFlightCompletion_RacesSyncDispose_PumpNeverStrands_Stress()
     {
         var cap = TimeSpan.FromSeconds(10);
-        // Each iteration is a full connect + force-abort cycle (~15ms, churns a connection), so CAP it rather
-        // than scaling linearly with SLON_STRESS_ITERATIONS - this is path coverage (no teeth on the fence),
-        // a few hundred is plenty and avoids dominating the stress run / churning thousands of connections.
-        var stress = int.TryParse(Environment.GetEnvironmentVariable("SLON_STRESS_ITERATIONS"), out var n) && n > 0 ? n : 0;
+        // Each iteration is a full connect + force-abort cycle (~15ms) that churns a connection AND leaves a
+        // lingering pg_sleep backend (a force-aborted backend ignores the RST until its sleep ends), so this
+        // does NOT scale - thousands of iterations just exhaust max_connections. HARD cap at 300, deliberately
+        // NOT routed through StressEnv/SLON_UNCAPPED: uncapping only buys "too many clients", never more signal
+        // (this is path coverage with no teeth on the fence). The floor of 100 keeps it a meaningful soak.
+        var stress = StressEnv.Iterations(fallback: 0, cap: int.MaxValue);
         var iters = Math.Min(Math.Max(stress, 10), 300);
         for (var i = 0; i < iters; i++)
         {

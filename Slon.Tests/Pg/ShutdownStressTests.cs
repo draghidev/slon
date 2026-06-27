@@ -22,14 +22,10 @@ namespace Slon.Tests.Pg;
 [DoNotParallelize]
 public class ShutdownStressTests
 {
-    static int Iterations
-    {
-        get
-        {
-            var raw = Environment.GetEnvironmentVariable("SLON_STRESS_ITERATIONS");
-            return int.TryParse(raw, out var n) && n > 0 ? n : 500;
-        }
-    }
+    // In-memory ReplayTransport (no Postgres), but each iteration spins up a protocol with a 5ms heartbeat
+    // timer; those accumulate super-linearly past ~20k (timer/GC pressure), so cap there. SLON_UNCAPPED=1
+    // drives the raw value for a deliberate soak (expect non-linear cost at very high counts).
+    static int Iterations => StressEnv.Iterations(fallback: 500, cap: 20_000);
 
     static readonly TimeSpan Cap = TimeSpan.FromSeconds(10);
 

@@ -11,14 +11,9 @@ namespace Slon.Tests.Pg;
 [DoNotParallelize]
 public class ExclusiveAccessFlowStressTests
 {
-    static int Iterations
-    {
-        get
-        {
-            var raw = Environment.GetEnvironmentVariable("SLON_STRESS_ITERATIONS");
-            return int.TryParse(raw, out var n) && n > 0 ? n : 1000;
-        }
-    }
+    // Real exclusive-access flows per iteration (this base count is further divided per scenario).
+    // Capped so a blanket high count can't mountain the suite; SLON_UNCAPPED=1 drives the raw value.
+    static int Iterations => StressEnv.Iterations(fallback: 1_000, cap: 5_000);
 
     static readonly TimeSpan Cap = TimeSpan.FromSeconds(10);
 
