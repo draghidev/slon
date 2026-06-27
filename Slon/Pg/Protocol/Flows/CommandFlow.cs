@@ -1120,18 +1120,14 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
     }
 
     FlowCallerInteractionCoreResult IValueTaskSource<FlowCallerInteractionCoreResult>.GetResult(short token)
-    {
-        var result = _callerInteractionCore.GateTaskSource.GetResult(token);
-        _callerInteractionCore.GateTaskSource.Reset();
-        return result;
-    }
+        => _callerInteractionCore.ConsumeGateResult(token);
 
     ValueTaskSourceStatus IValueTaskSource<FlowCallerInteractionCoreResult>.GetStatus(short token)
-        => _callerInteractionCore.GateTaskSource.GetStatus(token);
+        => _callerInteractionCore.GateStatus(token);
 
     void IValueTaskSource<FlowCallerInteractionCoreResult>.OnCompleted(Action<object?> continuation, object? state, short token, ValueTaskSourceOnCompletedFlags flags)
     {
-        _callerInteractionCore.GateTaskSource.OnCompleted(continuation, state, token, flags);
+        _callerInteractionCore.OnGateCompleted(continuation, state, token, flags);
         // Recheck-after-register. The drain signal is a sticky LEVEL (IsDraining); the gate open is a
         // one-shot EDGE (the consumer's TrySetResult, fired OUTSIDE _rearmLock). If the consumer set
         // draining and opened the gate before we registered here, that edge was buffered and then wiped by
@@ -1151,7 +1147,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
             // sync socket I/O on this pool thread (the double-block). A real inline takeover never reaches
             // here - it resumes the already-parked body directly, leaving IsAsync=false for sync drain.
             IsAsync = true;
-            _callerInteractionCore.GateTaskSource.TrySetResult(default, runContinuationsAsynchronously: true);
+            _callerInteractionCore.OpenGate(runContinuationsAsynchronously: true);
         }
     }
 
@@ -1287,7 +1283,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
             // the body parked on the inter-result gate is woken by the consumer's gate-open (the always-
             // present, heartbeat-independent waker - the heartbeat's CancelPendingWait is an optimization
             // on top). A false TrySetResult means the gate was already faulted by a teardown.
-            flow._callerInteractionCore.GateTaskSource.TrySetResult(default);
+            flow._callerInteractionCore.OpenGate(runContinuationsAsynchronously: false);
             // Close-latch self-deliver: under close THIS call is the sole completer of the generation it
             // just armed - self-deliver here, ordered after our Reset, so the live generation always has
             // a completer. Idempotent against a racing body writer (CAS). Read the latch AFTER the Reset.
@@ -1340,7 +1336,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                 if (flow.WaitForDrainOnDispose) flow.MarkConsumerWaitForDrain(); else flow.MarkConsumerGone();
                 // INLINE (runContinuationsAsynchronously: false): a gate-parked body resumes + drains here.
                 // Buffered (no-op) if the body isn't gate-parked.
-                flow._callerInteractionCore.GateTaskSource.TrySetResult(default, runContinuationsAsynchronously: false);
+                flow._callerInteractionCore.OpenGate(runContinuationsAsynchronously: false);
                 flow.AfterDisposeWakeHook?.Invoke();
                 if (flow.WaitForDrainOnDispose)
                 {
@@ -1414,13 +1410,13 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
             // read settles, so the next flow still finds RFQ - that guarantee comes from item lifetime,
             // not from Dispose blocking on it.
             //   1. mark consumer-gone (the body's !IsDraining guards then skip the handoff gates),
-            //   2. open the async gate - the SOLE async-gate waker; RequestWake cannot reach GateTaskSource,
+            //   2. open the async gate - the SOLE async-gate waker; RequestWake cannot reach the gate,
             //      so a body parked on the inter-result gate hangs without this,
             //   3. RequestWake to wake a sync-suspended body (TP-queues its stored continuation).
             // The body's autonomous terminal completes the move-next source (clean end), waking any
             // consumer still mid-await. No drive loop, no DisposeAsyncCore await.
             if (flow.WaitForDrainOnDispose) flow.MarkConsumerWaitForDrain(); else flow.MarkConsumerGone();
-            flow._callerInteractionCore.GateTaskSource.TrySetResult(default);
+            flow._callerInteractionCore.OpenGate(runContinuationsAsynchronously: false);
             flow._callerInteractionCore.RequestWake();
             flow.AfterDisposeWakeHook?.Invoke();
             // Opt-in await-drain: PARK on the body's completion signal (TCS-backed WaitForComplete), so

@@ -37,21 +37,41 @@ struct FlowCallerInteractionCore<TResult>
     public Exception SetCloseLatch(Exception exception)
         => Interlocked.CompareExchange(ref _closeException, exception, null) ?? exception;
 
-    public Slon.Threading.Tasks.Sources.ManualResetValueTaskSourceCore<TResult> GateTaskSource;
+    // The async result/await channel. Encapsulated: callers drive it through the gate-intent methods below,
+    // never the raw MRVTSC. The inline-vs-async continuation mode (runContinuationsAsynchronously) is the
+    // load-bearing knob - inline = a sync disposer's park-before-open takeover resumes the body on its own
+    // thread; async = an autonomous wake that must not run the body inline on the signaller's stack.
+    Slon.Threading.Tasks.Sources.ManualResetValueTaskSourceCore<TResult> _gate;
 
     public void Initialize()
     {
-        GateTaskSource.CanCompleteConcurrently = true;
+        _gate.CanCompleteConcurrently = true;
     }
 
-    public ValueTask<TResult> GetGateTask(IValueTaskSource<TResult> source) => new(source, GateTaskSource.Version);
+    public ValueTask<TResult> GetGateTask(IValueTaskSource<TResult> source) => new(source, _gate.Version);
+
+    // ---- Gate intent surface (the IVTS facade forwards its three interface methods to these) ----
+    // Complete the gate. runContinuationsAsynchronously=false resumes a parked body inline on THIS thread
+    // (the takeover); true schedules it (the autonomous wake).
+    public void OpenGate(bool runContinuationsAsynchronously)
+        => _gate.TrySetResult(default!, runContinuationsAsynchronously);
+    public System.Threading.Tasks.Sources.ValueTaskSourceStatus GateStatus(short token) => _gate.GetStatus(token);
+    public void OnGateCompleted(Action<object?> continuation, object? state, short token, ValueTaskSourceOnCompletedFlags flags)
+        => _gate.OnCompleted(continuation, state, token, flags);
+    // The consumer took the gate signal: read the result, then rearm for the next inter-result boundary.
+    public TResult ConsumeGateResult(short token)
+    {
+        var result = _gate.GetResult(token);
+        _gate.Reset();
+        return result;
+    }
 
     public void CancelPendingWait(Exception exception)
     {
         // Latch first (monotone), then fault the gate, so a consumer observing the gate fault always
         // reads the latch set.
         var latched = SetCloseLatch(exception);
-        GateTaskSource.TrySetException(latched, runContinuationsAsynchronously: true);
+        _gate.TrySetException(latched, runContinuationsAsynchronously: true);
         _mres?.Set();
     }
 
@@ -117,7 +137,7 @@ struct FlowCallerInteractionCore<TResult>
     // DisposeAsync). Spec: WakeProtocol.tla. Fires both wake mechanisms:
     //   - SignalProgress wakes a sync caller blocked in WaitForContinuation.
     //   - Interlocked.Exchange on _wakeContinuation queues the body's resume action to TP if
-    //     present, covering async DisposeAsync on a sync-suspended body where GateTaskSource
+    //     present, covering async DisposeAsync on a sync-suspended body where the gate
     //     can't reach the wait.
     public void RequestWake()
     {
@@ -150,7 +170,7 @@ struct FlowCallerInteractionCore<TResult>
         _progressSignaled = false;
         _wakeRequested = false;
         _closeException = null;
-        GateTaskSource.Reset();
+        _gate.Reset();
     }
 
     public readonly struct ContinuationCapturingAwaitable(FieldRef<FlowCallerInteractionCore<TResult>> fieldRef)
@@ -166,9 +186,9 @@ struct FlowCallerInteractionCore<TResult>
                 // Surface a pending cancellation set by CancelPendingWait. The gate source is
                 // only completed when cancellation fires. In the normal sync-flow handoff path
                 // it stays Pending and we just return.
-                var gateTaskSource = fieldRef.Invoke().GateTaskSource;
-                if (gateTaskSource.GetStatus(gateTaskSource.Version) != System.Threading.Tasks.Sources.ValueTaskSourceStatus.Pending)
-                    gateTaskSource.GetResult(gateTaskSource.Version);
+                var gate = fieldRef.Invoke()._gate;
+                if (gate.GetStatus(gate.Version) != System.Threading.Tasks.Sources.ValueTaskSourceStatus.Pending)
+                    gate.GetResult(gate.Version);
             }
 
             public void OnCompleted(Action continuation)
