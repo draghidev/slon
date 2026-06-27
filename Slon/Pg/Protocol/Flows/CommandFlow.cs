@@ -355,6 +355,17 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
         var waiter = context.GetDecoderAsync().ConfigureAwait(false);
         if (waiter.IsCompleted)
         {
+            // Gate the inline Start on activation SUCCEEDED, not merely SETTLED - the same guard the
+            // deferred callback below already has. A faulted-settled activation (a racing dispose/teardown
+            // faulted us before we took the wire) is IsDecoderSettled=true but IsDecoderReady=false; we
+            // never claimed the wire, so Starting ExecutePipelined here would tenure the shared ReadPromise
+            // a legitimately-activated flow still holds -> "already executing". Bail to our OWN promise
+            // instead, exactly like the deferred path - the framework observes the close on the pipeline task.
+            if (!waiter.IsCompletedSuccessfully)
+            {
+                _executePipelinedCore.SetException(context.ClosedException ?? new PgClientClosedException(null));
+                return new ValueTask(this, _executePipelinedCore.Version);
+            }
             // Handing the shared-promise-backed task to the framework is safe: the contract guarantees
             // the waiter is consumed (releasing the promise tenure via GetResult's Reset) before the
             // item's position is republished, so a successor's dispatch always finds the tenure released.

@@ -304,6 +304,9 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IThreadPoolWorkItem
         // See IsDecoderSettled: a faulted activation must complete the await so GetResult
         // rethrows into the body's catch paths.
         public bool IsCompleted => control.IsDecoderSettled;
+        // Mirrors DecoderAwaitable.IsCompletedSuccessfully: settled with a REAL decoder (Activate ran),
+        // not woken by a teardown fault. A direct dispatcher only has a claim on the shared promise here.
+        public bool IsCompletedSuccessfully => control.IsDecoderReady;
 
         public PgDecoder GetResult()
         {
