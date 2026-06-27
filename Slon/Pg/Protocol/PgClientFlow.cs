@@ -177,6 +177,13 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IThreadPoolWorkItem
     /// (use TrySet semantics).
     protected virtual void OnComplete(Exception? exception) {}
 
+    // The per-flow handoff rendezvous primitive for the (wait-list-free) sync source handoff: non-null only
+    // for a flow that needs a caller takeover (a sync CommandFlow with a parked caller). The source signals
+    // it when it dequeues-and-holds the flow for that caller (OnExecutorSuspended), and the caller parks on
+    // it in WaitForExecutor. null = no handoff (async flows, or a flow with no waiting caller) - the source
+    // runs it autonomously on the executor, nothing to rendezvous. null/non-null IS the waiter-presence gate.
+    internal virtual ManualResetEventSlim? GetHandoffMres() => null;
+
     PgDecoder IValueTaskSource<PgDecoder>.GetResult(short token) => _activationTaskSource.GetResult(token);
     ValueTaskSourceStatus IValueTaskSource<PgDecoder>.GetStatus(short token) => _activationTaskSource.GetStatus(token);
     void IValueTaskSource<PgDecoder>.OnCompleted(Action<object?> continuation, object? state, short token, ValueTaskSourceOnCompletedFlags flags)

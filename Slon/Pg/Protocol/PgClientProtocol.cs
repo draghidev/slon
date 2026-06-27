@@ -415,7 +415,6 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
     {
         var isAsync = flow.IsAsyncForEnqueue;
         PgClientFlowSource.EnqueueResult enqueue = default;
-        PgClientFlowSource.State.SyncWaitNode? syncNode = null;
         lock (_syncRoot)
         {
             if (_status != requiredStatus)
@@ -426,18 +425,18 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
 
             // Both modes write the SPSC storage, so the enqueue must serialize with concurrent
             // same-protocol producers (single-producer contract). The sync flow goes in at its real FIFO
-            // position with its wait-node appended atomically (node order == queue order); its blocking
-            // rendezvous runs OUTSIDE the lock (WaitForExecutor). Depth is counted at dispatch
-            // (executor-single-writer), so there is no producer-side increment to serialize.
+            // position (it IS its own waiter via GetHandoffMres); its blocking rendezvous runs OUTSIDE the
+            // lock (WaitForExecutor). Depth is counted at dispatch (executor-single-writer), so there is no
+            // producer-side increment to serialize.
             if (isAsync)
                 enqueue = _source.Enqueue(flow);
             else
-                syncNode = _source.EnqueueSyncWaiter(flow);
+                _source.EnqueueSyncWaiter(flow);
         }
         if (isAsync)
             enqueue.Execute(runContinuationsAsynchronously: true);
         else
-            _source.WaitForExecutor(syncNode!);
+            _source.WaitForExecutor(flow);
         return true;
     }
 

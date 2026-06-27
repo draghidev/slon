@@ -63,16 +63,16 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
         => WaitForExecutor(EnqueueSyncWaiter(flow));
 
     // Two-phase split for callers that enqueue under an outer lock (TryQueueFlow under _syncRoot):
-    // EnqueueSyncWaiter appends the flow + its wait-node under the lock (node order == queue order),
-    // WaitForExecutor runs the blocking rendezvous OUTSIDE it.
-    public State.SyncWaitNode EnqueueSyncWaiter(PgClientFlow flow)
+    // EnqueueSyncWaiter appends the flow under the lock (FIFO order), WaitForExecutor runs the blocking
+    // rendezvous (parking on the flow's own handoff MRES) OUTSIDE it.
+    public PgClientFlow EnqueueSyncWaiter(PgClientFlow flow)
     {
         if (Volatile.Read(ref _state.IsCompleted))
             ThrowCompleted();
         return _state.EnqueueSyncWaiter(flow);
     }
 
-    public void WaitForExecutor(State.SyncWaitNode node) => _state.WaitForExecutor(node);
+    public void WaitForExecutor(PgClientFlow flow) => _state.WaitForExecutor(flow);
 
     // Drain the inert head of the source: items enqueued but never picked up by the executor.
     // CompleteAsync only sees dispatched flows, so anything still in the SPSC queue needs separate
@@ -120,14 +120,10 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
         // dequeue would tear the read). Set before Complete.
         public TaskCompletionSource? DrainSignal;
 
-        // Sync-handoff wait-list: a lock-free intrusive SPSC FIFO of parked sync callers, in queue
-        // order. A node is linked atomically with its flow's enqueue under the protocol's _syncRoot
-        // (node-at-head == sync-flow-at-head). Producer = the _syncRoot-serialized sync enqueue;
-        // single consumer = the head caller's close-out. Only the head caller drives the rendezvous;
-        // the rest park on their own MRES until baton-passed. Linked list, not array - this is the rare
-        // contended-sync path, not a hot queue.
-        SyncWaitNode? _syncHead;
-        SyncWaitNode? _syncTail;
+        // Sync-handoff FIFO is just _storage (sync+async in submission order); the current sync head the
+        // executor is holding for its caller is HeldSyncFlow. No separate wait-list: each parked caller
+        // parks on its OWN flow's MRES (PgClientFlow.GetHandoffMres), which the executor signals when it
+        // holds that flow. The old intrusive-list-of-wait-nodes (and its lagging-link spin) is gone.
         // One-shot takeover. The head caller's inline claim re-enters the pump on the caller's thread:
         // _takeoverPending makes that pull dequeue the head sync flow (its own), then _takeoverActive
         // makes the NEXT pull fake-miss so the pump parks (hands back to TP) instead of draining the
@@ -142,54 +138,6 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
         // substitute for the SPSC-illegal queue peek a producer can't do itself.
         public bool ParkedAtSyncHead;
 
-        internal sealed class SyncWaitNode
-        {
-            public readonly ManualResetEventSlim Mres = new(false);
-            public SyncWaitNode? Next;
-        }
-
-        // Append a fresh waiter to the tail. Called under the protocol's _syncRoot (serialized
-        // producer), atomically with the flow's enqueue, so node order == queue order. The
-        // Interlocked.Exchange on the tail synchronizes with the consumer's empty-transition CAS.
-        public SyncWaitNode AppendSyncWaiter()
-        {
-            var node = new SyncWaitNode();
-            var prev = Interlocked.Exchange(ref _syncTail, node);
-            if (prev is null)
-                Volatile.Write(ref _syncHead, node);   // list was empty: publish the head
-            else
-                prev.Next = node;
-            return node;
-        }
-
-        // True iff this node is the current head (the caller's turn to drive the rendezvous).
-        public bool IsSyncHead(SyncWaitNode node) => ReferenceEquals(Volatile.Read(ref _syncHead), node);
-
-        // Pop the head (the caller that just finished its takeover) and return the successor to wake,
-        // or null when the list drained. Single consumer. Order matters: clear _syncHead BEFORE the
-        // tail CAS so a producer whose Exchange returns null (sees us empty) publishes its own head
-        // without racing a lagging clear.
-        public SyncWaitNode? PopSyncHeadAndPeek(SyncWaitNode node)
-        {
-            var next = Volatile.Read(ref node.Next);
-            if (next is not null)
-            {
-                Volatile.Write(ref _syncHead, next);
-                return next;
-            }
-            // No linked successor: either genuinely empty, or a producer is mid-append (it Exchanged
-            // the tail but hasn't linked node.Next yet). Clear head first, then try to retire the tail.
-            Volatile.Write(ref _syncHead, null);
-            if (Interlocked.CompareExchange(ref _syncTail, null, node) == node)
-                return null;   // tail was still us: genuinely empty
-            // Producer raced in: spin until it links node.Next, then that node is the new head.
-            var spin = new SpinWait();
-            while ((next = Volatile.Read(ref node.Next)) is null)
-                spin.SpinOnce();
-            Volatile.Write(ref _syncHead, next);
-            return next;
-        }
-
         public State(PgClientProtocol protocol, PipelineScheduler scheduler)
         {
             FlushGate = new(protocol);
@@ -198,17 +146,17 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
         }
 
         // Invoked under the wake lock when the executor parks. If it dequeued a sync flow and is HOLDING
-        // it (HeldSyncFlow) for that flow's caller, signal the wait-list head so it takes over and runs
-        // the held flow on its own thread. Idle / async-drained parks are not a sync rendezvous.
+        // it (HeldSyncFlow) for that flow's caller, signal THAT flow's own handoff MRES so its caller takes
+        // over and runs the held flow on its own thread. Idle / async-drained parks are not a sync rendezvous.
         void OnExecutorSuspended()
         {
-            var atSyncHead = HeldSyncFlow is not null;
-            // Reserve this park for the head sync caller (TryClaim reads this under the same lock) BEFORE
+            var held = HeldSyncFlow;
+            // Reserve this park for the held sync caller (TryClaim reads this under the same lock) BEFORE
             // signalling, so a producer's TryClaim can't steal the park between the signal and the gate.
-            Volatile.Write(ref ParkedAtSyncHead, atSyncHead);
-            if (atSyncHead)
+            Volatile.Write(ref ParkedAtSyncHead, held is not null);
+            if (held is not null)
             {
-                Volatile.Read(ref _syncHead)?.Mres.Set();
+                held.GetHandoffMres()?.Set();   // exactly the just-held caller, parked on its own flow's MRES
                 return;
             }
             // Parking idle / async-headed with work still queued: re-drive the pump on TP rather than
@@ -239,14 +187,11 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
             // Wake the executor so its next wait resolves Completed. During completion TryClaim is allowed
             // to claim a sync-head park too (see below): if the executor is parked at a sync head whose
             // caller is about to bail, that park must be un-parked here or it strands (DrainSignal never
-            // fires).
+            // fires). Un-parking the executor is ALL Complete does for sync callers now: each parked caller
+            // wakes when ITS OWN flow is drained inert (DrainInert -> ExecutionControl.Complete -> OnComplete
+            // -> HandleException -> SignalProgress sets the flow's MRES), then re-reads IsCompleted and bails.
+            // No direct wait-list head wake - there is no wait-list.
             TryClaim(runContinuationsAsynchronously: true);
-            // Wake a blocked sync caller so it bails (its flow drains inert) instead of stranding on its
-            // node. Under the wake lock to serialize with the caller's Reset: IsCompleted is already
-            // published, so a caller that observes this Set re-reads IsCompleted == true and bails.
-            WakeSignal.AcquireWakeLock();
-            Volatile.Read(ref _syncHead)?.Mres.Set();
-            WakeSignal.ReleaseWakeLock();
         }
 
         // Claim the executor's parked wait and dispatch its continuation. Gated on ParkedAtSyncHead so an
@@ -272,14 +217,10 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
         }
 
         // Phase 1 of the sync handoff, under the protocol's _syncRoot: enqueue the sync flow at its real
-        // FIFO position in the one queue (no priority slot) and append its wait-node atomically, so the
-        // node order matches the queue order. Returns the node for the out-of-lock rendezvous.
-        public SyncWaitNode EnqueueSyncWaiter(PgClientFlow flow)
+        // FIFO position in the one queue (no priority slot, no wait-node - the flow IS its own waiter via
+        // GetHandoffMres). Returns the flow for the out-of-lock rendezvous.
+        public PgClientFlow EnqueueSyncWaiter(PgClientFlow flow)
         {
-            // Append the wait-node BEFORE the flow so the node (read via _syncHead) is published ahead
-            // of the flow becoming dequeuable: a concurrent executor that fake-misses on this flow then
-            // always sees a non-null head in OnExecutorSuspended (HeadIsSyncHandoff implies head set).
-            var node = AppendSyncWaiter();
             // Capture the routing async-mode (sync here) as the flow's stable bind snapshot BEFORE it is
             // published to the executor's pull, so the pull's dequeue-then-check sees a value that agrees
             // with this routing and stays put even if the body later flips IsAsync. By routing, not the
@@ -287,26 +228,32 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
             flow.CaptureAsyncRoutingSnapshot(isAsync: false);
             _storage.Enqueue(flow);
             Volatile.Write(ref QueueNotEmpty, true);
-            return node;
+            return flow;
         }
 
         // Phase 2, OUTSIDE the lock (blocks): drive the executor to this flow's FIFO turn and take it
-        // over so the body runs on the caller's thread.
-        public void WaitForExecutor(SyncWaitNode node)
+        // over so the body runs on the caller's thread. Parks on the flow's OWN handoff MRES.
+        public void WaitForExecutor(PgClientFlow flow)
         {
             var wakeSignal = WakeSignal;
-            // Kick the executor so it pulls and drains earlier flows in FIFO order, fake-missing on the
-            // first sync head and parking there - OnExecutorSuspended then signals THAT head's node. A
-            // no-op if the executor is already running (it reaches our flow on its own).
+            var mres = flow.GetHandoffMres()!;   // non-null on the sync path (a sync CommandFlow)
+            // Kick the executor so it pulls and drains earlier flows in FIFO order, dequeue-and-holding the
+            // first sync head and parking - OnExecutorSuspended then signals THAT held flow's MRES. A no-op
+            // if the executor is already running (it reaches our flow on its own).
             wakeSignal.Signal(runContinuationsAsynchronously: true);
 
             while (true)
             {
-                node.Mres.Wait();
+                mres.Wait();
                 wakeSignal.AcquireWakeLock();
-                if (IsSyncHead(node) && wakeSignal.TryClaimLocked())
+                // Reset under the lock, right after Wait: a successful claim hands the body a CLEAN MRES (the
+                // body reuses it for its own WaitForContinuation rendezvous). Manual-reset + two signal
+                // sources (OnExecutorSuspended here, the inert-drain SignalProgress on completion), so the
+                // Reset must serialize with the Set under the wake lock.
+                mres.Reset();
+                if (ReferenceEquals(HeldSyncFlow, flow) && wakeSignal.TryClaimLocked())
                 {
-                    TakeoverPending = true;   // our inline pull dequeues our own (now head) flow
+                    TakeoverPending = true;   // our inline pull dequeues our own (now held) flow
                     wakeSignal.ReleaseWakeLock();
                     // Inline: the pump continuation runs on this thread, dequeues our flow, runs its body,
                     // then one-shot fake-misses and re-parks (pump back to TP) so this returns.
@@ -321,19 +268,14 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
                     wakeSignal.ReleaseWakeLock();
                     break;
                 }
-                node.Mres.Reset();
                 wakeSignal.ReleaseWakeLock();
             }
 
-            // Close-out: pop ourselves and hand the baton to the successor. Normally that goes through the
-            // executor (re-signal -> it drains async deferred during our window and re-parks at the next
-            // sync head, where OnExecutorSuspended signals it). During completion the executor resolves
-            // Completed instead of re-parking, so wake the successor directly so it bails too.
-            var next = PopSyncHeadAndPeek(node);
-            if (Volatile.Read(ref IsCompleted))
-                next?.Mres.Set();
-            else
-                wakeSignal.Signal(runContinuationsAsynchronously: true);
+            // Close-out: kick the executor to advance to the next FIFO flow. It dequeues-and-holds the next
+            // sync head and OnExecutorSuspended signals THAT caller's MRES. On completion the executor
+            // resolves Completed instead of advancing, but each parked caller wakes when ITS OWN flow drains
+            // inert (its terminal SignalProgress sets its MRES), so no direct successor wake is needed here.
+            wakeSignal.Signal(runContinuationsAsynchronously: true);
         }
 
         // Async enqueue (the EnqueueResult / Execute path). Capture the routing async-mode (async here)

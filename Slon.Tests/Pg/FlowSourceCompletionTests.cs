@@ -33,12 +33,18 @@ public class FlowSourceCompletionTests
         void Record(PgClientFlow? f)
         {
             if (ReferenceEquals(f, flow))
+            {
                 Interlocked.Increment(ref consumed);
+                // Mirror the protocol's drain onInert (flow.Complete -> OnComplete -> SignalProgress -> MRES
+                // .Set): a never-held sync flow drained inert wakes its handoff caller, which bails on
+                // IsCompleted. With the wait-list-free source, this drain wake IS the completion-bail.
+                f.GetHandoffMres()?.Set();
+            }
         }
 
-        // Sync caller: append the flow + wait-node (this alone makes HasSyncWaiter true), then block in
-        // WaitForExecutor. On the fixed source it is taken over or bailed; on the unfixed source it
-        // strands waiting for a signal the spinning executor never sends.
+        // Sync caller: append the flow (this alone makes HasSyncWaiter true), then block in WaitForExecutor.
+        // On the fixed source it is taken over or bailed; on the unfixed source it strands waiting for a
+        // signal the spinning executor never sends.
         var node = source.EnqueueSyncWaiter(flow);
         var caller = Task.Run(() => source.WaitForExecutor(node));
 
@@ -98,7 +104,13 @@ public class FlowSourceCompletionTests
         void Record(PgClientFlow? f)
         {
             if (f is not null && consumed.ContainsKey(f))
+            {
                 lock (consumed) consumed[f]++;
+                // Mirror the protocol's drain onInert wake (see QueuedSyncFlow): waking the sync flow's
+                // handoff caller is the completion-bail under the wait-list-free source. Harmless on the
+                // async head (no caller parks on its MRES).
+                f.GetHandoffMres()?.Set();
+            }
         }
 
         source.Enqueue(asyncFlow);
