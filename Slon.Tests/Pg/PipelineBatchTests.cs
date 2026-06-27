@@ -114,7 +114,10 @@ public class PipelineBatchTests
         syncThread.Join(TimeSpan.FromSeconds(120));
 
         if (failure[0] is { } ex)
-            Assert.Fail($"concurrent sync/async raised {ex.GetType().Name}: {ex.Message}");
+            // Full ToString (not just Message): on an "already executing" double-start the stack pins WHICH
+            // ExecutePipelined Start fired - DispatchPipelinedRead's fast (waiter.IsCompleted) vs slow
+            // (OnCompleted callback) branch, or the protocol's ExecuteCore - which a bare Message can't.
+            Assert.Fail($"concurrent sync/async raised {ex.GetType().Name}: {ex.Message}\n{ex}");
     }
 
     // Each queued flow carries multiple commands, so the batch holds the shared read baton across a
