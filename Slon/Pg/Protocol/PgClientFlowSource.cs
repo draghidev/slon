@@ -236,7 +236,12 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
         public void WaitForExecutor(PgClientFlow flow)
         {
             var wakeSignal = WakeSignal;
-            var mres = flow.GetHandoffMres()!;   // non-null on the sync path (a sync CommandFlow)
+            // Caller-handoff path only: the routing (TryQueueFlow / ExclusiveAccessFlow.Queue, gated on
+            // NeedsSyncHandoff) sends autonomous sync flows (null MRES, no parked caller) down the async
+            // dispatch path instead, so a flow that reaches here always carries its waiter MRES. Fail loud
+            // rather than NRE if that invariant is ever bypassed.
+            var mres = flow.GetHandoffMres()
+                ?? throw new InvalidOperationException("WaitForExecutor reached with a null handoff MRES: an autonomous sync flow must route via async dispatch (NeedsSyncHandoff), not the caller-handoff park.");
             // Kick the executor so it pulls and drains earlier flows in FIFO order, dequeue-and-holding the
             // first sync head and parking - OnExecutorSuspended then signals THAT held flow's MRES. A no-op
             // if the executor is already running (it reaches our flow on its own).

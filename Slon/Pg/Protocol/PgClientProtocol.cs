@@ -413,7 +413,10 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
     bool TryQueueFlow(PgClientFlow flow, ProtocolStatus requiredStatus) => TryQueueFlow<bool>(flow, requiredStatus);
     bool TryQueueFlow<TState>(PgClientFlow flow, ProtocolStatus requiredStatus, Func<TState, bool>? predicate = null, TState state = default!)
     {
-        var isAsync = flow.IsAsyncForEnqueue;
+        // Handoff only when a caller is parked to take the flow over (NeedsSyncHandoff): an async flow,
+        // or an autonomous sync flow (null handoff MRES, no waiter), takes the dispatch path so the
+        // executor drives it rather than holding it for a caller that never comes.
+        var handoff = flow.NeedsSyncHandoff;
         PgClientFlowSource.EnqueueResult enqueue = default;
         lock (_syncRoot)
         {
@@ -428,12 +431,12 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
             // position (it IS its own waiter via GetHandoffMres); its blocking rendezvous runs OUTSIDE the
             // lock (WaitForExecutor). Depth is counted at dispatch (executor-single-writer), so there is no
             // producer-side increment to serialize.
-            if (isAsync)
+            if (!handoff)
                 enqueue = _source.Enqueue(flow);
             else
                 _source.EnqueueSyncWaiter(flow);
         }
-        if (isAsync)
+        if (!handoff)
             enqueue.Execute(runContinuationsAsynchronously: true);
         else
             _source.WaitForExecutor(flow);

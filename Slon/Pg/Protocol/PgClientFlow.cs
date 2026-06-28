@@ -102,6 +102,16 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IThreadPoolWorkItem
         }
     }
 
+    // Routing gate for the sync caller-handoff path (fec0355's waiter-presence gate, evaluated directly).
+    // A flow takes the handoff (park a caller, run its body on that caller's thread) only if it routes
+    // SYNC and posts a handoff MRES (non-null = a caller is there to hand to). A sync flow with NO waiter
+    // (null MRES) runs AUTONOMOUSLY: it is routed like an async flow so the executor DRIVES it (the body
+    // still does sync I/O via IsAsync), never held for a caller that will never come. Without this an
+    // autonomous sync flow would NRE on the null MRES in WaitForExecutor or hang held in
+    // OnExecutorSuspended. Short-circuits on the async path, so GetHandoffMres is only consulted for sync
+    // flows - where it is the genuine question being asked.
+    internal bool NeedsSyncHandoff => !IsAsyncForEnqueue && GetHandoffMres() is not null;
+
     // Probably should use a cts here.
     public void Cancel()
     {

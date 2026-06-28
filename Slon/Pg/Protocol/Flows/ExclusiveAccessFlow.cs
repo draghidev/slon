@@ -141,7 +141,10 @@ sealed class ExclusiveAccessFlow : PgClientFlow
         if (cancellationToken.CanBeCanceled)
             subflow.BindCallerToken(cancellationToken);
         subflow.GetExecutionControl(_innerControl).Bind(_activationTimeout);
-        if (subflow.IsAsyncForEnqueue)
+        // Same routing gate as the protocol's outer Queue: hand off only when a caller is parked
+        // (NeedsSyncHandoff). An async subflow, or an autonomous sync subflow (null handoff MRES), is
+        // dispatched so the inner executor drives it instead of holding it for an absent caller.
+        if (!subflow.NeedsSyncHandoff)
             innerSource.Enqueue(subflow).Execute(runContinuationsAsynchronously: true);
         else
             innerSource.EnqueueSyncWithHandoff(subflow);
