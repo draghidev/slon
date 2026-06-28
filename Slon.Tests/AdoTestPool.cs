@@ -27,6 +27,10 @@ static class AdoTestPool
     internal static ValueTask<SlonConnection> OpenConnectionAsync(CancellationToken ct = default)
         => _shared.OpenConnectionAsync(ct);
 
+    // Sync sibling: opens synchronously (sync exclusive-scope acquire) so the whole lease - acquire,
+    // commands, release - drives end-to-end on the caller's thread via the nested sync handoff.
+    internal static SlonConnection OpenConnection() => _shared.OpenConnection();
+
     // Construct a fresh, non-pooled SlonDataSource the caller owns end to end. Use in tests
     // that need non-default configuration (auto-prepare thresholds, tight heartbeat ticks,
     // alternate pool sizing) or that intentionally fault the wire / break the pool's state.

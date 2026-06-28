@@ -10,6 +10,13 @@ sealed class StartupFlow : PgClientFlow
     readonly PgClientOptions _options;
     readonly TimeSpan _startupTimeout;
     readonly List<KeyValuePair<string, string>> _parameters;
+    // Sync startup hands the body off to the Start() caller's thread: that caller parks in
+    // WaitForExecutor on this MRES until the executor reaches and holds this flow, then drives the
+    // handshake inline on its own thread (no TP escape during connection open). One-shot flow (fresh per
+    // open, not pooled), so the MRES is allocated eagerly when sync; an async startup never parks => null,
+    // the waiter-presence gate fec0355 keys on. The scripted body runs straight through (no consumer gate /
+    // WaitForContinuation), so the MRES is only the handoff park, never reused for body rendezvous.
+    readonly ManualResetEventSlim? _handoffMres;
 
     // Parsed from the BackendKeyData wire message. Pulled by PgClientProtocol after the flow
     // completes; the protocol stores them as its own fields and exposes them via Control.
@@ -29,7 +36,11 @@ sealed class StartupFlow : PgClientFlow
         if (options.Database is not null)
             _parameters.Add(new KeyValuePair<string, string>("database", options.Database));
         IsAsync = async;
+        if (!async)
+            _handoffMres = new(false);
     }
+
+    internal override ManualResetEventSlim? GetHandoffMres() => _handoffMres;
 
     protected override async ValueTask<FlowTasks> ExecuteAuto(Context context)
     {
