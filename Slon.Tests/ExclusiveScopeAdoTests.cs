@@ -14,16 +14,29 @@ public class ExclusiveScopeAdoTests
         return await cmd.ExecuteNonQueryAsync(CancellationToken.None);
     }
 
+    // Prove the current lease holds a real wire and runs session-local state on it: a uniquely-named TEMP
+    // table whose INSERT succeeds only if the CREATE landed on this same held wire. Unique name + DROP so it
+    // is robust to pool return not DISCARDing temp tables (a reused wire would otherwise collide on a fixed
+    // name) and leaves the wire clean for the next lease.
+    static async Task ProveHeldWire(SlonConnection conn)
+    {
+        var t = "slon_held_" + Guid.NewGuid().ToString("N");
+        await ExecNonQuery(conn, $"CREATE TEMP TABLE {t} (x int)");
+        Assert.AreEqual(1, await ExecNonQuery(conn, $"INSERT INTO {t} VALUES (1)"));
+        await ExecNonQuery(conn, $"DROP TABLE {t}");
+    }
+
     [TestMethod]
     public async Task Async_SessionLocalTempTable_VisibleAcrossCommands()
     {
         await using var conn = await AdoTestPool.OpenConnectionAsync();
-        await ExecNonQuery(conn, "CREATE TEMP TABLE slon_scope_probe (x int)");
+        var t = "slon_scope_" + Guid.NewGuid().ToString("N");
+        await ExecNonQuery(conn, $"CREATE TEMP TABLE {t} (x int)");
         // The INSERT/UPDATE reference the session-local table: they succeed only because the prior CREATE ran on
         // THIS same held wire. On a multiplexed wire they'd land elsewhere and throw "relation does not exist".
-        Assert.AreEqual(3, await ExecNonQuery(conn, "INSERT INTO slon_scope_probe VALUES (1),(2),(3)"));
-        Assert.AreEqual(3, await ExecNonQuery(conn, "UPDATE slon_scope_probe SET x = x + 1"));
-        await ExecNonQuery(conn, "DROP TABLE slon_scope_probe");
+        Assert.AreEqual(3, await ExecNonQuery(conn, $"INSERT INTO {t} VALUES (1),(2),(3)"));
+        Assert.AreEqual(3, await ExecNonQuery(conn, $"UPDATE {t} SET x = x + 1"));
+        await ExecNonQuery(conn, $"DROP TABLE {t}");
     }
 
     [TestMethod]
@@ -49,10 +62,7 @@ public class ExclusiveScopeAdoTests
         for (var i = 0; i < 8; i++)
         {
             await using var conn = await AdoTestPool.OpenConnectionAsync();
-            await ExecNonQuery(conn, "CREATE TEMP TABLE t (x int)");
-            // INSERT references the just-created session-local table: it returns 1 only if the CREATE landed
-            // on this same held wire - which requires this lease to have gotten a freshly-released scope.
-            Assert.AreEqual(1, await ExecNonQuery(conn, "INSERT INTO t VALUES (1)"));
+            await ProveHeldWire(conn);
         }
     }
 
@@ -79,11 +89,11 @@ public class ExclusiveScopeAdoTests
     public async Task Async_ReopenSameConnection_ReacquiresScope()
     {
         await using var conn = await AdoTestPool.OpenConnectionAsync();
-        await ExecNonQuery(conn, "CREATE TEMP TABLE slon_reopen_probe (x int)");
+        await ProveHeldWire(conn);
         await conn.CloseAsync();
 
         await conn.OpenAsync(CancellationToken.None);
-        await ExecNonQuery(conn, "CREATE TEMP TABLE slon_reopen_probe (x int)");
-        Assert.AreEqual(2, await ExecNonQuery(conn, "INSERT INTO slon_reopen_probe VALUES (1),(2)"));
+        // The reopened lease must hold a freshly-acquired scope and run its own session-local state.
+        await ProveHeldWire(conn);
     }
 }
