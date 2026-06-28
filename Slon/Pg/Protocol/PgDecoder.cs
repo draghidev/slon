@@ -268,6 +268,13 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
         return false;
     }
 
+    // Auto-switch read, mirroring the encoder's FlushAuto: a sync flow takes the BLOCKING read path
+    // (GetNext -> MoveNext -> channel.MoveNext, a real blocking syscall - the BCL does the waiting), an
+    // async flow takes GetNextAsync. Using GetNextAsync unconditionally for a sync flow leaves the read on
+    // the non-blocking/emulated path, so the body completes on a TP thread instead of inline.
+    public ValueTask<BackendMessage> GetNextAuto()
+        => CurrentExecutionControl.IsAsync ? GetNextAsync() : new(GetNext());
+
     public ValueTask<BackendMessage> GetNextAsync()
     {
         var task = MoveNextAsync();

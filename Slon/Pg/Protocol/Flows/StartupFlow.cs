@@ -66,9 +66,9 @@ sealed class StartupFlow : PgClientFlow
         encoder.CopyStartupBuffer(spanWriter.InnerWriter);
         await encoder.FlushAuto().ConfigureAwait(false);
 
-        var decoder = await context.GetDecoderAsync().ConfigureAwait(false);
+        var decoder = await context.GetDecoderAuto().ConfigureAwait(false);
         decoder.ReadTimeout = _startupTimeout;
-        var message = await decoder.GetNextAsync().ConfigureAwait(false);
+        var message = await decoder.GetNextAuto().ConfigureAwait(false);
         var authType = ParseAuthMessage(message, out var reader);
         switch (authType)
         {
@@ -89,7 +89,7 @@ sealed class StartupFlow : PgClientFlow
                 encoder.WriteStartupMD5Password(_options.Username, _options.Password, salt, _options.PasswordEncoding);
                 await encoder.FlushAuto().ConfigureAwait(false);
 
-                message = await decoder.GetNextAsync().ConfigureAwait(false);
+                message = await decoder.GetNextAuto().ConfigureAwait(false);
                 authType = ParseAuthMessage(message, out reader);
                 if (authType != AuthenticationType.Ok)
                     throw new InvalidOperationException("Unexpected authentication response.");
@@ -111,7 +111,7 @@ sealed class StartupFlow : PgClientFlow
         }
 
         // PgClientFlow will handle ParameterStatus messages, so we just need to handle BackendKeyData and RFQ.
-        message = await decoder.GetNextAsync().ConfigureAwait(false);
+        message = await decoder.GetNextAuto().ConfigureAwait(false);
         if (message.EnsureExpectedOrError(BackendType.BackendKeyData) is { } keyDataError)
             PostgresException.Throw(keyDataError);
         message.DebugEnsureBuffered();
@@ -123,7 +123,7 @@ sealed class StartupFlow : PgClientFlow
         BackendProcessId = processId;
         BackendSecretKey = secretKey;
 
-        message = await decoder.GetNextAsync().ConfigureAwait(false);
+        message = await decoder.GetNextAuto().ConfigureAwait(false);
         if (message.EnsureExpectedOrError(BackendType.ReadyForQuery) is { } rfqError)
             PostgresException.Throw(rfqError);
 
