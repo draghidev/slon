@@ -73,17 +73,6 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
     // IsAsync restore and flip a genuine sync drain back to async mid-batch.
     bool _drainModeEntered;
 
-    // Test seam (null in production - the null-check short-circuits with no await on the hot path). Invoked
-    // right before the body registers on the inter-result gate, so a test can deterministically force
-    // open-before-park: land a dispose's draining+signal BEFORE this park, the race that is otherwise rare.
-    internal Func<System.Threading.Tasks.ValueTask>? BeforeGateParkHook;
-    // Test-only: fired on the dispose path right after the wake (TrySetResult + RequestWake) has fully run,
-    // so a harness can release the held body only then - the body registers AFTER the wake (and its
-    // continuation-read), the deterministic open-before-park the single gate-park hook can't pin.
-    internal Action? AfterDisposeWakeHook;
-    // Test-only: fired on each drain read, so a harness can capture the thread the drain runs on (the
-    // disposer's own thread under the two-way rendezvous; a pool thread under the autonomous fallback).
-    internal Action? OnDrainReadHook;
 
     // The consumer DISPOSED the enumerator (the two consumer departure paths below), as opposed to the
     // body opting the consumer out on its own cancel/close drain. The terminal suppresses a user-cancel
@@ -248,7 +237,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
             //   small window: an executor on a separate thread can reach here before the caller sets
             //   IsWaiting, so we always do the unwind later if we didn't here, to not stall past writing.
             if (!IsAsync && _callerInteractionCore.IsWaiting)
-                await SetContinuationAndUnblockWaiter().ConfigureAwait(false);
+                await SetContinuationAndUnblockWaiter();
 
             // All writes captured as a single task. If they back-pressure (TCP send buffer full) the
             // task is pending and the framework awaits it inline between iterations so the next item's
@@ -468,7 +457,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
         // If we have a continuation stored we must already be on the caller thread,
         // otherwise we must make sure to unblock the executor (see comment in the write phase).
         if (!IsAsync && !_callerInteractionCore.HasContinuation)
-            await SetContinuationAndUnblockWaiter().ConfigureAwait(false);
+            await SetContinuationAndUnblockWaiter();
 
         try
         {
@@ -633,14 +622,10 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
 
                         if (!IsDraining)
                         {
-                            // Test seam (null in production): a hook point right before the inter-result gate
-                            // park, so a test can deterministically drive an open-before-park dispose.
-                            if (BeforeGateParkHook is { } parkHook)
-                                await parkHook().ConfigureAwait(false);
                             if (IsAsync)
                                 await AwaitResultGate(context).ConfigureAwait(false);
                             else
-                                await SetContinuationAndUnblockWaiter().ConfigureAwait(false);
+                                await SetContinuationAndUnblockWaiter();
 
                             /* The next MoveNext or MoveNextAsync call resumes here. */
                         }
@@ -657,7 +642,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                         // thread. Safe: the disposer waits on the rendezvous mres, not the move-next task, so
                         // this suspend can't sync-over-async deadlock it. One-shot (_drainModeEntered below),
                         // so later commands drain straight through on the disposer's thread.
-                        await SetContinuationAndUnblockWaiter().ConfigureAwait(false);
+                        await SetContinuationAndUnblockWaiter();
                     }
                     else
                     {
@@ -676,8 +661,6 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                 // This also causes us to pick up any I/O exception thrown during user code that was stored on the resultmessage enumerator.
                 // In drain mode this dispose IS the drain: it reads remaining DataRows + CommandComplete for the current command.
                 state = ref context.GetProtocolStatic<ReadState>();
-                if (IsDraining)
-                    OnDrainReadHook?.Invoke();
                 if (IsAsync)
                     await state.ResultMessageEnumerator.DisposeAsync().ConfigureAwait(false);
                 else
@@ -1099,16 +1082,22 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
         HandleException(exception);
     }
 
-    // Set up the field ref on demand. Most flows are async and never need this. Wrapped in an async
-    // method so the awaiter field can be shared, since this is sync-only.
-    async ValueTask SetContinuationAndUnblockWaiter()
+    // Return the rendezvous awaitable DIRECTLY (NOT via an async ValueTask wrapper). The wrapper added a
+    // second await level whose inner OnCompleted set _mres (unblocking the disposer) BEFORE the body had
+    // registered its continuation on the wrapper's ValueTask. So under TP contention the disposer could
+    // complete that ValueTask before the body registered, and the body's late UnsafeOnCompleted on the
+    // already-completed source was dispatched to the ThreadPool - the body bounced off the disposer's thread
+    // and ran its SYNC drain on a foreign pool thread (the double-block). Awaiting the awaitable directly
+    // captures the BODY's MoveNext as _continuation in the SAME OnCompleted that sets _mres, so the disposer
+    // always finds it and invokes the body's MoveNext INLINE on its own thread. No intermediate ValueTask.
+    FlowCallerInteractionCore<FlowCallerInteractionCoreResult>.ContinuationCapturingAwaitable SetContinuationAndUnblockWaiter()
     {
         FieldRef<FlowCallerInteractionCore<FlowCallerInteractionCoreResult>> fieldRef;
         unsafe
         {
             fieldRef = FieldRef<FlowCallerInteractionCore<FlowCallerInteractionCoreResult>>.Create(&GetCallerInteractionCore, this);
         }
-        await _callerInteractionCore.SetContinuationAndUnblockWaiter(fieldRef);
+        return _callerInteractionCore.SetContinuationAndUnblockWaiter(fieldRef);
     }
 
     static ref FlowCallerInteractionCore<FlowCallerInteractionCoreResult> GetCallerInteractionCore(CommandFlow instance)
@@ -1376,11 +1365,13 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
             if (flow.IsAsync)
             {
                 flow.IsAsync = false;
-                if (flow.WaitForDrainOnDispose) flow.MarkConsumerWaitForDrain(); else flow.MarkConsumerGone();
+                if (flow.WaitForDrainOnDispose)
+                    flow.MarkConsumerWaitForDrain();
+                else
+                    flow.MarkConsumerGone();
                 // INLINE (runContinuationsAsynchronously: false): a gate-parked body resumes + drains here.
                 // Buffered (no-op) if the body isn't gate-parked.
                 flow._callerInteractionCore.OpenGate(runContinuationsAsynchronously: false);
-                flow.AfterDisposeWakeHook?.Invoke();
                 if (flow.WaitForDrainOnDispose)
                 {
                     // Pump the rendezvous: take each continuation the body hands off and run it inline, until
@@ -1461,7 +1452,6 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
             if (flow.WaitForDrainOnDispose) flow.MarkConsumerWaitForDrain(); else flow.MarkConsumerGone();
             flow._callerInteractionCore.OpenGate(runContinuationsAsynchronously: false);
             flow._callerInteractionCore.RequestWake();
-            flow.AfterDisposeWakeHook?.Invoke();
             // Opt-in await-drain: PARK on the body's completion signal (TCS-backed WaitForComplete), so
             // the wire is drained to RFQ before this returns. This WAITS on the body, it does not DRIVE
             // it - no poll loop, so no busy-spin. Bounded by the flow/enumerator token: if the caller's
