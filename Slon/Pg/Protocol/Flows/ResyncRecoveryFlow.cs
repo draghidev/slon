@@ -190,8 +190,9 @@ sealed class ResyncRecoveryFlow : PgClientFlow
             // commit per statement. BEGIN upgrades that implicit block into an explicit transaction, so
             // the ROLLBACK below unwinds the whole thing. (When canWriteSync is false the flow's own
             // Query/Sync already terminated its block - nothing to upgrade, just close any open BEGIN.)
-            encoder.WriteQuery("BEGIN");
+            // The trailing comment tags the resync move in server logs / pg_stat_activity.
+            encoder.WriteQuery("BEGIN -- Slon connection recovery");
         // Closes the now-explicit (or already-explicit) transaction; a no-op-with-notice when Idle.
-        encoder.WriteQuery("ROLLBACK");
+        encoder.WriteQuery("ROLLBACK -- Slon connection recovery");
     }
 }
