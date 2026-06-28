@@ -31,6 +31,27 @@ static class AdoTestPool
     // commands, release - drives end-to-end on the caller's thread via the nested sync handoff.
     internal static SlonConnection OpenConnection() => _shared.OpenConnection();
 
+    // MULTIPLEXED command path: a data-source-bound command runs on a pool-picked wire without leasing a
+    // connection / exclusive scope. The right tool for stateless one-off commands - keeps the small shared
+    // pool exercising multiplexing instead of starving on exclusive leases. Use OpenConnection* only when
+    // the test genuinely needs session state / transactions across commands (and prefer an isolated source
+    // for those, so an exclusive lease can't poison the shared pool).
+    internal static async ValueTask<int> ExecuteNonQueryAsync(string sql, CancellationToken ct = default)
+    {
+        await using var cmd = new SlonCommand(_shared, sql);
+        return await cmd.ExecuteNonQueryAsync(ct);
+    }
+
+    internal static int ExecuteNonQuery(string sql)
+    {
+        using var cmd = new SlonCommand(_shared, sql);
+        return cmd.ExecuteNonQuery();
+    }
+
+    // A data-source-bound (MULTIPLEXED) command, for tests that need to drive a specific execute method
+    // themselves (e.g. assert ExecuteScalar throws). Runs on a pool-picked wire - no connection lease.
+    internal static SlonCommand CreateCommand(string sql) => new(_shared, sql);
+
     // Construct a fresh, non-pooled SlonDataSource the caller owns end to end. Use in tests
     // that need non-default configuration (auto-prepare thresholds, tight heartbeat ticks,
     // alternate pool sizing) or that intentionally fault the wire / break the pool's state.

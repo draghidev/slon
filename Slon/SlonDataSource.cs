@@ -233,13 +233,23 @@ public sealed class SlonDataSource: DbDataSource
         throw new NotImplementedException();
     }
 
+    // The MULTIPLEXED command path: build the flow, then let the pool pick a wire (power-of-two-choices
+    // load score) and enqueue the flow onto its protocol, WITHOUT leasing/holding the connection - other
+    // flows multiplex onto the same wire concurrently. No proxy bookkeeping (pipeline depth, break-on-fault
+    // are connection-lease concerns); auto-prepare completion rides the options' OnCommandResultAction. The
+    // schedule callback runs under the pool's stripe walk and returns whether the wire accepted the flow.
     internal CommandFlow EnqueueCommands(CommandFlowOptions options)
     {
-        throw new NotImplementedException();
+        var flow = new CommandFlow(async: false, options);
+        _connectionPool.Get(static (ctx, f) => ctx.Connection.TryQueue(f), flow, ConnectionTimeout);
+        return flow;
     }
-    internal ValueTask<CommandFlow> EnqueueCommandsAsync(CommandFlowOptions options, CancellationToken cancellationToken)
+
+    internal async ValueTask<CommandFlow> EnqueueCommandsAsync(CommandFlowOptions options, CancellationToken cancellationToken)
     {
-        throw new NotImplementedException();
+        var flow = new CommandFlow(async: true, options);
+        await _connectionPool.GetAsync(static (ctx, f) => ctx.Connection.TryQueue(f), flow, ConnectionTimeout, cancellationToken).ConfigureAwait(false);
+        return flow;
     }
 
     internal string SensitiveConnectionString => throw new NotImplementedException();
@@ -272,6 +282,7 @@ public sealed class SlonDataSource: DbDataSource
     {
         var connection = CreateConnection();
         connection.SetProxy(GetProxy(connection, ConnectionTimeout));
+        connection.AcquireExclusiveScope();
         return connection;
     }
 
@@ -280,12 +291,14 @@ public sealed class SlonDataSource: DbDataSource
     {
         var connection = CreateConnection();
         connection.SetProxy(await GetProxyAsync(connection, ConnectionTimeout, cancellationToken).ConfigureAwait(false));
+        await connection.AcquireExclusiveScopeAsync(cancellationToken).ConfigureAwait(false);
         return connection;
     }
     public new async ValueTask<SlonConnection> OpenConnectionAsync(CancellationToken cancellationToken)
     {
         var connection = CreateConnection();
         connection.SetProxy(await GetProxyAsync(connection, ConnectionTimeout, cancellationToken).ConfigureAwait(false));
+        await connection.AcquireExclusiveScopeAsync(cancellationToken).ConfigureAwait(false);
         return connection;
     }
 

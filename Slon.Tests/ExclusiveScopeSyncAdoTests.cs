@@ -25,7 +25,8 @@ public class ExclusiveScopeSyncAdoTests
     public void Sync_SessionLocalTempTable_StaysOnCallerThread()
     {
         var caller = Environment.CurrentManagedThreadId;
-        using var conn = AdoTestPool.OpenConnection();
+        using var ds = AdoTestPool.NewIsolatedDataSource();
+        using var conn = ds.OpenConnection();
         Assert.AreEqual(caller, Environment.CurrentManagedThreadId, "sync Open returned on a different thread");
 
         var t = "slon_sync_" + Guid.NewGuid().ToString("N");
@@ -42,7 +43,8 @@ public class ExclusiveScopeSyncAdoTests
     public void Sync_Reader_StaysOnCallerThread()
     {
         var caller = Environment.CurrentManagedThreadId;
-        using var conn = AdoTestPool.OpenConnection();
+        using var ds = AdoTestPool.NewIsolatedDataSource();
+        using var conn = ds.OpenConnection();
         ExecNonQuery(conn, "SET application_name = 'slon_sync_probe'");
         for (var i = 0; i < 4; i++)
         {

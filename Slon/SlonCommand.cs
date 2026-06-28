@@ -41,6 +41,9 @@ public sealed class SlonCommand: DbCommand
     public SlonCommand(SlonConnection connection) : this(connection, null, null) {}
     public SlonCommand(string commandText) : this(null, null, commandText) {}
     public SlonCommand(SlonConnection connection, string commandText) : this(connection, null, commandText) {}
+    // A data-source-bound command runs on the MULTIPLEXED path (no connection lease, no exclusive scope) -
+    // the stateless fast path. Use this for one-off commands that don't need session state / transactions.
+    public SlonCommand(SlonDataSource dataSource, string commandText) : this(null, dataSource, commandText) {}
 
     void ThrowIfDisposed() => _batchCore.ThrowIfDisposed();
     void ThrowIfDisposedOrReadOnly() => _batchCore.ThrowIfDisposedOrReadOnly();

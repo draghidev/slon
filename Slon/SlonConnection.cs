@@ -169,7 +169,7 @@ public sealed partial class SlonConnection : IAdoConnection
     }
 
     internal TimeSpan DefaultCommandTimeout => DbDataSource.DefaultCommandTimeout;
-    internal SlonTransaction? CurrentTransaction { get; }
+    internal SlonTransaction? CurrentTransaction { get; private set; }
 
     void DisposeCore()
     {
@@ -229,21 +229,69 @@ public sealed partial class SlonConnection : IAdoConnection
         }
     }
 
+    // The data-source open paths (SlonDataSource.OpenConnection*) SetProxy directly rather than going
+    // through OpenCore/OpenAsyncCore, so they acquire the lease's exclusive scope through these. A
+    // SlonConnection holds an exclusive scope for its whole lease however it was opened.
+    internal void AcquireExclusiveScope() => EnsureConnected().AcquireExclusiveScope();
+    internal ValueTask AcquireExclusiveScopeAsync(CancellationToken cancellationToken) => EnsureConnected().AcquireExclusiveScopeAsync(cancellationToken);
+
+    // The exclusive scope is held for the lease, so the wire is serial: BEGIN opens a transaction on it
+    // that this connection's later commands run inside (PG auto-enrolls them on the wire's open block),
+    // until COMMIT/ROLLBACK closes it. Emitted as ordinary commands through the held scope.
     SlonTransaction BeginTransactionCore(IsolationLevel isolationLevel)
     {
         EnsureConnected();
-        // The exclusive scope is already held for the lease (acquired at Open), so the wire is serial and a
-        // transaction runs safely on it. TODO emit BEGIN/COMMIT/ROLLBACK as subflows (SlonTransaction).
-        return new SlonTransaction(this, isolationLevel);
+        ThrowIfTransactionActive();
+        ExecuteTransactionStatement(BeginTransactionSql(isolationLevel));
+        return CurrentTransaction = new SlonTransaction(this, isolationLevel);
     }
 
-    ValueTask<TTransaction> BeginTransactionAsyncCore<TTransaction>(IsolationLevel isolationLevel, CancellationToken cancellationToken)
+    async ValueTask<TTransaction> BeginTransactionAsyncCore<TTransaction>(IsolationLevel isolationLevel, CancellationToken cancellationToken)
         where TTransaction: DbTransaction
     {
         Debug.Assert(typeof(TTransaction) == typeof(DbTransaction) || typeof(TTransaction) == typeof(SlonTransaction));
         EnsureConnected();
-        // Scope already held for the lease; transaction SQL (BEGIN/COMMIT/ROLLBACK) emission is TODO (SlonTransaction).
-        return new ValueTask<TTransaction>((TTransaction)(object)new SlonTransaction(this, isolationLevel));
+        ThrowIfTransactionActive();
+        await ExecuteTransactionStatementAsync(BeginTransactionSql(isolationLevel), cancellationToken).ConfigureAwait(false);
+        var transaction = new SlonTransaction(this, isolationLevel);
+        CurrentTransaction = transaction;
+        return (TTransaction)(object)transaction;
+    }
+
+    void ThrowIfTransactionActive()
+    {
+        if (CurrentTransaction is not null)
+            ThrowHelper.ThrowInvalidOperation("A transaction is already in progress; nested transactions are not supported (use a savepoint instead).");
+    }
+
+    void ValidateTransaction(SlonTransaction transaction)
+    {
+        if (!ReferenceEquals(CurrentTransaction, transaction))
+            ThrowHelper.ThrowInvalidOperation("This transaction is not the connection's active transaction (it has already completed, or belongs to another connection).");
+    }
+
+    // PG BEGIN with the matching isolation level (default = READ COMMITTED). Snapshot maps to REPEATABLE
+    // READ, which IS snapshot isolation in PostgreSQL.
+    static string BeginTransactionSql(IsolationLevel isolationLevel) => isolationLevel switch
+    {
+        IsolationLevel.Unspecified or IsolationLevel.ReadCommitted => "BEGIN",
+        IsolationLevel.Serializable => "BEGIN ISOLATION LEVEL SERIALIZABLE",
+        IsolationLevel.RepeatableRead or IsolationLevel.Snapshot => "BEGIN ISOLATION LEVEL REPEATABLE READ",
+        IsolationLevel.ReadUncommitted => "BEGIN ISOLATION LEVEL READ UNCOMMITTED",
+        _ => throw new ArgumentOutOfRangeException(nameof(isolationLevel), isolationLevel, "Unsupported isolation level for a PostgreSQL transaction."),
+    };
+
+    void ExecuteTransactionStatement(string sql)
+    {
+        using var cmd = new SlonCommand(this, sql);
+        cmd.ExecuteNonQuery();
+    }
+
+    async ValueTask ExecuteTransactionStatementAsync(string sql, CancellationToken cancellationToken)
+    {
+        var cmd = new SlonCommand(this, sql);
+        await using (cmd.ConfigureAwait(false))
+            await cmd.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
 
     void OpenCore()
@@ -435,14 +483,32 @@ public sealed partial class SlonConnection : IAdoConnection
         return new();
     }
 
-    public void CommitTransaction(SlonTransaction slonTransaction)
+    internal void CommitTransaction(SlonTransaction slonTransaction)
     {
-        throw new NotImplementedException();
+        ValidateTransaction(slonTransaction);
+        ExecuteTransactionStatement("COMMIT");
+        CurrentTransaction = null;
     }
 
-    public void RollbackTransaction(SlonTransaction slonTransaction)
+    internal void RollbackTransaction(SlonTransaction slonTransaction)
     {
-        throw new NotImplementedException();
+        ValidateTransaction(slonTransaction);
+        ExecuteTransactionStatement("ROLLBACK");
+        CurrentTransaction = null;
+    }
+
+    internal async ValueTask CommitTransactionAsync(SlonTransaction slonTransaction, CancellationToken cancellationToken)
+    {
+        ValidateTransaction(slonTransaction);
+        await ExecuteTransactionStatementAsync("COMMIT", cancellationToken).ConfigureAwait(false);
+        CurrentTransaction = null;
+    }
+
+    internal async ValueTask RollbackTransactionAsync(SlonTransaction slonTransaction, CancellationToken cancellationToken)
+    {
+        ValidateTransaction(slonTransaction);
+        await ExecuteTransactionStatementAsync("ROLLBACK", cancellationToken).ConfigureAwait(false);
+        CurrentTransaction = null;
     }
 
     ConnectionState GetState()
@@ -578,7 +644,7 @@ public sealed partial class SlonConnection : DbConnection
     /// <returns>A <see cref="SlonTransaction"/> object representing the new transaction.</returns>
     /// <remarks>Nested transactions are not supported.</remarks>
     public new ValueTask<SlonTransaction> BeginTransactionAsync(IsolationLevel level, CancellationToken cancellationToken = default)
-        => BeginTransactionAsyncCore<SlonTransaction>(IsolationLevel.Unspecified, cancellationToken);
+        => BeginTransactionAsyncCore<SlonTransaction>(level, cancellationToken);
 
     /// <inheritdoc />
     protected override DbTransaction BeginDbTransaction(IsolationLevel isolationLevel)
@@ -586,7 +652,7 @@ public sealed partial class SlonConnection : DbConnection
 
     /// <inheritdoc />
     protected override ValueTask<DbTransaction> BeginDbTransactionAsync(IsolationLevel isolationLevel, CancellationToken cancellationToken)
-        => BeginTransactionAsyncCore<DbTransaction>(IsolationLevel.Unspecified, cancellationToken);
+        => BeginTransactionAsyncCore<DbTransaction>(isolationLevel, cancellationToken);
 
     /// <summary>Creates and returns a <see cref="T:System.Data.Common.DbCommand" /> object associated with the current connection.</summary>
     /// <param name="commandText">The command text to be used.</param>

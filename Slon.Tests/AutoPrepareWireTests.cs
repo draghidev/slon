@@ -198,6 +198,11 @@ public class AutoPrepareWireTests
 
         var drained = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         pg.PushMaintenance(new CloseStatement("slon_test_drain_probe") { Completion = drained });
+        // Maintenance runs on the protocol's OUTER pipeline, which the connection's held exclusive scope
+        // owns for the whole lease - so the armed MaintenanceFlow is queued behind the scope and can't
+        // drain. Release the scope (close the connection); the PgConnection survives the lease (pool unit),
+        // so we keep inspecting it. Maintenance is a protocol concern, never scope work.
+        await conn.CloseAsync();
         await drained.Task.WaitAsync(TimeSpan.FromSeconds(10));
 
         // The completion fires from the flow's cleanup walk, after RemoveTracked for sqlA and before

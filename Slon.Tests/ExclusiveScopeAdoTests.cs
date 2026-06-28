@@ -4,6 +4,10 @@ namespace Slon.Tests;
 // visible to its later commands - the correctness property multiplexing would break. Validated with a TEMP
 // table (session-local: an INSERT/UPDATE referencing it succeeds only if the earlier CREATE landed on the SAME
 // held wire - on a multiplexed wire it would be "relation does not exist") and a session GUC read back stably.
+//
+// Each test uses an ISOLATED data source: these lease EXCLUSIVE connections, so sharing the small multiplexed
+// test pool would starve it / let one lease's failure poison the others. Stateless command tests use the
+// shared multiplexed path (AdoTestPool.ExecuteNonQueryAsync) instead.
 [TestClass]
 [DoNotParallelize]
 public class ExclusiveScopeAdoTests
@@ -29,7 +33,8 @@ public class ExclusiveScopeAdoTests
     [TestMethod]
     public async Task Async_SessionLocalTempTable_VisibleAcrossCommands()
     {
-        await using var conn = await AdoTestPool.OpenConnectionAsync();
+        await using var ds = AdoTestPool.NewIsolatedDataSource();
+        await using var conn = await ds.OpenConnectionAsync(CancellationToken.None);
         var t = "slon_scope_" + Guid.NewGuid().ToString("N");
         await ExecNonQuery(conn, $"CREATE TEMP TABLE {t} (x int)");
         // The INSERT/UPDATE reference the session-local table: they succeed only because the prior CREATE ran on
@@ -42,7 +47,8 @@ public class ExclusiveScopeAdoTests
     [TestMethod]
     public async Task Async_SessionGucStableAcrossCommands()
     {
-        await using var conn = await AdoTestPool.OpenConnectionAsync();
+        await using var ds = AdoTestPool.NewIsolatedDataSource();
+        await using var conn = await ds.OpenConnectionAsync(CancellationToken.None);
         await ExecNonQuery(conn, "SET application_name = 'slon_scope_probe'");
         for (var i = 0; i < 8; i++)
         {
@@ -53,15 +59,16 @@ public class ExclusiveScopeAdoTests
         }
     }
 
-    // Closing a connection must release its scope so the wire returns to the pool. The shared pool is
+    // Closing a connection must release its scope so the wire returns to the pool. The isolated source is
     // MaxPoolSize=4, so leasing-and-closing well past that count only completes if every close releases:
     // a leaked scope would pin its wire and the 5th open would starve and hang the test.
     [TestMethod]
     public async Task Async_CloseReleasesScope_ReusableBeyondPoolCapacity()
     {
+        await using var ds = AdoTestPool.NewIsolatedDataSource();
         for (var i = 0; i < 8; i++)
         {
-            await using var conn = await AdoTestPool.OpenConnectionAsync();
+            await using var conn = await ds.OpenConnectionAsync(CancellationToken.None);
             await ProveHeldWire(conn);
         }
     }
@@ -71,9 +78,10 @@ public class ExclusiveScopeAdoTests
     [TestMethod]
     public async Task Async_ConcurrentLeases_AllReleaseCleanly()
     {
+        await using var ds = AdoTestPool.NewIsolatedDataSource();
         async Task LeaseRunClose()
         {
-            await using var conn = await AdoTestPool.OpenConnectionAsync();
+            await using var conn = await ds.OpenConnectionAsync(CancellationToken.None);
             await ExecNonQuery(conn, "SELECT 1");
         }
 
@@ -88,7 +96,8 @@ public class ExclusiveScopeAdoTests
     [TestMethod]
     public async Task Async_ReopenSameConnection_ReacquiresScope()
     {
-        await using var conn = await AdoTestPool.OpenConnectionAsync();
+        await using var ds = AdoTestPool.NewIsolatedDataSource();
+        await using var conn = await ds.OpenConnectionAsync(CancellationToken.None);
         await ProveHeldWire(conn);
         await conn.CloseAsync();
 
