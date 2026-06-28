@@ -518,6 +518,8 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
         {
             // Drive the result to its CommandComplete so RecordsAffected is populated (we discard any
             // rows - this is ExecuteNonQuery). Only data-modifying statements contribute a non-zero count.
+            // RecordsAffected throws a PostgresException on a failed command, so the error surfaces here
+            // instead of silently reporting 0 affected.
             foreach (var _ in result) { }
             recordsAffected = checked(recordsAffected + result.RecordsAffected);
         }
@@ -541,6 +543,8 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
                 // rows - this is ExecuteNonQuery). Only data-modifying statements contribute a non-zero count.
                 var rows = result.GetAsyncEnumerator(cancellationToken);
                 while (await rows.MoveNextAsync().ConfigureAwait(false)) { }
+                // RecordsAffected throws a PostgresException on a failed command (stored ErrorResponse),
+                // so the error surfaces here instead of silently reporting 0 affected.
                 recordsAffected = checked(recordsAffected + result.RecordsAffected);
             }
             return checked((int)recordsAffected);
@@ -562,6 +566,9 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
             using var rowEnumerator = result.GetAsyncEnumerator();
             if (rowEnumerator.MoveNext())
                 return result.FieldCount is not 0 ? rowEnumerator.Current.GetValue<object>(0) : null;
+            // No row from this result: surface a failed command (stored ErrorResponse) instead of
+            // silently returning null.
+            result.GetCommandComplete();
         }
         return null;
     }
@@ -589,6 +596,9 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
                 {
                     await rowEnumerator.DisposeAsync().ConfigureAwait(false);
                 }
+                // No row from this result: surface a failed command (stored ErrorResponse) instead of
+                // silently returning null.
+                enumerator.Current.GetCommandComplete();
             }
             return null;
         }
