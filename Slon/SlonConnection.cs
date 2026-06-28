@@ -231,19 +231,19 @@ public sealed partial class SlonConnection : IAdoConnection
 
     SlonTransaction BeginTransactionCore(IsolationLevel isolationLevel)
     {
-        var proxy = EnsureConnected();
-        proxy.BeginExclusiveScope();
-        // TODO either push in a BEGIN TX inside the next flow, or set up a transaction flow to enqueue.
+        EnsureConnected();
+        // The exclusive scope is already held for the lease (acquired at Open), so the wire is serial and a
+        // transaction runs safely on it. TODO emit BEGIN/COMMIT/ROLLBACK as subflows (SlonTransaction).
         return new SlonTransaction(this, isolationLevel);
     }
 
-    async ValueTask<TTransaction> BeginTransactionAsyncCore<TTransaction>(IsolationLevel isolationLevel, CancellationToken cancellationToken)
+    ValueTask<TTransaction> BeginTransactionAsyncCore<TTransaction>(IsolationLevel isolationLevel, CancellationToken cancellationToken)
         where TTransaction: DbTransaction
     {
         Debug.Assert(typeof(TTransaction) == typeof(DbTransaction) || typeof(TTransaction) == typeof(SlonTransaction));
-        await EnsureConnected().BeginExclusiveScopeAsync(cancellationToken).ConfigureAwait(false);
-        // TODO either push in a BEGIN TX inside the next flow, or set up a transaction flow to enqueue.
-        return (TTransaction)(object)new SlonTransaction(this, isolationLevel);
+        EnsureConnected();
+        // Scope already held for the lease; transaction SQL (BEGIN/COMMIT/ROLLBACK) emission is TODO (SlonTransaction).
+        return new ValueTask<TTransaction>((TTransaction)(object)new SlonTransaction(this, isolationLevel));
     }
 
     void OpenCore()
@@ -256,6 +256,10 @@ public sealed partial class SlonConnection : IAdoConnection
         try
         {
             SetProxy(DbDataSource.GetProxy(this, DbDataSource.ConnectionTimeout));
+            // SlonConnection holds an exclusive scope for its whole lease: its commands run serially on one
+            // wire (safe default - Slon can't parse SQL to spot session state). The data-source command path
+            // never Opens, so it stays multiplexed.
+            EnsureConnected().AcquireExclusiveScope();
         }
         catch
         {
@@ -275,6 +279,7 @@ public sealed partial class SlonConnection : IAdoConnection
         {
 
             SetProxy(await DbDataSource.GetProxyAsync(this, DbDataSource.ConnectionTimeout, cancellationToken).ConfigureAwait(false));
+            await EnsureConnected().AcquireExclusiveScopeAsync(cancellationToken).ConfigureAwait(false);
         }
         catch
         {

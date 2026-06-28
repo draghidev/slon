@@ -21,7 +21,12 @@ sealed class AdoConnectionProxy : IDisposable, IAsyncDisposable
 
     CommandFlow? _cachedFlow;
     int _pipelineDepth;
-    bool _inExclusiveScope;
+    // A SlonConnection holds an exclusive scope for its whole lease (acquired at Open), so its commands run
+    // serially on one wire instead of multiplexed - the safe default, since Slon can't parse SQL to know
+    // which commands carry session state (SET / LISTEN / temp tables / BEGIN...). Null on the data-source
+    // path (transient per-command proxy, which never Opens, so it stays multiplexed). Routing keys on this
+    // being non-null, so the connection/data-source split needs no separate flag.
+    ExclusiveAccessFlow? _exclusiveFlow;
 
     internal AdoConnectionProxy(SlonDataSource dataSource, PgConnection pgConnection, IAdoConnection connection)
     {
@@ -131,10 +136,20 @@ sealed class AdoConnectionProxy : IDisposable, IAsyncDisposable
         {
             var instance = (AdoConnectionProxy)state!;
             Interlocked.Decrement(ref instance._pipelineDepth);
-            // If we're in an exclusive scope we must report a broken state to the connection.
-            if (exception is not null && instance._inExclusiveScope)
+            // A flow-level fault while holding an exclusive scope breaks the connection (the wire is the
+            // connection's; a torn flow means a torn session). SQL errors don't reach here - they surface
+            // on the result, the flow completes cleanly.
+            if (exception is not null && instance._exclusiveFlow is not null)
                 instance._connection.Break(exception);
         }, this);
+        // A SlonConnection holds an exclusive scope for its lease: route the command as a subflow into the
+        // held scope's inner pipeline (serial on this one wire) instead of onto the multiplexed protocol
+        // pipeline. The data-source path never acquires a scope, so it falls through to the direct enqueue.
+        if (_exclusiveFlow is { } scope)
+        {
+            scope.Queue(flow);
+            return true;
+        }
         if (!connection.TryQueue(flow))
         {
             Interlocked.Decrement(ref _pipelineDepth);
@@ -148,27 +163,40 @@ sealed class AdoConnectionProxy : IDisposable, IAsyncDisposable
         // TODO spin up a connection and write out cancel
     }
 
-    public bool InExclusiveScope => _inExclusiveScope;
+    public bool InExclusiveScope => _exclusiveFlow is not null;
 
-    public void BeginExclusiveScope()
+    // Acquire the connection's exclusive scope at Open and hold it for the whole lease. The scope flow's
+    // mode matches the caller: a sync acquire (async: false) is driven to activation by THIS thread via the
+    // source handoff (WaitForExecutor), so the caller drives the scope + its subflows end-to-end on one
+    // thread; an async acquire is executor-driven. From here every command on this proxy routes as a subflow.
+    public void AcquireExclusiveScope()
     {
-        _inExclusiveScope = true;
+        _exclusiveFlow = _pgConnection.Protocol.BeginExclusiveScope(async: false);
+        _exclusiveFlow.BeginScopeAsync(CancellationToken.None).GetAwaiter().GetResult();
     }
 
-    public ValueTask BeginExclusiveScopeAsync(CancellationToken cancellationToken = default)
+    public async ValueTask AcquireExclusiveScopeAsync(CancellationToken cancellationToken = default)
     {
-        _inExclusiveScope = true;
-        return new();
+        _exclusiveFlow = _pgConnection.Protocol.BeginExclusiveScope(async: true);
+        await _exclusiveFlow.BeginScopeAsync(cancellationToken).ConfigureAwait(false);
     }
 
     public void EndExclusiveScope()
     {
-
+        if (_exclusiveFlow is { } flow)
+        {
+            _exclusiveFlow = null;
+            flow.CompleteScopeAsync().AsTask().GetAwaiter().GetResult();
+        }
     }
 
-    public ValueTask EndExclusiveScopeAsync()
+    public async ValueTask EndExclusiveScopeAsync()
     {
-        return new();
+        if (_exclusiveFlow is { } flow)
+        {
+            _exclusiveFlow = null;
+            await flow.CompleteScopeAsync().ConfigureAwait(false);
+        }
     }
 
     public void Dispose()

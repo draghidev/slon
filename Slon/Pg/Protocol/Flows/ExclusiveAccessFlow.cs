@@ -45,6 +45,13 @@ sealed class ExclusiveAccessFlow : PgClientFlow
     // Idempotence guards for the cascade hooks (fire once per tenure). Reset in OnReset.
     bool _innerStopping;
     bool _innerAborting;
+    // Sync-flow handoff rendezvous. A sync scope flow (async: false) is enqueued via the source's
+    // EnqueueSyncWaiter + WaitForExecutor, which parks the caller's thread on THIS mres until the executor
+    // hands the scope flow over - so the caller drives activation + its subflows end-to-end on its own
+    // thread (the single-thread locality the sync path exists for). Allocated lazily on sync selection
+    // (PrepareScope) - async scopes never park here, so they never pay for it. Once allocated it is reused
+    // across tenures of the cached flyweight (Reset in OnReset).
+    ManualResetEventSlim? _handoffMres;
 
     internal ExclusiveAccessFlow(PgClientProtocol protocol, PgClientProtocol.Control innerControl, PgClientProtocol.ExclusiveScopeState state, Func<Exception?, ValueTask> completeInner)
         : base(supportsPipelining: false)
@@ -72,7 +79,15 @@ sealed class ExclusiveAccessFlow : PgClientFlow
         _acquired = false;
         _activationTimeout = activationTimeout;
         IsAsync = async;
+        // Sync scope flow uses the handoff rendezvous (WaitForExecutor parks on GetHandoffMres). Allocate
+        // it on first sync selection; an async scope leaves it null and never parks.
+        if (!async)
+            _handoffMres ??= new(false);
     }
+
+    // Non-null only once a sync scope has selected it - lets a sync scope flow be handed off to its
+    // caller's thread via the source's WaitForExecutor. Async scopes return null (they never park).
+    internal override ManualResetEventSlim? GetHandoffMres() => _handoffMres;
 
     protected override void OnReset()
     {
@@ -81,6 +96,7 @@ sealed class ExclusiveAccessFlow : PgClientFlow
         _consumerGone = new(TaskCreationOptions.RunContinuationsAsynchronously);
         _innerStopping = false;
         _innerAborting = false;
+        _handoffMres?.Reset();
     }
 
     /// Resolves once this flow is activated and owns the wire - the caller awaits it to gain exclusive
