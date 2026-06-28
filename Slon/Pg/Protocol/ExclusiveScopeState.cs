@@ -99,7 +99,7 @@ sealed partial class PgClientProtocol
         // creates no source and starts no executor.
         public PgClientFlowSource AcquireForTurn(PgClientProtocol protocol)
         {
-            var innerSource = PgClientFlowSource.Create(protocol, protocol._options.ExecutionScheduler);
+            var innerSource = PgClientFlowSource.Create(protocol, _innerControl, protocol._options.ExecutionScheduler);
             var first = _innerPipeline is null;
             _innerPipeline = Pipeline.Create<PgClientFlow, Policy, PgClientFlowSource, PgClientFlowSource.Enumerator>(
                 new Policy(protocol, _innerControl), innerSource, _innerPipeline);

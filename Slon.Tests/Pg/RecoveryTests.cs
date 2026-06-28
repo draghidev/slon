@@ -109,7 +109,7 @@ public class RecoveryTests
         // standalone one is enough for a test flow that is taken over (OnExecutorSuspended Sets it, the
         // caller Waits); it does not reuse a caller-core like CommandFlow.
         readonly ManualResetEventSlim _handoffMres = new(false);
-        internal override ManualResetEventSlim? GetHandoffMres() => _handoffMres;
+        protected override ManualResetEventSlim? GetHandoffMres() => _handoffMres;
 
         /// Runs after the write shape lands but before the fault fires. Lets a test kill the
         /// transport at the exact point where the flow's own writes succeeded but the

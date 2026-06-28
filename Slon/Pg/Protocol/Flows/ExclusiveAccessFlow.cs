@@ -87,7 +87,7 @@ sealed class ExclusiveAccessFlow : PgClientFlow
 
     // Non-null only once a sync scope has selected it - lets a sync scope flow be handed off to its
     // caller's thread via the source's WaitForExecutor. Async scopes return null (they never park).
-    internal override ManualResetEventSlim? GetHandoffMres() => _handoffMres;
+    protected override ManualResetEventSlim? GetHandoffMres() => _handoffMres;
 
     protected override void OnReset()
     {

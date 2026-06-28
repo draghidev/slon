@@ -1067,7 +1067,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
     // A sync CommandFlow's caller parks on this for the source handoff (WaitForExecutor). Reuses the
     // caller-core MRES - safe because the handoff turn-handshake completes BEFORE the body's first
     // WaitForContinuation. GetMres ensures non-null (lazy field); a null here on the sync path is a bug.
-    internal override ManualResetEventSlim? GetHandoffMres() => _callerInteractionCore.GetMres();
+    protected override ManualResetEventSlim? GetHandoffMres() => _callerInteractionCore.GetMres();
 
     protected override void OnComplete(Exception? exception)
     {

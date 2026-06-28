@@ -29,7 +29,7 @@ public class FlowSourceDirectStressTests
         for (int i = 0; i < Iterations; i++)
         {
             const int N = 8;
-            var source = PgClientFlowSource.Create(protocol);
+            var source = PgClientFlowSource.Create(protocol, protocol.FlowControl);
             var enumerator = source.GetAsyncEnumerator();
 
             var flows = new PgClientFlow[N];

@@ -27,8 +27,11 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
 
     PgClientFlowSource(State state) => _state = state;
 
-    public static PgClientFlowSource Create(PgClientProtocol protocol, PipelineScheduler? executionScheduler = null)
-        => new(new State(protocol, executionScheduler ?? PipelineScheduler.ThreadPool));
+    // control: the one Control every flow in this source is bound to (the protocol's FlowControl for the
+    // outer source, the scope's inner control for a nested source). Stored so the source can pull a flow's
+    // handoff MRES through ExecutionControl rather than off a bare flow ref.
+    public static PgClientFlowSource Create(PgClientProtocol protocol, PgClientProtocol.Control control, PipelineScheduler? executionScheduler = null)
+        => new(new State(protocol, control, executionScheduler ?? PipelineScheduler.ThreadPool));
 
     /// Enqueues an async-mode flow. The caller dispatches via the returned <see cref="EnqueueResult"/>.
     /// During a sync-flow handoff, the item is queued but the dispatch is a no-op. The executor will
@@ -138,9 +141,15 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
         // substitute for the SPSC-illegal queue peek a producer can't do itself.
         public bool ParkedAtSyncHead;
 
-        public State(PgClientProtocol protocol, PipelineScheduler scheduler)
+        // The Control every flow in this source is bound to. Used to mint a flow's ExecutionControl so the
+        // source pulls the handoff MRES through it rather than off a bare flow ref (GetHandoffMres is
+        // protected on PgClientFlow).
+        readonly PgClientProtocol.Control _control;
+
+        public State(PgClientProtocol protocol, PgClientProtocol.Control control, PipelineScheduler scheduler)
         {
             FlushGate = new(protocol);
+            _control = control;
             WakeSignal = new(runContinuationsAsynchronously: true, scheduler, enableWaitForSuspended: true);
             WakeSignal.OnSuspended = OnExecutorSuspended;
         }
@@ -156,7 +165,7 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
             Volatile.Write(ref ParkedAtSyncHead, held is not null);
             if (held is not null)
             {
-                held.GetHandoffMres()?.Set();   // exactly the just-held caller, parked on its own flow's MRES
+                held.GetExecutionControl(_control).GetHandoffMres()?.Set();   // exactly the just-held caller, parked on its own flow's MRES
                 return;
             }
             // Parking idle / async-headed with work still queued: re-drive the pump on TP rather than
@@ -240,7 +249,7 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
             // NeedsSyncHandoff) sends autonomous sync flows (null MRES, no parked caller) down the async
             // dispatch path instead, so a flow that reaches here always carries its waiter MRES. Fail loud
             // rather than NRE if that invariant is ever bypassed.
-            var mres = flow.GetHandoffMres()
+            var mres = flow.GetExecutionControl(_control).GetHandoffMres()
                 ?? throw new InvalidOperationException("WaitForExecutor reached with a null handoff MRES: an autonomous sync flow must route via async dispatch (NeedsSyncHandoff), not the caller-handoff park.");
             // Kick the executor so it pulls and drains earlier flows in FIFO order, dequeue-and-holding the
             // first sync head and parking - OnExecutorSuspended then signals THAT held flow's MRES. A no-op

@@ -40,7 +40,7 @@ sealed class StartupFlow : PgClientFlow
             _handoffMres = new(false);
     }
 
-    internal override ManualResetEventSlim? GetHandoffMres() => _handoffMres;
+    protected override ManualResetEventSlim? GetHandoffMres() => _handoffMres;
 
     protected override async ValueTask<FlowTasks> ExecuteAuto(Context context)
     {

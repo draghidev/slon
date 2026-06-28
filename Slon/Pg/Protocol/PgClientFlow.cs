@@ -192,7 +192,11 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IThreadPoolWorkItem
     // it when it dequeues-and-holds the flow for that caller (OnExecutorSuspended), and the caller parks on
     // it in WaitForExecutor. null = no handoff (async flows, or a flow with no waiting caller) - the source
     // runs it autonomously on the executor, nothing to rendezvous. null/non-null IS the waiter-presence gate.
-    internal virtual ManualResetEventSlim? GetHandoffMres() => null;
+    // The sync handoff MRES a caller parks on (null = autonomous, no waiter). protected, NOT internal:
+    // it is reachable only by the flow's own subclasses (which override it) and by ExecutionControl (the
+    // nested write-side handle) - the source pulls it via ExecutionControl.GetHandoffMres, never off a
+    // bare flow ref. Keeps the handoff primitive off PgClientFlow's internal API, like _rfqCount.
+    protected virtual ManualResetEventSlim? GetHandoffMres() => null;
 
     PgDecoder IValueTaskSource<PgDecoder>.GetResult(short token) => _activationTaskSource.GetResult(token);
     ValueTaskSourceStatus IValueTaskSource<PgDecoder>.GetStatus(short token) => _activationTaskSource.GetStatus(token);
@@ -386,6 +390,12 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IThreadPoolWorkItem
         // Outstanding server-obligation count: RFQs the server still owes the wire for what's
         // been written. Read by TryRecoverItemFailure to decide drain length.
         public int RfqCount => flow._rfqCount;
+
+        // The flow's sync handoff MRES (null = autonomous). The ONLY way to reach it: the source pulls it
+        // through this control-mediated handle rather than off a bare flow ref, so the primitive stays
+        // encapsulated on the flow (GetHandoffMres is protected). Used by the source's WaitForExecutor /
+        // OnExecutorSuspended.
+        public ManualResetEventSlim? GetHandoffMres() => flow.GetHandoffMres();
 
         // Initializes a recovery flow's RFQ obligation to what the failed flow's wire activity
         // left outstanding. Routed through the write-side handle (alongside OnMessageWrite) so

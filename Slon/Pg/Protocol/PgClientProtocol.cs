@@ -138,7 +138,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
 
     public string CurrentSearchPath { get; set; } = "public";
 
-    Control FlowControl { get; }
+    internal Control FlowControl { get; }
     CancellationToken AbortToken => _close.AbortToken;
     CancellationToken StoppingToken => _close.StoppingToken;
     public int PipelineDepth => _pipeline.Depth;
@@ -281,7 +281,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
 
     async ValueTask StartAsync(StartupFlow flow, ValueTask flowCompletion, CancellationToken cancellationToken = default)
     {
-        _source = PgClientFlowSource.Create(this, _options.ExecutionScheduler);
+        _source = PgClientFlowSource.Create(this, FlowControl, _options.ExecutionScheduler);
         _pipeline = Pipeline.Create<PgClientFlow, Policy, PgClientFlowSource, PgClientFlowSource.Enumerator>(new Policy(this, FlowControl), _source);
         FlowControl.BindPipeline(new PipelineFlowSlots<Policy, PgClientFlowSource, PgClientFlowSource.Enumerator>(_pipeline));
         // Seed the wire's transaction status to Idle before the startup flow is queued. A fresh

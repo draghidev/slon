@@ -25,7 +25,7 @@ public class FlowSourceCompletionTests
         // The source only reads Protocol.UnflushedBytes on the pull path (0 before Initialize); nothing
         // else of the protocol is touched.
         var protocol = PgClientProtocol.Create(new PgClientProtocolOptions(PgTestPool.NewOptions()));
-        var source = PgClientFlowSource.Create(protocol);
+        var source = PgClientFlowSource.Create(protocol, protocol.FlowControl);
         var enumerator = source.GetAsyncEnumerator();
 
         var flow = CommandFlow.CreateUninitialized();
@@ -38,7 +38,7 @@ public class FlowSourceCompletionTests
                 // Mirror the protocol's drain onInert (flow.Complete -> OnComplete -> SignalProgress -> MRES
                 // .Set): a never-held sync flow drained inert wakes its handoff caller, which bails on
                 // IsCompleted. With the wait-list-free source, this drain wake IS the completion-bail.
-                f.GetHandoffMres()?.Set();
+                f.GetExecutionControl(protocol.FlowControl).GetHandoffMres()?.Set();
             }
         }
 
@@ -88,7 +88,7 @@ public class FlowSourceCompletionTests
     public async Task AsyncAheadOfQueuedSyncFlow_CompletesBeforeHandoff_AllResolvedOnce()
     {
         var protocol = PgClientProtocol.Create(new PgClientProtocolOptions(PgTestPool.NewOptions()));
-        var source = PgClientFlowSource.Create(protocol);
+        var source = PgClientFlowSource.Create(protocol, protocol.FlowControl);
         var enumerator = source.GetAsyncEnumerator();
 
         // FIFO: an async flow queued AHEAD of the sync waiter. At completion the sync head can't be held
@@ -109,7 +109,7 @@ public class FlowSourceCompletionTests
                 // Mirror the protocol's drain onInert wake (see QueuedSyncFlow): waking the sync flow's
                 // handoff caller is the completion-bail under the wait-list-free source. Harmless on the
                 // async head (no caller parks on its MRES).
-                f.GetHandoffMres()?.Set();
+                f.GetExecutionControl(protocol.FlowControl).GetHandoffMres()?.Set();
             }
         }
 
