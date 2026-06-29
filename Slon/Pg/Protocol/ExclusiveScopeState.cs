@@ -36,6 +36,12 @@ sealed partial class PgClientProtocol
         // outer pipeline serializes them so only one holds the shared inner pipeline at a time. (Pooling
         // overflow flows is a later optimization; today they are allocated fresh.)
         ExclusiveAccessFlow _cachedFlow = null!;
+        // 1 while the cached flow is leased to a live scope: claimed atomically in RentFlow, released in the
+        // cached flow's OnComplete. RentFlow runs OUTSIDE _syncRoot and concurrent begins race it, so the
+        // claim cannot lean on IsPending/IsCompleted - those cannot tell "available" from "rented but not
+        // yet executed", and two begins reading IsPending=true would both take the one flyweight and stomp
+        // its per-scope state (PrepareScope) mid-flight.
+        int _cachedLeased;
 
         ExclusiveScopeState(PgClientProtocol protocol, Control innerControl, CloseSignal scopeClose)
         {
@@ -84,12 +90,23 @@ sealed partial class PgClientProtocol
         // begin-time guard / throw: a concurrent begin gets its own waiter instead of failing.
         public ExclusiveAccessFlow RentFlow()
         {
-            // Cached flow is available when it is not in a live scope (never started, or completed);
-            // otherwise allocate an overflow waiter over the same state.
-            var flow = _cachedFlow.IsPending || _cachedFlow.IsCompleted ? _cachedFlow : NewFlow();
+            // Atomically claim the cached flow: the FIRST concurrent begin wins it, later begins each get a
+            // fresh overflow waiter over the same state (the outer pipeline serializes their turns). The
+            // claim is held for the whole tenure and released in the cached flow's OnComplete - so a second
+            // begin can never re-rent a still-live flyweight and stomp it.
+            var flow = Interlocked.CompareExchange(ref _cachedLeased, 1, 0) == 0 ? _cachedFlow : NewFlow();
             if (flow.IsCompleted)
                 flow.Reset();
             return flow;
+        }
+
+        // Release the cached-flow claim at the end of its tenure (from OnComplete), freeing the next
+        // concurrent begin to claim and Reset it. A no-op for overflow flows - only the one cached flyweight
+        // is claim-tracked.
+        public void ReleaseFlow(ExclusiveAccessFlow flow)
+        {
+            if (ReferenceEquals(flow, _cachedFlow))
+                Interlocked.Exchange(ref _cachedLeased, 0);
         }
 
         // Acquire the scope at the flow's TURN: create the fresh per-scope source, build the inner pipeline

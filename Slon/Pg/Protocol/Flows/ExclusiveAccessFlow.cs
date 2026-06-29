@@ -203,6 +203,9 @@ sealed class ExclusiveAccessFlow : PgClientFlow
         if (exception is not null)
             _handoffReady.TrySetException(exception);
         _scopeEnded.TrySetResult();
+        // Tenure is fully torn down (Complete orders teardown before the done-signal): release the cached
+        // flow's claim so the next concurrent begin can claim and Reset this flyweight. No-op for overflow.
+        _state.ReleaseFlow(this);
     }
 
     // Cascade hooks (run from the OUTER heartbeat - this flow lives on the outer pipeline, so it IS
