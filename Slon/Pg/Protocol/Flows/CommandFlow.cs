@@ -41,16 +41,11 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
     CancellationToken _cancelDeliverToken;
     // Set by the body's cancel drain transition; the terminal SetResult delivers OCE (not a clean end).
     bool _deliverCancelOce;
-    // TRUE while the body runs SYNCHRONOUSLY on an inline dispatch stack (inside DispatchPipelinedRead's
-    // `ExecutePipelined(context)` call, on either the fast path or the activation callback), where the
-    // shared ReadPromise is tenured on that frame. A TERMINAL move-next completion taken here would
-    // overstay the tenure and drive ExecuteSource into a TryStart over the live promise. While set, the
-    // terminal records its outcome in _pendingInlineTerminal instead of completing; the dispatch site
-    // lands it right after ExecutePipelined returns - by which point, for a fully-synchronous body, the
-    // builder's task-get has released the tenure (_started=false) - so completion is tenure-free with no
-    // ThreadPool hop. Cleared the instant the body suspends (it then resumes on a continuation stack).
-    bool _onInlineDispatchStack;
-    bool _pendingInlineTerminal;
+    // (Removed: the _onInlineDispatchStack / _pendingInlineTerminal terminal-defer. It guarded an INLINE
+    // move-next completion driving ExecuteSource into a TryStart over the tenured ReadPromise - a conflict
+    // that ceased to exist once DeliverTerminal moved to runContinuationsAsynchronously:true, so the
+    // completion's advance is always off-stack. The defer outlived its reason; the terminal now completes
+    // directly on any frame. Verified: full suite 205/0 + ~15M mixed-flow stress, no "already executing".)
     // Fresh ErrorResponses captured while draining a consumer-gone flow (one per faulting sync segment).
     // Surfaced at the terminal so an await-drain DisposeAsync (WaitForDrainOnDispose) rethrows them - Npgsql
     // parity: a Postgres error hit while draining a disposed reader must not be swallowed. Lazily allocated;
@@ -359,23 +354,14 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
             // the waiter is consumed (releasing the promise tenure via GetResult's Reset) before the
             // item's position is republished, so a successor's dispatch always finds the tenure released.
             PromiseAsyncValueTaskMethodBuilder.Promise = promise;
-            ValueTask fastTask;
-            _onInlineDispatchStack = true;
             try
             {
-                fastTask = ExecutePipelined(context);
+                return ExecutePipelined(context);
             }
             finally
             {
-                _onInlineDispatchStack = false;
                 PromiseAsyncValueTaskMethodBuilder.Promise = null;
             }
-            // The body ran (and, if fully synchronous, completed) inline above. If it deferred its
-            // terminal (reached while still on this tenured frame), land it now: ExecutePipelined has
-            // returned, so for a sync-completed body the builder's task-get already released the tenure
-            // (_started=false). Deterministic, tenure-free, no ThreadPool.
-            LandPendingInlineTerminal();
-            return fastTask;
         }
 
         _context = context;
@@ -396,19 +382,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
             }
             var promise = flow._pipelinePromise!;
             PromiseAsyncValueTaskMethodBuilder.Promise = promise;
-            flow._onInlineDispatchStack = true;
-            ValueTask task;
-            try
-            {
-                task = flow.ExecutePipelined(ctx);
-            }
-            finally
-            {
-                flow._onInlineDispatchStack = false;
-            }
-            // Same deterministic landing as the fast path: a fully-synchronous body on THIS activation
-            // stack also tenures the promise on this frame; land its deferred terminal after the call.
-            flow.LandPendingInlineTerminal();
+            ValueTask task = flow.ExecutePipelined(ctx);
             try
             {
                 if (!task.IsCompleted)
@@ -820,14 +794,15 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                 using (_rearmLock.EnterScope())
                 {
                     _enumeratorCompleted = true;
-                    if (_onInlineDispatchStack)
-                    {
-                        // Still synchronous on the inline dispatch frame (promise tenured here). Record the
-                        // terminal; the dispatch site lands it after ExecutePipelined returns and the tenure
-                        // is released. No completion (and so no ExecuteSource drive) happens on this frame.
-                        _pendingInlineTerminal = true;
-                        return;
-                    }
+                    // INVARIANT: the terminal completes here directly, even when this runs on the inline
+                    // dispatch frame that still tenures the shared ReadPromise. Safe ONLY because every
+                    // terminal completer (DeliverTerminal / DeliverClose / RepairLostTerminal / HandleException)
+                    // uses runContinuationsAsynchronously:true, so the consumer wake - and the pipeline advance
+                    // it can drive - is scheduled off THIS stack, never re-entering a TryStart over the still-
+                    // tenured promise. (This replaced a _pendingInlineTerminal defer that moved the completion
+                    // off-frame; the defer became redundant once completion went async, and its bare-bool
+                    // frame-guard had a cross-thread strand bug. If a terminal completer is ever made inline,
+                    // the shared-promise TryStart throws "already executing" - a loud regression, not silent.)
                     DeliverTerminal();
                 }
                 return;
@@ -901,17 +876,6 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
             _enumeratorMoveNextTaskSource.TrySetResult(false, runContinuationsAsynchronously: true);
         // _enumeratorCompleted was set by the caller (SetResult's completed branch) before this runs.
         WakePumpOnCompletion();
-    }
-
-    // Land a terminal the body deferred while it was on the inline dispatch frame. Called from the
-    // dispatch site right after ExecutePipelined returns - for a fully-synchronous body the promise
-    // tenure has already been released by the builder's task-get, so this completes tenure-free.
-    void LandPendingInlineTerminal()
-    {
-        if (!_pendingInlineTerminal)
-            return;
-        _pendingInlineTerminal = false;
-        DeliverTerminal();
     }
 
     // Token-bounded await-drain for WaitForDrainOnDispose. Parks on the body's completion until it
@@ -1133,8 +1097,6 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
         _cancelRequested = false;
         _cancelDeliverToken = default;
         _deliverCancelOce = false;
-        _onInlineDispatchStack = false;
-        _pendingInlineTerminal = false;
         _drainErrors = null;
         _consumerDisposed = false;
         _draining = false;
