@@ -347,7 +347,16 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
             // instead, exactly like the deferred path - the framework observes the close on the pipeline task.
             if (!waiter.IsCompletedSuccessfully)
             {
-                _executePipelinedCore.SetException(context.ClosedException ?? new PgClientClosedException(null));
+                // Activation settled NOT-ready: surface its ACTUAL fault - a real close, an activation
+                // TIMEOUT, or caller CANCELLATION (the three completers in PgClientFlow.OnHeartbeat /
+                // RegisterActivationCancellation). The old `?? new PgClientClosedException(null)` fallback
+                // both MASKED the real error (a TimeoutException / OCE surfaced as "connection closed") AND
+                // MANUFACTURED a protocol close out of a timeout/cancel - cascading a shutdown that took down
+                // the wire + sibling flows. GetResult on a settled-not-ready source rethrows the real one.
+                // We bail to our OWN _executePipelinedCore (never the shared promise - we never claimed the
+                // wire), so there's no TryStart-over-tenured conflict and a timed-out flow just faults clean.
+                try { waiter.GetAwaiter().GetResult(); }
+                catch (Exception ex) { _executePipelinedCore.SetException(ex); }
                 return new ValueTask(this, _executePipelinedCore.Version);
             }
             // Handing the shared-promise-backed task to the framework is safe: the contract guarantees
@@ -375,9 +384,13 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
             // wake can also come from teardown faulting the activation source to unstrand us; we never
             // took the wire then, so Starting ExecutePipelined would tenure a promise a successor may
             // already hold (TryStart -> "already executing"). Surface the close to our own source instead.
-            if (!ctx.GetDecoderAsync().GetAwaiter().IsCompletedSuccessfully)
+            var activation = ctx.GetDecoderAsync().GetAwaiter();
+            if (!activation.IsCompletedSuccessfully)
             {
-                flow._executePipelinedCore.SetException(ctx.ClosedException ?? new PgClientClosedException(null));
+                // Same as the fast path: surface the activation's real fault (close / timeout / cancel),
+                // never a synthesized close. See the fast-path comment for why the old fallback was wrong.
+                try { activation.GetResult(); }
+                catch (Exception ex) { flow._executePipelinedCore.SetException(ex); }
                 return;
             }
             var promise = flow._pipelinePromise!;
