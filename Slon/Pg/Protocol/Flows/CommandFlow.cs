@@ -1046,19 +1046,6 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
     // WaitForContinuation. GetMres ensures non-null (lazy field); a null here on the sync path is a bug.
     protected override ManualResetEventSlim? GetHandoffMres() => _callerInteractionCore.GetMres();
 
-    protected override void OnComplete(Exception? exception)
-    {
-        if (exception is null)
-            return;
-        // Once the body has started, its own catch paths own the caller-facing fault - faulting here
-        // too would be a concurrent writer on the move-next source. When the flow failed before the
-        // body ever ran (deferred dispatch, dispatch-time throw, pre-body fault), do it here as the
-        // single writer.
-        if (_bodyStarted)
-            return;
-        HandleException(exception);
-    }
-
     // Return the rendezvous awaitable DIRECTLY (NOT via an async ValueTask wrapper). The wrapper added a
     // second await level whose inner OnCompleted set _mres (unblocking the disposer) BEFORE the body had
     // registered its continuation on the wrapper's ValueTask. So under TP contention the disposer could
@@ -1080,14 +1067,23 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
     static ref FlowCallerInteractionCore<FlowCallerInteractionCoreResult> GetCallerInteractionCore(CommandFlow instance)
         => ref instance._callerInteractionCore;
 
-    protected override void OnAbort(PgClientClosedException exception)
-        => _callerInteractionCore.CancelPendingWait(exception);
+    protected override void OnAbort(PgClientClosedException exception) => FaultCaller(exception);
 
-    // Same primitive as OnAbort: TrySet on the gate source faults a parked body so it can
-    // exit through HandleException. Idempotent across heartbeat ticks. Graceful-stopping
-    // fires before AbortToken in the graceful Shutdown path, so this is the earlier wake.
-    protected override void OnStopping(PgClientClosedException exception)
-        => _callerInteractionCore.CancelPendingWait(exception);
+    // Same wire-death verdict as OnAbort (graceful-stopping fires first in the graceful Shutdown path, so
+    // this is the earlier wake). Idempotent across ticks.
+    protected override void OnStopping(PgClientClosedException exception) => FaultCaller(exception);
+
+    // The close verdict, both reach-paths in one place. A RUNNING body is woken (TrySet on the gate source)
+    // so it exits through its own HandleException - the single writer once the body started. A NEVER-RAN
+    // flow (drained from the backlog, body never started) has no body to wake, so deliver to the caller
+    // directly. This is the never-ran fault delivery that used to live in OnComplete; it is the same event.
+    void FaultCaller(PgClientClosedException exception)
+    {
+        if (_bodyStarted)
+            _callerInteractionCore.CancelPendingWait(exception);
+        else
+            HandleException(exception);
+    }
 
     protected override void OnReset()
     {

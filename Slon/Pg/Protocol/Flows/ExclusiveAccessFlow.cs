@@ -79,6 +79,12 @@ sealed class ExclusiveAccessFlow : PgClientFlow
         _acquired = false;
         _activationTimeout = activationTimeout;
         IsAsync = async;
+        // Release the cached-flow claim at terminal (success OR fault) via the completion action, which runs
+        // AFTER Complete sets IsCompleted - the reclaiming begin keys its Reset on IsCompleted, so releasing
+        // any earlier would let it grab a not-yet-completed flow. Set per-tenure (Reset clears the action),
+        // never once: a pooled flow must not carry a stale action. Exception ignored - release is lifecycle.
+        // A no-op for overflow flows (ReleaseFlow ref-checks the cached instance).
+        SetCompletionAction(static (f, _, s) => ((PgClientProtocol.ExclusiveScopeState)s!).ReleaseFlow((ExclusiveAccessFlow)f), _state);
         // Sync scope flow uses the handoff rendezvous (WaitForExecutor parks on GetHandoffMres). Allocate
         // it on first sync selection; an async scope leaves it null and never parks.
         if (!async)
@@ -195,45 +201,39 @@ sealed class ExclusiveAccessFlow : PgClientFlow
         return ValueTask.CompletedTask;
     }
 
-    // A pre-activation fault must reach the caller's HandoffReady await so it never gets a stranded
-    // scope, and we never take the wire. A post-activation completion just releases the body's gate
-    // (HandoffReady was already resolved). Backstop for the cascade hooks below.
-    protected override void OnComplete(Exception? exception)
-    {
-        if (exception is not null)
-            _handoffReady.TrySetException(exception);
-        _scopeEnded.TrySetResult();
-        // Tenure is fully torn down (Complete orders teardown before the done-signal): release the cached
-        // flow's claim so the next concurrent begin can claim and Reset this flyweight. No-op for overflow.
-        _state.ReleaseFlow(this);
-    }
-
-    // Cascade hooks (run from the OUTER heartbeat - this flow lives on the outer pipeline, so it IS
-    // enumerated and DOES get OnStopping/OnAbort; this is the lever into the scope). The scope signal is
-    // already tripped via its link to the protocol's _close, so inner flows already see the close on
-    // their tokens. Two things a token alone does NOT do, both done here: (1) stop the inner EXECUTOR
-    // (drive the inner pipeline's CompleteAsync), and (2) release the body's _scopeEnded gate so
-    // ExecuteAuto returns - the protocol is tearing the scope down, the user will not call
-    // CompleteScopeAsync. Must be cheap + non-blocking (heartbeat contract): fire-and-forget, faults
-    // observed (never thrown into the heartbeat). Idempotent across ticks.
+    // Cascade hooks: the wire-death verdict reaching this flow. For a DISPATCHED scope flow they run from
+    // the OUTER heartbeat (this flow lives on the outer pipeline, so it IS enumerated); for a BACKLOG flow
+    // the shutdown drain delivers them via Control.DeliverClose (the heartbeat never reaches the backlog).
+    // The scope signal is already tripped via its link to the protocol's _close, so inner flows already see
+    // the close on their tokens. What a token alone does NOT do, done here: (1) stop the inner EXECUTOR
+    // (drive the inner pipeline's CompleteAsync), (2) release the body's _scopeEnded gate so ExecuteAuto
+    // returns (the protocol is tearing the scope down, the user will not call CompleteScopeAsync), and (3)
+    // for a never-activated flow, fault the parked BeginScopeAsync caller (the secondary gate completion
+    // does not touch). Must be cheap + non-blocking (heartbeat contract): fire-and-forget, faults observed.
+    // Idempotent across ticks.
 
     // Graceful: drain the inner pipeline to a clean RFQ, THEN release the body. Releasing only after the
-    // drain settles lets in-flight inner subflows finish cleanly first. Pre-turn (not acquired) there is
-    // no inner executor to drain - just release the body's gate; OnComplete faults HandoffReady. The
-    // scope signal is already tripped via its link, so an acquire racing this sees the close on its tokens.
+    // drain settles lets in-flight inner subflows finish cleanly first. Never-activated (not acquired):
+    // there is no inner executor to drain - fault the parked caller and release the body's gate. The scope
+    // signal is already tripped via its link, so an acquire racing this sees the close on its tokens.
     protected override void OnStopping(PgClientClosedException exception)
     {
         if (_innerStopping)
             return;
         _innerStopping = true;
         if (Volatile.Read(ref _acquired))
+        {
             DrainThenEndScope(_completeInner(null));
+        }
         else
+        {
+            _handoffReady.TrySetException(exception);
             _scopeEnded.TrySetResult();
+        }
     }
 
     // Forceful: complete the inner items WITH the reason, and release the body's gate immediately (the
-    // wire is dead - no clean drain to wait for). Pre-turn there is nothing to complete.
+    // wire is dead - no clean drain to wait for). Never-activated: fault the parked caller instead.
     protected override void OnAbort(PgClientClosedException exception)
     {
         if (_innerAborting)
@@ -241,6 +241,8 @@ sealed class ExclusiveAccessFlow : PgClientFlow
         _innerAborting = true;
         if (Volatile.Read(ref _acquired))
             FireAndForget(_completeInner(exception));
+        else
+            _handoffReady.TrySetException(exception);
         _scopeEnded.TrySetResult();
     }
 

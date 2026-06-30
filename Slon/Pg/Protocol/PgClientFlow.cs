@@ -163,6 +163,12 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IThreadPoolWorkItem
         _activationTaskSource.Reset();
         _rfqCount = 0;
         _lastMessageInducesRfq = false;
+        // Clear the completion action: it is captured per-tenure (with its state), so a recycled flow must
+        // not carry the prior tenure's action into the next - it would fire a stale callback (wrong
+        // connection's depth-decrement / Break). Every setter re-arms per use (MaintenanceFlow.Bind,
+        // AdoConnectionProxy per-queue, ExclusiveAccessFlow.PrepareScope), so clearing here is the safe default.
+        _completionAction = null;
+        _completionState = null;
         OnReset();
     }
 
@@ -180,13 +186,6 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IThreadPoolWorkItem
     /// AbortToken. Idempotent across heartbeat ticks (subclasses use TrySet).
     protected virtual void OnStopping(PgClientClosedException exception) {}
     protected virtual void OnReset() {}
-    /// Completion observation point for the flow. On exceptional completion a flow must fault
-    /// its caller-facing sources here: the body's own fault paths only run when the body ran,
-    /// and a flow can fail before that (dispatch-time throw, pre-body protocol fault) or be
-    /// supplanted by recovery. Implementations must tolerate racing the body's own fault path
-    /// (use TrySet semantics).
-    protected virtual void OnComplete(Exception? exception) {}
-
     // The per-flow handoff rendezvous primitive for the (wait-list-free) sync source handoff: non-null only
     // for a flow that needs a caller takeover (a sync CommandFlow with a parked caller). The source signals
     // it when it dequeues-and-holds the flow for that caller (OnExecutorSuspended), and the caller parks on
@@ -594,6 +593,18 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IThreadPoolWorkItem
             flow.OnHeartbeat(interval);
         }
 
+        /// Fail a never-started flow drained from the backlog at shutdown with the wire-death reason. The
+        /// heartbeat fires OnStopping/OnAbort for the flows the pipeline enumerates (dispatched); it never
+        /// reaches the backlog, so the drain delivers here. Because the body never ran, OnStopping and OnAbort
+        /// take the IDENTICAL branch - no inner executor to drain, no graceful/forceful distinction to make -
+        /// so one hook faults the caller gate (the flow is a bystander to the wire's death). Complete then
+        /// signals done (the TCS) and fires the action, whose exception drives e.g. the ADO connection Break.
+        public void FailUnstarted(PgClientClosedException exception)
+        {
+            flow.OnStopping(exception);
+            Complete(exception);
+        }
+
         /// Framework lifecycle: marks the flow started. Called from the pipeline policy's
         /// ExecuteItemAsync before the flow body runs.
         public void Start() => flow._started = true;
@@ -607,19 +618,11 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IThreadPoolWorkItem
                 return;
             flow._completed = true;
             flow._activationCancellationTokenRegistration.Dispose();
-            // OnComplete BEFORE the completion TCS, so WaitForComplete (the done-signal) resolves only
-            // after teardown has fully run - "done" means "fully torn down" for every flow. Otherwise a
-            // waiter keyed on WaitForComplete observes done and, for a pooled flyweight, re-Initializes
-            // the instance while this OnComplete is still in flight: a stale OnComplete then lands on the
-            // next tenure's freshly-Reset state and its teardown overlaps the next tenure's shared-wire
-            // use. Wrapped so a throwing teardown can't strand the TCS (every WaitForComplete would hang).
-            // Deliberately NO activation-source faulting here: a parked deferred dispatch holds no
-            // resources, the caller is faulted via OnComplete, and Reset clears the registration on
-            // reuse. Invoking the bridge on a completed flow would create-and-start the body for a
-            // dead tenure, taking the shared read promise for nothing and racing instance reuse. The
-            // heartbeat abort path keeps its own faulting - that's protocol teardown, not completion.
-            try { flow.OnComplete(exception); }
-            catch (Exception ex) { /* TODO log */ control.FailProtocol(ex); }
+            // Wire-death fault delivery is NOT done here - it rides the OnStopping/OnAbort hooks (dispatched
+            // flows from the heartbeat, backlog flows from the shutdown drain's DeliverClose), so a flow's
+            // caller gate is faulted by the close verdict, not by completion. Completion just signals done
+            // (the TCS) and notifies the post-done action. Deliberately NO activation-source faulting here:
+            // a parked deferred dispatch holds no resources, and Reset clears the registration on reuse.
             if (exception is not null)
                 flow._completionTcs.TrySetException(exception);
             else

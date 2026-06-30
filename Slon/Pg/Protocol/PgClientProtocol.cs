@@ -622,7 +622,10 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
             // it is no longer dequeuing, so the drain is the sole consumer. Items still in the SPSC
             // queue were never dispatched, so faulting each unblocks its consumer's MoveNextAsync.
             await Task.WhenAny(executorStopped.Task, completeTask).ConfigureAwait(false);
-            _source.DrainInertItems(flow => flow.GetExecutionControl(FlowControl).Complete(closedException));
+            // Never-ran backlog flows the heartbeat never enumerated: deliver the close to each caller gate
+            // and complete with the reason. FailUnstarted carries the never-ran fault that used to live in
+            // OnComplete (one hook suffices - an unstarted flow has no graceful/forceful distinction).
+            _source.DrainInertItems(flow => flow.GetExecutionControl(FlowControl).FailUnstarted(closedException));
 
             // Drain remaining (dispatched) items. closedException is delivered to each via
             // policy.CompleteItem.
