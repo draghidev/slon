@@ -310,6 +310,19 @@ public sealed class SlonDataSource: DbDataSource
 
     protected override void Dispose(bool disposing)
     {
+        // The data source owns its connection pool (created in EnsureInitialized); disposing it closes
+        // every wire. Without this a disposed source leaked its whole pool (MinPoolSize warms one eagerly,
+        // up to MaxPoolSize), so a process that creates many short-lived sources exhausts max_connections.
+        // Guard on `disposing` so the DisposeAsync path (which runs DisposeAsyncCore then Dispose(false))
+        // doesn't double-dispose; the pool's own _disposed makes a double harmless regardless.
+        if (disposing)
+            (_connectionPool as IDisposable)?.Dispose();
+    }
+
+    protected override async ValueTask DisposeAsyncCore()
+    {
+        if (_connectionPool is not null)
+            await _connectionPool.DisposeAsync().ConfigureAwait(false);
     }
 
     // Internal for testing.
