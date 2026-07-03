@@ -1,6 +1,7 @@
 using Slon.Pg;
 using Slon.Pg.Protocol;
 using Slon.Pg.Protocol.Flows;
+using static Slon.Tests.Pg.ProtocolDiag;
 
 namespace Slon.Tests.Pg;
 
@@ -217,7 +218,8 @@ public class ProtocolCompletionTests
             });
             gate.Set();
 
-            await Task.WhenAll(complete, dispose, runTask).WaitAsync(TimeSpan.FromSeconds(10));
+            await WhenAllOrDump(protocol, $"iteration {i}: racing teardown did not converge", TimeSpan.FromSeconds(10),
+                ("complete", complete), ("dispose", dispose), ("runTask", runTask));
             Assert.IsTrue(protocol.IsCompleted, $"iteration {i}: protocol did not reach Completed");
         }
     }
@@ -250,7 +252,8 @@ public class ProtocolCompletionTests
             var complete = Task.Run(async () => { gate.Wait(); await protocol.CompleteAsync(); });
             var dispose = Task.Run(async () => { gate.Wait(); await protocol.DisposeAsync(); });
             gate.Set();
-            await Task.WhenAll(complete, dispose, runTask).WaitAsync(TimeSpan.FromSeconds(10));
+            await WhenAllOrDump(protocol, $"iteration {i}: racing teardown did not converge", TimeSpan.FromSeconds(10),
+                ("complete", complete), ("dispose", dispose), ("runTask", runTask));
             Assert.IsTrue(protocol.IsCompleted, $"iteration {i}: protocol did not reach Completed");
         }
     }
@@ -292,7 +295,8 @@ public class ProtocolCompletionTests
             var complete = Task.Run(async () => { gate.Wait(); await protocol.CompleteAsync(); });
             var dispose = Task.Run(async () => { gate.Wait(); await protocol.DisposeAsync(); });
             gate.Set();
-            await Task.WhenAll(complete, dispose, runTask).WaitAsync(TimeSpan.FromSeconds(10));
+            await WhenAllOrDump(protocol, $"iteration {i}: racing teardown did not converge", TimeSpan.FromSeconds(10),
+                ("complete", complete), ("dispose", dispose), ("runTask", runTask));
             Assert.IsTrue(protocol.IsCompleted, $"iteration {i}: protocol did not reach Completed");
         }
     }
@@ -325,7 +329,8 @@ public class ProtocolCompletionTests
             var complete = Task.Run(async () => { gate.Wait(); await protocol.CompleteAsync(); });
             var dispose = Task.Run(async () => { gate.Wait(); await protocol.DisposeAsync(); });
             gate.Set();
-            await Task.WhenAll(complete, dispose, runTask).WaitAsync(TimeSpan.FromSeconds(10));
+            await WhenAllOrDump(protocol, $"iteration {i}: racing teardown did not converge", TimeSpan.FromSeconds(10),
+                ("complete", complete), ("dispose", dispose), ("runTask", runTask));
             Assert.IsTrue(protocol.IsCompleted, $"iteration {i}: protocol did not reach Completed");
         }
     }

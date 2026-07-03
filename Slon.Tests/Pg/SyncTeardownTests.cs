@@ -35,7 +35,7 @@ public class SyncTeardownTests
                 Assert.IsTrue(protocol.TryQueue(flow));
                 var e = flow.GetEnumerator();
                 while (e.MoveNext()) { }
-                e.DisposeAsync().AsTask().GetAwaiter().GetResult();
+                e.Dispose();
             }
             catch (Exception ex)
             {

@@ -63,13 +63,16 @@ static class PgTestPool
 
     // Sync flow exerciser shared across the Pg-layer tests. Driving CommandFlow directly so
     // the assertions attribute to the protocol, not to any ADO surface.
-    internal static async Task RunSync(PgClientProtocol protocol, string sql)
+    internal static Task RunSync(PgClientProtocol protocol, string sql)
     {
         var flow = new CommandFlow(async: false, Command.Create(sql));
         Assert.IsTrue(protocol.TryQueue(flow));
         var e = flow.GetEnumerator();
         while (e.MoveNext()) { }
-        await e.DisposeAsync();
+        // Sync Dispose, like a real sync consumer. DisposeAsync's await-drain can pend on pipeline
+        // retirement and resume on a TP thread, which breaks the caller-thread assertions awaiting this.
+        e.Dispose();
+        return Task.CompletedTask;
     }
 
     internal static async Task RunAsync(PgClientProtocol protocol, string sql)

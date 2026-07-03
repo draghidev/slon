@@ -1,5 +1,6 @@
 using Slon.Pg;
 using Slon.Pg.Protocol.Flows;
+using static Slon.Tests.Pg.ProtocolDiag;
 
 namespace Slon.Tests.Pg;
 
@@ -123,6 +124,7 @@ public class SyncFlowHandoffTests
 
             var threads = new Thread[concurrency];
             var exceptions = new Exception?[concurrency];
+            var progress = new int[concurrency];
             for (int i = 0; i < concurrency; i++)
             {
                 int idx = i;
@@ -131,7 +133,11 @@ public class SyncFlowHandoffTests
                     try
                     {
                         for (int j = 0; j < 20; j++)
+                        {
+                            Volatile.Write(ref progress[idx], j);
                             PgTestPool.RunSync(leases[idx].Protocol, "select 1").GetAwaiter().GetResult();
+                        }
+                        Volatile.Write(ref progress[idx], 20);
                     }
                     catch (Exception ex) { exceptions[idx] = ex; }
                 });
@@ -139,7 +145,21 @@ public class SyncFlowHandoffTests
             }
 
             foreach (var t in threads) t.Start();
-            foreach (var t in threads) Assert.IsTrue(t.Join(TimeSpan.FromSeconds(30)), "thread timed out");
+            foreach (var t in threads)
+            {
+                if (t.Join(TimeSpan.FromSeconds(30)))
+                    continue;
+                // Self-classifying hang report, decode by gauges. A stuck activation turn reads as
+                // activated={completed=True} (gate starvation). All-null slots split on the gauges:
+                // backlog=1 means the flow was never pulled (dispatch wake lost), while backlog=0
+                // outstanding=0 with a thread stuck mid-iteration means the flow fully completed and
+                // the caller's handoff wake never fired (the rendezvous seam).
+                var diag = string.Join("\n", leases.Take(leased).Select((l, i) =>
+                    $"protocol {i}: progress={Volatile.Read(ref progress[i])}/20 backlog={l.Protocol.Backlog} outstanding={l.Protocol.Outstanding} " +
+                    $"executor={Describe(l.Protocol.FlowControl.ExecutorFlow)} activated={Describe(l.Protocol.FlowControl.ActivatedFlow)}" +
+                    (l.Protocol.Backlog > 0 ? $"\n  source: {SourceState(l.Protocol)}" : "")));
+                Assert.Fail($"thread timed out\n{diag}");
+            }
 
             for (int i = 0; i < concurrency; i++)
                 Assert.IsNull(exceptions[i], $"thread {i} threw: {exceptions[i]}");
@@ -197,7 +217,7 @@ public class SyncFlowHandoffTests
         }
 
         foreach (var t in threads) t.Start();
-        foreach (var t in threads) Assert.IsTrue(t.Join(TimeSpan.FromSeconds(30)), "a sync caller thread timed out (possible misrouted wake / deadlock)");
+        JoinAllOrDump(threads, lease.Protocol, "a sync caller thread timed out (possible misrouted wake / deadlock)");
 
         for (int i = 0; i < concurrency; i++)
         {
@@ -272,7 +292,7 @@ public class SyncFlowHandoffTests
                         var flow = Submit(async: false, 's');
                         var e = flow.GetEnumerator();
                         while (e.MoveNext()) { }          // sync handoff + body run inline on THIS thread
-                        e.DisposeAsync().AsTask().GetAwaiter().GetResult();
+                        e.Dispose();
                         if (Environment.CurrentManagedThreadId != ownThread)
                             mismatches[idx]++;
                     }
@@ -304,7 +324,7 @@ public class SyncFlowHandoffTests
         }
 
         foreach (var t in threads) t.Start();
-        foreach (var t in threads) Assert.IsTrue(t.Join(TimeSpan.FromSeconds(30)), "a mixed-flow caller thread timed out (possible misrouted wake / deadlock)");
+        JoinAllOrDump(threads, protocol, "a mixed-flow caller thread timed out (possible misrouted wake / deadlock)");
 
         for (int i = 0; i < threads.Length; i++)
             Assert.IsNull(exceptions[i], $"thread {i} threw: {exceptions[i]}");
@@ -366,7 +386,17 @@ public class SyncFlowHandoffTests
                 var (flow, async) = flows[k];
                 driveTasks[k] = async ? Task.Run(() => DriveAsyncReadRank(flow)) : Task.Run(() => DriveSyncReadRank(flow));
             }
-            ranks = await Task.WhenAll(driveTasks).WaitAsync(TimeSpan.FromSeconds(30));
+            try
+            {
+                ranks = await Task.WhenAll(driveTasks).WaitAsync(TimeSpan.FromSeconds(30));
+            }
+            catch (TimeoutException)
+            {
+                Assert.Fail($"block {b}: drive tasks timed out\nbacklog={protocol.Backlog} outstanding={protocol.Outstanding} " +
+                    $"executor={Describe(protocol.FlowControl.ExecutorFlow)} activated={Describe(protocol.FlowControl.ActivatedFlow)}\n" +
+                    $"source: {SourceState(protocol)}");
+                return;
+            }
 
             // The sync flow (index 2) must have a HIGHER rank than the earlier-submitted async flows
             // (index 0, 1): the server processed it after them. A lower rank means it jumped ahead.
@@ -431,7 +461,7 @@ public class SyncFlowHandoffTests
         }
 
         foreach (var t in threads) t.Start();
-        foreach (var t in threads) Assert.IsTrue(t.Join(TimeSpan.FromSeconds(30)), "a sync caller thread timed out (possible misrouted wake / deadlock)");
+        JoinAllOrDump(threads, protocol, "a sync caller thread timed out (possible misrouted wake / deadlock)");
 
         for (int i = 0; i < concurrency; i++)
         {
@@ -449,7 +479,7 @@ public class SyncFlowHandoffTests
         while (e.MoveNext())
             foreach (var row in e.Current)
                 rank = row.GetValue<int>(0);
-        e.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        e.Dispose();
         return rank;
     }
 

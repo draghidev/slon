@@ -98,7 +98,19 @@ public class CommandDrainTests
             var e = flow.GetAsyncEnumerator();
             Assert.IsTrue(await e.MoveNextAsync(), $"iter {i}: first result not delivered");
             e.Dispose(); // SYNC dispose of an async flow, mid-batch - the raced path.
-            await PgTestPool.RunAsync(protocol, "select 1").WaitAsync(TimeSpan.FromSeconds(10));
+            try
+            {
+                await PgTestPool.RunAsync(protocol, "select 1").WaitAsync(TimeSpan.FromSeconds(10));
+            }
+            catch (TimeoutException)
+            {
+                // Self-classifying hang report. A pinned drain reads as activated={completed=False} (the
+                // disposed flow never finished draining, the probe dispatched but can't activate). A lost
+                // dispatch wake reads as backlog=1 with both slots null (the probe never left the source).
+                // A dead pump reads as pumpTask=Faulted with the killer's stack.
+                Assert.Fail($"iter {i}: usability probe timed out\n{ProtocolDiag.Gauges(protocol)}\n" +
+                    $"source: {ProtocolDiag.SourceState(protocol)}");
+            }
         }
     }
 

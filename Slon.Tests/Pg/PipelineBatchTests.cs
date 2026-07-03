@@ -84,7 +84,15 @@ public class PipelineBatchTests
             try
             {
                 for (int i = 0; i < iters && Volatile.Read(ref failure[0]) is null; i++)
-                    await PgTestPool.RunAsync(protocol, "select 1");
+                {
+                    // Per-iteration timeout so a read-side hang self-reports fast (select 1 is <1ms).
+                    try { await PgTestPool.RunAsync(protocol, "select 1").WaitAsync(TimeSpan.FromSeconds(20)); }
+                    catch (TimeoutException)
+                    {
+                        Capture(new Exception($"async RunAsync HUNG at iter {i}."));
+                        break;
+                    }
+                }
             }
             catch (Exception ex) { Capture(ex); }
         });
@@ -102,7 +110,7 @@ public class PipelineBatchTests
                         break;
                     var e = flow.GetEnumerator();
                     while (e.MoveNext()) { }
-                    e.DisposeAsync().AsTask().GetAwaiter().GetResult();
+                    e.Dispose();
                 }
             }
             catch (Exception ex) { Capture(ex); }
