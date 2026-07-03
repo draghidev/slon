@@ -4,7 +4,7 @@ using System.Threading.Tasks.Sources;
 
 namespace Slon.Pg.Protocol;
 
-abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IThreadPoolWorkItem
+abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgClientFlow>, IThreadPoolWorkItem
 {
     PgClientProtocol.Control? _pendingActivationControl;
 
@@ -45,7 +45,13 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IThreadPoolWorkItem
     // so plain flags are sufficient.
     bool _started;
     bool _completed;
-    TaskCompletionSource _completionTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    // Completion signal over the forked core: completers are cross-strand (retirement, teardown),
+    // waiters resume via the continuation dispatcher on the ambient scheduler. The flow itself is
+    // the IValueTaskSource, typed <PgClientFlow> because every other identity slot is claimed by
+    // the flow types; the flow-as-result is the free disambiguator (the old Slon.Protocols
+    // pattern). At most one pending waiter per tenure; post-completion awaits resolve
+    // synchronously.
+    Slon.Threading.Tasks.Sources.ManualResetValueTaskSourceCore<PgClientFlow> _completionCore;
 
     // Activation state.
     Slon.Threading.Tasks.Sources.ManualResetValueTaskSourceCore<PgDecoder> _activationTaskSource;
@@ -122,6 +128,7 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IThreadPoolWorkItem
     {
         _supportsPipelining = supportsPipelining;
         _activationTaskSource.CanCompleteConcurrently = true;
+        _completionCore.CanCompleteConcurrently = true;
     }
 
     public void SetCompletionAction(Action<PgClientFlow, Exception?, object?> action, object? state)
@@ -139,10 +146,18 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IThreadPoolWorkItem
     internal bool IsStarted => _started && !_completed;
     internal bool IsPending => !_started;
 
-    // Internal completion sync for benchmarks + Postgres startup wait.
-    // Refreshed per Reset cycle so pooled flows get a fresh signal each tenure.
-    internal ValueTask WaitForComplete(CancellationToken cancellationToken = default)
-        => new(_completionTcs.Task.WaitAsync(cancellationToken));
+    // Internal completion sync for the dispose drain, Postgres startup wait, and benchmarks.
+    // Scheduler-aware: the signal completes through the forked value-task-source core, so the
+    // waiter resumes on the ambient scheduler instead of the TCS's unconditional thread-pool
+    // dispatch. At most one PENDING waiter per tenure (post-completion awaits resolve
+    // synchronously). The token is checked on entry only: the park itself is not cancelable, the
+    // signal fires on every exit path (terminal, fault delivery, teardown), including the
+    // cancel-delivered terminal.
+    internal ValueTask<PgClientFlow> WaitForComplete(CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return new(this, _completionCore.Version);
+    }
 
     // Public for pooling. Reset is called by consumers between uses.
     public void Reset()
@@ -159,7 +174,9 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IThreadPoolWorkItem
             ThrowHelper.ThrowInvalidOperation("Cannot pool a flow with EnableActivationTimeout: a recycled instance can be wrong-tenure-completed by a stale activation timeout. Implement generation-checked completion first.");
         _started = false;
         _completed = false;
-        _completionTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        // Version bump per tenure. Cross-tenure completer staleness rests on the done -> torn-down
+        // -> retired layering (Complete precedes recycle), the same basis as the rest of this reset.
+        _completionCore.Reset();
         _activationTaskSource.Reset();
         _rfqCount = 0;
         _lastMessageInducesRfq = false;
@@ -196,6 +213,11 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IThreadPoolWorkItem
     // nested write-side handle) - the source pulls it via ExecutionControl.GetHandoffMres, never off a
     // bare flow ref. Keeps the handoff primitive off PgClientFlow's internal API, like _rfqCount.
     protected virtual ManualResetEventSlim? GetHandoffMres() => null;
+
+    PgClientFlow IValueTaskSource<PgClientFlow>.GetResult(short token) => _completionCore.GetResult(token);
+    ValueTaskSourceStatus IValueTaskSource<PgClientFlow>.GetStatus(short token) => _completionCore.GetStatus(token);
+    void IValueTaskSource<PgClientFlow>.OnCompleted(Action<object?> continuation, object? state, short token, ValueTaskSourceOnCompletedFlags flags)
+        => _completionCore.OnCompleted(continuation, state, token, flags);
 
     PgDecoder IValueTaskSource<PgDecoder>.GetResult(short token) => _activationTaskSource.GetResult(token);
     ValueTaskSourceStatus IValueTaskSource<PgDecoder>.GetStatus(short token) => _activationTaskSource.GetStatus(token);
@@ -609,7 +631,7 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IThreadPoolWorkItem
         /// ExecuteItemAsync before the flow body runs.
         public void Start() => flow._started = true;
 
-        /// Framework lifecycle: marks the flow completed, signals the per-flow completion TCS,
+        /// Framework lifecycle: marks the flow completed, fires the per-flow completion signal,
         /// disposes any per-await activation-cancellation registration, fires the registered
         /// completion action. Called from the pipeline policy's CompleteItem.
         public void Complete(Exception? exception = null)
@@ -621,17 +643,20 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IThreadPoolWorkItem
             // Wire-death fault delivery is NOT done here - it rides the OnStopping/OnAbort hooks (dispatched
             // flows from the heartbeat, backlog flows from the shutdown drain's DeliverClose), so a flow's
             // caller gate is faulted by the close verdict, not by completion. Completion just signals done
-            // (the TCS) and notifies the post-done action. Deliberately NO activation-source faulting here:
+            // and notifies the post-done action. Deliberately NO activation-source faulting here:
             // a parked deferred dispatch holds no resources, and Reset clears the registration on reuse.
+            // Async continuation dispatch: completers run in retirement/teardown contexts where
+            // inline caller continuations are a re-entrancy hazard, the contract the old TCS's
+            // RunContinuationsAsynchronously carried, minus its unconditional thread-pool destination.
             if (exception is not null)
-                flow._completionTcs.TrySetException(exception);
+                flow._completionCore.TrySetException(exception, runContinuationsAsynchronously: true);
             else
-                flow._completionTcs.TrySetResult();
+                flow._completionCore.TrySetResult(flow, runContinuationsAsynchronously: true);
             // The completion callback runs from CompleteItem in the advancer/retirement work-item
             // context: a raw throw would crash that thread unobserved. Don't swallow either - a
             // throwing completion callback means the consumer-side integration is broken, so the
             // pipeline won't drain naturally. Tear down via FailProtocol (fire-and-forget self-evict).
-            // The flow itself is already completed (TCS set above); this callback is a notification.
+            // The flow itself is already completed (signal fired above); this callback is a notification.
             try { flow._completionAction?.Invoke(flow, exception, flow._completionState); }
             catch (Exception ex) { /* TODO log */ control.FailProtocol(ex); }
         }

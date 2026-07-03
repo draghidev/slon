@@ -279,7 +279,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         connection.Reader.Complete(reason);
     }
 
-    async ValueTask StartAsync(StartupFlow flow, ValueTask flowCompletion, CancellationToken cancellationToken = default)
+    async ValueTask StartAsync(StartupFlow flow, ValueTask<PgClientFlow> flowCompletion, CancellationToken cancellationToken = default)
     {
         _source = PgClientFlowSource.Create(this, FlowControl, _options.ExecutionScheduler);
         _pipeline = Pipeline.Create<PgClientFlow, Policy, PgClientFlowSource, PgClientFlowSource.Enumerator>(new Policy(this, FlowControl), _source);

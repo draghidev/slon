@@ -141,6 +141,18 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
         // substitute for the SPSC-illegal queue peek a producer can't do itself.
         public bool ParkedAtSyncHead;
 
+        // Single-runner latch over the executor continuation. _driving is 1 while a Slon-driven pump turn
+        // runs its synchronous body (DispatchClaimed -> the turn's park-return). A drive that arrives
+        // during that window - including a re-entrant self-heal raised from inside the turn's OWN
+        // OnExecutorSuspended (which runs mid-MoveNext, before the continuation has unwound) - records
+        // _redrive instead of dispatching a second continuation onto another thread. The active runner
+        // serves _redrive on its way out (RunLoop). This is what keeps two pumps off Draghi's
+        // Count==0 inline-activation gate, i.e. off the "already executing" shared-promise collision: the
+        // handover is atomic, the continuation is only ever live on one thread. All three fields transition
+        // under the wake lock, paired with OnExecutorSuspended and the claim sites.
+        int _driving;
+        bool _redrive;
+
         // The Control every flow in this source is bound to. Used to mint a flow's ExecutionControl so the
         // source pulls the handoff MRES through it rather than off a bare flow ref (GetHandoffMres is
         // protected on PgClientFlow).
@@ -162,10 +174,18 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
             var held = HeldSyncFlow;
             // Reserve this park for the held sync caller (TryClaim reads this under the same lock) BEFORE
             // signalling, so a producer's TryClaim can't steal the park between the signal and the gate.
-            Volatile.Write(ref ParkedAtSyncHead, held is not null);
+            // Plain store: every reader (Drive, RunLoop) and the claim-site clear are under this same wake
+            // lock, so its acquire/release barriers publish it - no volatile needed.
+            ParkedAtSyncHead = held is not null;
             if (held is not null)
             {
-                held.GetExecutionControl(_control).GetHandoffMres()?.Set();   // exactly the just-held caller, parked on its own flow's MRES
+                // Hand the held sync caller its takeover wake - but only if NO runner is live. A live runner
+                // (this park is its OWN suspend, mid-MoveNext) signals the caller from RunLoop AFTER it drops
+                // _driving, so the caller can't wake into a held latch, fail its _driving==0 claim, and
+                // strand. The b-path (executor resumed off a trailing await, outside RunLoop) has no later
+                // release point, so it signals here.
+                if (_driving == 0)
+                    held.GetExecutionControl(_control).GetHandoffMres()?.Set();   // the just-held caller, parked on its own flow's MRES
                 return;
             }
             // Parking idle / async-headed with work still queued: re-drive the pump on TP rather than
@@ -176,8 +196,18 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
             // hand-back arms here with the next caller's flow already queued but unsignalled. Self-healing
             // here keeps all of that contained in the source. Claim the park we just armed and dispatch
             // its continuation on TP; an async dispatch only schedules, so it is safe under this wake lock.
-            if (HasItem() && WakeSignal.TryClaimLocked())
-                WakeSignal.DispatchClaimed(runContinuationsAsynchronously: true);
+            if (HasItem())
+            {
+                // A Slon-driven turn is live (this park is its own suspend): record the re-drive and let
+                // that runner serve it after the continuation unwinds - dispatching a second continuation
+                // here would race the still-unwinding MoveNext (the double-pump). With no runner (the
+                // executor was resumed off a trailing/commit await, outside RunLoop), keep the original
+                // self-heal: claim and dispatch on TP.
+                if (_driving == 1)
+                    _redrive = true;
+                else if (WakeSignal.TryClaimLocked())
+                    WakeSignal.DispatchClaimed(runContinuationsAsynchronously: true);
+            }
         }
 
         // Register Complete as the completion-token callback. Done here (not in Enumerator) so Complete
@@ -215,14 +245,83 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
         // un-park an executor whose caller is bailing (else it strands and DrainSignal never fires). Only
         // Complete reaches here post-completion (the async Execute path throws at Enqueue first).
         public void TryClaim(bool runContinuationsAsynchronously)
+            => Drive(runContinuationsAsynchronously);
+
+        // === The single-runner invariant ===
+        // _driving==1 means exactly one thread is driving the executor continuation. It is taken (paired
+        // with a successful WakeSignal claim) and dropped only under the wake lock, so DispatchClaimed is
+        // never invoked on two threads at once - that is what keeps two pumps off Draghi's Count==0 inline-
+        // activation gate (the "already executing" shared-promise collision). A drive that finds a runner
+        // live records _redrive; the runner serves it before relinquishing. The MRES handoff to a sync
+        // caller's takeover is sequenced through the SAME latch: the runner signals the caller only AFTER it
+        // drops _driving, so the caller's claim (gated on _driving==0) always finds the latch free. Every
+        // transition - _driving, _redrive, the sync-head MRES signal - happens under the wake lock, so they
+        // totally order against each other and against TryClaimLocked.
+
+        // Single funnel for every drive that does not already hold the runner role: the producer enqueue,
+        // Complete, and the sync caller's kick / close-out. Either BECOMES the runner (claim + take _driving)
+        // or, with a runner live, records a re-drive it serves on its way out - never a second concurrent
+        // DispatchClaimed. Never steals a sync-head park reserved for that head's own takeover (the sync
+        // caller claims it via WaitForExecutor); Complete is the lone exception, lifted once IsCompleted (no
+        // more takeovers), so a bailing caller's park is un-parked and DrainSignal can fire.
+        void Drive(bool runAsync)
         {
             var wakeSignal = WakeSignal;
             wakeSignal.AcquireWakeLock();
-            var reserved = ParkedAtSyncHead && !Volatile.Read(ref IsCompleted);
-            var claimed = !reserved && wakeSignal.TryClaimLocked();
+            var became = false;
+            if (ParkedAtSyncHead && !Volatile.Read(ref IsCompleted))
+            {
+                // Reserved for a sync-head takeover: do not steal and do not re-drive - the caller owns it.
+            }
+            else if (_driving == 1)
+                _redrive = true;
+            else if (wakeSignal.TryClaimLocked())
+            {
+                _driving = 1;
+                _redrive = false;   // fresh runner counts only the re-drives raised during ITS run
+                became = true;
+            }
             wakeSignal.ReleaseWakeLock();
-            if (claimed)
-                wakeSignal.DispatchClaimed(runContinuationsAsynchronously);
+            if (!became)
+                return;
+            if (runAsync)
+                wakeSignal.Scheduler.SubmitDetached(static s => ((State)s!).RunLoop(), this);
+            else
+                RunLoop();
+        }
+
+        // The single runner: drives one claimed turn at a time to its park, INLINE (the continuation
+        // re-enters the protocol on this thread, so DispatchClaimed must be off the wake lock). After each
+        // turn it either SERVES an accrued re-drive (a producer enqueue or a self-heal) by re-claiming the
+        // just-armed park and staying the runner, or RELINQUISHES (drops _driving). A turn that parks off a
+        // WakeSignal arm (a trailing/commit await on the recovery / write-back-pressure path) has nothing to
+        // re-claim, so it relinquishes and that resume's own park self-heals. On relinquishing at a sync-head
+        // park it hands the caller its takeover wake AFTER dropping _driving - signalling before the drop
+        // would let the caller wake into a held latch, fail its _driving==0 claim, reset its MRES, and
+        // strand with no re-signal (the executor is already parked and will not re-park).
+        void RunLoop()
+        {
+            var wakeSignal = WakeSignal;
+            while (true)
+            {
+                wakeSignal.DispatchClaimed(runContinuationsAsynchronously: false);
+                wakeSignal.AcquireWakeLock();
+                if (_redrive
+                    && !(ParkedAtSyncHead && !Volatile.Read(ref IsCompleted))
+                    && wakeSignal.TryClaimLocked())
+                {
+                    _redrive = false;
+                    wakeSignal.ReleaseWakeLock();
+                    continue;
+                }
+                // Relinquish. Drop the latch, then hand a reserved sync-head park to its caller. HeldSyncFlow
+                // is non-null exactly when we parked at a sync head (OnExecutorSuspended sets them together).
+                _driving = 0;
+                var handBack = Volatile.Read(ref IsCompleted) ? null : HeldSyncFlow;
+                handBack?.GetExecutionControl(_control).GetHandoffMres()?.Set();
+                wakeSignal.ReleaseWakeLock();
+                return;
+            }
         }
 
         // Phase 1 of the sync handoff, under the protocol's _syncRoot: enqueue the sync flow at its real
@@ -253,8 +352,9 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
                 ?? throw new InvalidOperationException("WaitForExecutor reached with a null handoff MRES: an autonomous sync flow must route via async dispatch (NeedsSyncHandoff), not the caller-handoff park.");
             // Kick the executor so it pulls and drains earlier flows in FIFO order, dequeue-and-holding the
             // first sync head and parking - OnExecutorSuspended then signals THAT held flow's MRES. A no-op
-            // if the executor is already running (it reaches our flow on its own).
-            wakeSignal.Signal(runContinuationsAsynchronously: true);
+            // if the executor is already running (it reaches our flow on its own). Through the latch so the
+            // kick can't spin up a second runner alongside one already live.
+            Drive(runAsync: true);
 
             while (true)
             {
@@ -265,13 +365,29 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
                 // sources (OnExecutorSuspended here, the inert-drain SignalProgress on completion), so the
                 // Reset must serialize with the Set under the wake lock.
                 mres.Reset();
-                if (ReferenceEquals(HeldSyncFlow, flow) && wakeSignal.TryClaimLocked())
+                // Become the single runner for our own takeover. _driving==0 gates against a runner already
+                // live (an async drive that beat us here): we lose this round, loop, and retry when it parks
+                // at our sync head and re-signals our MRES (OnExecutorSuspended's held branch).
+                if (ReferenceEquals(HeldSyncFlow, flow) && _driving == 0 && wakeSignal.TryClaimLocked())
                 {
+                    _driving = 1;
+                    _redrive = false;   // fresh runner: only re-drives raised during OUR run count
                     TakeoverPending = true;   // our inline pull dequeues our own (now held) flow
+                    // Consume the sync-head reservation NOW, under the same wake lock that set it
+                    // (OnExecutorSuspended). ParkedAtSyncHead is a producer-readable "this park is reserved
+                    // for a parked sync caller" flag; once WE (that caller) claim it, it is no longer reserved
+                    // - we are the runner. Leaving it true lets it go STALE-TRUE for the whole takeover body:
+                    // a concurrent async Drive then reads it, treats a live-caller park as reserved, and drops
+                    // its wake without recording a re-drive (Drive's reserved branch is a no-op), so the async
+                    // item strands with the pipeline empty and its response buffered. Cleared here, that Drive
+                    // falls through to _redrive and the runner serves it. Set together with HeldSyncFlow at the
+                    // park; cleared together with the claim that consumes them. Plain store: under the wake lock,
+                    // same as its set (OnExecutorSuspended) and its reads (Drive, RunLoop).
+                    ParkedAtSyncHead = false;
                     wakeSignal.ReleaseWakeLock();
                     // Inline: the pump continuation runs on this thread, dequeues our flow, runs its body,
                     // then one-shot fake-misses and re-parks (pump back to TP) so this returns.
-                    wakeSignal.DispatchClaimed(runContinuationsAsynchronously: false);
+                    RunLoop();
                     break;
                 }
                 // Completion bail: the source completed and we did not claim a park to take our flow over.
@@ -289,7 +405,9 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
             // sync head and OnExecutorSuspended signals THAT caller's MRES. On completion the executor
             // resolves Completed instead of advancing, but each parked caller wakes when ITS OWN flow drains
             // inert (its terminal SignalProgress sets its MRES), so no direct successor wake is needed here.
-            wakeSignal.Signal(runContinuationsAsynchronously: true);
+            // Through the latch: if our takeover's RunLoop is still unwinding, this records a re-drive it
+            // serves rather than racing a second runner onto the wire.
+            Drive(runAsync: true);
         }
 
         // Async enqueue (the EnqueueResult / Execute path). Capture the routing async-mode (async here)

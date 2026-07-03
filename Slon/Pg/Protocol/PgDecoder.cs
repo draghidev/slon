@@ -72,7 +72,14 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
 
     internal void Initialize(PgClientProtocol.Control control)
     {
-        Debug.Assert(_remainingTimeout == Timeout.InfiniteTimeSpan);
+        // A read disarms its own timeout in its finally, but the read task's SetResult drives the next
+        // flow's activation (BindDecoder -> here) on the SAME stack (the inline completion -> advancer ->
+        // ActivateHeadItem cascade), so that disarm can lag this re-init. The single-reader gate guarantees
+        // the prior read has fully completed - no in-flight read owns this timeout - so a lingering armed
+        // value is a benign leftover; reset it rather than let it ride into (or the heartbeat fire it on)
+        // the new flow's reads.
+        if (_remainingTimeout != Timeout.InfiniteTimeSpan)
+            SetRemainingTimeout(Timeout.InfiniteTimeSpan);
         ReadTimeout = _defaultReadTimeout;
         if (!ReferenceEquals(_control, control))
             _control = control;

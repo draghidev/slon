@@ -91,7 +91,12 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
     void MarkConsumerGone()
     {
         Volatile.Write(ref _consumerDisposed, true);
-        Volatile.Write(ref _draining, true);
+        // Full fence, not a release: this store pairs with the body's register-then-recheck on the
+        // inter-result gate. The gate open that follows can no-op fence-free against an already
+        // consumed generation, so a release store can stay unpublished past the body's recheck -
+        // the body then parks on the fresh generation with both the edge and the level missed and
+        // pins the pipeline's activated slot.
+        Interlocked.Exchange(ref _draining, true);
     }
 
     // Consumer departure path 2 of 2: WAIT-FOR-DRAIN. The consumer disposed and wants DisposeAsync to park
@@ -100,7 +105,8 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
     void MarkConsumerWaitForDrain()
     {
         Volatile.Write(ref _consumerDisposed, true);
-        Volatile.Write(ref _draining, true);
+        // Full fence, same pairing as MarkConsumerGone.
+        Interlocked.Exchange(ref _draining, true);
     }
 
     // NOT a consumer departure: the BODY itself opts the consumer out during its own cancel/StoppingToken
