@@ -35,6 +35,17 @@ sealed class PipeSegmentEnumerator<TSegmenter, TSegment>(PipeReader reader, TSeg
 
     public PipeReader PipeReader => reader;
 
+    // The underlying reader reported completion, so the wire is at EOF. Disarm the deferred advance by
+    // clearing the pending-segment sentinel: a re-drive past completion (recovery drain, or any caller
+    // that keeps pulling after false) must not re-apply a stale consume position, whose segment and
+    // backing array have since been consumed and pool-recycled, driving the buffer accounting negative.
+    // Returns false so completion sites read as return EndOfData().
+    bool EndOfData()
+    {
+        _currentLength = -1;
+        return false;
+    }
+
     ValueTask<bool> IAsyncEnumerator<TSegment>.MoveNextAsync() => MoveNextAsync(CancellationToken.None);
     public ValueTask<bool> MoveNextAsync(CancellationToken cancellationToken = default)
     {
@@ -47,12 +58,12 @@ sealed class PipeSegmentEnumerator<TSegmenter, TSegment>(PipeReader reader, TSeg
             // Not everything was buffered when the segment was returned (e.g. with length prefixed segments).
             if (_consumePosition is null)
             {
-                task = reader.ReadAtLeastAsync(int.Max((int)_currentLength, int.MaxValue), cancellationToken);
+                task = reader.ReadAtLeastAsync((int)long.Min(_currentLength, int.MaxValue), cancellationToken);
                 if (!task.IsCompletedSuccessfully)
                     return Core(task, cancellationToken, consume: true);
                 result = task.Result;
                 if (result.IsCompleted)
-                    return new(false);
+                    return new(EndOfData());
                 if (result.IsCanceled)
                     return new(Task.FromException<bool>(new OperationCanceledException(cancellationToken)));
 
@@ -72,7 +83,7 @@ sealed class PipeSegmentEnumerator<TSegmenter, TSegment>(PipeReader reader, TSeg
 
         result = task.Result;
         if (result.IsCompleted)
-            return new(false);
+            return new(EndOfData());
         if (result.IsCanceled)
             return new(Task.FromException<bool>(new OperationCanceledException(cancellationToken)));
 
@@ -106,7 +117,7 @@ sealed class PipeSegmentEnumerator<TSegmenter, TSegment>(PipeReader reader, TSeg
             {
                 var result = await task.ConfigureAwait(false);
                 if (result.IsCompleted)
-                    return false;
+                    return EndOfData();
                 if (result.IsCanceled)
                     ThrowHelper.ThrowOperationCanceled(cancellationToken);
 
@@ -178,9 +189,9 @@ sealed class PipeSegmentEnumerator<TSegmenter, TSegment>(PipeReader reader, TSeg
         {
             if (_consumePosition is null)
             {
-                result = syncReader.ReadAtLeast(int.Max((int)_currentLength, int.MaxValue), timeout);
+                result = syncReader.ReadAtLeast((int)long.Min(_currentLength, int.MaxValue), timeout);
                 if (result.IsCompleted)
-                    return false;
+                    return EndOfData();
                 if (result.IsCanceled)
                     ThrowHelper.ThrowOperationCanceled(CancellationToken.None);
 
@@ -203,7 +214,7 @@ sealed class PipeSegmentEnumerator<TSegmenter, TSegment>(PipeReader reader, TSeg
         while (true)
         {
             if (result.IsCompleted)
-                return false;
+                return EndOfData();
             if (result.IsCanceled)
                 ThrowHelper.ThrowOperationCanceled(CancellationToken.None);
 
