@@ -20,7 +20,6 @@ sealed class AdoConnectionProxy : IDisposable, IAsyncDisposable
     readonly IAdoConnection _connection;
 
     CommandFlow? _cachedFlow;
-    int _pipelineDepth;
     // A SlonConnection holds an exclusive scope for its whole lease (acquired at Open), so its commands run
     // serially on one wire instead of multiplexed - the safe default, since Slon can't parse SQL to know
     // which commands carry session state (SET / LISTEN / temp tables / BEGIN...). Null on the data-source
@@ -51,8 +50,6 @@ sealed class AdoConnectionProxy : IDisposable, IAsyncDisposable
     }
 
     public string ConnectionString => ""; // TODO pull from client or pass it in somehow.
-
-    public int PipeplineDepth => _pipelineDepth;
 
     internal PgClientFlow? CurrentReadingFlow { get; set; }
     internal PgClientFlow? CurrentWritingFlow { get; set; }
@@ -131,11 +128,9 @@ sealed class AdoConnectionProxy : IDisposable, IAsyncDisposable
 
     bool TryQueueOn(PgConnection connection, PgClientFlow flow)
     {
-        Interlocked.Increment(ref _pipelineDepth);
         flow.SetCompletionAction(static (flow, exception, state) =>
         {
             var instance = (AdoConnectionProxy)state!;
-            Interlocked.Decrement(ref instance._pipelineDepth);
             // A flow-level fault while holding an exclusive scope breaks the connection (the wire is the
             // connection's; a torn flow means a torn session). SQL errors don't reach here - they surface
             // on the result, the flow completes cleanly.
@@ -151,10 +146,7 @@ sealed class AdoConnectionProxy : IDisposable, IAsyncDisposable
             return true;
         }
         if (!connection.TryQueue(flow))
-        {
-            Interlocked.Decrement(ref _pipelineDepth);
             return false;
-        }
         return true;
     }
 
