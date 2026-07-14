@@ -80,7 +80,7 @@ public class BackpressureDeadlockTests
         finally
         {
             readMadeProgress.TrySetResult();
-            try { await protocol.CompleteAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(5)); }
+            try { await protocol.CompleteAsync().WaitAsync(TimeSpan.FromSeconds(5)); }
             catch { }
         }
     }

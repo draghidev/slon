@@ -88,7 +88,7 @@ public class RacingDisposeInMemoryRace
         {
             try { await Protocol.DisposeAsync(); } catch { }
             Clock.Advance(TimeSpan.FromSeconds(120));
-            try { await Protocol.CompleteAsync().AsTask().WaitAsync(Cap); } catch { }
+            try { await Protocol.CompleteAsync().WaitAsync(Cap); } catch { }
         }
     }
 
@@ -294,7 +294,7 @@ public class RacingDisposeInMemoryRace
         await using var s = await BuildToFirstResultParked();
         var consumer = new GranularConsumer(s.Enumerator);
 
-        var complete = s.Protocol.CompleteAsync().AsTask();
+        var complete = s.Protocol.CompleteAsync();
 
         s.Heartbeat();
         await SettleAsync();
@@ -319,7 +319,7 @@ public class RacingDisposeInMemoryRace
         await using var s = await BuildToFirstResultParked();
         var consumer = new GranularConsumer(s.Enumerator);
 
-        var complete = s.Protocol.CompleteAsync().AsTask();
+        var complete = s.Protocol.CompleteAsync();
 
         s.Heartbeat();
         await SettleAsync();
@@ -375,7 +375,7 @@ public class RacingDisposeInMemoryRace
         var consumer = new GranularConsumer(s.Enumerator);
 
         // Graceful StoppingToken only - deliberately no heartbeat, no forceful DisposeAsync.
-        var complete = s.Protocol.CompleteAsync().AsTask();
+        var complete = s.Protocol.CompleteAsync();
         await SettleAsync();
 
         // Drive the consumer loop: its next MoveNextAsync must open the gate-parked body. Release the
@@ -463,7 +463,7 @@ public class RacingDisposeInMemoryRace
         var afterFlow = recStream.RecordedLength;
 
         var full = recStream.Snapshot();
-        await protocol.CompleteAsync().AsTask().WaitAsync(Cap);
+        await protocol.CompleteAsync().WaitAsync(Cap);
 
         var handshake = full.AsSpan(0, handshakeLen).ToArray();
         var response = full.AsSpan(handshakeLen, afterFlow - handshakeLen).ToArray();

@@ -20,12 +20,21 @@ sealed class CloseSignal : IDisposable
     readonly CancellationTokenSource _stoppingCts;
     readonly CancellationTokenSource _abortCts;
     readonly CloseSignal? _parent;
+    readonly CancellationTokenRegistration _parentStoppingRegistration;
+    readonly CancellationTokenRegistration _parentAbortRegistration;
 
-    CloseSignal(CancellationTokenSource stoppingCts, CancellationTokenSource abortCts, CloseSignal? parent)
+    CloseSignal(
+        CancellationTokenSource stoppingCts,
+        CancellationTokenSource abortCts,
+        CloseSignal? parent,
+        CancellationTokenRegistration parentStoppingRegistration = default,
+        CancellationTokenRegistration parentAbortRegistration = default)
     {
         _stoppingCts = stoppingCts;
         _abortCts = abortCts;
         _parent = parent;
+        _parentStoppingRegistration = parentStoppingRegistration;
+        _parentAbortRegistration = parentAbortRegistration;
     }
 
     // Root: both CTSes on the time provider so a FakeTimeProvider drives the abort escalation
@@ -38,9 +47,28 @@ sealed class CloseSignal : IDisposable
     // Linked child: its tokens fire when the parent's do (and can be tripped independently). Chains
     // Reason to the parent.
     public static CloseSignal CreateLinked(CloseSignal parent, TimeProvider timeProvider)
-        => new(CancellationTokenSource.CreateLinkedTokenSource(parent.StoppingToken),
-               CancellationTokenSource.CreateLinkedTokenSource(parent.AbortToken),
-               parent);
+    {
+        var stopping = new CancellationTokenSource(Timeout.InfiniteTimeSpan, timeProvider);
+        var abort = new CancellationTokenSource(Timeout.InfiniteTimeSpan, timeProvider);
+        CancellationTokenRegistration stoppingRegistration = default;
+        CancellationTokenRegistration abortRegistration = default;
+        try
+        {
+            stoppingRegistration = parent.StoppingToken.UnsafeRegister(
+                static (state, _) => ((CancellationTokenSource)state!).Cancel(), stopping);
+            abortRegistration = parent.AbortToken.UnsafeRegister(
+                static (state, _) => ((CancellationTokenSource)state!).Cancel(), abort);
+            return new(stopping, abort, parent, stoppingRegistration, abortRegistration);
+        }
+        catch
+        {
+            abortRegistration.Dispose();
+            stoppingRegistration.Dispose();
+            abort.Dispose();
+            stopping.Dispose();
+            throw;
+        }
+    }
 
     /// The close reason consumers throw. Falls through to the parent's so a child cascaded from a parent
     /// trip resolves the parent's reason. Null until the first trip materializes it.
@@ -90,6 +118,8 @@ sealed class CloseSignal : IDisposable
     // disposing them releases that registration). Never disposes the parent.
     public void Dispose()
     {
+        _parentStoppingRegistration.Dispose();
+        _parentAbortRegistration.Dispose();
         _stoppingCts.Dispose();
         _abortCts.Dispose();
     }

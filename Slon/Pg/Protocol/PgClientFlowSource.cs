@@ -582,13 +582,12 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
             wakeSignal.AcquireWakeLock();
 
             // One-shot takeover hand-back: the sync caller's pull just fake-missed (TakeoverActive).
-            // Reset it and Arm so the pump parks here - the caller's inline DispatchClaimed returns and
-            // the pump is back on TP. The caller's close-out re-signal resumes it for any trailing work.
-            if (_state.TakeoverActive)
-            {
+            // Reset it; unless completing (checked below, BEFORE any arm), Arm so the pump parks here -
+            // the caller's inline DispatchClaimed returns and the pump is back on TP. The caller's
+            // close-out re-signal resumes it for any trailing work.
+            var takeoverHandBack = _state.TakeoverActive;
+            if (takeoverHandBack)
                 _state.TakeoverActive = false;
-                return wakeSignal.Arm();
-            }
 
             // Completion BEATS the primary queue, including any queued sync flow: once completing, the
             // whole queue drains inert and blocked sync callers bail (Complete wakes them; WaitForExecutor
@@ -597,12 +596,28 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
             // can't be done consistently; draining everything inert is the uniform model (previously this
             // was gated on a queued sync waiter to keep the executor alive for a takeover - that gate is
             // gone). Fire DrainSignal so Shutdown drains the residual as the sole consumer.
+            //
+            // Every park in this method MUST pass this check under the arm's own wake-lock hold - that is
+            // the whole lost-wake proof: Complete's write-then-Drive either precedes this hold (this read
+            // sees true, no arm) or follows the registration's release (Drive claims the armed _pending).
+            // The takeover hand-back arm used to skip it, relying on the sync caller's close-out Drive -
+            // which only covers a hand-back parked synchronously inside that caller's takeover RunLoop. A
+            // turn that suspends off-signal between the body and this pull (item-result / commit / trailing
+            // await) arms LATER, on its TP resume with _driving==0, after both the close-out Drive and
+            // Complete's Drive have passed and found nothing armed: the arm was unchecked, the wake lost,
+            // and shutdown hung on DrainSignal (the pool-mix wedge).
             if (Volatile.Read(ref _state.IsCompleted) || _completionToken.IsCancellationRequested)
             {
                 wakeSignal.ReleaseWakeLock();
                 _state.DrainSignal?.TrySetResult();
                 return WaitForNextAwaitable.Completed();
             }
+
+            // Not completing: park the hand-back. Skips the item-retry branch below on purpose - the
+            // one-shot must park even with items queued (hand the pump back to TP rather than draining
+            // a later flow on the sync caller's thread).
+            if (takeoverHandBack)
+                return wakeSignal.Arm();
 
             // A dispatchable item is available - retry to consume it - UNLESS a sync flow is already held
             // for its caller's takeover, in which case we park here and let that caller take it (we must

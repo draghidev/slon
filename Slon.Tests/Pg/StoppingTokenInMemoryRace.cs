@@ -129,7 +129,7 @@ public class StoppingTokenInMemoryRace
         catch (TimeoutException) { return $"flowA never parked on its read within {Cap} - scenario not set up (dispatch raced completion)"; }
 
         // StoppingToken + flush. A is parked mid-read; completion can no longer drain it inert.
-        var completeTask = protocol.CompleteAsync().AsTask();
+        var completeTask = protocol.CompleteAsync();
         Log($"{variant} rep{rep} A parked, completeAsync called");
 
         string? captured = null;
@@ -231,7 +231,7 @@ public class StoppingTokenInMemoryRace
         Log($"capture: flowB drained, recorded={afterB}");
 
         var full = recStream.Snapshot();
-        await protocol.CompleteAsync().AsTask().WaitAsync(Cap);
+        await protocol.CompleteAsync().WaitAsync(Cap);
         Log($"capture: complete, total={full.Length}");
 
         var handshake = full.AsSpan(0, handshakeLen).ToArray();

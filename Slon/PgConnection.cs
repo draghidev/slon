@@ -199,7 +199,7 @@ sealed class PgConnection : IPoolConnection<PgConnection>
         // PgConnection's lifetime spans many leases under pooling.
         _tracker?.Deregister(this);
         _selfHeartbeat?.Dispose();
-        return _protocol.CompleteAsync(exception);
+        return new ValueTask(_protocol.CompleteAsync(exception));
     }
 
     public TrackedStatus GetTrackedStatus(TrackedCommand tracked)

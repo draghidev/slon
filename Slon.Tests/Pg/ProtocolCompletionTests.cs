@@ -35,6 +35,19 @@ public class ProtocolCompletionTests
         await e.DisposeAsync();
     }
 
+    [TestMethod]
+    public async Task Completion_PassivelyObservesSameTaskAsCompleteAsync()
+    {
+        var protocol = await ConnectAsync();
+        var completion = protocol.Completion;
+        Assert.IsFalse(completion.IsCompleted, "observing Completion must not initiate shutdown");
+
+        var driven = protocol.CompleteAsync();
+        Assert.AreSame(completion, driven);
+        await driven;
+        Assert.IsTrue(completion.IsCompletedSuccessfully);
+    }
+
     // The wire-handoff guard (GuardWireIdleOnHandoff): a cleanly-completed flow on the multiplexed
     // outer pipeline that leaves the wire in a transaction - an unscoped BEGIN - must fail the
     // protocol rather than let the next interleaved flow run inside the open transaction. A real
@@ -69,9 +82,25 @@ public class ProtocolCompletionTests
     {
         var protocol = await ConnectAsync();
         await RunAsync(protocol, "select 1");
+        var completion = protocol.Completion;
+        Assert.AreSame(completion, protocol.CompleteAsync());
+        await completion;
+
+        // Terminal callers observe the same completion without touching disposed close signals,
+        // including a late forceful escalation and the scope-abort surface.
+        Assert.AreSame(completion, protocol.CompleteAsync(new InvalidOperationException("late")));
+        protocol.AbortActiveScope();
+        await protocol.DisposeAsync();
+    }
+
+    [TestMethod]
+    public async Task BeginExclusiveScope_AfterCompletion_IsRejectedAtAdmission()
+    {
+        var protocol = await ConnectAsync();
         await protocol.CompleteAsync();
-        await protocol.CompleteAsync();
-        await protocol.CompleteAsync();
+
+        Assert.ThrowsExactly<InvalidOperationException>(
+            () => protocol.BeginExclusiveScope(async: true));
     }
 
     // Forceful DisposeAsync after a normal flow finishes. Same final state as CompleteAsync
@@ -335,6 +364,52 @@ public class ProtocolCompletionTests
         }
     }
 
+    // Regression for the takeover hand-back lost wake (the pool-mix wedge). The wedge needs the
+    // FAULT path: a normally-completing sync body resumes the pump INLINE inside the caller's
+    // Dispose, so its hand-back arm is ordered strictly before the caller's close-out re-signal
+    // and is always claimed. A FAULTED body instead rides RecoverItem's trailing await - the pump
+    // resumes on a TP thread with no close-out behind it, and the one-shot hand-back park
+    // (WaitCore's TakeoverActive branch) armed WITHOUT re-checking IsCompleted: WakeSignal left
+    // _pending stuck true with the continuation stored, DrainSignal never fired, and shutdown hung
+    // forever at its WhenAny. Recipe: CompleteAsync mid-body plants IsCompleted while the executor
+    // is off-signal (its Drive is a guaranteed no-op - nothing armed), then DisposeAsync's abort
+    // faults the body and drives the pump through the unchecked arm. The phase sweep walks the
+    // teardown across pre-takeover, mid-body, and post-body so mid-body iterations hit the window
+    // on every run rather than by scheduler luck.
+    [TestMethod]
+    public async Task CompleteAsync_ThenDisposeAsync_MidSyncFlowBody_ConvergesCleanly()
+    {
+        for (var i = 0; i < 30; i++)
+        {
+            var protocol = await ConnectAsync();
+            var flow = new CommandFlow(async: false, Command.Create("select pg_sleep(0.02)"));
+            Assert.IsTrue(protocol.TryQueue(flow));
+            using var consumerStarted = new ManualResetEventSlim(false);
+            var runTask = Task.Run(() =>
+            {
+                var e = flow.GetEnumerator();
+                try
+                {
+                    consumerStarted.Set();
+                    while (e.MoveNext()) { }
+                }
+                catch (PgClientClosedException)
+                {
+                }
+                e.Dispose();
+            });
+            consumerStarted.Wait();
+            // 0-14ms across a ~20ms body: early iterations land before/at takeover, the middle of
+            // the sweep lands inside the body window, late ones after it.
+            await Task.Delay(i % 15);
+            var complete = protocol.CompleteAsync();
+            var dispose = protocol.DisposeAsync().AsTask();
+            await WhenAllOrDump(protocol, $"iteration {i}: mid-body teardown did not converge", TimeSpan.FromSeconds(10),
+                ("complete", complete), ("dispose", dispose), ("runTask", runTask));
+            Assert.IsTrue(protocol.IsCompleted, $"iteration {i}: protocol did not reach Completed");
+        }
+    }
+
     // CompleteAsync with a parked flow (enqueued but not yet activated). The graceful drain
     // observes the flow, AbortToken fires when CompletionTimeout elapses, heartbeat propagates
     // the closed exception into the flow's activation source. Flow's MoveNextAsync surfaces
@@ -422,7 +497,7 @@ public class ProtocolCompletionTests
 
         var tasks = new Task[16];
         for (int i = 0; i < tasks.Length; i++)
-            tasks[i] = protocol.CompleteAsync().AsTask();
+            tasks[i] = protocol.CompleteAsync();
         await Task.WhenAll(tasks);
     }
 }

@@ -82,9 +82,26 @@ sealed class ExclusiveAccessFlow : PgClientFlow
         // Release the cached-flow claim at terminal (success OR fault) via the completion action, which runs
         // AFTER Complete sets IsCompleted - the reclaiming begin keys its Reset on IsCompleted, so releasing
         // any earlier would let it grab a not-yet-completed flow. Set per-tenure (Reset clears the action),
-        // never once: a pooled flow must not carry a stale action. Exception ignored - release is lifecycle.
+        // never once: a pooled flow must not carry a stale action.
         // A no-op for overflow flows (ReleaseFlow ref-checks the cached instance).
-        SetCompletionAction(static (f, _, s) => ((PgClientProtocol.ExclusiveScopeState)s!).ReleaseFlow((ExclusiveAccessFlow)f), _state);
+        //
+        // The close-verdict routing here is the backstop for a flow the executor pulled after the close
+        // verdict fired but before the source's completion cutoff became visible: dispatched but never
+        // started, so the heartbeat's hooks skip it once completed and the inert drain never saw it -
+        // the residual shutdown drain's Complete(reason) is the last signal that ever reaches this flow,
+        // and without the routing its parked caller (HandoffReady has no activation timeout) hangs
+        // forever. TrySet makes it inert on every other terminal: a resolved handoff or an
+        // already-delivered hook wins, and non-close faults don't touch the gates.
+        SetCompletionAction(static (f, ex, s) =>
+        {
+            var flow = (ExclusiveAccessFlow)f;
+            if (ex is PgClientClosedException closed)
+            {
+                flow._handoffReady.TrySetException(closed);
+                flow._scopeEnded.TrySetResult();
+            }
+            ((PgClientProtocol.ExclusiveScopeState)s!).ReleaseFlow(flow);
+        }, _state);
         // Sync scope flow uses the handoff rendezvous (WaitForExecutor parks on GetHandoffMres). Allocate
         // it on first sync selection; an async scope leaves it null and never parks.
         if (!async)
@@ -185,12 +202,31 @@ sealed class ExclusiveAccessFlow : PgClientFlow
         // wire to the next waiter.
         if (_consumerGone.Task.IsCompleted)
             return ValueTask.CompletedTask;
+        // Shutdown-manufactured turn: a stop's cascade retires the prior holder, and the advance can
+        // pull this flow before the source's completion cutoff is visible - a turn that exists only
+        // because the protocol is dying. The reason is materialized before any close token fires and
+        // this activation is causally downstream of those tokens (the cascade retired the holder), so
+        // the shutdown that made this turn is always visible here. Fault the caller gate instead of
+        // handing over a dying wire; the shutdown drain completes the flow with the same reason.
+        if (_protocol.CloseReason is { } closeReason)
+        {
+            _handoffReady.TrySetException(closeReason);
+            return ValueTask.CompletedTask;
+        }
         // Acquire the scope at the turn: create the fresh source + start the inner executor. Deferred to
         // here so the inner pipeline only ever runs for a flow that actually won its turn.
         _innerSource = _state.AcquireForTurn(_protocol);
         Volatile.Write(ref _acquired, true);
-        // Hand the connection to the user; they submit subflows and end the scope.
-        _handoffReady.SetResult();
+        // Hand the connection to the user; they submit subflows and end the scope. A close cascade
+        // that landed between the reason check above and the _acquired write took the not-acquired
+        // branch: it already faulted the gate and released _scopeEnded, and its idempotence flags mean
+        // no hook will ever drain the just-acquired inner pipeline - so on a lost handoff, drain it
+        // here and retire (the caller observes the close, not a scope).
+        if (!_handoffReady.TrySetResult())
+        {
+            await _completeInner(null).ConfigureAwait(false);
+            return ValueTask.CompletedTask;
+        }
         // Hold the wire until the scope ends (CompleteScopeAsync) OR the consumer detaches mid-hold (the
         // user canceled after handoff and will never call CompleteScopeAsync). Either way the held scope
         // must end so the body returns; a consumer-gone mid-hold drains the inner pipeline like a graceful

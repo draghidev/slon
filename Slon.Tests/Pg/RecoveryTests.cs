@@ -637,7 +637,7 @@ public class RecoveryTests
         {
             // A wedged protocol's completion may also hang; guard it so a deadlock result stays a
             // clean TimeoutException from the body, not a hung cleanup.
-            try { await protocol.CompleteAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(5)); }
+            try { await protocol.CompleteAsync().WaitAsync(TimeSpan.FromSeconds(5)); }
             catch { }
         }
     }
@@ -687,7 +687,7 @@ public class RecoveryTests
         }
         finally
         {
-            try { await protocol.CompleteAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(5)); }
+            try { await protocol.CompleteAsync().WaitAsync(TimeSpan.FromSeconds(5)); }
             catch { }
         }
     }

@@ -131,6 +131,9 @@ public class ExclusiveScopeMultiWaiterTests
 
         // B's pre-turn waiter must have been torn down (faulted), not left hanging.
         await Assert.ThrowsExactlyAsync<PgClientClosedException>(async () => await bWait.WaitAsync(TimeSpan.FromSeconds(10)));
+        // DisposeAsync is fire-and-forget; Completed is only guaranteed once the drain is joined
+        // (a post-dispose CompleteAsync returns the same drain task).
+        await protocol.CompleteAsync();
         Assert.IsTrue(protocol.IsCompleted, "protocol must reach Completed despite a pre-turn waiter");
     }
 }

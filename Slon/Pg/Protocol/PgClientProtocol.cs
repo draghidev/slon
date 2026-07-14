@@ -161,6 +161,17 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
     // pool's idle fast path must not grab it as free while LoadScore counts that backlog as load).
     internal bool IsIdle => Outstanding is 0;
     internal bool IsCompleted => Status is ProtocolStatus.Completed;
+
+    // Draining-or-later: visible within the first statement of RunShutdownAsync, a full drain
+    // ahead of the Completed latch - the pool's scheduling veto reads this so a stopping
+    // protocol stops winning placement races it can only fault-and-rebind.
+    internal bool IsDraining => Status is ProtocolStatus.Draining or ProtocolStatus.Completed;
+    internal bool IsSchedulable => Status is ProtocolStatus.Ready;
+
+    // Non-null the instant shutdown has begun: the reason is materialized under the Shutdown gate
+    // BEFORE any close token fires, so a cascade-driven observer (whose schedule is causally
+    // downstream of those tokens) can never read null on a shutdown it was itself created by.
+    internal PgClientClosedException? CloseReason => _close.Reason;
     // The wire's last-seen transaction status (Idle / Transaction / Error). For connection-state queries,
     // recovery's status-gated ROLLBACK, and pool steering (an open-transaction wire is a hard-skip).
     internal TransactionStatus TransactionStatus => _transactionStatus;
@@ -324,17 +335,6 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         }
     }
 
-    bool SignalDraining()
-    {
-        lock (_syncRoot)
-        {
-            if (_status is not ProtocolStatus.Completed)
-                _status = ProtocolStatus.Draining;
-            _drainingCount++;
-            return _status is ProtocolStatus.Draining;
-        }
-    }
-
     void SignalCompleted()
     {
         lock (_syncRoot)
@@ -390,22 +390,61 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
     // flyweight and reused across scopes.
     internal Flows.ExclusiveAccessFlow BeginExclusiveScope(bool async)
     {
-        _exclusiveScope ??= ExclusiveScopeState.Create(this);
-        // Rent a waiter: the cached flow on the common sequential path, an overflow flow when a prior
-        // scope is still live (concurrent begin). N waiters share the one state; the outer pipeline's
-        // ordering serializes their turns and is the fair hand-out. No begin-time reuse guard - a
-        // concurrent begin gets its own waiter rather than a throw.
-        var flow = _exclusiveScope.RentFlow();
-        // No source, no inner-pipeline init here: the flow creates the source and starts the inner
-        // executor at its TURN (AcquireForTurn), so a never-consumed scope starts nothing.
-        flow.PrepareScope(async, _options.FlowActivationTimeout);
-        return Queue(flow);
+        Flows.ExclusiveAccessFlow flow;
+        PgClientFlowSource.EnqueueResult enqueue = default;
+        bool handoff;
+        lock (_syncRoot)
+        {
+            if (_status is not ProtocolStatus.Ready)
+                ThrowHelper.ThrowInvalidOperation("Protocol is unavailable.");
+
+            // Creation and enqueue share the shutdown admission lock: a rejected begin never touches
+            // the close signal, while an admitted flow is owned by the pipeline drain.
+            _exclusiveScope ??= ExclusiveScopeState.Create(this);
+            flow = _exclusiveScope.RentFlow();
+            flow.PrepareScope(async, _options.FlowActivationTimeout);
+
+            handoff = flow.NeedsSyncHandoff;
+            if (!handoff)
+                enqueue = _source.Enqueue(flow);
+            else
+                _source.EnqueueSyncWaiter(flow);
+        }
+
+        if (!handoff)
+            enqueue.Execute(runContinuationsAsynchronously: true);
+        else
+            _source.WaitForExecutor(flow);
+
+        var control = flow.GetExecutionControl(FlowControl);
+        control.Bind(_options.FlowActivationTimeout);
+        if (_scoringEnabled && !control.IsPipelined)
+            Interlocked.Increment(ref _pipelineStalls);
+        return flow;
     }
 
     // Scope-only abort: trips the active scope's CloseSignal, breaking any subflow parked on a wire
     // read/write via the scope shells' tokens, without touching the protocol's own token (the pooled
     // protocol survives). The future ADO connection-dispose path drives this.
-    internal void AbortActiveScope() => _exclusiveScope?.AbortScope();
+    internal void AbortActiveScope()
+    {
+        ExclusiveScopeState? scope;
+        lock (_syncRoot)
+        {
+            if (_closeReleaseStarted || (scope = _exclusiveScope) is null)
+                return;
+            _closeUsers++;
+        }
+
+        try
+        {
+            scope.AbortScope();
+        }
+        finally
+        {
+            ReleaseCloseUse();
+        }
+    }
 
     bool TryQueueFlow<TState>(PgClientFlow flow, Func<TState, bool>? predicate = null, TState state = default!)
         => TryQueueFlow(flow, ProtocolStatus.Ready, predicate, state);
@@ -449,7 +488,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
     /// Either way returns only once the pipeline has fully drained - the awaitable counterpart to the
     /// fire-and-forget <see cref="DisposeAsync"/> / <see cref="Dispose"/> / <see cref="FailProtocol"/>.
     /// So forceful-and-await is just CompleteAsync(reason); graceful-and-await is CompleteAsync().
-    public ValueTask CompleteAsync(Exception? closeReason = null)
+    public Task CompleteAsync(Exception? closeReason = null)
         => Shutdown(closeReason, forceful: closeReason is not null);
 
     /// Async forceful tear-down. Fires AbortToken immediately, fails activations for pipelined
@@ -482,33 +521,20 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
     internal void FailProtocol(Exception? reason)
         => FireAndForget(DisposeAsyncCore(reason));
 
-    /// Shared core for the Dispose paths: forceful Shutdown wrapped with resource disposal as a
-    /// single fire-and-forget unit. The OBSERVABLE resources (the cancellation sources, whose tokens
-    /// a caller may still read after a graceful <see cref="CompleteAsync"/>) stay alive until a
-    /// Dispose path releases them here. The transport is not observable and is released by Shutdown
-    /// at completion regardless of path. Idempotent via <c>_disposed</c>.
+    /// Shared core for the Dispose paths: a forceful Shutdown, nothing more. Completion is the
+    /// protocol's single terminal stage - Shutdown's completion finally releases EVERY resource
+    /// (transport, heartbeat, scope signal, close signal), so a bare <see cref="CompleteAsync"/>
+    /// is fully terminal and the Dispose verbs are aliases differing only in forcefulness and
+    /// fire-and-forget shape. Idempotent via <c>_disposed</c>.
     bool _disposed;
     async ValueTask DisposeAsyncCore(Exception? closeReason)
     {
+        // Pure alias over the terminal drain: forceful shutdown, all resource release happens in
+        // Shutdown's completion finally (the single terminal stage). This gate only makes the
+        // dispose VERB idempotent; it owns no resources of its own.
         if (Interlocked.Exchange(ref _disposed, true))
             return;
-        try
-        {
-            await Shutdown(closeReason, forceful: true).ConfigureAwait(false);
-        }
-        finally
-        {
-            _heartbeat?.Dispose();
-            // The transport was already released by Shutdown's completion (it's not observable state).
-            // Here we release only the OBSERVABLE resources - the cancellation sources whose tokens a
-            // caller may still read after a graceful CompleteAsync. That's what makes these Dispose-
-            // gated rather than completion-gated. Disposing the abort CTS also drops the scheduled
-            // CancelAfter(CompletionTimeout) timer without firing it. The scope signal (a linked child)
-            // is disposed too, releasing its registration on _close; the scope signal must be disposed
-            // BEFORE its parent _close so the link registration is gone first.
-            _exclusiveScope?.Dispose();
-            _close.Dispose();
-        }
+        await Shutdown(closeReason, forceful: true).ConfigureAwait(false);
     }
 
     /// async void (not a discard) so the background drain's exceptions are observed here rather than
@@ -525,20 +551,31 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         }
     }
 
-    // Single-winner drain. The first Shutdown caller claims this and runs the body; concurrent and later
-    // callers await the same completion. Two bodies would race the CTS lifecycle (a forceful
-    // DisposeAsyncCore disposing _abortCts while a graceful body is still in its finally) and double-arm
-    // the drain signal. SignalDraining can't gate this alone - it returns true throughout the Draining
-    // window, so a graceful CompleteAsync and a forceful DisposeAsync both pass during the drain.
-    TaskCompletionSource? _shutdownCompletion;
+    // Passive completion observation, matching Pipeline.Completion: this task never initiates
+    // shutdown, and CompleteAsync returns the same task after signalling it. The TCS is available
+    // from construction so wrappers can attach regardless of who eventually drives completion.
+    readonly TaskCompletionSource _completion = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
-    ValueTask Shutdown(Exception? closeReason, bool forceful)
+    /// <summary>Completes after terminal drain and resource teardown. Observing this task does not
+    /// initiate shutdown; <see cref="CompleteAsync"/> does.</summary>
+    public Task Completion => _completion.Task;
+
+    // Single-winner drain. The first Shutdown caller claims this and runs the body; concurrent and later
+    // callers await Completion. Separate from the completion TCS because that task must be observable
+    // before shutdown begins.
+    bool _shutdownStarted;
+    bool _closeReleaseStarted;
+    int _closeUsers;
+    TaskCompletionSource? _closeUsersDrained;
+
+    Task Shutdown(Exception? closeReason, bool forceful)
     {
         bool owner;
+        bool ownsCloseUse = false;
         TaskCompletionSource completion;
         lock (_syncRoot)
         {
-            owner = _shutdownCompletion is null;
+            owner = !_shutdownStarted;
             if (owner)
             {
                 // Materialize the canonical closed exception BEFORE any cancellation can fire (the forceful
@@ -548,9 +585,20 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
                 // sets it once; losers read the same instance. Wraps closeReason as inner. CloseSignal also
                 // re-materializes on every trip, so the invariant is structural, not just this ordering.
                 _close.MaterializeReason(closeReason);
-                _shutdownCompletion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                _shutdownStarted = true;
+                if (_status is not ProtocolStatus.Completed)
+                    _status = ProtocolStatus.Draining;
+                _drainingCount++;
             }
-            completion = _shutdownCompletion!;
+            completion = _completion;
+
+            // The drain owner retains the close signal through RunShutdownAsync. A forceful loser
+            // leases it only for the synchronous escalation below; terminal release waits for leases.
+            if (forceful && !owner && !_closeReleaseStarted)
+            {
+                _closeUsers++;
+                ownsCloseUse = true;
+            }
         }
 
         // Forceful escalation: idempotent, applied by ANY forceful caller - including one that loses the
@@ -561,13 +609,45 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         // happens-after the owner's materialize. _abortCts is live: DisposeAsyncCore (the only forceful
         // caller, gated by _disposed so it runs once) fires this before its await and disposes the CTSes
         // only afterwards.
-        if (forceful)
+        if (forceful && (owner || ownsCloseUse))
         {
-            _close.Abort();
-            _connection?.Abort();
+            try
+            {
+                _close.Abort();
+                _connection?.Abort();
+            }
+            finally
+            {
+                if (ownsCloseUse)
+                    ReleaseCloseUse();
+            }
         }
 
-        return owner ? DriveShutdownAsync(forceful, completion) : new ValueTask(completion.Task);
+        if (owner)
+            _ = DriveShutdownAsync(forceful, completion);
+        return completion.Task;
+    }
+
+    void ReleaseCloseUse()
+    {
+        lock (_syncRoot)
+        {
+            Debug.Assert(_closeUsers > 0);
+            if (--_closeUsers == 0)
+                _closeUsersDrained?.SetResult();
+        }
+    }
+
+    Task? BeginCloseRelease()
+    {
+        lock (_syncRoot)
+        {
+            Debug.Assert(!_closeReleaseStarted);
+            _closeReleaseStarted = true;
+            return _closeUsers == 0
+                ? null
+                : (_closeUsersDrained ??= new(TaskCreationOptions.RunContinuationsAsynchronously)).Task;
+        }
     }
 
     // Owns the single drain body and publishes its outcome to every awaiting caller. Run outside
@@ -583,14 +663,11 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         catch (Exception ex)
         {
             completion.SetException(ex);
-            throw;
         }
     }
 
     async Task RunShutdownAsync(bool forceful)
     {
-        SignalDraining();
-
         // Set by the Shutdown gate under _syncRoot before any cancellation fired.
         var closedException = _close.Reason!;
 
@@ -647,23 +724,44 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         {
             // Disarm the CTS scheduled by the graceful path.
             _close.DisarmAbortTimeout();
-            SignalCompleted();
-            // Release the transport once the drain has completed. Single-winner gating runs this body
-            // exactly once, so the wire is closed exactly once at completion - NOT gated on Dispose. The
-            // transport is not observable protocol state: unlike the cancellation sources (whose tokens a
-            // caller may still read after a graceful CompleteAsync), a completed protocol's wire can't be
-            // reached by anyone. Without this, a CompleteAsync never followed by Dispose leaked its socket
-            // (max_connections).
-            if (_connection is not null)
+            try
             {
-                // Release the transport through the endpoints the protocol holds - the connection owns
-                // no teardown. Error-complete the writer (DISCARDS any buffered write rather than
-                // flushing it: graceful reached a clean RFQ, forceful already Abort'd the socket; the
-                // error completion writes nothing and never starts the flush promise), then complete
-                // the reader via the enumerator that owns it. Both dispose the shared stream
-                // (idempotent), closing the socket.
-                await _connection.Writer.CompleteAsync(closedException).ConfigureAwait(false);
-                await _pipeSegmentEnumerator.DisposeAsync().ConfigureAwait(false);
+                // Release the transport once the drain has completed. Single-winner gating runs this body
+                // exactly once, so the wire is closed exactly once at completion - NOT gated on Dispose. The
+                // transport is not observable protocol state: unlike the cancellation sources (whose tokens a
+                // caller may still read after a graceful CompleteAsync), a completed protocol's wire can't be
+                // reached by anyone. Without this, a CompleteAsync never followed by Dispose leaked its socket
+                // (max_connections).
+                if (_connection is not null)
+                {
+                    // Release the transport through the endpoints the protocol holds - the connection owns
+                    // no teardown. Error-complete the writer (DISCARDS any buffered write rather than
+                    // flushing it: graceful reached a clean RFQ, forceful already Abort'd the socket; the
+                    // error completion writes nothing and never starts the flush promise), then complete
+                    // the reader via the enumerator that owns it. Both dispose the shared stream
+                    // (idempotent), closing the socket.
+                    await _connection.Writer.CompleteAsync(closedException).ConfigureAwait(false);
+                    await _pipeSegmentEnumerator.DisposeAsync().ConfigureAwait(false);
+                }
+            }
+            finally
+            {
+                // Stop new signal users and wait for any synchronous forceful escalation already
+                // admitted by Shutdown or AbortActiveScope. The pipeline itself is fully drained.
+                if (BeginCloseRelease() is { } closeUsersDrained)
+                    await closeUsersDrained.ConfigureAwait(false);
+
+                try
+                {
+                    _heartbeat?.Dispose();
+                    _exclusiveScope?.Dispose();
+                    _close.Dispose();
+                }
+                finally
+                {
+                    // Pool eviction may replace this backend as soon as Completed becomes visible.
+                    SignalCompleted();
+                }
             }
         }
     }
@@ -1207,4 +1305,3 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
             => ref _commandFlowReadState;
     }
 }
-

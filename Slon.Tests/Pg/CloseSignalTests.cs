@@ -115,4 +115,18 @@ public class CloseSignalTests
 
         Assert.IsFalse(signal.AbortToken.IsCancellationRequested, "Disarmed timeout must not escalate to abort.");
     }
+
+    [TestMethod]
+    public void LinkedChild_AbortTimeout_UsesTimeProvider()
+    {
+        var time = new FakeTimeProvider();
+        using var parent = CloseSignal.CreateRoot(time);
+        using var child = CloseSignal.CreateLinked(parent, time);
+
+        child.ArmAbortTimeout(TimeSpan.FromSeconds(10));
+        time.Advance(TimeSpan.FromSeconds(10));
+
+        Assert.IsTrue(child.AbortToken.IsCancellationRequested);
+        Assert.IsFalse(parent.AbortToken.IsCancellationRequested);
+    }
 }

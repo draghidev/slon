@@ -183,7 +183,7 @@ public class CommandDrainTests
         await Assert.ThrowsExactlyAsync<PgClientClosedException>(async () => await MoveNext(e, flowAsync));
         await e.DisposeAsync();
 
-        await completeTask.AsTask().WaitAsync(TimeSpan.FromSeconds(10));
+        await completeTask.WaitAsync(TimeSpan.FromSeconds(10));
     }
 
     // Graceful shutdown overlapping consumer-side dispose. The first MoveNext's outcome may
@@ -215,7 +215,7 @@ public class CommandDrainTests
         catch (PgClientClosedException) { }
         await Dispose(e, useAsyncDispose);
 
-        await completeTask.AsTask().WaitAsync(TimeSpan.FromSeconds(10));
+        await completeTask.WaitAsync(TimeSpan.FromSeconds(10));
     }
 
     // Async flow: shutdown signalled before the consumer ever touches the flow. The parked
@@ -237,7 +237,7 @@ public class CommandDrainTests
         await Assert.ThrowsExactlyAsync<PgClientClosedException>(async () => await e.MoveNextAsync());
         await e.DisposeAsync();
 
-        await completeTask.AsTask().WaitAsync(TimeSpan.FromSeconds(10));
+        await completeTask.WaitAsync(TimeSpan.FromSeconds(10));
     }
 
     // Pipelined multi-flow: both flows queued before any MoveNext, then CompleteAsync fires.
@@ -273,7 +273,7 @@ public class CommandDrainTests
         await eA.DisposeAsync();
         await eB.DisposeAsync();
 
-        await completeTask.AsTask().WaitAsync(TimeSpan.FromSeconds(10));
+        await completeTask.WaitAsync(TimeSpan.FromSeconds(10));
     }
 
     // Graceful-then-abort escalation: a body parked on actual I/O (pg_sleep keeps the server
@@ -301,6 +301,6 @@ public class CommandDrainTests
             async () => await moveNextTask.WaitAsync(TimeSpan.FromSeconds(10)));
         await e.DisposeAsync();
 
-        await completeTask.AsTask().WaitAsync(TimeSpan.FromSeconds(10));
+        await completeTask.WaitAsync(TimeSpan.FromSeconds(10));
     }
 }

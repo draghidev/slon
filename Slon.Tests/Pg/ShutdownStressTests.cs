@@ -83,9 +83,9 @@ public class ShutdownStressTests
                 await eB.MoveNextAsync().AsTask().WaitAsync(Cap);
                 await eA.DisposeAsync();
                 await eB.DisposeAsync();
-                await completeTask.AsTask().WaitAsync(Cap);
+                await completeTask.WaitAsync(Cap);
             });
-            try { await protocol.CompleteAsync().AsTask().WaitAsync(Cap); }
+            try { await protocol.CompleteAsync().WaitAsync(Cap); }
             catch { }
         });
     }
@@ -114,9 +114,77 @@ public class ShutdownStressTests
 
                 await moveNextTask.WaitAsync(Cap);
                 await e.DisposeAsync();
-                await completeTask.AsTask().WaitAsync(Cap);
+                await completeTask.WaitAsync(Cap);
             });
-            try { await protocol.CompleteAsync().AsTask().WaitAsync(Cap); }
+            try { await protocol.CompleteAsync().WaitAsync(Cap); }
+            catch { }
+        });
+    }
+
+    // ----- Scenario C: exclusive-scope holder + pre-turn waiter vs stop -----
+    //
+    // Hammers the verdict-delivery race for a scope waiter that never won its turn: A holds the
+    // scope (activated, idle), B is enqueued behind it, and the protocol stops without either scope
+    // ending. B's HandoffReady must fault with PgClientClosedException - the close verdict has three
+    // racing deliverers (the inert-queue drain, the heartbeat's cascade hooks, and the residual
+    // pipeline drain) plus one wrong one (A's teardown retiring normally and advancing the executor
+    // into B before the source's completion cutoff is visible). Each failure mode is classified:
+    // a successful HandoffReady means B was PROMOTED onto a stopping protocol, a timeout means the
+    // verdict was never delivered (B completed by the residual drain, which faults no caller gate).
+    // Iteration parity alternates forceful DisposeAsync with graceful CompleteAsync; the pre-stop
+    // delay sweeps the stop across the 5ms heartbeat phase, since the wrong-deliverer window opens
+    // only when a tick lands between the close verdict firing and the source cutoff being installed.
+
+    [TestMethod]
+    public async Task Stress_PreTurnScopeWaiter_StopDeliversVerdict()
+    {
+        var options = PgTestPool.NewOptions();
+        var handshake = Handshake();
+
+        await RunIterationsAsync(async i =>
+        {
+            var protocolOptions = new PgClientProtocolOptions(options) { CompletionTimeout = TimeSpan.FromMilliseconds(2), HeartbeatInterval = TimeSpan.FromMilliseconds(5) };
+            var protocol = PgClientProtocol.Create(protocolOptions);
+            await protocol.StartAsync(options, new ReplayTransport(handshake));
+            await RunIterationAsync(i, async () =>
+            {
+                var a = protocol.BeginExclusiveScope(async: true);
+                await a.HandoffReady.WaitAsync(Cap);
+                var b = protocol.BeginExclusiveScope(async: true);
+                var bWait = b.HandoffReady;
+
+                if (i % 7 != 0)
+                    await Task.Delay(i % 7);
+
+                if (i % 2 == 0)
+                    await protocol.DisposeAsync();
+                else
+                    _ = protocol.CompleteAsync();
+
+                try
+                {
+                    await bWait.WaitAsync(Cap);
+                    Assert.Fail($"iter {i}: pre-turn waiter PROMOTED - HandoffReady resolved successfully on a stopping protocol");
+                }
+                catch (TimeoutException)
+                {
+                    // Self-classifying: pin which population the waiter died in - inert-in-queue
+                    // (pending, sweep never ran), dispatched-never-completed (started, heartbeat
+                    // missed), or completed-verdict-less (backstop hole).
+                    Assert.Fail($"iter {i}: pre-turn waiter STRANDED - no verdict on HandoffReady within {Cap} " +
+                        $"[b: pending={b.IsPending} started={b.IsStarted} completed={b.IsCompleted}, " +
+                        $"protocol: draining={protocol.IsDraining} completed={protocol.IsCompleted}]");
+                }
+                catch (PgClientClosedException)
+                {
+                }
+
+                // The latch contract: Completed is only guaranteed once the drain is awaited
+                // (DisposeAsync is fire-and-forget); a false read after this await is a real latch bug.
+                await protocol.CompleteAsync().WaitAsync(Cap);
+                Assert.IsTrue(protocol.IsCompleted, $"iter {i}: protocol not Completed after awaited drain");
+            });
+            try { await protocol.CompleteAsync().WaitAsync(Cap); }
             catch { }
         });
     }

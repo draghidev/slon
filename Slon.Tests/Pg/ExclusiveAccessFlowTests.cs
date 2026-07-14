@@ -87,7 +87,7 @@ public class ExclusiveAccessFlowTests
             // Shut down the protocol with the scope still open. Without the cascade, the inner executor
             // would never be woken and the protocol drain would hang.
             var cause = new InvalidOperationException("test shutdown");
-            await protocol.CompleteAsync(cause).AsTask().WaitAsync(TimeSpan.FromSeconds(10));
+            await protocol.CompleteAsync(cause).WaitAsync(TimeSpan.FromSeconds(10));
 
             Assert.IsTrue(protocol.IsCompleted, "Protocol must reach Completed; a hang means the inner executor was stranded.");
             Assert.AreSame(cause, protocol.CompletionException, "shutdown reason preserved");

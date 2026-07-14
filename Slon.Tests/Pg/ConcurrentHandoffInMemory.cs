@@ -94,7 +94,7 @@ public class ConcurrentHandoffInMemory
 
         Volatile.Write(ref stop, true);
         runSync.Release();
-        try { await protocol.CompleteAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(10)); } catch { }
+        try { await protocol.CompleteAsync().WaitAsync(TimeSpan.FromSeconds(10)); } catch { }
         if (failure[0] is { } f)
             Assert.Fail($"forced-overlap (in-memory) raised {f.GetType().Name}: {f.Message}\n{f}");
 
@@ -165,7 +165,7 @@ public class ConcurrentHandoffInMemory
 
         await asyncLoop;
         syncThread.Join(TimeSpan.FromSeconds(30));
-        try { await protocol.CompleteAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(10)); } catch { }
+        try { await protocol.CompleteAsync().WaitAsync(TimeSpan.FromSeconds(10)); } catch { }
 
         if (failure[0] is { } ex2)
             Assert.Fail($"concurrent sync/async (in-memory) raised {ex2.GetType().Name}: {ex2.Message}\n{ex2}");
@@ -197,7 +197,7 @@ public class ConcurrentHandoffInMemory
         await e.DisposeAsync();
         var total = rec.RecordedLength;
         var full = rec.Snapshot();
-        await protocol.CompleteAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(10));
+        await protocol.CompleteAsync().WaitAsync(TimeSpan.FromSeconds(10));
 
         var handshake = full.AsSpan(0, handshakeLen).ToArray();
         var response = full.AsSpan(handshakeLen, total - handshakeLen).ToArray();
