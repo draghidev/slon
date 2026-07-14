@@ -43,9 +43,20 @@ static class PgTestPool
     };
 
     // Lease a clean protocol from the bounded shared pool. Use ONLY in tests that complete their flows
-    // cleanly. The protocol auto-returns when idle, so the Lease's DisposeAsync has nothing to do.
+    // cleanly. The protocol's busy-to-idle transition returns it to the pool.
     internal static async ValueTask<Lease> LeaseAsync()
-        => new(await _pool.GetAsync(LeaseTimeout).ConfigureAwait(false));
+    {
+        try
+        {
+            return new(await _pool.GetAsync(LeaseTimeout).ConfigureAwait(false));
+        }
+        catch (TimeoutException ex)
+        {
+            // Self-classifying: a lease timeout without the slot census is undiagnosable after the
+            // fact (which state starved the rent - unschedulable conns, dead futures, non-idle?).
+            throw new TimeoutException($"{ex.Message} [slots: {_pool.DescribeSlots()}]", ex);
+        }
+    }
 
     // Construct a fresh, non-pooled protocol the caller owns end to end. Use in tests that fault the wire,
     // destroy the protocol, or need custom heartbeat/timeout settings. Standalone heartbeat (no onIdle),
@@ -93,8 +104,6 @@ static class PgTestPool
         readonly PooledProtocol _conn;
         internal Lease(PooledProtocol conn) => _conn = conn;
         public PgClientProtocol Protocol => _conn.Protocol;
-        // Nothing to return: the protocol republishes itself to the idle channel when it goes idle
-        // (depth -> 0). A still-busy wire just keeps serving (and may be multiplexed onto) until it drains.
         public ValueTask DisposeAsync() => default;
     }
 
@@ -105,9 +114,14 @@ static class PgTestPool
     {
         int _started;
         Action? _idleSignal;
+        IDisposable? _heartbeatRegistration;
         public PgClientProtocol Protocol { get; }
 
-        PooledProtocol(PgClientProtocol protocol) => Protocol = protocol;
+        PooledProtocol(PgClientProtocol protocol)
+        {
+            Protocol = protocol;
+            protocol.Completion.ConfigureAwait(false).GetAwaiter().UnsafeOnCompleted(ReleaseHeartbeatRegistration);
+        }
 
         public static async ValueTask<PooledProtocol> CreateAsync(PgClientOptions options, ConnectionPoolContext<PooledProtocol> poolContext, CancellationToken cancellationToken)
         {
@@ -117,8 +131,9 @@ static class PgTestPool
                 var protocol = PgClientProtocol.Create(new PgClientProtocolOptions(options));
                 var conn = new PooledProtocol(protocol);
                 conn._idleSignal = poolContext.CreateConnectionIdleSignal(conn);
-                // Pool drives the heartbeat (a non-null onIdle disables the protocol's self-heartbeat).
-                poolContext.OnHeartbeat(static (c, interval) => c.Protocol.Heartbeat(interval), conn);
+                // Register before startup so any startup-terminal path releases the registration
+                // through the protocol completion observer too.
+                conn._heartbeatRegistration = poolContext.OnHeartbeat(static (c, interval) => c.Protocol.Heartbeat(interval), conn);
                 await protocol.StartAsync(options, transport, conn.SignalIdleIfStarted, cancellationToken).ConfigureAwait(false);
                 return conn;
             }
@@ -140,10 +155,15 @@ static class PgTestPool
         }
 
         public void Start() => Volatile.Write(ref _started, 1);
+
         public bool IsIdle => Protocol.IsIdle;
-        public bool IsCompleted => Protocol.IsCompleted;
+        public bool IsSchedulable => Protocol.IsSchedulable;
+        public Task Completion => Protocol.Completion;
         public int CompareTo(PooledProtocol? other) => Protocol.CompareTo(other?.Protocol);
-        public ValueTask CompleteAsync(Exception? exception = null) => Protocol.CompleteAsync(exception);
+        public Task CompleteAsync(Exception? exception = null) => Protocol.CompleteAsync(exception);
+
+        void ReleaseHeartbeatRegistration()
+            => Interlocked.Exchange(ref _heartbeatRegistration, null)?.Dispose();
     }
 
     sealed class Factory : IPoolConnectionFactory<PooledProtocol>

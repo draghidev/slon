@@ -243,7 +243,7 @@ sealed class EmptyProtocol<TMode> : IPoolConnection<EmptyProtocol<TMode>>
         return true;
     }
 
-    async ValueTask IPoolConnection<EmptyProtocol<TMode>>.CompleteAsync(Exception? exception)
+    async Task IPoolConnection<EmptyProtocol<TMode>>.CompleteAsync(Exception? exception)
     {
         lock (_syncRoot)
         {
@@ -265,7 +265,8 @@ sealed class EmptyProtocol<TMode> : IPoolConnection<EmptyProtocol<TMode>>
     }
 
     bool IPoolConnection<EmptyProtocol<TMode>>.IsIdle => PipelineDepth is 0;
-    bool IPoolConnection<EmptyProtocol<TMode>>.IsCompleted => _status is ProtocolStatus.Completed;
+    bool IPoolConnection<EmptyProtocol<TMode>>.IsSchedulable => _status is ProtocolStatus.Ready;
+    Task IPoolConnection<EmptyProtocol<TMode>>.Completion => _pipeline.Completion;
 
     // The benchmark protocol has no startup flow (it constructs immediately Ready), so there is
     // no suppressed idle publication for the pool's post-lease Start to unblock.

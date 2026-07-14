@@ -24,7 +24,7 @@ public class ConnectionPoolBenchmark
 
     ConnectionPool<FakeConnection> _pool = null!;
     FakeFactory _factory = null!;
-    static readonly Func<SchedulingContext<FakeConnection>, object?, bool> AlwaysTrue = static (_, _) => true;
+    static readonly Func<ConnectionCandidate<FakeConnection>, object?, bool> AlwaysTrue = static (_, _) => true;
 
     [GlobalSetup]
     public async Task Setup()
@@ -118,6 +118,7 @@ public class ConnectionPoolBenchmark
 
 sealed class FakeConnection : IPoolConnection<FakeConnection>
 {
+    static readonly Task NeverCompletes = new TaskCompletionSource().Task;
     int _depth;
     Action? _idleSignal;
 
@@ -132,7 +133,8 @@ sealed class FakeConnection : IPoolConnection<FakeConnection>
     }
 
     public bool IsIdle => Volatile.Read(ref _depth) is 0;
-    public bool IsCompleted => false;
+    public bool IsSchedulable => true;
+    public Task Completion => NeverCompletes;
 
     public int CompareTo(FakeConnection? other)
     {
@@ -143,7 +145,7 @@ sealed class FakeConnection : IPoolConnection<FakeConnection>
         return l < r ? -1 : l == r ? 0 : 1;
     }
 
-    public ValueTask CompleteAsync(Exception? exception = null) => default;
+    public Task CompleteAsync(Exception? exception = null) => Task.CompletedTask;
 
     // The fake drives idle publication explicitly via MarkIdleAndSignal, so the startup
     // suppression gate Start() exists for has nothing to unblock here.

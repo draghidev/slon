@@ -85,6 +85,8 @@ sealed class PgConnection : IPoolConnection<PgConnection>
     // Used in non-pool mode where we own the heartbeat tick ourselves. In pool mode the pool's
     // heartbeat dispatcher drives OnHeartbeat and this stays null.
     Heartbeat? _selfHeartbeat;
+    IDisposable? _poolHeartbeatRegistration;
+    int _sessionLifetimeReleased;
     // Per-session monotonic counter for explicit-prepare names. Lives here (not on CommandTracker)
     // so successive SlonConnections that share this PgConnection through the pool can't collide
     // on `_ep{N}`. The counter persists for the protocol-session lifetime.
@@ -105,6 +107,7 @@ sealed class PgConnection : IPoolConnection<PgConnection>
         _tracker = tracker;
         _maintenanceInterval = maintenanceInterval;
         _tracker?.Register(this);
+        protocol.Completion.ConfigureAwait(false).GetAwaiter().UnsafeOnCompleted(ReleaseSessionLifetime);
     }
 
     public PgClientProtocol Protocol => _protocol;
@@ -148,9 +151,8 @@ sealed class PgConnection : IPoolConnection<PgConnection>
             _underlyingPoolIdleSignal!();
     }
 
-    // Lifecycle gate: called once, after Open + lease-commit, to put the connection in service.
-    // From this point on, depth-to-zero transitions publish to the pool's idle channel.
-    // Before this, they're suppressed.
+    // Lifecycle gate: the pool calls this after installing the fully-started connection and
+    // before scheduling initial work. Every subsequent depth-to-zero edge may publish.
     public void Start() => Volatile.Write(ref _isStarted, 1);
 
     // Passed to protocol.Start when not pooled, the protocol uses "onIdle is non-null" as the
@@ -162,13 +164,27 @@ sealed class PgConnection : IPoolConnection<PgConnection>
     {
         if (poolContext is not null)
         {
-            poolContext.OnHeartbeat(static (conn, interval) => conn.OnHeartbeat(interval), this);
+            SetPoolHeartbeatRegistration(poolContext.OnHeartbeat(static (conn, interval) => conn.OnHeartbeat(interval), this));
         }
         else
         {
-            _selfHeartbeat = new Heartbeat(options.HeartbeatInterval);
-            _selfHeartbeat.Register(OnHeartbeat);
+            var heartbeat = new Heartbeat(options.HeartbeatInterval);
+            heartbeat.Register(OnHeartbeat);
+            SetSelfHeartbeat(heartbeat);
         }
+    }
+
+    void SetSelfHeartbeat(Heartbeat heartbeat)
+    {
+        if (Volatile.Read(ref _sessionLifetimeReleased) != 0)
+        {
+            heartbeat.Dispose();
+            return;
+        }
+
+        _selfHeartbeat = heartbeat;
+        if (Volatile.Read(ref _sessionLifetimeReleased) != 0)
+            Interlocked.Exchange(ref _selfHeartbeat, null)?.Dispose();
     }
 
     // Heartbeat tick: opportunity to start a maintenance flow if work has accumulated, then drive
@@ -189,17 +205,36 @@ sealed class PgConnection : IPoolConnection<PgConnection>
 
     // IPoolConnection<PgConnection>
     public bool IsIdle => _protocol.IsIdle;
-    public bool IsCompleted => _protocol.IsCompleted;
+    public bool IsSchedulable => _protocol.IsSchedulable;
+    public Task Completion => _protocol.Completion;
     public Exception? CompletionException => _protocol.CompletionException;
     public int CompareTo(PgConnection? other) => _protocol.CompareTo(other?._protocol);
 
-    public ValueTask CompleteAsync(Exception? exception = null)
+    public Task CompleteAsync(Exception? exception = null) => _protocol.CompleteAsync(exception);
+
+    void SetPoolHeartbeatRegistration(IDisposable registration)
     {
-        // Tracker deregister happens here (true session end), not on per-lease proxy Dispose.
-        // PgConnection's lifetime spans many leases under pooling.
+        if (Volatile.Read(ref _sessionLifetimeReleased) != 0)
+        {
+            registration.Dispose();
+            return;
+        }
+
+        _poolHeartbeatRegistration = registration;
+        if (Volatile.Read(ref _sessionLifetimeReleased) != 0)
+            Interlocked.Exchange(ref _poolHeartbeatRegistration, null)?.Dispose();
+    }
+
+    void ReleaseSessionLifetime()
+    {
+        if (Interlocked.Exchange(ref _sessionLifetimeReleased, 1) != 0)
+            return;
+
+        Interlocked.Exchange(ref _poolHeartbeatRegistration, null)?.Dispose();
+        Interlocked.Exchange(ref _selfHeartbeat, null)?.Dispose();
+        // PgConnection spans many ADO leases; tracker membership follows the protocol session,
+        // ending at terminal completion/eviction rather than per-lease proxy disposal.
         _tracker?.Deregister(this);
-        _selfHeartbeat?.Dispose();
-        return new ValueTask(_protocol.CompleteAsync(exception));
     }
 
     public TrackedStatus GetTrackedStatus(TrackedCommand tracked)

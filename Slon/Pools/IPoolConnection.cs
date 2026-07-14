@@ -4,16 +4,20 @@ namespace Slon.Pools;
 public interface IPoolConnection<TSelf>
     where TSelf : class, IPoolConnection<TSelf>
 {
-    ValueTask CompleteAsync(Exception? exception = null);
+    Task CompleteAsync(Exception? exception = null);
 
     bool IsIdle { get; }
-    bool IsCompleted { get; }
+    /// Advisory scheduling predicate. False while new work must not be placed: during shutdown,
+    /// terminal completion, or a transient recovery that has taken continuity away. A successful
+    /// recovery may make it true again. The definitive decision remains the scheduling callback.
+    bool IsSchedulable { get; }
+    /// Passive terminal observation. Must be the same fully-quiet completion represented by
+    /// <see cref="CompleteAsync"/>, without initiating completion itself.
+    Task Completion { get; }
     int CompareTo(TSelf? other);
 
-    /// Called by the pool exactly once, after the create-path has committed the lease for this
-    /// connection. Implementations should use this to unblock any idle-channel publication that
-    /// was suppressed during initial startup. Without the gate, depth-to-zero transitions
-    /// during startup would publish the connection as available before the pool's
-    /// future.Complete had assigned it to its first lessee.
+    /// Called by the pool exactly once after the fully-created connection has been installed in
+    /// its pool slot, and before any initial work is scheduled. Implementations should use this
+    /// admission boundary to enable idle-channel publication.
     void Start();
 }

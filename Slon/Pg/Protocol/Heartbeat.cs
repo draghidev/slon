@@ -18,6 +18,7 @@ public sealed class Heartbeat : IDisposable
     ActionNode? _actionHead;
     ActionNode? _actionTail;
     Action<TimeSpan, TimeSpan>? _onDrift;
+    bool _disposed;
 
     /// Invoked when a tick arrives later than <see cref="DriftThresholdMultiplier"/> times the
     /// requested interval. Callback receives (requestedInterval, actualElapsed). Wire to a
@@ -43,6 +44,7 @@ public sealed class Heartbeat : IDisposable
             using (_timer)
             {
                 var tasks = new List<Task>();
+                var actions = new List<Func<TimeSpan, ValueTask>>();
                 // 0 = no previous tick observed yet; the first tick has no prior reference
                 // to measure drift against, so we just stamp it and skip the check.
                 long previousTickTimestamp = 0;
@@ -56,14 +58,25 @@ public sealed class Heartbeat : IDisposable
 
                     try
                     {
-                        var next = _actionHead;
-                        while (next is not null)
+                        // Snapshot registrations so callbacks execute without holding the lifetime
+                        // lock. Unregistration can then physically unlink its node and release the
+                        // captured connection immediately; a callback already in this tick's
+                        // snapshot may finish once, as with any concurrent disposal boundary.
+                        lock (_lock)
+                        {
+                            var next = _actionHead;
+                            while (next is not null)
+                            {
+                                actions.Add(next.Action!);
+                                next = next.Next;
+                            }
+                        }
+
+                        foreach (var action in actions)
                         {
                             // TODO this smells, for flexibility the signature should be ValueTask, but there is no ValueTask.WhenAll.
                             // TODO even though single await (and continuation) IValueTaskSources would be perfectly compatible with WhenAny/All etc.
-                            var task = next.Action(period).AsTask();
-                            tasks.Add(task);
-                            next = next.Next;
+                            tasks.Add(action(period).AsTask());
                         }
                         await Task.WhenAll(tasks).ConfigureAwait(false);
 
@@ -85,7 +98,7 @@ public sealed class Heartbeat : IDisposable
                         //TODO log
                     }
 
-                    tasks.TrimExcess();
+                    actions.Clear();
                     tasks.Clear();
                 }
             }
@@ -97,24 +110,81 @@ public sealed class Heartbeat : IDisposable
         _timer.Period = interval;
     }
 
-    public void Register(Func<TimeSpan, ValueTask> action)
+    public IDisposable Register(Func<TimeSpan, ValueTask> action)
     {
         lock (_lock)
         {
-            var node = new ActionNode(action);
+            if (_disposed)
+                throw new ObjectDisposedException(nameof(Heartbeat));
+
+            var node = new ActionNode(this, action) { Previous = _actionTail };
             if (_actionTail is not null)
                 _actionTail.Next = node;
-            if (_actionHead is null)
+            else
                 _actionHead = node;
             _actionTail = node;
+            return node;
         }
     }
 
-    public void Dispose() => _timer.Dispose();
-
-    sealed class ActionNode(Func<TimeSpan, ValueTask> action)
+    void Unregister(ActionNode node)
     {
-        public Func<TimeSpan, ValueTask> Action { get; } = action;
-        public ActionNode? Next { get; set; }
+        lock (_lock)
+        {
+            if (!ReferenceEquals(node.Owner, this))
+                return;
+
+            if (node.Previous is { } previous)
+                previous.Next = node.Next;
+            else
+                _actionHead = node.Next;
+
+            if (node.Next is { } next)
+                next.Previous = node.Previous;
+            else
+                _actionTail = node.Previous;
+
+            node.Detach();
+        }
     }
+
+    public void Dispose()
+    {
+        lock (_lock)
+        {
+            if (_disposed)
+                return;
+
+            _disposed = true;
+            var next = _actionHead;
+            while (next is not null)
+            {
+                var current = next;
+                next = next.Next;
+                current.Detach();
+            }
+            _actionHead = _actionTail = null;
+        }
+
+        _timer.Dispose();
+    }
+
+    sealed class ActionNode(Heartbeat owner, Func<TimeSpan, ValueTask> action) : IDisposable
+    {
+        public Heartbeat? Owner { get; private set; } = owner;
+        public Func<TimeSpan, ValueTask>? Action { get; private set; } = action;
+        public ActionNode? Previous { get; set; }
+        public ActionNode? Next { get; set; }
+
+        public void Dispose() => Owner?.Unregister(this);
+
+        public void Detach()
+        {
+            Owner = null;
+            Action = null;
+            Previous = null;
+            Next = null;
+        }
+    }
+
 }
