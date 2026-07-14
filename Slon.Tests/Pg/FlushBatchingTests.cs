@@ -1,5 +1,6 @@
 using System.Buffers.Binary;
 using System.IO.Pipelines;
+using Draghi.Pipelining;
 using Slon.Pg;
 using Slon.Pg.Protocol;
 using Slon.Pg.Protocol.Flows;
@@ -13,9 +14,9 @@ namespace Slon.Tests.Pg;
 // in-memory transport counts physical flushes (each non-empty FlushAsync = one wire segment). Flows park
 // on their reads (no responses fed), so we measure writes only and tear the protocol down at the end.
 //
-// Two feed shapes: a synchronous burst (all N co-queued before the executor drains -> should be 1 segment)
-// and concurrent producers racing the executor (the multiplexed-pool condition). The contrast tells us
-// whether the mechanism works and the suite just isn't densely pipelined, or the coalescing itself is off.
+// The tests pause the configured execution scheduler before submitting the measured flows. This makes
+// co-queueing a property of the fixture rather than a timing assumption, so physical flush count is a
+// stable assertion and production code needs no test-only park/flush counters.
 [TestClass]
 [DoNotParallelize]
 public class FlushBatchingTests
@@ -36,15 +37,21 @@ public class FlushBatchingTests
         return b.AsSpan(0, o).ToArray();
     }
 
-    static async Task<(PgClientProtocol, FlushCountingTransport)> CreateAsync()
+    static async Task<(PgClientProtocol, FlushCountingTransport, PausableScheduler)> CreateAsync()
     {
         var options = new PgClientOptions { EndPoint = TestEndPoint.Default, Username = "postgres", Password = "postgres123", Database = "postgres" };
         var transport = new FlushCountingTransport(Handshake());
+        var scheduler = new PausableScheduler();
         // Long timeouts so the parked (response-less) flows aren't aborted while we measure writes.
-        var protocolOptions = new PgClientProtocolOptions(options) { CompletionTimeout = TimeSpan.FromSeconds(30), HeartbeatInterval = TimeSpan.FromSeconds(5) };
+        var protocolOptions = new PgClientProtocolOptions(options)
+        {
+            CompletionTimeout = TimeSpan.FromSeconds(30),
+            HeartbeatInterval = TimeSpan.FromSeconds(5),
+            ExecutionScheduler = scheduler
+        };
         var protocol = PgClientProtocol.Create(protocolOptions);
         await protocol.StartAsync(options, transport);
-        return (protocol, transport);
+        return (protocol, transport, scheduler);
     }
 
     static CommandFlow Cmd() => new(async: true, Command.Create("select 1"));
@@ -72,39 +79,157 @@ public class FlushBatchingTests
     [TestMethod]
     public async Task BurstEnqueue_Coalesces()
     {
-        var (p, t) = await CreateAsync();
+        var (p, t, scheduler) = await CreateAsync();
         try
         {
             var perCmd = await WarmAndMeasure(p, t);
             var baseBytes = t.Counter.FlushedBytes;
             var baseFlush = t.Counter.FlushCount;
-            for (var i = 0; i < N; i++)
-                Assert.IsTrue(p.TryQueue(Cmd()));               // co-queued before the executor drains
+            await scheduler.PauseAsync();
+            try
+            {
+                for (var i = 0; i < N; i++)
+                    Assert.IsTrue(p.TryQueue(Cmd(), mustPipeline: true));
+            }
+            finally { scheduler.Resume(); }
             await WaitForBytes(t, baseBytes + N * perCmd);
             var flushes = t.Counter.FlushCount - baseFlush;
-            Assert.IsTrue(flushes <= 2, $"a co-queued burst of {N} sub-threshold commands should coalesce to ~1 wire segment, saw {flushes}");
+            Assert.AreEqual(1, flushes,
+                $"a deterministically co-queued burst of {N} sub-threshold commands produced {flushes} wire segments");
         }
-        finally { await p.DisposeAsync(); }
+        finally
+        {
+            scheduler.Resume();
+            await p.DisposeAsync();
+        }
     }
 
-    [TestMethod, Ignore]
-    public async Task ConcurrentProducers_Coalesce()
+    [TestMethod]
+    public async Task ConcurrentProducers_WhenCoQueued_Coalesce()
     {
-        var (p, t) = await CreateAsync();
+        var (p, t, scheduler) = await CreateAsync();
         try
         {
             var perCmd = await WarmAndMeasure(p, t);
             var baseBytes = t.Counter.FlushedBytes;
             var baseFlush = t.Counter.FlushCount;
-            // N producers racing the executor - the multiplexed-pool condition (flows arrive from separate
-            // callers onto one wire). If the pre-park flush fires on a TryGetNext miss that immediately
-            // finds an item on the WaitCore retry, each lands as its own segment.
-            await Task.WhenAll(Enumerable.Range(0, N).Select(_ => Task.Run(() => Assert.IsTrue(p.TryQueue(Cmd())))));
+            await scheduler.PauseAsync();
+            try
+            {
+                await Task.WhenAll(Enumerable.Range(0, N).Select(_ => Task.Run(
+                    () => Assert.IsTrue(p.TryQueue(Cmd(), mustPipeline: true)))));
+            }
+            finally { scheduler.Resume(); }
             await WaitForBytes(t, baseBytes + N * perCmd);
             var flushes = t.Counter.FlushCount - baseFlush;
-            Assert.IsTrue(flushes <= 3, $"concurrent producers of {N} sub-threshold commands should still mostly coalesce, saw {flushes} segments (one-per-command = the pre-park flush firing before the has-item recheck)");
+            Assert.AreEqual(1, flushes,
+                $"{N} concurrent producers, co-queued before execution, produced {flushes} wire segments");
         }
-        finally { await p.DisposeAsync(); }
+        finally
+        {
+            scheduler.Resume();
+            await p.DisposeAsync();
+        }
+    }
+
+    // An arrival after the executor has decided to perform its idle flush is a new batch, even if it
+    // reaches the queue before WaitCore rechecks it. Pin that boundary explicitly instead of folding
+    // this legitimate race into the deterministic coalescing assertions above.
+    [TestMethod]
+    public async Task EnqueueDuringIdleFlush_FormsNextBatch()
+    {
+        var (p, t, scheduler) = await CreateAsync();
+        try
+        {
+            var perCmd = await WarmAndMeasure(p, t);
+            var baseBytes = t.Counter.FlushedBytes;
+            var baseFlush = t.Counter.FlushCount;
+            var racedEnqueue = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            t.Counter.RunBeforeNextNonEmptyFlush(
+                () => racedEnqueue.TrySetResult(p.TryQueue(Cmd(), mustPipeline: true)));
+            Assert.IsTrue(p.TryQueue(Cmd(), mustPipeline: true));
+            Assert.IsTrue(await racedEnqueue.Task.WaitAsync(SettleTimeout));
+            await WaitForBytes(t, baseBytes + 2 * perCmd);
+            Assert.AreEqual(2, t.Counter.FlushCount - baseFlush);
+        }
+        finally
+        {
+            scheduler.Resume();
+            await p.DisposeAsync();
+        }
+    }
+
+    sealed class PausableScheduler : PipelineScheduler
+    {
+        readonly object _sync = new();
+        readonly Queue<Work> _held = new();
+        TaskCompletionSource? _idle;
+        bool _paused;
+        int _running;
+
+        public Task PauseAsync()
+        {
+            lock (_sync)
+            {
+                _paused = true;
+                return _running is 0
+                    ? Task.CompletedTask
+                    : (_idle ??= new(TaskCreationOptions.RunContinuationsAsynchronously)).Task;
+            }
+        }
+
+        public void Resume()
+        {
+            Work[] held;
+            lock (_sync)
+            {
+                _paused = false;
+                held = _held.ToArray();
+                _held.Clear();
+            }
+            foreach (var work in held)
+                SubmitDetached(work.Action, work.State, work.PreferLocal);
+        }
+
+        public override void SubmitDetached(Action<object?> action, object? state, bool preferLocal = true)
+        {
+            var work = new Work(action, state, preferLocal);
+            lock (_sync)
+            {
+                if (_paused)
+                {
+                    _held.Enqueue(work);
+                    return;
+                }
+                _running++;
+            }
+            PipelineScheduler.ThreadPool.SubmitDetached(static state => ((Dispatch)state!).Run(), new Dispatch(this, work), preferLocal);
+        }
+
+        void Finished()
+        {
+            TaskCompletionSource? idle = null;
+            lock (_sync)
+            {
+                if (--_running is 0)
+                {
+                    idle = _idle;
+                    _idle = null;
+                }
+            }
+            idle?.TrySetResult();
+        }
+
+        readonly record struct Work(Action<object?> Action, object? State, bool PreferLocal);
+
+        sealed class Dispatch(PausableScheduler scheduler, Work work)
+        {
+            public void Run()
+            {
+                try { work.Action(work.State); }
+                finally { scheduler.Finished(); }
+            }
+        }
     }
 
     sealed class FlushCountingTransport : TransportConnection
@@ -127,8 +252,10 @@ public class FlushBatchingTests
         public sealed class CountingWriter(PipeWriter inner) : PipeWriter
         {
             long _unflushed;
+            Action? _beforeNextNonEmptyFlush;
             public int FlushCount;
             public long FlushedBytes;
+            public void RunBeforeNextNonEmptyFlush(Action action) => Volatile.Write(ref _beforeNextNonEmptyFlush, action);
             // The protocol reads UnflushedBytes for the flush-threshold gate; the base PipeWriter throws
             // unless these delegate to the real (unflushed-tracking) pipe writer.
             public override bool CanGetUnflushedBytes => inner.CanGetUnflushedBytes;
@@ -143,6 +270,7 @@ public class FlushBatchingTests
             {
                 if (_unflushed > 0)
                 {
+                    Interlocked.Exchange(ref _beforeNextNonEmptyFlush, null)?.Invoke();
                     FlushCount++;
                     Volatile.Write(ref FlushedBytes, FlushedBytes + _unflushed);
                     _unflushed = 0;
