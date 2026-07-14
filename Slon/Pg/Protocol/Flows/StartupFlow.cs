@@ -95,19 +95,13 @@ sealed class StartupFlow : PgClientFlow
                     throw new InvalidOperationException("Unexpected authentication response.");
                 break;
             case AuthenticationType.GSS:
-                break;
             case AuthenticationType.GSSContinue:
-                break;
             case AuthenticationType.SSPI:
-                break;
             case AuthenticationType.SASL:
-                break;
             case AuthenticationType.SASLContinue:
-                break;
             case AuthenticationType.SASLFinal:
-                break;
             default:
-                throw new ArgumentOutOfRangeException(nameof(authType), authType, "Unknown authentication type");
+                throw new ArgumentOutOfRangeException(nameof(authType), authType, "Unsupported authentication type");
         }
 
         // PgClientFlow will handle ParameterStatus messages, so we just need to handle BackendKeyData and RFQ.
