@@ -251,7 +251,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
             // See https://www.postgresql.org/message-id/CADT4RqAH2nuVwM6cEugFL2z6apwXfP3OJb=zxR6jRgWEpx_2Ww@mail.gmail.com
             // https://github.com/pgjdbc/pgjdbc/issues/194
             // https://github.com/npgsql/npgsql/issues/641
-            var encoder = context.GetEncoder();
+            var encoder = IsAsync ? default : context.GetEncoder();
             if (IsAsync)
             {
                 writeTask = WriteAllCommandsAsync();
