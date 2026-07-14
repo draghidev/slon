@@ -95,6 +95,20 @@ sealed partial class PgClientProtocol
             // claim is held for the whole tenure and released in the cached flow's OnComplete - so a second
             // begin can never re-rent a still-live flyweight and stomp it.
             var flow = Interlocked.CompareExchange(ref _cachedLeased, 1, 0) == 0 ? _cachedFlow : NewFlow();
+            // Consumption gate: the release (completion-action, cascade-final) can precede the prior
+            // scope's WaitForComplete continuation actually running - its GetResult token is still
+            // live, and the Reset below would bump the version under it (a stale-token throw on the
+            // close path). Rentability is release AND consumption: while the signal is unconsumed,
+            // undo the claim and take an overflow flow; the consuming GetResult clears the flag
+            // (consume-then-clear, release/acquire), after which the next rent may Reset safely.
+            // Not a Dekker: registration happens-before retirement (the CompleteScopeAsync hoist),
+            // which happens-before the release Exchange, which the claim CAS above acquires - so this
+            // read cannot miss a registered waiter. A flow with no waiter leaves the flag clear.
+            if (ReferenceEquals(flow, _cachedFlow) && flow.CompletionWaiterPending)
+            {
+                Interlocked.Exchange(ref _cachedLeased, 0);
+                flow = NewFlow();
+            }
             if (flow.IsCompleted)
                 flow.Reset();
             return flow;

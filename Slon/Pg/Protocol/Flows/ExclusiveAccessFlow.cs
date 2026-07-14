@@ -182,11 +182,16 @@ sealed class ExclusiveAccessFlow : PgClientFlow
         // (null reason) reaches rest immediately and leaves the scope signal untripped - the flyweight
         // is reusable for the next scope.
         await _completeInner(null).ConfigureAwait(false);
+        // Register the completion waiter BEFORE unleashing retirement: the token capture must
+        // happen-before the signal fires, so RentFlow's consumption gate observes the pending waiter
+        // for the whole release-to-consumption window (a late capture could land on a version the
+        // next tenure's Reset already bumped).
+        var completion = WaitForComplete();
         _scopeEnded.TrySetResult();
         // WaitForComplete resolves only after the framework has run OnComplete (Complete orders teardown
         // before the done-signal), so on return the prior tenure is provably fully torn down and the
         // flyweight is safe for the next BeginExclusiveScope to re-Initialize.
-        await WaitForComplete().ConfigureAwait(false);
+        await completion.ConfigureAwait(false);
     }
 
     protected override async ValueTask<FlowTasks> ExecuteAuto(Context context)

@@ -52,6 +52,9 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
     // pattern). At most one pending waiter per tenure; post-completion awaits resolve
     // synchronously.
     Slon.Threading.Tasks.Sources.ManualResetValueTaskSourceCore<PgClientFlow> _completionCore;
+    // 1 while a WaitForComplete token is live (set at capture, cleared after GetResult consumed the
+    // core). Guards reuse: Reset bumps the core's version, so it must not run while this is set.
+    int _completionWaiterPending;
 
     // Activation state.
     Slon.Threading.Tasks.Sources.ManualResetValueTaskSourceCore<PgDecoder> _activationTaskSource;
@@ -156,13 +159,30 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
     internal ValueTask<PgClientFlow> WaitForComplete(CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        // Publish waiter-pending before the token capture: a reuse path that observes the flag
+        // clear (acquire) is guaranteed the consumption below already happened, so a Reset cannot
+        // invalidate a live token. Ordering contract on reuse-tracked flows: register BEFORE the
+        // enqueue (always safe - the tenure doesn't exist yet, covers autonomous flows), or before
+        // unleashing retirement for a consumer that controls it (the exclusive close path). Any
+        // later registration races Reset and can capture the wrong tenure's version - undefined,
+        // and asserted against in Reset. (A late-await API would need a generation-checked capture:
+        // a single packed gen|pending word, CAS on both sides - deferred until pooling needs it.)
+        Volatile.Write(ref _completionWaiterPending, 1);
         return new(this, _completionCore.Version);
     }
+
+    /// True while a completion waiter holds an unconsumed token on this tenure's signal. Reuse
+    /// paths (the exclusive flyweight's rent) must not Reset the flow while set: the waiter's
+    /// continuation may still be in dispatch and its GetResult would land on a bumped version.
+    internal bool CompletionWaiterPending => Volatile.Read(ref _completionWaiterPending) != 0;
 
     // Public for pooling. Reset is called by consumers between uses.
     public void Reset()
     {
         Debug.Assert(IsPending || IsCompleted, "Cannot reset a flow that is mid-execution.");
+        Debug.Assert(!CompletionWaiterPending,
+            "Reset while a completion waiter's token is live - the waiter's GetResult would land on a bumped version. " +
+            "Reuse paths must gate on CompletionWaiterPending (consumption), not on completion.");
         // Enforcement (TODO until landed). Pooling (reset + reuse) a flow that arms the activation
         // timeout is unsafe: the heartbeat's activation-timeout TrySetException is generation-agnostic,
         // so a recycled instance can be wrong-tenure-completed by a stale timeout from the prior tenure.
@@ -214,7 +234,20 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
     // bare flow ref. Keeps the handoff primitive off PgClientFlow's internal API, like _rfqCount.
     protected virtual ManualResetEventSlim? GetHandoffMres() => null;
 
-    PgClientFlow IValueTaskSource<PgClientFlow>.GetResult(short token) => _completionCore.GetResult(token);
+    PgClientFlow IValueTaskSource<PgClientFlow>.GetResult(short token)
+    {
+        // Consume-then-clear: the release store orders the core consumption before the flag clear,
+        // so a reuse path's acquire read of "not pending" proves the token's lifetime ended. Fault
+        // delivery (GetResult throwing the completion exception) is consumption too.
+        try
+        {
+            return _completionCore.GetResult(token);
+        }
+        finally
+        {
+            Volatile.Write(ref _completionWaiterPending, 0);
+        }
+    }
     ValueTaskSourceStatus IValueTaskSource<PgClientFlow>.GetStatus(short token) => _completionCore.GetStatus(token);
     void IValueTaskSource<PgClientFlow>.OnCompleted(Action<object?> continuation, object? state, short token, ValueTaskSourceOnCompletedFlags flags)
         => _completionCore.OnCompleted(continuation, state, token, flags);
