@@ -1,0 +1,444 @@
+using System.Net;
+using System.Runtime.CompilerServices;
+using Microsoft.VisualStudio.TestTools.UnitTesting;
+using Slon.Pg;
+using Slon.Pg.Protocol;
+using Slon.Pg.Protocol.Flows;
+using Slon.Runtime.CompilerServices;
+using Slon.Transport;
+
+namespace Slon.Tests;
+
+// End-to-end tests for PgClientProtocol.Policy.TryRecoverItemFailure and the substitute
+// RecoveryDrainFlow it returns. Each test wires a real PG connection, queues a deliberately
+// throwing flow at a chosen failure point, then verifies that subsequent flows on the same
+// protocol still succeed (the wire was cleaned by the recovery item).
+//
+// The throwing flow lives in this file (FaultingFlow) so the failure phase is controllable
+// per test without leaking into the production flow library.
+//
+// Verification contract note. The pipeline framework deliberately does NOT complete a failed
+// item when TryRecoverItemFailure returns true - the recovery item substitutes for it, and the
+// POLICY completes the failed flow when the recovery completes (RecoveryDrainFlow.BindFailedFlow
+// -> CompleteItem's binding discharge; the failed item's lifetime extends as far as the
+// recovery does). Most tests still verify via the next flow succeeding (the wire was cleaned);
+// the failed flow's own completion carries its original exception, plus the recovery's fault
+// when the recovery itself died (see RecoveryItselfFails_FailedFlowCompletes_WithBothFaults).
+[TestClass]
+public class RecoveryTests
+{
+    static PgClientOptions NewOptions() => new()
+    {
+        EndPoint = new IPEndPoint(IPAddress.Loopback, 5432),
+        Username = "postgres",
+        Password = "postgres123",
+        Database = "postgres",
+    };
+
+    static async Task<PgClientProtocol> ConnectAsync()
+    {
+        var options = NewOptions();
+        var transport = await SocketStreamConnection.ConnectAsync((IPEndPoint)options.EndPoint);
+        var protocol = PgClientProtocol.Create(new PgClientProtocolOptions(options));
+        await protocol.StartAsync(options, transport);
+        return protocol;
+    }
+
+    static async Task RunAsync(PgClientProtocol protocol, string sql)
+    {
+        var flow = new CommandFlow(async: true, Command.Create(sql));
+        Assert.IsTrue(protocol.TryQueue(flow));
+        var e = flow.GetAsyncEnumerator();
+        while (await e.MoveNextAsync()) { }
+        await e.DisposeAsync();
+    }
+
+    static async Task RunSync(PgClientProtocol protocol, string sql)
+    {
+        var flow = new CommandFlow(async: false, Command.Create(sql));
+        Assert.IsTrue(protocol.TryQueue(flow));
+        var e = flow.GetEnumerator();
+        while (e.MoveNext()) { }
+        await e.DisposeAsync();
+    }
+
+    // Where the FaultingFlow's body throws. PreReturn = before returning FlowTasks (surfaces
+    // as PipelineItemFailureKind.ExecuteItemTask). PipelineTask = the returned pipeline task
+    // faults (PipelineItemFailureKind.PipelineTask or PipelineTaskWaiter). TrailingTask = the
+    // returned trailing execution task faults (PipelineItemFailureKind.TrailingExecutionTask).
+    internal enum FaultPhase
+    {
+        PreReturn,
+        PipelineTask,
+        TrailingTask
+    }
+
+    // What to write to the wire before the body throws. Determines the RFQ obligation and
+    // pending-byte state the recovery sees.
+    internal enum WriteShape
+    {
+        None,
+        QueryNoFlush,
+        ParseBindExecuteNoSync,
+        MultipleSyncsNoFlush
+    }
+
+    // Test flow that lets each test pick its failure phase and write shape. Recovery's input
+    // signal is the failed flow's recorded write state (rfqCount, lastMessageInducesRfq,
+    // protocol's unflushed bytes), so faithful reproduction of those wire states is the
+    // primary job here.
+    internal sealed class FaultingFlow : PgClientFlow
+    {
+        readonly FaultPhase _phase;
+        readonly WriteShape _shape;
+        readonly ValueTaskSourcePromise<bool> _readPromise = new();
+
+        /// Runs after the write shape lands but before the fault fires. Lets a test kill the
+        /// transport at the exact point where the flow's own writes succeeded but the
+        /// recovery's wire I/O will fail (see RecoveryItselfFails_*).
+        public Action? AfterWrites { get; init; }
+
+        public FaultingFlow(bool async, FaultPhase phase, WriteShape shape)
+            : base(supportsPipelining: true)
+        {
+            _phase = phase;
+            _shape = shape;
+            IsAsync = async;
+        }
+
+        protected override ValueTask<FlowTasks> ExecuteAuto(Context context)
+        {
+            var encoder = context.GetEncoder();
+            switch (_shape)
+            {
+                case WriteShape.None:
+                    break;
+                case WriteShape.QueryNoFlush:
+                    encoder.WriteQuery("select 1");
+                    break;
+                case WriteShape.ParseBindExecuteNoSync:
+                    encoder.WriteParse("select 1");
+                    encoder.WriteBind();
+                    encoder.WriteExecute();
+                    break;
+                case WriteShape.MultipleSyncsNoFlush:
+                    encoder.WriteSync();
+                    encoder.WriteSync();
+                    encoder.WriteSync();
+                    break;
+            }
+
+            AfterWrites?.Invoke();
+
+            if (_phase is FaultPhase.PreReturn)
+                throw new InvalidOperationException("FaultingFlow pre-return synthetic failure.");
+
+            ValueTask pipelineTask = _phase is FaultPhase.PipelineTask
+                ? FailedTask()
+                : ValueTask.CompletedTask;
+            ValueTask trailingTask = _phase is FaultPhase.TrailingTask
+                ? FailedTask()
+                : default;
+
+            return new(new FlowTasks(trailingExecutionTask: trailingTask, pipelineTask: pipelineTask));
+
+            static ValueTask FailedTask()
+                => new(Task.FromException(new InvalidOperationException("FaultingFlow synthetic failure.")));
+        }
+    }
+
+    // Pipeline-task failure: the read phase faults. Recovery sees the failed flow's recorded
+    // state and constructs a no-op drain (nothing written, nothing pending) so the wire stays
+    // intact and the next flow runs cleanly.
+    //
+    // Verification: queue the faulting flow (do NOT await its completion, the pipeline
+    // contract abandons it when recovery succeeds), then queue and await the next flow. If
+    // the next flow completes successfully recovery worked.
+    [TestMethod]
+    public async Task PipelineTask_FailureRecovers_NextFlowSucceeds()
+    {
+        var protocol = await ConnectAsync();
+        try
+        {
+            var faulting = new FaultingFlow(async: true, FaultPhase.PipelineTask, WriteShape.None);
+            Assert.IsTrue(protocol.TryQueue(faulting));
+
+            await RunAsync(protocol, "select 1");
+        }
+        finally { await protocol.CompleteAsync(); }
+    }
+
+    // Execute-item-task failure (PreReturn throw) after a Query was written but not flushed.
+    // _rfqCount is 1, _lastMessageInducesRfq is true, UnflushedBytes > 0. Recovery doesn't
+    // inject a Sync (lastMessageInducesRfq is true) and flushes the Query so the server
+    // produces its RFQ, which the drain consumes.
+    [TestMethod]
+    public async Task ExecuteItemTask_FailureRecovers_NextFlowSucceeds()
+    {
+        var protocol = await ConnectAsync();
+        try
+        {
+            var faulting = new FaultingFlow(async: true, FaultPhase.PreReturn, WriteShape.QueryNoFlush);
+            Assert.IsTrue(protocol.TryQueue(faulting));
+
+            await RunAsync(protocol, "select 1");
+        }
+        finally { await protocol.CompleteAsync(); }
+    }
+
+    // Trailing-execution-task failure. The policy treats this uniformly with ExecuteItemTask:
+    // trailing failures don't revoke the flow's write privileges on the protocol, so the
+    // recovery flow can flush pending bytes and inject a Sync normally. If the underlying wire
+    // is actually dead the recovery flow's own flush/drain will surface that exception. If the
+    // wire is alive (cancellation, timeout, encoder hiccup), recovery cleans up and the next
+    // flow proceeds.
+    [TestMethod]
+    public async Task TrailingExecutionTask_FailureRecovers_NextFlowSucceeds()
+    {
+        var protocol = await ConnectAsync();
+        try
+        {
+            var faulting = new FaultingFlow(async: true, FaultPhase.TrailingTask, WriteShape.None);
+            Assert.IsTrue(protocol.TryQueue(faulting));
+
+            await RunAsync(protocol, "select 1");
+        }
+        finally { await protocol.CompleteAsync(); }
+    }
+
+    // Parse+Bind+Execute then throw pre-return. _rfqCount is 0, _lastMessageInducesRfq is
+    // false, UnflushedBytes > 0. Recovery's injectSync gate fires (drainCount becomes 1) and
+    // the recovery flushes the pending bytes so the server actually processes them.
+    [TestMethod]
+    public async Task WriterStateRemediation_NoSyncSent_RecoveryInjectsSync()
+    {
+        var protocol = await ConnectAsync();
+        try
+        {
+            var faulting = new FaultingFlow(async: true, FaultPhase.PreReturn, WriteShape.ParseBindExecuteNoSync);
+            Assert.IsTrue(protocol.TryQueue(faulting));
+
+            // Multiple subsequent flows succeed: confirms the recovery's injected Sync drained
+            // the extended-protocol sequence cleanly and no stray RFQ was left on the wire.
+            for (int i = 0; i < 3; i++)
+                await RunAsync(protocol, "select 1");
+        }
+        finally { await protocol.CompleteAsync(); }
+    }
+
+    // Three Syncs written without flush, then pre-return throw. _rfqCount is 3,
+    // _lastMessageInducesRfq is true, UnflushedBytes > 0. Recovery doesn't inject a Sync
+    // (drainCount stays at 3) and flushes so all three Syncs hit the server. Drain consumes
+    // exactly three RFQs.
+    //
+    // Verification: run several subsequent flows. Any miscount would leave an extra RFQ on
+    // the wire that the next CommandFlow would consume out of order and either fail or
+    // mis-decode. Running multiple successful flows after recovery is the cleanest plumb of
+    // "all RFQs were drained, exactly zero leftovers" since the protocol doesn't expose the
+    // drain counter directly.
+    [TestMethod]
+    public async Task MultipleRfqsOutstanding_DrainsAllBeforeNext()
+    {
+        var protocol = await ConnectAsync();
+        try
+        {
+            var faulting = new FaultingFlow(async: true, FaultPhase.PreReturn, WriteShape.MultipleSyncsNoFlush);
+            Assert.IsTrue(protocol.TryQueue(faulting));
+
+            for (int i = 0; i < 5; i++)
+                await RunAsync(protocol, "select 1");
+        }
+        finally { await protocol.CompleteAsync(); }
+    }
+
+    // The recovery flow's async mode is inherited from the failed flow's IsAsyncAtBind. An
+    // async-failed flow yields an async recovery, so the drain decode does not block the
+    // executor on a sync path. Verified end-to-end: async failure followed by an async flow
+    // succeeds without deadlock.
+    [TestMethod]
+    public async Task AsyncFlowFailure_RecoveryUsesAsyncMode()
+    {
+        var protocol = await ConnectAsync();
+        try
+        {
+            var faulting = new FaultingFlow(async: true, FaultPhase.PreReturn, WriteShape.QueryNoFlush);
+            Assert.IsTrue(protocol.TryQueue(faulting));
+
+            await RunAsync(protocol, "select 1");
+        }
+        finally { await protocol.CompleteAsync(); }
+    }
+
+    // Sync-failed flow: the recovery is constructed with async=false. The substitute is run
+    // through the executor's normal path (recovery items aren't enqueued via the sync
+    // handoff), but the inherited IsAsync flag guards the recovery's own dispatch shape.
+    // End-to-end: a sync flow fails, a sync flow runs after, both complete. Confirms the
+    // recovery handed off cleanly between the two sync caller threads without stranding the
+    // executor.
+    [TestMethod]
+    public async Task SyncFlowFailure_RecoveryHandoffWorks()
+    {
+        var protocol = await ConnectAsync();
+        try
+        {
+            var faulting = new FaultingFlow(async: false, FaultPhase.PreReturn, WriteShape.QueryNoFlush);
+            Assert.IsTrue(protocol.TryQueue(faulting));
+
+            await RunSync(protocol, "select 1");
+        }
+        finally { await protocol.CompleteAsync(); }
+    }
+
+    // Pipelined sibling behind a faulting flow. Both are queued back to back, the first
+    // faults pre-return with bytes already buffered. Recovery has to clean the wire AND
+    // preserve the sibling's queue position so the sibling can still run. End-to-end: queue
+    // both, the sibling completes successfully on the same protocol.
+    [TestMethod]
+    public async Task FaultingFlow_WithPipelinedSibling_SiblingCompletes()
+    {
+        var protocol = await ConnectAsync();
+        try
+        {
+            var faulting = new FaultingFlow(async: true, FaultPhase.PreReturn, WriteShape.QueryNoFlush);
+            var sibling = new CommandFlow(async: true, Command.Create("select 1"));
+            Assert.IsTrue(protocol.TryQueue(faulting));
+            Assert.IsTrue(protocol.TryQueue(sibling));
+
+            var e = sibling.GetAsyncEnumerator();
+            while (await e.MoveNextAsync()) { }
+            await e.DisposeAsync();
+        }
+        finally { await protocol.CompleteAsync(); }
+    }
+
+    // Two faulting flows back to back. The first fails, the second is enqueued behind, also
+    // fails. Recovery must handle the second recovery on top of the first, leaving the wire
+    // clean for a third (healthy) flow. Confirms recovery composes with itself.
+    [TestMethod]
+    public async Task BackToBackFailures_RecoveryComposes()
+    {
+        var protocol = await ConnectAsync();
+        try
+        {
+            var f1 = new FaultingFlow(async: true, FaultPhase.PreReturn, WriteShape.QueryNoFlush);
+            var f2 = new FaultingFlow(async: true, FaultPhase.PreReturn, WriteShape.QueryNoFlush);
+            Assert.IsTrue(protocol.TryQueue(f1));
+            Assert.IsTrue(protocol.TryQueue(f2));
+
+            await RunAsync(protocol, "select 1");
+        }
+        finally { await protocol.CompleteAsync(); }
+    }
+
+    // Multi-command CommandFlow that succeeds after recovery clears a prior failed flow.
+    // Confirms recovery's wire-cleanup doesn't disturb the multi-command read state machine
+    // that a subsequent flow's iteration depends on.
+    [TestMethod]
+    public async Task MultiCommandFlow_AfterRecovery_Completes()
+    {
+        var protocol = await ConnectAsync();
+        try
+        {
+            var faulting = new FaultingFlow(async: true, FaultPhase.PreReturn, WriteShape.ParseBindExecuteNoSync);
+            Assert.IsTrue(protocol.TryQueue(faulting));
+
+            var multi = new CommandFlow(async: true, Command.Create("select 1"), Command.Create("select 2"), Command.Create("select 3"));
+            Assert.IsTrue(protocol.TryQueue(multi));
+            var e = multi.GetAsyncEnumerator();
+            while (await e.MoveNextAsync()) { }
+            await e.DisposeAsync();
+        }
+        finally { await protocol.CompleteAsync(); }
+    }
+
+    // The recovery itself failing: the transport is dead by the time the recovery drain tries
+    // to flush, so the RecoveryDrainFlow faults instead of cleaning the wire. Two contracts
+    // under test: (1) recovery-of-recovery does not exist - the recovery's own fault completes
+    // it directly (in a Debug run, a policy re-consult would fire TryRecoverItemFailure's
+    // assert and crash the test); (2) the binding discharge still completes the FAILED flow on
+    // every recovery exit - with its original exception as primary and the recovery's fault
+    // attached (a flow's completion exception carries every failure that terminated its
+    // position).
+    //
+    // Deterministic by construction: the flow kills the writer (Writer.Complete - the
+    // PipeWriter's own lifecycle API, no disposal-ownership violation) AFTER its writes land
+    // but BEFORE its synthetic fault fires, so the original failure stays the synthetic one
+    // and the recovery's first wire I/O (the injected-Sync flush) hits a completed writer.
+    [TestMethod]
+    public async Task RecoveryItselfFails_FailedFlowCompletes_WithBothFaults()
+    {
+        var options = NewOptions();
+        var transport = await SocketStreamConnection.ConnectAsync((IPEndPoint)options.EndPoint);
+        var protocol = PgClientProtocol.Create(new PgClientProtocolOptions(options));
+        await protocol.StartAsync(options, transport);
+
+        var faulting = new FaultingFlow(async: true, FaultPhase.PipelineTask, WriteShape.ParseBindExecuteNoSync)
+        {
+            AfterWrites = () => transport.Writer.Complete(new IOException("synthetic transport death")),
+        };
+        Assert.IsTrue(protocol.TryQueue(faulting));
+
+        Exception? completion = null;
+        try
+        {
+            await faulting.WaitForComplete().AsTask().WaitAsync(TimeSpan.FromSeconds(10));
+        }
+        catch (Exception ex)
+        {
+            completion = ex;
+        }
+
+        Assert.IsInstanceOfType<AggregateException>(completion,
+            $"Failed flow must complete with both terminal facts when the recovery also died. Got: {completion}");
+        var aggregate = (AggregateException)completion;
+        Assert.AreEqual(2, aggregate.InnerExceptions.Count);
+        Assert.IsInstanceOfType<InvalidOperationException>(aggregate.InnerExceptions[0],
+            "The original failure is the primary.");
+        StringAssert.Contains(aggregate.InnerExceptions[0].Message, "synthetic");
+        // The recovery's flush over the completed writer surfaces as ObjectDisposedException
+        // (the PipeWriter completed-writer convention) - the recovery's own terminal fact,
+        // riding behind the original.
+        Assert.IsInstanceOfType<ObjectDisposedException>(aggregate.InnerExceptions[1]);
+    }
+
+    // Read-side death: the recovery's flush SUCCEEDS (writer alive), and its DrainPhase read
+    // faults instead - the recovery's PIPELINE task rather than its trailing task. This is the
+    // guarded-task path end to end in the real protocol: the recovery commits as an ordinary
+    // tail, its late fault travels as the framework's marker, and the framework completes it
+    // directly (a policy re-consult would fire TryRecoverItemFailure's assert in this Debug
+    // run). The failed flow still completes with both terminal facts.
+    [TestMethod]
+    public async Task RecoveryReadFails_FailedFlowCompletes_WithBothFaults()
+    {
+        var options = NewOptions();
+        var transport = await SocketStreamConnection.ConnectAsync((IPEndPoint)options.EndPoint);
+        var protocol = PgClientProtocol.Create(new PgClientProtocolOptions(options));
+        await protocol.StartAsync(options, transport);
+
+        var faulting = new FaultingFlow(async: true, FaultPhase.PipelineTask, WriteShape.ParseBindExecuteNoSync)
+        {
+            AfterWrites = () => transport.Reader.Complete(new IOException("synthetic read death")),
+        };
+        Assert.IsTrue(protocol.TryQueue(faulting));
+
+        Exception? completion = null;
+        try
+        {
+            await faulting.WaitForComplete().AsTask().WaitAsync(TimeSpan.FromSeconds(10));
+        }
+        catch (Exception ex)
+        {
+            completion = ex;
+        }
+
+        Assert.IsInstanceOfType<AggregateException>(completion,
+            $"Failed flow must complete with both terminal facts when the recovery also died. Got: {completion}");
+        var aggregate = (AggregateException)completion;
+        Assert.AreEqual(2, aggregate.InnerExceptions.Count);
+        Assert.IsInstanceOfType<InvalidOperationException>(aggregate.InnerExceptions[0],
+            "The original failure is the primary.");
+        StringAssert.Contains(aggregate.InnerExceptions[0].Message, "synthetic");
+        Assert.AreNotSame(aggregate.InnerExceptions[0], aggregate.InnerExceptions[1],
+            "The recovery's own read fault rides behind the original.");
+    }
+}
