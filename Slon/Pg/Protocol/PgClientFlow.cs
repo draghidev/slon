@@ -4,8 +4,26 @@ using System.Threading.Tasks.Sources;
 
 namespace Slon.Pg.Protocol;
 
-abstract class PgClientFlow : IValueTaskSource<PgDecoder>
+abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IThreadPoolWorkItem
 {
+    PgClientProtocol.Control? _pendingActivationControl;
+
+    /// Pairs this flow with its protocol control for a queued activation dispatch. The flow
+    /// itself is the IThreadPoolWorkItem: an immutable (flow, control) pairing per queued
+    /// activation, zero-alloc, immune to the shared-work-item lost-update where a second
+    /// Initialize overwrote the first's item before its Execute ran (one pending activation
+    /// per flow tenure makes the field safe).
+    internal void PrepareActivationDispatch(PgClientProtocol.Control control)
+        => _pendingActivationControl = control;
+
+    void IThreadPoolWorkItem.Execute()
+    {
+        var control = _pendingActivationControl;
+        Debug.Assert(control is not null);
+        _pendingActivationControl = null;
+        control!.Activate(this);
+    }
+
     readonly bool _supportsPipelining;
     Action<TimeSpan>? _decoderOnHeartbeatAction; // TODO should we have this here?
     int _rfqCount;
@@ -117,6 +135,12 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>
     protected virtual void OnHeartbeat(TimeSpan interval) {}
     protected virtual void OnAbort(PgClientClosedException exception) {}
     protected virtual void OnReset() {}
+    /// Completion observation point for the flow. On exceptional completion a flow must fault
+    /// its caller-facing sources here: the body's own fault paths only run when the body ran,
+    /// and a flow can fail before that (dispatch-time throw, pre-body protocol fault) or be
+    /// supplanted by recovery. Implementations must tolerate racing the body's own fault path
+    /// (use TrySet semantics).
+    protected virtual void OnComplete(Exception? exception) {}
 
     PgDecoder IValueTaskSource<PgDecoder>.GetResult(short token) => _activationTaskSource.GetResult(token);
     ValueTaskSourceStatus IValueTaskSource<PgDecoder>.GetStatus(short token) => _activationTaskSource.GetStatus(token);
@@ -188,8 +212,9 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>
         // Sync-flow auto path claims completed up front so the await machinery takes the sync
         // shortcut (no state machine box allocated, no continuation registered) and falls
         // straight to GetResult, which blocks via AsTask if activation hasn't fired yet.
-        // Async flows always reflect actual readiness.
-        public bool IsCompleted => control.IsDecoderReady || (auto && !control.IsAsync);
+        // Async flows reflect SETTLED (not just succeeded): a faulted activation completes
+        // the await so GetResult rethrows (see IsDecoderSettled).
+        public bool IsCompleted => control.IsDecoderSettled || (auto && !control.IsAsync);
 
         // Only valid after IsCompleted is true. For the sync-flow auto path, IsCompleted is
         // true unconditionally, so this may run while the decoder isn't actually ready. In
@@ -198,7 +223,7 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>
         public PgDecoder GetResult()
         {
             cancellationToken.ThrowIfCancellationRequested();
-            if (control.IsDecoderReady)
+            if (control.IsDecoderSettled)
                 return control.GetDecoderResult();
             return control.GetDecoderTask(cancellationToken).GetAwaiter().GetResult();
         }
@@ -250,12 +275,14 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>
     protected readonly struct ConfiguredDecoderAwaitable(ExecutionControl control, CancellationToken cancellationToken, bool continueOnCapturedContext) : ICriticalNotifyCompletion
     {
         public ConfiguredDecoderAwaitable GetAwaiter() => this;
-        public bool IsCompleted => control.IsDecoderReady;
+        // See IsDecoderSettled: a faulted activation must complete the await so GetResult
+        // rethrows into the body's catch paths.
+        public bool IsCompleted => control.IsDecoderSettled;
 
         public PgDecoder GetResult()
         {
             cancellationToken.ThrowIfCancellationRequested();
-            if (control.IsDecoderReady)
+            if (control.IsDecoderSettled)
                 return control.GetDecoderResult();
             if (control.IsAsync)
                 ThrowHelper.ThrowInvalidOperation("Decoder is not ready and the flow is async. GetResult violates the awaiter contract.");
@@ -309,6 +336,21 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>
 
         // Small optimization to allow us to skip the final sync message if we can piggyback on the flow's final rfq.
         public bool LastMessageInducesRfq => flow._lastMessageInducesRfq;
+
+        // Outstanding server-obligation count: RFQs the server still owes the wire for what's
+        // been written. Read by TryRecoverItemFailure to decide drain length.
+        public int RfqCount => flow._rfqCount;
+
+        // Initializes a recovery flow's RFQ obligation to what the failed flow's wire activity
+        // left outstanding. Routed through the write-side handle (alongside OnMessageWrite) so
+        // _rfqCount mutation stays concentrated on this surface rather than leaking onto
+        // PgClientFlow's public-ish API. Only called from PgClientProtocol.Control.TryRecoverItemFailure.
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public void TransferInheritedRfqCount(int count)
+        {
+            Debug.Assert(flow._rfqCount == 0, "Inherited RFQ count can only be set on a freshly-reset flow.");
+            flow._rfqCount = count;
+        }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public void OnMessageWrite(PgTypes.FrontendType type)
@@ -410,21 +452,29 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>
 
         public void OnHeartbeat(TimeSpan interval)
         {
-            // Abort propagation: if AbortToken fired (protocol shutting down forcefully, or
-            // CompleteAsync's CompletionTimeout elapsed and escalated), fail this flow's
-            // activation source so anything parked on GetDecoderAsync gets unblocked. Flow
-            // bodies currently doing I/O observe AbortToken directly via construction-time
-            // wiring (PgDecoder, PgProtocolDataWriter) - this path is only load-bearing for
-            // pipelined flows that haven't been activated yet. TrySetException on an already-
-            // completed activation source is a no-op, so iterating the head flow is harmless.
-            if (control.ClosedException is { } ex && !flow._completed)
+            // Abort propagation gates on AbortToken. Graceful Shutdown materializes
+            // ClosedException up front but defers AbortToken until CompletionTimeout
+            // escalation, so in-flight flows drain naturally until then. ClosedException is
+            // guaranteed non-null when AbortToken fires because Shutdown materializes it
+            // before cancelling _abortCts (and _abortCts is only fired from Shutdown).
+            // TrySetException on an already-completed activation source is a no-op, so
+            // iterating the head flow is harmless.
+            if (control.AbortToken.IsCancellationRequested && !flow._completed)
             {
+                var ex = control.ClosedException!;
                 flow._activationTaskSource.TrySetException(ex, runContinuationsAsynchronously: true);
                 flow.OnAbort(ex);
                 return;
             }
 
-            if (flow._activationTaskSource.GetStatus(flow._activationTaskSource.Version) is ValueTaskSourceStatus.Pending
+            // Same sentinel guard as PgDecoder.OnHeartbeat: InfiniteTimeSpan (-1ms) and Zero
+            // both mean "no activation timeout". Without the guard an infinite budget reads
+            // as instantly expired and the first heartbeat tick spuriously times out any
+            // flow still pending activation (observed as ~1s "Operation timed out waiting
+            // for activation" failures under contention with the protocol-level default
+            // ConnectionTimeout = Infinite).
+            if (flow._remainingActivationTimeout != Timeout.InfiniteTimeSpan && flow._remainingActivationTimeout != TimeSpan.Zero
+                && flow._activationTaskSource.GetStatus(flow._activationTaskSource.Version) is ValueTaskSourceStatus.Pending
                 && (flow._remainingActivationTimeout -= interval) <= TimeSpan.Zero)
                 flow._activationTaskSource.TrySetException(new TimeoutException("Operation timed out waiting for activation."), runContinuationsAsynchronously: true);
 
@@ -449,6 +499,15 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>
                 flow._completionTcs.TrySetException(exception);
             else
                 flow._completionTcs.TrySetResult();
+            // Deliberately NO activation-source faulting here: a parked deferred dispatch
+            // holds no resources (TryStart happens only when the bridge runs), the caller is
+            // faulted via OnComplete, and Reset clears the registration on reuse. Invoking
+            // the bridge on a completed flow would create-and-start the body for a dead
+            // tenure - it takes the shared pipelined-read promise tenure for nothing and
+            // races instance reuse on this very source (observed as double continuation
+            // registration aborts). The heartbeat abort path keeps its own faulting; that is
+            // protocol teardown, not per-flow completion.
+            flow.OnComplete(exception);
             flow._completionAction?.Invoke(flow, exception, flow._completionState);
         }
 
@@ -474,6 +533,16 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>
         // Context as the DecoderAwaitable.
         public bool IsDecoderReady
             => flow._activationTaskSource.GetStatus(flow._activationTaskSource.Version) is ValueTaskSourceStatus.Succeeded;
+
+        /// Awaiter-completion check: completed means SETTLED, not succeeded. A faulted
+        /// activation (timeout, abort) must complete the await so GetResult rethrows into
+        /// the body's catch paths. Treating Faulted as pending parks the body on a source
+        /// that will never transition again, and its late registration lands on the slot the
+        /// dispatch bridge still occupies (invocation does not clear the continuation; only
+        /// Reset does) - observed as an unhandled InvalidOperationException on the TP under
+        /// activation-timeout conditions.
+        public bool IsDecoderSettled
+            => flow._activationTaskSource.GetStatus(flow._activationTaskSource.Version) is not ValueTaskSourceStatus.Pending;
         public PgDecoder GetDecoderResult()
             => flow._activationTaskSource.GetResult(flow._activationTaskSource.Version);
         public void OnDecoder(Action<object?> continuation, object? state, ValueTaskSourceOnCompletedFlags flags)

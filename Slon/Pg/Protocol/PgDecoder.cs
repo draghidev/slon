@@ -57,7 +57,12 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
 
     void OnHeartbeat(TimeSpan elapsed)
     {
-        if (_remainingTimeout != Timeout.InfiniteTimeSpan && (_remainingTimeout -= elapsed) <= TimeSpan.Zero)
+        // Both InfiniteTimeSpan and Zero are treated as "no timeout" - the latter falls out of
+        // Command.Timeout defaulting to default(TimeSpan), which is the common "I didn't set a
+        // timeout" case. Without the Zero guard the first heartbeat tick would fire the cancel
+        // immediately and abort any read parked on actual I/O.
+        if (_remainingTimeout != Timeout.InfiniteTimeSpan && _remainingTimeout != TimeSpan.Zero
+            && (_remainingTimeout -= elapsed) <= TimeSpan.Zero)
             _cancellationTokenSource.Cancel();
     }
 

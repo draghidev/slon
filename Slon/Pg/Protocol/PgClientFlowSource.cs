@@ -264,10 +264,27 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
         public ValueTask<bool> MoveNextAsync()
         {
             if (TryGetReady(out var result))
+            {
+                // On the completion path with pipelined bytes still buffered we must push them
+                // before returning. In-flight flows have written queries the server hasn't
+                // received yet; without this flush their read phase parks forever and drain
+                // hangs.
+                if (!result && _state.Protocol.UnflushedBytes is not 0)
+                    return FlushThenComplete();
                 return new(result);
+            }
             if (_state.Protocol.UnflushedBytes is not 0)
                 return FlushThenPark();
             return Park();
+        }
+
+        async ValueTask<bool> FlushThenComplete()
+        {
+            // CancellationToken.None on purpose: in-flight flows have written bytes that must
+            // reach the wire so their read phase can drain. The writer's own _cts (linked to
+            // AbortToken) is the correct cancellation gate for transport-level abort.
+            await _state.Protocol.FlushAsync(CancellationToken.None).ConfigureAwait(false);
+            return false;
         }
 
         bool TryGetReady(out bool result)
@@ -297,7 +314,8 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
 
         async ValueTask<bool> FlushThenPark()
         {
-            await _state.Protocol.FlushAsync(_completionToken).ConfigureAwait(false);
+            // CancellationToken.None on purpose, same reasoning as FlushThenComplete.
+            await _state.Protocol.FlushAsync(CancellationToken.None).ConfigureAwait(false);
             return await Park().ConfigureAwait(false);
         }
 

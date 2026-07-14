@@ -166,7 +166,7 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
         var flow = new StartupFlow(async: false, options, timeout == default ? options.ConnectionTimeout : timeout);
         var task = StartAsync(flow, flow.WaitForComplete());
         Debug.Assert(task.IsCompleted);
-        task.GetAwaiter().GetResult();
+        task.AsTask().GetAwaiter().GetResult();
     }
 
     public async ValueTask StartAsync(PgClientOptions options, TransportConnection connection, Action? onIdle = null, CancellationToken cancellationToken = default)
@@ -228,7 +228,7 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
         }
     }
 
-    Enumerator GetFlows() => new(_pipeline.GetEnumerator());
+    Enumerator GetFlows() => new(this);
 
     public T Queue<T>(T flow) where T : PgClientFlow
     {
@@ -300,8 +300,15 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
     /// drain completion should call <see cref="CompleteAsync"/> first.
     public ValueTask DisposeAsync()
     {
-        FireAndForget(Shutdown(closeReason: null, forceful: true));
-        return default;
+        try
+        {
+            FireAndForget(DisposeAsyncCore(closeReason: null));
+            return ValueTask.CompletedTask;
+        }
+        catch (Exception ex)
+        {
+            return ValueTask.FromException(ex);
+        }
     }
 
     /// Synchronous tear-down for callers that can't go async (the canonical case is
@@ -309,13 +316,39 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
     /// connection/protocol cleanup). Same fire-and-forget semantics as <see cref="DisposeAsync"/>:
     /// AbortToken fires immediately, pipeline drain happens in the background. Idempotent.
     public void Dispose()
-        => FireAndForget(Shutdown(closeReason: null, forceful: true));
+        => FireAndForget(DisposeAsyncCore(closeReason: null));
 
     /// Internal emergency self-evict for the two framework-internal "we cannot continue" sites
     /// (startup catch, OnParameterStatus encoding failure). Fire-and-forget shape so it can run
     /// from the message-processing thread. Pool eviction picks up via the status flag.
     internal void FailProtocol(Exception? reason)
-        => FireAndForget(Shutdown(reason, forceful: true));
+        => FireAndForget(DisposeAsyncCore(reason));
+
+    /// Shared core for the Dispose paths: forceful Shutdown wrapped with resource disposal as a
+    /// single fire-and-forget unit. Resources stay alive across a graceful
+    /// <see cref="CompleteAsync"/> so the caller can still observe state via the cached tokens;
+    /// only Dispose paths release them. Idempotent via <c>_disposed</c>.
+    bool _disposed;
+    async ValueTask DisposeAsyncCore(Exception? closeReason)
+    {
+        if (Interlocked.Exchange(ref _disposed, true))
+            return;
+        try
+        {
+            await Shutdown(closeReason, forceful: true).ConfigureAwait(false);
+        }
+        finally
+        {
+            _heartbeat?.Dispose();
+            // Disposing _abortCts releases the scheduled CancelAfter(CompletionTimeout) timer
+            // without firing it. Downstream linked CTSes (PgDecoder, PgProtocolDataWriter)
+            // observe a dead source - state already captured stays valid, new registrations
+            // against the cached token would throw, but by here the protocol is Completed and
+            // nothing should be registering.
+            _abortCts.Dispose();
+            _stoppingCts.Dispose();
+        }
+    }
 
     /// Discarding a ValueTask silently swallows any exception thrown by the background drain.
     /// async void with a top-level try/catch ensures exceptions are observed (caught here) rather
@@ -354,15 +387,13 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
         // flows are observing StoppingToken activation comes soon for pending ones anyway."
         if (forceful)
         {
+            // Sync Cancel: AbortToken is internal-only, callbacks are framework-authored and audited.
             _abortCts.Cancel();
         }
         else
         {
-            // Graceful path: fire StoppingToken first so well-behaved flow bodies observe at
-            // coordination boundaries and drain themselves cooperatively. Schedule AbortToken
-            // as the escalation backstop in case they don't drain in time.
-            _stoppingCts.Cancel();
             _abortCts.CancelAfter(_options.CompletionTimeout);
+            await _stoppingCts.CancelAsync().ConfigureAwait(false);
         }
 
         try
@@ -372,12 +403,8 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
         }
         finally
         {
-            _abortCts.CancelAfter(TimeSpan.Zero);
-            // Heartbeat disposed AFTER drain in all paths: it needs to keep ticking during the
-            // drain to propagate AbortToken to parked flows via OnHeartbeat. Disposing up-front
-            // would strand them. Same principle should apply at the DbDataSource pool level for
-            // the pool-shared heartbeat: don't dispose until the pool's drain finishes.
-            _heartbeat?.Dispose();
+            // Disarm the CTS scheduled by the graceful path.
+            _abortCts.CancelAfter(Timeout.InfiniteTimeSpan);
             SignalCompleted();
         }
     }
@@ -399,29 +426,26 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
         return new();
     }
 
-
     public struct Enumerator
     {
         Pipeline<PgClientFlow, Policy, PgClientFlowSource, PgClientFlowSource.Enumerator>.Enumerator _inner;
 
-        internal Enumerator(Pipeline<PgClientFlow, Policy, PgClientFlowSource, PgClientFlowSource.Enumerator>.Enumerator inner) => _inner = inner;
+        internal Enumerator(PgClientProtocol protocol) => _inner = protocol._pipeline.GetEnumerator();
 
         public PgClientFlow Current => _inner.Current;
         public Enumerator GetEnumerator() => this;
         public bool MoveNext() => _inner.MoveNext();
     }
 
-    internal readonly struct Policy : IPipelinePolicy<PgClientFlow>
+    readonly struct Policy : IPipelinePolicy<PgClientFlow>
     {
         readonly PgClientProtocol _protocol;
         readonly ValueTaskSourcePromise<PipelineItemResult> _promise;
-        readonly ActivationWorkItem _activationWorkItem;
 
         public Policy(PgClientProtocol protocol)
         {
             _protocol = protocol;
             _promise = new();
-            _activationWorkItem = new(protocol.FlowControl);
             ExecutionScheduler = protocol._options.ExecutionScheduler;
             ActivationScheduler = protocol._options.ActivationScheduler;
         }
@@ -432,8 +456,56 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public void CompleteItem(PgClientFlow item, int remainingDepth, Exception? exception)
         {
-            item.GetExecutionControl(_protocol.FlowControl).Complete(exception);
+            // OnCompleted (protocol bookkeeping: ActivatedFlow release, read-state recycle)
+            // must run BEFORE Complete (user-visible completion): Complete fires the flow's
+            // completion action, which may Reset() and re-enqueue the SAME instance
+            // (MaintenanceFlow does, pooled CommandFlows will). If that next tenure's
+            // Activate lands before OnCompleted's depth-0 CAS, the CAS comparand matches the
+            // new activation of the same reference (ABA) and severs a live binding - the
+            // decoder's next read aborts on a null ActivatedFlow. Ordering the release first
+            // closes this by causality: same-instance reuse cannot begin until after it.
+            // Reduction: ActivatedFlowReductionTests.TenureReuse_Cas_{CompleteBeforeRelease_Hazardous,ReleaseBeforeComplete}.
+            // Recovery items take the hardened path (capture + try/finally); keeping the EH out
+            // of this method preserves its inlineability for the common case.
+            if (item is RecoveryDrainFlow { FailedFlow: { } failedFlow } recovery)
+            {
+                CompleteRecoveryItem(recovery, failedFlow, remainingDepth, exception);
+                return;
+            }
+
             _protocol.FlowControl.OnCompleted(item, remainingDepth);
+            item.GetExecutionControl(_protocol.FlowControl).Complete(exception);
+        }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        void CompleteRecoveryItem(RecoveryDrainFlow recovery, PgClientFlow failedFlow, int remainingDepth, Exception? exception)
+        {
+            // Capture the binding BEFORE Complete fires the recovery's completion action:
+            // completion is the reuse gate, and a Reset on reuse clears the binding (same
+            // causality as the OnCompleted-before-Complete ordering below).
+            var failureException = recovery.FailureException!;
+
+            _protocol.FlowControl.OnCompleted(recovery, remainingDepth);
+            try
+            {
+                recovery.GetExecutionControl(_protocol.FlowControl).Complete(exception);
+            }
+            finally
+            {
+                // A recovery flow's completion ends its supplanted item's extended lifetime (see
+                // RecoveryDrainFlow.FailedFlow): the wire is resynced (or definitively dead) and
+                // no protocol machinery references the failed tenure anymore. The supplanted flow
+                // completes on EVERY exit - including the recovery's own fault (e.g. I/O mid-
+                // drain) and a throwing completion action - or its caller strands forever. A
+                // flow's completion exception carries every failure that terminated its position:
+                // usually just its own (the original failure), but a recovery that also died adds
+                // a second terminal fact the caller has a claim on (the wire was never resynced,
+                // session state is gone), attached behind the original as the primary.
+                // Single-level by construction: TryRecoverItemFailure refuses RecoveryDrainFlow
+                // items, so a bound failed flow is never itself a recovery with a binding.
+                failedFlow.GetExecutionControl(_protocol.FlowControl).Complete(
+                    exception is null ? failureException : new AggregateException(failureException, exception));
+            }
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -469,11 +541,18 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
             // work via await, so they MUST go through TP to keep the latch hold bounded.
             if (preferAsync && item.IsAsyncAtBind)
             {
-                _activationWorkItem.Initialize(item);
+                // The flow itself is the work item: an immutable (flow, control) pairing per
+                // queued activation, zero-alloc. A single cached mutable work item here was a
+                // lost-update box - two activations in flight (TP latency under load) let the
+                // second Initialize overwrite the first before its Execute read the item, so
+                // both executions activated the later flow and the earlier one never
+                // activated (committed-never-activated hang, dump-diagnosed June 2026). One
+                // pending activation per flow tenure makes the per-flow field safe.
+                item.PrepareActivationDispatch(_protocol.FlowControl);
                 if (ActivationScheduler is { } scheduler)
-                    scheduler.SubmitDetached(ActivationWorkItemAction, _activationWorkItem, preferLocal: true);
+                    scheduler.SubmitDetached(ActivationWorkItemAction, item, preferLocal: true);
                 else
-                    ThreadPool.UnsafeQueueUserWorkItem(_activationWorkItem, preferLocal: true);
+                    ThreadPool.UnsafeQueueUserWorkItem(item, preferLocal: true);
             }
             else
                 _protocol.FlowControl.Activate(item);
@@ -483,22 +562,66 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
 
         public bool TryRecoverItemFailure(in PipelineItemFailureContext context, PgClientFlow failedItem, CancellationToken cancellationToken, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out PgClientFlow? recoveryItem)
         {
-            recoveryItem = null;
-            return false;
+            // Recovery-on-recovery does not exist, and the framework guarantees it structurally:
+            // a committed recovery's late fault travels as the framework's marker exception and
+            // is completed directly, never consulted here (pre-commit recovery failures complete
+            // directly too). The assert keeps that contract loud; the refusal backstops release
+            // builds (a dead-wire drain cannot be re-drained) and keeps the CompleteItem binding
+            // discharge single-level by construction.
+            System.Diagnostics.Debug.Assert(failedItem is not RecoveryDrainFlow,
+                "Recovery item routed back into TryRecoverItemFailure - recovery-on-recovery must not exist.");
+
+            // Pipeline is shutting down: skip recovery and let the framework propagate the failure.
+            if (cancellationToken.IsCancellationRequested || failedItem is RecoveryDrainFlow)
+            {
+                recoveryItem = null;
+                return false;
+            }
+
+            var control = _protocol.FlowControl;
+            var failedControl = failedItem.GetExecutionControl(control);
+            var inheritedRfqCount = failedControl.RfqCount;
+            var unflushedBytes = _protocol.UnflushedBytes;
+
+            // Inject Sync when the failed flow's last buffered message didn't induce RFQ - wire
+            // is mid-sequence and the server is waiting for a terminator. Skip if last was already
+            // self-terminating (Sync/Query), or if nothing is buffered (no bytes to send).
+            var injectSync = !failedControl.LastMessageInducesRfq && unflushedBytes > 0;
+            var flushPendingBytes = unflushedBytes > 0;
+            var drainCount = inheritedRfqCount + (injectSync ? 1 : 0);
+
+            var recovery = new RecoveryDrainFlow(
+                async: failedItem.IsAsyncAtBind,
+                drainCount: drainCount,
+                injectSync: injectSync,
+                flushPendingBytes: flushPendingBytes);
+            recovery.GetExecutionControl(control).TransferInheritedRfqCount(inheritedRfqCount);
+
+            // Per the policy contract, the framework will NOT complete a supplanted item -
+            // that is this policy's job, and it happens when the recovery completes (see
+            // CompleteItem): the failed item's lifetime extends as far as the recovery does.
+            // Complete(exception) also faults the activation rendezvous, so a parked dispatch
+            // resumes, observes the failure, and releases the shared pipelined-read promise
+            // tenure it holds. That unwind resolves inline against the faulted source; a
+            // queued sibling dispatching against the same promise in that instant hits the
+            // already-started canary and recovers - a visible transient failure, not a hang.
+            recovery.BindFailedFlow(failedItem, context.Exception);
+
+            recoveryItem = recovery;
+            return true;
         }
 
-        sealed class ActivationWorkItem(Control flowControl) : IThreadPoolWorkItem
-        {
-            PgClientFlow _item = null!;
-            public void Initialize(PgClientFlow item) => _item = item;
-            void IThreadPoolWorkItem.Execute() => flowControl.Activate(_item);
-        }
     }
 
     internal sealed class Control(PgClientProtocol protocol) : IProtocolStatic<CommandFlow.ReadState>
     {
         public PgClientFlow? ExecutorFlow { get; private set; }
-        public PgClientFlow? ActivatedFlow { get; private set; }
+        PgClientFlow? _activatedFlow;
+        public PgClientFlow? ActivatedFlow
+        {
+            get => Volatile.Read(ref _activatedFlow);
+            private set => Volatile.Write(ref _activatedFlow, value);
+        }
 
         public PgProtocolDataWriter Writer => protocol._protocolDataWriter;
 
@@ -654,12 +777,40 @@ sealed class PgClientProtocol : IDisposable, IAsyncDisposable
 
         internal void OnCompleted(PgClientFlow flow, int remainingDepth)
         {
-            ActivatedFlow = null;
+            // ActivatedFlow is the decoder's current-reader handle. The framework dispatches
+            // Activate(next) and Complete(prev) across threads (Policy.ActivateHeadItem TP-
+            // queues; OnCommittedTaskCompleted/DrainSlotInline run on whichever thread
+            // completed the prior waiter task - typically the socket-completion thread). A
+            // brief null window between Complete(A) and Activate(B) means a continuation
+            // resuming on the socket thread can deref a null binding. Holding the stale
+            // reference between completions is safe: in-flight reads only happen during an
+            // activated flow's drain and the framework's per-item Activate-before-Complete
+            // invariant ensures the binding has been republished by the time those reads
+            // execute. The next Activate overwrites the stale slot.
+            //
+            // At pipeline park (remainingDepth == 0) we want to release the flow reference
+            // so GC can collect command parameters / descriptors / buffers it roots. Use CAS
+            // so a concurrent Enqueue's Activate(B) that landed first stays untouched: the
+            // depth==0 read could be stale relative to a user-thread Enqueue that the
+            // framework already processed into an Activate. Same-instance re-activation
+            // (which the CAS cannot distinguish - ABA) is excluded by ordering instead:
+            // Policy.CompleteItem runs this before Complete(), and instance reuse is only
+            // legal from the completion action onward.
+            //
+            // Recycle the read state and signal idle only when the slot is actually clear
+            // (we cleared it, or it already was). A failed CAS against a live successor
+            // means that flow may be mid-drain on this state right now - swapping it then
+            // would yank the shared read promise out from under its pending dispatch, and
+            // the connection is not idle either.
             if (remainingDepth is 0)
             {
-                // Get rid of any rooted buffers, refs and so on.
-                _commandFlowReadState = new();
-                protocol._poolConnectionIdleSignal?.Invoke();
+                var observed = Interlocked.CompareExchange(ref _activatedFlow, null, flow);
+                if (observed is null || ReferenceEquals(observed, flow))
+                {
+                    // Get rid of any rooted buffers, refs and so on.
+                    _commandFlowReadState = new();
+                    protocol._poolConnectionIdleSignal?.Invoke();
+                }
             }
         }
 

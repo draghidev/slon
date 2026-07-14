@@ -43,6 +43,9 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
     ValueTaskSourcePromise<bool>? _pipelinePromise;
     Context _context;
     ValueTask _task;
+    // TRUE once ExecutePipelined's state machine has begun running; from that point the
+    // body's catch paths own caller-facing fault propagation (see OnComplete).
+    bool _bodyStarted;
 
     ValueTask<bool> EnumeratorMoveNextTask => new(this, _enumeratorMoveNextTaskSource.Version);
 
@@ -79,6 +82,12 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
     public Enumerator GetAsyncEnumerator(CancellationToken cancellationToken = default)
     {
         _callerCancellationToken = cancellationToken;
+        // A cancelable token arms the only truly concurrent completer of the move-next source
+        // (the cancellation registration completes it from an arbitrary thread while the body
+        // keeps reading). Pay for thread-safe completion only then; never disarm mid-tenure -
+        // a fired registration may still be in flight. Reset clears it.
+        if (cancellationToken.CanBeCanceled)
+            _enumeratorMoveNextTaskSource.CanCompleteConcurrently = true;
         return new(this);
     }
 
@@ -211,6 +220,11 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
         var waiter = context.GetDecoderAuto().ConfigureAwait(false);
         if (waiter.IsCompleted)
         {
+            // Handing the shared-promise-backed task to the framework is safe: the framework
+            // contract guarantees the waiter task is consumed (releasing the promise tenure
+            // via GetResult's Reset) before the item's pipeline position is republished to
+            // the executor's inline-activation gate. A successor's dispatch therefore always
+            // finds the tenure released.
             PromiseAsyncValueTaskMethodBuilder.Promise = promise;
             try
             {
@@ -276,6 +290,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
     [AsyncMethodBuilder(typeof(PromiseAsyncValueTaskMethodBuilder))]
     async ValueTask ExecutePipelined(Context context)
     {
+        _bodyStarted = true;
         // If we have a continuation stored we must already be on the caller thread,
         // otherwise we must make sure to unblock the executor (see comment in the write phase).
         if (!IsAsync && !_callerInteractionCore.HasContinuation)
@@ -401,11 +416,13 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
 
             SetResult(null);
         }
-        catch (PgClientClosedException) when (context.IsProtocolClosed)
+        catch (PgClientClosedException ex) when (context.IsProtocolClosed)
         {
             // Scope the catch to our own closure so a nested protocol's closed exception
-            // bubbling through doesn't get treated as ours. Protocol will terminate the
-            // backend connection.
+            // bubbling through doesn't get treated as ours. HandleException signals the
+            // consumer's pending MoveNextTask before rethrow, otherwise the consumer
+            // stays parked forever even after the executor's recovery path runs.
+            HandleException(ex);
             throw;
         }
         catch (OperationCanceledException ex) when (ex.CancellationToken == _callerCancellationToken)
@@ -426,13 +443,15 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                 // If we do want to cancel something we have to take into account a cancellation actually cancels a *transaction* and not just a single command.
             }
 
+            HandleException(ex);
             throw;
         }
-        catch (TimeoutException)
+        catch (TimeoutException ex)
         {
-            throw;
             // Issue backend cancel(s), this is a timeout on I/O, luckily this means we have a fairly high certainty we cancel our own commands.
             // We have to issue as many cancels as there are syncs in this flow.
+            HandleException(ex);
+            throw;
         }
         catch (Exception ex)
         {
@@ -492,13 +511,28 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
         }
     }
 
+    /// Faults the caller-facing sources. Reached from the body's catch paths for in-body
+    /// faults, and from OnComplete for failures the body never observed (dispatch-time throw,
+    /// pre-body protocol fault). Callers are structurally sequential with each other - the
+    /// framework completes an item only after its pipeline task settles, and OnComplete
+    /// defers to a parked dispatch's unwind - so the _enumeratorCompleted guard suffices for
+    /// double-call idempotency. The cancellation registration is the one genuinely concurrent
+    /// completer; when a cancelable token armed it, the source is in thread-safe completion
+    /// mode and we must use TrySet semantics to absorb a lost race. Continuations run
+    /// asynchronously: this can fire from the pipeline's completion chain and must not run
+    /// caller code under it.
     void HandleException(Exception ex)
     {
+        if (_enumeratorCompleted)
+            return;
         // Mark the flow terminally completed so the caller's next MoveNext returns the cached
         // task result (which throws the exception) instead of resetting the source and parking.
         _enumeratorCompleted = true;
         // We have to make sure to unblock the caller if the flow failed to (could be a cancellation, io error, etc).
-        _enumeratorMoveNextTaskSource.SetException(ex);
+        if (_enumeratorMoveNextTaskSource.CanCompleteConcurrently)
+            _enumeratorMoveNextTaskSource.TrySetException(ex, runContinuationsAsynchronously: true);
+        else
+            _enumeratorMoveNextTaskSource.SetException(ex, runContinuationsAsynchronously: true);
         // Wake any sync MoveNext parked in WaitForContinuation. The body just faulted, so no
         // continuation will be registered. The caller needs to observe the exception via the
         // move-next task source.
@@ -506,6 +540,21 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
             _callerInteractionCore.SignalProgress();
         // TODO use tryrecover to consume as many rfqs as we have left at the time of throwing.
         // TODO This essentially replaces manually having to consume the flow remainder on unexpected errors (e.g. unhandled protocol errors).
+    }
+
+    protected override void OnComplete(Exception? exception)
+    {
+        if (exception is null)
+            return;
+        // Once the body has started, its own catch paths own the caller-facing fault -
+        // faulting here too would be a concurrent writer pair on the move-next source.
+        // When the flow failed without the body ever running (parked deferred dispatch,
+        // dispatch-time throw, pre-body protocol fault), no body will ever fault the caller:
+        // do it here, as the single writer (the parked bridge is never invoked for completed
+        // flows; Reset clears its registration on reuse).
+        if (_bodyStarted)
+            return;
+        HandleException(exception);
     }
 
     // Set-up field ref on demand, most flows will be asynchronous and never need this.
@@ -530,13 +579,22 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
     {
         Debug.Assert(IsPending || IsCompleted);
         _commandIndex = -1;
+        _executePipelinedCore.Reset();
         _enumeratorMoveNextTaskSource.Reset();
+        // Back to single-threaded completion; the next tenure re-arms it if it binds a
+        // cancelable token.
+        _enumeratorMoveNextTaskSource.CanCompleteConcurrently = false;
         _enumeratorCurrent = default;
         _isResultReady = false;
         _callerInteractionCore.Reset();
         _callerCancellationToken = default;
         _callerCancellationTokenRegistration.Dispose();
         _callerCancellationTokenRegistration = default;
+        // Dispatch state is per-tenure.
+        _pipelinePromise = null;
+        _context = default;
+        _task = default;
+        _bodyStarted = false;
     }
 
     FlowCallerInteractionCoreResult IValueTaskSource<FlowCallerInteractionCoreResult>.GetResult(short token)
@@ -630,7 +688,13 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
 
             // We only set it if it's not null, as we don't want to overwrite the initial GetEnumerator token until the first result is returned.
             if (cancellationToken is not null)
+            {
                 flow._callerCancellationToken = cancellationToken.GetValueOrDefault();
+                // Same as GetAsyncEnumerator: a cancelable token arms the concurrent
+                // completer, so completion must become thread-safe for this tenure.
+                if (flow._callerCancellationToken.CanBeCanceled)
+                    flow._enumeratorMoveNextTaskSource.CanCompleteConcurrently = true;
+            }
 
             // We reset the source ourselves in case the flow isn't waiting yet, as we must return a fresh task.
             flow._enumeratorMoveNextTaskSource.Reset();

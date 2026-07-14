@@ -177,6 +177,11 @@ readonly struct PgEncoder
 
     public void WriteBind(EncodedString commandName = default, EncodedString portalName = default, ImmutableArray<Parameter> parameters = default)
     {
+        // The signature invites `default` for the no-parameters case; a default ImmutableArray
+        // NREs on every member, so normalize before first use.
+        if (parameters.IsDefault)
+            parameters = ImmutableArray<Parameter>.Empty;
+
         var encoding = ClientEncoding;
         var portalNameBytes = portalName.AsNullTerminatedSpan(encoding);
         var commandNameBytes = commandName.AsNullTerminatedSpan(encoding);
