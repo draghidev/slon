@@ -342,23 +342,19 @@ sealed class ValueTaskSourcePromise<TResult> : IValueTaskSource<TResult>, IValue
 
     TResult IValueTaskSource<TResult>.GetResult(short token)
     {
-        try
-        {
-            return _core.GetResult(token);
-        }
-        finally
-        {
-            Reset();
-        }
-    }
-
-    void Reset()
-    {
         Debug.Assert(_taskSourceRequired);
+        // Fused consume-and-reset: a stale/mismatched token throws from the core's own token check
+        // with NOTHING consumed or reset - resetting on that path would wipe whatever tenure is
+        // ACTUALLY live (nulling a pending registration nobody will invoke, and reopening _started
+        // while that tenure's body may still be running). A genuine consume - successful or
+        // faulted alike - recycles the core, so the wrapper's own tenure state retires with it
+        // before the payload rethrow.
+        var result = _core.GetResultAndReset(token, out var error);
         _stateMachineBox?.Reset();
-        _core.Reset();
         _taskSourceRequired = false;
         Volatile.Write(ref _started, false);
+        error?.Throw();
+        return result;
     }
 
     ValueTaskSourceStatus IValueTaskSource.GetStatus(short token)

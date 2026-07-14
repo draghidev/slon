@@ -228,6 +228,22 @@ struct ManualResetValueTaskSourceCore<TResult>
         return _result!;
     }
 
+    /// Fused consume: GetResult and Reset as one tenure transition. A stale or premature token
+    /// throws with NOTHING consumed or reset - the live tenure is untouched, and the throw is the
+    /// loudest available signal of a second consumer. A genuine consume - successful or faulted -
+    /// resets the core for the next tenure and hands the payload error out instead of throwing,
+    /// so a wrapper can retire its own per-tenure state before rethrowing.
+    [StackTraceHidden]
+    public TResult GetResultAndReset(short token, out ExceptionDispatchInfo? error)
+    {
+        if (token != _version || !_completed)
+            ThrowInvalidOperationException();
+        error = _error;
+        var result = _result!;
+        Reset();
+        return result;
+    }
+
     /// <summary>Throws an exception in response to a failed <see cref="GetResult"/>.</summary>
     [StackTraceHidden]
     void ThrowForFailedGetResult()
