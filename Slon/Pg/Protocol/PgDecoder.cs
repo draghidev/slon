@@ -24,7 +24,9 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
     CancellationTokenSource _cancellationTokenSource;
 
     PgClientProtocol.Control _control = null!;
-    TimeSpan _remainingTimeout;
+    const long ClaimedTimeoutTicks = long.MinValue;
+    const long ExpiringTimeoutTicks = long.MinValue + 1;
+    long _remainingTimeoutTicks;
 
     PgClientFlow.ExecutionControl CurrentExecutionControl
     {
@@ -43,10 +45,36 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
         }
     }
 
+    // The heartbeat claims the scalar with a sentinel while decrementing it; arm/disarm waits out
+    // that short ownership window. Expiry publishes a second sentinel: re-entrant cleanup may
+    // disarm it during Cancel, while a new finite tenure cannot arm the old CTS before delivery.
     void SetRemainingTimeout(TimeSpan timeout)
     {
-        _remainingTimeout = timeout;
-        Interlocked.MemoryBarrier();
+        var spin = new SpinWait();
+        var disarming = timeout == Timeout.InfiniteTimeSpan || timeout == TimeSpan.Zero;
+        while (true)
+        {
+            var current = Volatile.Read(ref _remainingTimeoutTicks);
+            if (current == ClaimedTimeoutTicks || (current == ExpiringTimeoutTicks && !disarming))
+            {
+                spin.SpinOnce();
+                continue;
+            }
+            if (Interlocked.CompareExchange(ref _remainingTimeoutTicks, timeout.Ticks, current) == current)
+                return;
+        }
+    }
+
+    TimeSpan GetRemainingTimeout()
+    {
+        var spin = new SpinWait();
+        while (true)
+        {
+            var ticks = Volatile.Read(ref _remainingTimeoutTicks);
+            if (ticks != ClaimedTimeoutTicks)
+                return ticks == ExpiringTimeoutTicks ? TimeSpan.Zero : TimeSpan.FromTicks(ticks);
+            spin.SpinOnce();
+        }
     }
 
     PgDecoder(ReadChannel channel, CancellationToken abortToken, TimeSpan defaultReadTimeout)
@@ -78,7 +106,7 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
         // the prior read has fully completed - no in-flight read owns this timeout - so a lingering armed
         // value is a benign leftover; reset it rather than let it ride into (or the heartbeat fire it on)
         // the new flow's reads.
-        if (_remainingTimeout != Timeout.InfiniteTimeSpan)
+        if (GetRemainingTimeout() != Timeout.InfiniteTimeSpan)
             SetRemainingTimeout(Timeout.InfiniteTimeSpan);
         ReadTimeout = _defaultReadTimeout;
         if (!ReferenceEquals(_control, control))
@@ -89,12 +117,36 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
 
     void OnHeartbeat(TimeSpan elapsed)
     {
-        // Both InfiniteTimeSpan and Zero are treated as "no timeout" (Zero is the default(TimeSpan)
-        // "no timeout set" case). Without the Zero guard the first heartbeat tick would fire the
-        // cancel immediately and abort any read parked on I/O.
-        if (_remainingTimeout != Timeout.InfiniteTimeSpan && _remainingTimeout != TimeSpan.Zero
-            && (_remainingTimeout -= elapsed) <= TimeSpan.Zero)
-            _cancellationTokenSource.Cancel();
+        var ticks = Interlocked.Exchange(ref _remainingTimeoutTicks, ClaimedTimeoutTicks);
+        if (ticks == ClaimedTimeoutTicks)
+            return;
+        if (ticks == ExpiringTimeoutTicks)
+        {
+            Interlocked.CompareExchange(ref _remainingTimeoutTicks, ExpiringTimeoutTicks, ClaimedTimeoutTicks);
+            return;
+        }
+
+        var active = ticks != Timeout.InfiniteTimeSpan.Ticks && ticks != 0;
+        var remaining = active ? ticks - elapsed.Ticks : ticks;
+        // A concurrent arm/disarm replaced the sentinel and owns the next tenure. Never write the
+        // old tick into it or cancel on its behalf.
+        if (Interlocked.CompareExchange(ref _remainingTimeoutTicks, remaining, ClaimedTimeoutTicks) != ClaimedTimeoutTicks)
+            return;
+
+        if (active && remaining <= 0
+            && Interlocked.CompareExchange(ref _remainingTimeoutTicks, ExpiringTimeoutTicks, remaining) == remaining)
+        {
+            try
+            {
+                _cancellationTokenSource.Cancel();
+            }
+            finally
+            {
+                // A cancellation callback may have disarmed this tenure inline. Do not restore
+                // the expired budget over that cleanup (or over a subsequently recycled tenure).
+                Interlocked.CompareExchange(ref _remainingTimeoutTicks, remaining, ExpiringTimeoutTicks);
+            }
+        }
     }
 
     /// Applies not just to {Get,Move}Next but also {Get,Move}NextAsync, fully cancels I/O.
@@ -324,7 +376,7 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
                     bool success;
                     try
                     {
-                        success = channel.MoveNext(_remainingTimeout);
+                        success = channel.MoveNext(GetRemainingTimeout());
                     }
                     catch (Exception) when (_abortToken.IsCancellationRequested && _control.ClosedException is { } closed)
                     {
