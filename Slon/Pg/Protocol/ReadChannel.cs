@@ -33,11 +33,29 @@ sealed class ReadChannel
         return true;
     }
 
-    public ValueTask<ReadResult> ReadForPollAsync(CancellationToken cancellationToken)
-        => _messageBatchEnumerator.ReadForPollAsync(cancellationToken);
+    public ValueTask<ReadResult> ReadAsync(CancellationToken cancellationToken)
+        => _messageBatchEnumerator.ReadAsync(cancellationToken);
 
-    public bool PublishPollRead(ReadResult result, CancellationToken cancellationToken)
-        => _messageBatchEnumerator.PublishPollRead(result, cancellationToken);
+    public bool TryBeginConduitRead(CancellationToken cancellationToken, out ValueTask<int> task)
+        => _messageBatchEnumerator.TryBeginConduitRead(cancellationToken, out task);
+
+    public bool CompleteConduitRead(int length, CancellationToken cancellationToken, out ValueTask<int> next, out bool readFinished, out bool completed)
+    {
+        if (!_messageBatchEnumerator.CompleteConduitRead(length, cancellationToken, out next, out readFinished, out completed))
+            return false;
+        CommitBatch();
+        return true;
+    }
+
+    public void AbortConduitRead() => _messageBatchEnumerator.AbortConduitRead();
+
+    public bool TryMoveNextBatch(ReadResult result, CancellationToken cancellationToken, out bool completed)
+    {
+        if (!_messageBatchEnumerator.TryMoveNext(result, cancellationToken, out completed))
+            return false;
+        CommitBatch();
+        return true;
+    }
 
     public ValueTask<bool> MoveNextAsync(CancellationToken cancellationToken) => _messageBatchEnumerator.MoveNextAsync(cancellationToken);
     public bool MoveNext(TimeSpan timeout) => _messageBatchEnumerator.MoveNext(timeout);

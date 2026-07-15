@@ -26,6 +26,7 @@ sealed class PipeSegmentEnumerator<TSegmenter, TSegment>(PipeReader reader, TSeg
     : IEnumerator<TSegment>, IAsyncEnumerator<TSegment>
     where TSegmenter: IPipeSegmenter<TSegment>
 {
+    readonly StreamPipeReader? _directReader = reader as StreamPipeReader;
     TSegmenter _segmenter = segmenter;
     TSegment _current = default!;
 
@@ -35,25 +36,39 @@ sealed class PipeSegmentEnumerator<TSegmenter, TSegment>(PipeReader reader, TSeg
 
     public PipeReader PipeReader => reader;
 
-    public ValueTask<ReadResult> ReadForPollAsync(CancellationToken cancellationToken)
+    public ValueTask<ReadResult> ReadAsync(CancellationToken cancellationToken)
+        => reader.ReadAsync(cancellationToken);
+
+    public bool TryBeginDirectRead(CancellationToken cancellationToken, out ValueTask<int> task)
     {
-        var minimumSize = _currentLength is not -1 && _consumePosition is null
-            ? (int)Math.Min(_currentLength, int.MaxValue)
-            : _segmenter.MinimumSize;
-        return reader.ReadAtLeastAsync(minimumSize, cancellationToken);
+        if (_directReader is { SupportsDirectRead: true } directReader)
+        {
+            task = directReader.BeginDirectRead(cancellationToken);
+            return true;
+        }
+        task = default;
+        return false;
     }
 
-    public bool PublishPollRead(ReadResult result, CancellationToken cancellationToken)
+    public bool CompleteDirectRead(int length, CancellationToken cancellationToken, out ValueTask<int> next, out bool readFinished, out bool completed)
     {
-        if (result.IsCompleted)
-            return EndOfData();
+        if (!_directReader!.CompleteDirectRead(length, cancellationToken, out next, out var result))
+        {
+            readFinished = false;
+            completed = false;
+            return false;
+        }
+        readFinished = true;
+        return TryMoveNext(result, cancellationToken, out completed);
+    }
+
+    public void AbortDirectRead() => _directReader!.AbortDirectRead();
+
+    public bool TryMoveNext(ReadResult result, CancellationToken cancellationToken, out bool completed)
+    {
         if (result.IsCanceled)
             ThrowHelper.ThrowOperationCanceled(cancellationToken);
-
-        // Close the read without consuming bytes. TryMoveNext immediately re-opens it through TryRead
-        // and performs all framing/advance decisions synchronously from object-resident state.
-        reader.AdvanceTo(result.Buffer.Start, result.Buffer.Start);
-        return true;
+        return TryMoveNext(result, hasRead: true, out completed);
     }
 
     // The underlying reader reported completion, so the wire is at EOF. Disarm the deferred advance by
@@ -74,6 +89,9 @@ sealed class PipeSegmentEnumerator<TSegmenter, TSegment>(PipeReader reader, TSeg
     // distinguishes that would-block from EOF. This is the poll primitive used by read-wake drivers:
     // after one leaf wake they re-enter here and synchronously descend framing again.
     public bool TryMoveNext(out bool completed)
+        => TryMoveNext(default, hasRead: false, out completed);
+
+    bool TryMoveNext(ReadResult suppliedRead, bool hasRead, out bool completed)
     {
         completed = false;
 
@@ -81,7 +99,7 @@ sealed class PipeSegmentEnumerator<TSegmenter, TSegment>(PipeReader reader, TSeg
         {
             if (_consumePosition is null)
             {
-                if (!reader.TryRead(out var consumeResult))
+                if (!TryTakeRead(out var consumeResult))
                     return false;
                 if (consumeResult.IsCompleted)
                 {
@@ -105,7 +123,7 @@ sealed class PipeSegmentEnumerator<TSegmenter, TSegment>(PipeReader reader, TSeg
             }
         }
 
-        if (!reader.TryRead(out var result))
+        if (!TryTakeRead(out var result))
             return false;
         if (result.IsCompleted)
         {
@@ -137,6 +155,18 @@ sealed class PipeSegmentEnumerator<TSegmenter, TSegment>(PipeReader reader, TSeg
             case var value:
                 ThrowHelper.ThrowUnhandledCase(value);
                 return default;
+        }
+
+        bool TryTakeRead(out ReadResult result)
+        {
+            if (hasRead)
+            {
+                result = suppliedRead;
+                suppliedRead = default;
+                hasRead = false;
+                return true;
+            }
+            return reader.TryRead(out result);
         }
     }
 

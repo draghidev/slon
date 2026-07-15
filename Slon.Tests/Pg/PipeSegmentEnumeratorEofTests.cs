@@ -112,4 +112,27 @@ public class PipeSegmentEnumeratorEofTests
         Assert.IsTrue(completed);
         await e.DisposeAsync();
     }
+
+    [TestMethod]
+    public async Task DirectRead_PreservesFramingAndTerminalState()
+    {
+        var e = BuildEnumerator(LenPrefixed(24));
+
+        Assert.IsTrue(e.TryBeginDirectRead(default, out var read));
+        var length = await read;
+        Assert.IsTrue(e.CompleteDirectRead(length, default, out _, out var readFinished, out var completed));
+        Assert.IsTrue(readFinished);
+        Assert.IsFalse(completed);
+        Assert.AreEqual(24, e.Current);
+
+        Assert.IsFalse(e.TryMoveNext(out completed));
+        Assert.IsFalse(completed);
+        Assert.IsTrue(e.TryBeginDirectRead(default, out read));
+        length = await read;
+        Assert.IsFalse(e.CompleteDirectRead(length, default, out _, out readFinished, out completed));
+        Assert.IsTrue(readFinished);
+        Assert.IsTrue(completed);
+
+        await e.DisposeAsync();
+    }
 }

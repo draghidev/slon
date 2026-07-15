@@ -8,10 +8,10 @@ namespace Slon.Pipelines;
 abstract class StreamPipeReader : PipeReader
 {
     readonly ValueTaskSourcePromise<ReadResult> _readAsyncCorePromise = new();
-    readonly ValueTaskSourcePromise<ReadResult> _reentrantReadAsyncCorePromise = new();
     bool _isReadActive;
+    bool _directReadAwaitingData;
 
-    // Null in conduit mode (CancelPendingRead unsupported): the caller's token threads straight to
+    // Null in direct-read mode (CancelPendingRead unsupported): the caller's token threads straight to
     // the underlying stream read, so neither this source nor a per-read registration is allocated.
     protected AutoResetCancellationTokenSource? PendingReadTokenSource { get; }
     protected bool IsReaderCompleted { get; set; }
@@ -187,6 +187,77 @@ abstract class StreamPipeReader : PipeReader
         return TryReadCore(out result);
     }
 
+    internal bool SupportsDirectRead => PendingReadTokenSource is null;
+
+    // Direct leaf handoff. The caller awaits the stream's ValueTask<int> directly, then returns
+    // the byte count through CompleteDirectRead. This keeps buffer ownership and PipeReader read tenure
+    // here while removing the intermediate ReadAsyncCore completion frame.
+    internal ValueTask<int> BeginDirectRead(CancellationToken cancellationToken)
+    {
+        ThrowIfCompleted();
+        if (cancellationToken.IsCancellationRequested)
+            return ValueTask.FromException<int>(new OperationCanceledException(cancellationToken));
+        if (!TryStartRead())
+            ThrowAlreadyReading();
+
+        try
+        {
+            if (Segments.BufferedBytes is 0 && UseZeroByteReads)
+            {
+                _directReadAwaitingData = true;
+                return Stream.ReadAsync(Memory<byte>.Empty, cancellationToken);
+            }
+            return StartDataRead(cancellationToken);
+        }
+        catch
+        {
+            EndStartedRead();
+            throw;
+        }
+    }
+
+    // Returns false only when a zero-byte readiness wake descended into a data read that suspended.
+    internal bool CompleteDirectRead(int length, CancellationToken cancellationToken, out ValueTask<int> next, out ReadResult result)
+    {
+        if (_directReadAwaitingData)
+        {
+            _directReadAwaitingData = false;
+            next = StartDataRead(cancellationToken);
+            if (!next.IsCompletedSuccessfully)
+            {
+                result = default;
+                return false;
+            }
+            length = next.Result;
+        }
+
+        if (length is not 0)
+        {
+            ExaminedEverything = false;
+            Segments.Grow(length);
+        }
+        result = new ReadResult(Segments.GetReadOnlySequence(), isCanceled: false, isCompleted: length is 0);
+        next = default;
+        EndStartedRead();
+        return true;
+    }
+
+    internal void AbortDirectRead()
+    {
+        _directReadAwaitingData = false;
+        // The decoder uses one cleanup path for failures before and after CompleteDirectRead.
+        // A pre-cancelled begin never acquires tenure, while framing can fail after completion
+        // released it, so abort must tolerate either boundary.
+        if (_isReadActive)
+            EndStartedRead();
+    }
+
+    ValueTask<int> StartDataRead(CancellationToken cancellationToken)
+    {
+        var buffer = Segments.Reserve(0, enforceHint: false);
+        return Stream.ReadAsync(buffer, cancellationToken);
+    }
+
     protected ReadResult ReadCore(int minimumSize, TimeSpan timeout)
     {
         var deadline = new Deadline(timeout);
@@ -263,15 +334,7 @@ abstract class StreamPipeReader : PipeReader
 
     protected ValueTask<ReadResult> ReadAsyncCore(int minimumSize, CancellationToken cancellationToken)
     {
-        // An inline read completion can drive the decoder far enough to request the next physical read
-        // before this promise's producing SetResult frame has returned. The first operation is finished,
-        // but its promise tenure is still live; use the alternate slot for that one-level re-entry.
-        var promise = !_readAsyncCorePromise.IsStarted
-            ? _readAsyncCorePromise
-            : !_reentrantReadAsyncCorePromise.IsStarted
-                ? _reentrantReadAsyncCorePromise
-                : throw new InvalidOperationException("Both read promise tenures are active.");
-        PromiseAsyncValueTaskMethodBuilder<ReadResult>.Promise = promise;
+        PromiseAsyncValueTaskMethodBuilder<ReadResult>.Promise = _readAsyncCorePromise;
         try
         {
             return ReadAsyncCore(minimumSize, PendingReadTokenSource, cancellationToken);
@@ -292,7 +355,7 @@ abstract class StreamPipeReader : PipeReader
                 ThrowAlreadyReading();
             }
 
-            // Conduit mode (no source): caller's token threads straight to the stream read, no
+            // Direct-read mode (no source): caller's token threads straight to the stream read, no
             // registration. Otherwise hook the caller's token onto the source.
             CancellationTokenRegistration reg = default;
             CancellationToken token;

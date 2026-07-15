@@ -13,7 +13,7 @@ sealed class SocketStreamConnection : TransportConnection
     SocketStreamConnection(SealedNetworkStream stream, TransportConnectionOptions options)
     {
         _stream = stream;
-        // Conduit mode: the NetworkStream cancels natively off the token we pass its Read/Write, so
+        // NetworkStream cancels natively from the token passed to Read/Write, so
         // CancelPending* (and its per-op token-source registration) is dead weight here.
         Reader = new DefaultStreamPipeReader(stream, new StreamPipeReaderOptions(bufferSize: options.ReaderSegmentSize, useZeroByteReads: options.UseZeroByteReads), supportCancelPending: false);
         Writer = new DefaultStreamPipeWriter(stream, new StreamPipeWriterOptions(minimumBufferSize: options.WriterSegmentSize), supportCancelPending: false);

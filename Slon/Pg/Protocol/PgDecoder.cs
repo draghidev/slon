@@ -192,7 +192,7 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
             {
                 var handleTask = CurrentExecutionControl.HandleMessageAuto(channel.Current);
                 if (!handleTask.IsCompletedSuccessfully)
-                    return MoveNextAsyncCore(null, handleTask, cancellationToken);
+                    return MoveNextAsyncCore(null, null, handleTask, cancellationToken);
                 if (!handleTask.Result)
                     return new(true);
             }
@@ -202,31 +202,54 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
             if (completed)
                 return new(false);
 
-            ValueTask<ReadResult> readTask;
+            var readToken = _cancellationTokenSource.Token;
             try
             {
-                readTask = channel.ReadForPollAsync(_cancellationTokenSource.Token);
-            }
-            catch (Exception ex) when (_cancellationTokenSource.IsCancellationRequested)
-            {
-                throw TranslateReadCancellation(ex, cancellationToken);
-            }
-            if (!readTask.IsCompletedSuccessfully)
-                return MoveNextAsyncCore(readTask, null, cancellationToken);
-            try
-            {
-                if (!channel.PublishPollRead(readTask.Result, _cancellationTokenSource.Token))
+                if (channel.TryBeginDirectRead(readToken, out var directReadTask))
+                {
+                    try
+                    {
+                        while (true)
+                        {
+                            if (!directReadTask.IsCompletedSuccessfully)
+                                return MoveNextAsyncCore(null, directReadTask, null, cancellationToken);
+                            if (channel.CompleteDirectRead(directReadTask.Result, readToken, out directReadTask, out var readFinished, out var directReadCompleted))
+                                break;
+                            if (!readFinished)
+                                continue;
+                            if (directReadCompleted)
+                                return new(false);
+                            goto nextRead;
+                        }
+                        continue;
+                    }
+                    catch (Exception ex)
+                    {
+                        channel.AbortDirectRead();
+                        if (_cancellationTokenSource.IsCancellationRequested)
+                            throw TranslateReadCancellation(ex, cancellationToken);
+                        throw;
+                    }
+                }
+
+                var readTask = channel.ReadAsync(readToken);
+                if (!readTask.IsCompletedSuccessfully)
+                    return MoveNextAsyncCore(readTask, null, null, cancellationToken);
+                if (channel.TryMoveNextBatch(readTask.Result, _cancellationTokenSource.Token, out var readCompleted))
+                    continue;
+                if (readCompleted)
                     return new(false);
             }
             catch (Exception ex) when (_cancellationTokenSource.IsCancellationRequested)
             {
                 throw TranslateReadCancellation(ex, cancellationToken);
             }
+            nextRead:;
         }
 
         [MethodImpl(MethodImplOptions.NoInlining)]
         [AsyncMethodBuilder(typeof(NonContextRestoringPoolingValueTaskMethodBuilder<>))]
-        async ValueTask<bool> MoveNextAsyncCore(ValueTask<ReadResult>? readTask, ValueTask<bool>? messageHandledTask, CancellationToken cancellationToken)
+        async ValueTask<bool> MoveNextAsyncCore(ValueTask<ReadResult>? readTask, ValueTask<int>? directReadTask, ValueTask<bool>? messageHandledTask, CancellationToken cancellationToken)
         {
             var timeoutSet = false;
             var registration = cancellationToken.UnsafeRegister(static (state, _) => ((CancellationTokenSource)state!).Cancel(), _cancellationTokenSource);
@@ -252,12 +275,47 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
                             }
                             var result = await pendingRead.ConfigureAwait(false);
                             readTask = null;
-                            if (!_channel.PublishPollRead(result, _cancellationTokenSource.Token))
+                            if (_channel.TryMoveNextBatch(result, _cancellationTokenSource.Token, out var readCompleted))
+                                continue;
+                            if (readCompleted)
                                 return false;
                         }
                         catch (Exception ex) when (_cancellationTokenSource.IsCancellationRequested)
                         {
                             throw TranslateReadCancellation(ex, cancellationToken);
+                        }
+                    }
+
+                    if (directReadTask is { } pendingDirectRead)
+                    {
+                        try
+                        {
+                            if (!timeoutSet)
+                            {
+                                SetRemainingTimeout(ReadTimeout);
+                                timeoutSet = true;
+                            }
+                            var length = await pendingDirectRead.ConfigureAwait(false);
+                            if (_channel.CompleteDirectRead(length, _cancellationTokenSource.Token, out var nextDirectRead, out var readFinished, out var readCompleted))
+                            {
+                                directReadTask = null;
+                                continue;
+                            }
+                            if (!readFinished)
+                            {
+                                directReadTask = nextDirectRead;
+                                continue;
+                            }
+                            directReadTask = null;
+                            if (readCompleted)
+                                return false;
+                        }
+                        catch (Exception ex)
+                        {
+                            _channel.AbortDirectRead();
+                            if (_cancellationTokenSource.IsCancellationRequested)
+                                throw TranslateReadCancellation(ex, cancellationToken);
+                            throw;
                         }
                     }
 
@@ -280,7 +338,14 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
                     if (completed)
                         return false;
 
-                    try { readTask = _channel.ReadForPollAsync(_cancellationTokenSource.Token); }
+                    try
+                    {
+                        var token = _cancellationTokenSource.Token;
+                        if (_channel.TryBeginDirectRead(token, out var nextDirectRead))
+                            directReadTask = nextDirectRead;
+                        else
+                            readTask = _channel.ReadAsync(token);
+                    }
                     catch (Exception ex) when (_cancellationTokenSource.IsCancellationRequested)
                     { throw TranslateReadCancellation(ex, cancellationToken); }
                 }
