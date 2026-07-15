@@ -35,6 +35,27 @@ sealed class PipeSegmentEnumerator<TSegmenter, TSegment>(PipeReader reader, TSeg
 
     public PipeReader PipeReader => reader;
 
+    public ValueTask<ReadResult> ReadForPollAsync(CancellationToken cancellationToken)
+    {
+        var minimumSize = _currentLength is not -1 && _consumePosition is null
+            ? (int)Math.Min(_currentLength, int.MaxValue)
+            : _segmenter.MinimumSize;
+        return reader.ReadAtLeastAsync(minimumSize, cancellationToken);
+    }
+
+    public bool PublishPollRead(ReadResult result, CancellationToken cancellationToken)
+    {
+        if (result.IsCompleted)
+            return EndOfData();
+        if (result.IsCanceled)
+            ThrowHelper.ThrowOperationCanceled(cancellationToken);
+
+        // Close the read without consuming bytes. TryMoveNext immediately re-opens it through TryRead
+        // and performs all framing/advance decisions synchronously from object-resident state.
+        reader.AdvanceTo(result.Buffer.Start, result.Buffer.Start);
+        return true;
+    }
+
     // The underlying reader reported completion, so the wire is at EOF. Disarm the deferred advance by
     // clearing the pending-segment sentinel: a re-drive past completion (recovery drain, or any caller
     // that keeps pulling after false) must not re-apply a stale consume position, whose segment and
@@ -47,6 +68,78 @@ sealed class PipeSegmentEnumerator<TSegmenter, TSegment>(PipeReader reader, TSeg
     }
 
     ValueTask<bool> IAsyncEnumerator<TSegment>.MoveNextAsync() => MoveNextAsync(CancellationToken.None);
+
+    // Nonblocking counterpart to MoveNext/MoveNextAsync. It consumes every byte already available
+    // from the reader and returns false only when another physical read is required. completed
+    // distinguishes that would-block from EOF. This is the poll primitive used by read-wake drivers:
+    // after one leaf wake they re-enter here and synchronously descend framing again.
+    public bool TryMoveNext(out bool completed)
+    {
+        completed = false;
+
+        if (_currentLength is not -1)
+        {
+            if (_consumePosition is null)
+            {
+                if (!reader.TryRead(out var consumeResult))
+                    return false;
+                if (consumeResult.IsCompleted)
+                {
+                    completed = true;
+                    return EndOfData();
+                }
+                if (consumeResult.IsCanceled)
+                    ThrowHelper.ThrowOperationCanceled(CancellationToken.None);
+                if (consumeResult.Buffer.Length < _currentLength)
+                {
+                    reader.AdvanceTo(consumeResult.Buffer.Start, consumeResult.Buffer.End);
+                    return false;
+                }
+                reader.AdvanceTo(consumeResult.Buffer.GetPosition(_currentLength));
+                _currentLength = -1;
+            }
+            else
+            {
+                reader.AdvanceTo(_consumePosition.GetValueOrDefault(), _examinedPosition);
+                _currentLength = -1;
+            }
+        }
+
+        if (!reader.TryRead(out var result))
+            return false;
+        if (result.IsCompleted)
+        {
+            completed = true;
+            return EndOfData();
+        }
+        if (result.IsCanceled)
+            ThrowHelper.ThrowOperationCanceled(CancellationToken.None);
+
+        var status = _segmenter.CreateSegment(result.Buffer, out _currentLength, out _current);
+        switch (status)
+        {
+            case OperationStatus.NeedMoreData when _currentLength > 0:
+            case OperationStatus.Done:
+                ArgumentOutOfRangeException.ThrowIfNegativeOrZero(_currentLength, "segmentLength");
+                _consumePosition = _currentLength <= result.Buffer.Length ? result.Buffer.GetPosition(_currentLength) : null;
+                _examinedPosition = _consumePosition ?? result.Buffer.End;
+                return true;
+            case OperationStatus.NeedMoreData:
+                reader.AdvanceTo(result.Buffer.Start, result.Buffer.End);
+                return false;
+            case OperationStatus.InvalidData:
+                reader.Complete(new Exception("Segmenter encountered invalid data."));
+                completed = true;
+                return false;
+            case OperationStatus.DestinationTooSmall:
+                ThrowHelper.ThrowInvalidOperation();
+                return default;
+            case var value:
+                ThrowHelper.ThrowUnhandledCase(value);
+                return default;
+        }
+    }
+
     public ValueTask<bool> MoveNextAsync(CancellationToken cancellationToken = default)
     {
         ValueTask<ReadResult> task;

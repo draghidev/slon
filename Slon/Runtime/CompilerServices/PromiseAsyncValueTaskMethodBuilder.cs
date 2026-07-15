@@ -228,6 +228,7 @@ sealed class ValueTaskSourcePromise<TResult> : IValueTaskSource<TResult>, IValue
     bool _taskSourceRequired;
 
     public short Token => _core.Version;
+    public bool IsStarted => Volatile.Read(ref _started);
 
     public void AwaitOnCompleted<TAwaiter, TStateMachine>(
         ref TAwaiter awaiter,

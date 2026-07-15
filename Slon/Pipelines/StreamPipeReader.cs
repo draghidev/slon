@@ -8,6 +8,7 @@ namespace Slon.Pipelines;
 abstract class StreamPipeReader : PipeReader
 {
     readonly ValueTaskSourcePromise<ReadResult> _readAsyncCorePromise = new();
+    readonly ValueTaskSourcePromise<ReadResult> _reentrantReadAsyncCorePromise = new();
     bool _isReadActive;
 
     // Null in conduit mode (CancelPendingRead unsupported): the caller's token threads straight to
@@ -262,7 +263,15 @@ abstract class StreamPipeReader : PipeReader
 
     protected ValueTask<ReadResult> ReadAsyncCore(int minimumSize, CancellationToken cancellationToken)
     {
-        PromiseAsyncValueTaskMethodBuilder<ReadResult>.Promise = _readAsyncCorePromise;
+        // An inline read completion can drive the decoder far enough to request the next physical read
+        // before this promise's producing SetResult frame has returned. The first operation is finished,
+        // but its promise tenure is still live; use the alternate slot for that one-level re-entry.
+        var promise = !_readAsyncCorePromise.IsStarted
+            ? _readAsyncCorePromise
+            : !_reentrantReadAsyncCorePromise.IsStarted
+                ? _reentrantReadAsyncCorePromise
+                : throw new InvalidOperationException("Both read promise tenures are active.");
+        PromiseAsyncValueTaskMethodBuilder<ReadResult>.Promise = promise;
         try
         {
             return ReadAsyncCore(minimumSize, PendingReadTokenSource, cancellationToken);

@@ -2,6 +2,7 @@ using System.Buffers;
 using System.Buffers.Text;
 using System.Collections;
 using System.Diagnostics;
+using System.IO.Pipelines;
 using System.Runtime.CompilerServices;
 using System.Text;
 using Slon.Runtime.CompilerServices;
@@ -187,56 +188,46 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
         while (true)
         {
             var channel = _channel;
-            if (!channel.TryMoveNext())
+            while (channel.TryMoveNext())
             {
-                // The read can throw OCE synchronously: if the CTS (linked to AbortToken) is already
-                // cancelled at entry, it throws before returning a task, bypassing MoveNextAsyncCore's
-                // catch (which only runs when the read parks). A pre-check is a TOCTOU, so catch the
-                // synchronous throw and run it through the same translation as the async path.
-                ValueTask<bool> task;
-                try
-                {
-                    task = channel.MoveNextAsync(_cancellationTokenSource.Token);
-                }
-                catch (Exception ex) when (_cancellationTokenSource.IsCancellationRequested)
-                {
-                    // Key on the cancel state - which the protocol owns - NOT the exception type. A
-                    // cancelled read surfaces an OCE when the token is tripped at entry, but whatever the
-                    // transport throws when an in-flight read is aborted otherwise (today a wrapped socket
-                    // exception / ObjectDisposedException; another transport would throw its own). Keying
-                    // on the type would couple us to one transport's exception vocabulary and silently
-                    // fail to translate another's. Translate whatever it is; mirrors the sync MoveNext.
-                    throw TranslateReadCancellation(ex, cancellationToken);
-                }
-                if (!task.IsCompletedSuccessfully)
-                    return MoveNextAsyncCore(task, null, cancellationToken);
-
-                var success = task.Result;
-                channel.CommitBatch();
-                if (!success)
-                    return new(false);
-
-                if (!channel.TryMoveNext())
-                    ThrowHelper.ThrowInvalidOperation("No message in a new batch");
+                var handleTask = CurrentExecutionControl.HandleMessageAuto(channel.Current);
+                if (!handleTask.IsCompletedSuccessfully)
+                    return MoveNextAsyncCore(null, handleTask, cancellationToken);
+                if (!handleTask.Result)
+                    return new(true);
             }
 
-            var handleTask = CurrentExecutionControl.HandleMessageAuto(channel.Current);
-            if (!handleTask.IsCompletedSuccessfully)
-                return MoveNextAsyncCore(default, handleTask, cancellationToken);
-
-            // We have to try to fetch another message if this one was handled by the protocol.
-            if (handleTask.Result)
+            if (channel.TryMoveNextBatch(out var completed))
                 continue;
+            if (completed)
+                return new(false);
 
-            return new(true);
+            ValueTask<ReadResult> readTask;
+            try
+            {
+                readTask = channel.ReadForPollAsync(_cancellationTokenSource.Token);
+            }
+            catch (Exception ex) when (_cancellationTokenSource.IsCancellationRequested)
+            {
+                throw TranslateReadCancellation(ex, cancellationToken);
+            }
+            if (!readTask.IsCompletedSuccessfully)
+                return MoveNextAsyncCore(readTask, null, cancellationToken);
+            try
+            {
+                if (!channel.PublishPollRead(readTask.Result, _cancellationTokenSource.Token))
+                    return new(false);
+            }
+            catch (Exception ex) when (_cancellationTokenSource.IsCancellationRequested)
+            {
+                throw TranslateReadCancellation(ex, cancellationToken);
+            }
         }
 
-        // Implemented in an somewhat convoluted fashion to handle either task without needing another async frame.
         [MethodImpl(MethodImplOptions.NoInlining)]
         [AsyncMethodBuilder(typeof(NonContextRestoringPoolingValueTaskMethodBuilder<>))]
-        async ValueTask<bool> MoveNextAsyncCore(ValueTask<bool> task, ValueTask<bool>? messageHandledTask, CancellationToken cancellationToken)
+        async ValueTask<bool> MoveNextAsyncCore(ValueTask<ReadResult>? readTask, ValueTask<bool>? messageHandledTask, CancellationToken cancellationToken)
         {
-            var firstMessageHandled = messageHandledTask.HasValue;
             var timeoutSet = false;
             var registration = cancellationToken.UnsafeRegister(static (state, _) => ((CancellationTokenSource)state!).Cancel(), _cancellationTokenSource);
             try
@@ -245,48 +236,53 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
                 {
                     if (messageHandledTask is { } t)
                     {
-                        // If message wasn't handled we can surface it to the caller.
                         if (!await t.ConfigureAwait(false))
                             return true;
-
-                        while (_channel.TryMoveNext())
-                        {
-                            if (!await CurrentExecutionControl.HandleMessageAuto(_channel.Current).ConfigureAwait(false))
-                                return true;
-                        }
+                        messageHandledTask = null;
                     }
 
-                    try
+                    if (readTask is { } pendingRead)
                     {
-                        if (!timeoutSet)
+                        try
                         {
-                            SetRemainingTimeout(ReadTimeout);
-                            timeoutSet = true;
-                            if (firstMessageHandled)
-                                task = _channel.MoveNextAsync(_cancellationTokenSource.Token);
-                            firstMessageHandled = false;
+                            if (!timeoutSet)
+                            {
+                                SetRemainingTimeout(ReadTimeout);
+                                timeoutSet = true;
+                            }
+                            var result = await pendingRead.ConfigureAwait(false);
+                            readTask = null;
+                            if (!_channel.PublishPollRead(result, _cancellationTokenSource.Token))
+                                return false;
                         }
-                        else
+                        catch (Exception ex) when (_cancellationTokenSource.IsCancellationRequested)
                         {
-                            task = _channel.MoveNextAsync(_cancellationTokenSource.Token);
+                            throw TranslateReadCancellation(ex, cancellationToken);
                         }
-
-                        var success = await task.ConfigureAwait(false);
-                        _channel.CommitBatch();
-                        if (!success)
-                            return false;
-
-                        if (!_channel.TryMoveNext())
-                            ThrowHelper.ThrowInvalidOperation("No message in a new batch");
                     }
+
+                    while (_channel.TryMoveNext())
+                    {
+                        var handleTask = CurrentExecutionControl.HandleMessageAuto(_channel.Current);
+                        if (!handleTask.IsCompletedSuccessfully)
+                        {
+                            messageHandledTask = handleTask;
+                            break;
+                        }
+                        if (!handleTask.Result)
+                            return true;
+                    }
+                    if (messageHandledTask.HasValue)
+                        continue;
+
+                    if (_channel.TryMoveNextBatch(out var completed))
+                        continue;
+                    if (completed)
+                        return false;
+
+                    try { readTask = _channel.ReadForPollAsync(_cancellationTokenSource.Token); }
                     catch (Exception ex) when (_cancellationTokenSource.IsCancellationRequested)
-                    {
-                        // Key on cancel state, not exception type, so the translation stays independent
-                        // of the transport's exception vocabulary (see the entry-catch note above).
-                        throw TranslateReadCancellation(ex, cancellationToken);
-                    }
-
-                    messageHandledTask = CurrentExecutionControl.HandleMessageAuto(_channel.Current);
+                    { throw TranslateReadCancellation(ex, cancellationToken); }
                 }
             }
             finally
@@ -312,17 +308,27 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
         // path. Run the handler here: a body reading its terminating RFQ via TryGetNext would otherwise
         // leave _rfqCount stale and route the wrong count to recovery. TryHandleMessage returns false
         // only when the handler needs I/O, where we bail and the caller falls back to MoveNextAsync.
-        while (_channel.TryPeekNext(out var peeked))
+        while (true)
         {
-            if (!CurrentExecutionControl.TryHandleMessage(peeked, out var handled))
+            while (_channel.TryPeekNext(out var peeked))
+            {
+                if (!CurrentExecutionControl.TryHandleMessage(peeked, out var handled))
+                    goto unavailable;
+                _channel.TryMoveNext();
+                if (handled)
+                    continue;
+                message = _channel.Current;
+                return true;
+            }
+
+            // The current batch is exhausted. Descend through any bytes the PipeReader already owns
+            // before reporting unavailable; only a genuinely pending physical read should make the
+            // async caller install its continuation tree.
+            if (!_channel.TryMoveNextBatch(out _))
                 break;
-            _channel.TryMoveNext();
-            if (handled)
-                continue;
-            message = _channel.Current;
-            return true;
         }
 
+        unavailable:
         message = default;
         return false;
     }

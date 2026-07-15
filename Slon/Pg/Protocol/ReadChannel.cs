@@ -1,3 +1,4 @@
+using System.IO.Pipelines;
 using Slon.Pipelines;
 
 namespace Slon.Pg.Protocol;
@@ -23,6 +24,20 @@ sealed class ReadChannel
 
     public bool TryMoveNext() => _messageContext.TryMoveNext();
     public bool TryPeekNext(out BackendMessage message) => _messageContext.TryPeekNext(out message);
+
+    public bool TryMoveNextBatch(out bool completed)
+    {
+        if (!_messageBatchEnumerator.TryMoveNext(out completed))
+            return false;
+        CommitBatch();
+        return true;
+    }
+
+    public ValueTask<ReadResult> ReadForPollAsync(CancellationToken cancellationToken)
+        => _messageBatchEnumerator.ReadForPollAsync(cancellationToken);
+
+    public bool PublishPollRead(ReadResult result, CancellationToken cancellationToken)
+        => _messageBatchEnumerator.PublishPollRead(result, cancellationToken);
 
     public ValueTask<bool> MoveNextAsync(CancellationToken cancellationToken) => _messageBatchEnumerator.MoveNextAsync(cancellationToken);
     public bool MoveNext(TimeSpan timeout) => _messageBatchEnumerator.MoveNext(timeout);

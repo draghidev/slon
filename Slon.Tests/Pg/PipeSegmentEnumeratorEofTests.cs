@@ -87,4 +87,29 @@ public class PipeSegmentEnumeratorEofTests
 
         e.Dispose();
     }
+
+    [TestMethod]
+    public async Task TryMoveNext_PollsFragmentedSegmentWithoutSuspending()
+    {
+        var pipe = new Pipe();
+        var e = new PipeSegmentEnumerator<FixedSegmenter, int>(pipe.Reader, new FixedSegmenter());
+
+        Assert.IsFalse(e.TryMoveNext(out var completed));
+        Assert.IsFalse(completed);
+
+        var wire = LenPrefixed(24);
+        await pipe.Writer.WriteAsync(wire.AsMemory(0, 2));
+        Assert.IsFalse(e.TryMoveNext(out completed), "a partial header must request another read");
+        Assert.IsFalse(completed);
+
+        await pipe.Writer.WriteAsync(wire.AsMemory(2));
+        Assert.IsTrue(e.TryMoveNext(out completed));
+        Assert.IsFalse(completed);
+        Assert.AreEqual(24, e.Current);
+
+        await pipe.Writer.CompleteAsync();
+        Assert.IsFalse(e.TryMoveNext(out completed));
+        Assert.IsTrue(completed);
+        await e.DisposeAsync();
+    }
 }
