@@ -306,7 +306,7 @@ sealed class EmptyProtocol<TMode> : IPoolConnection<EmptyProtocol<TMode>>
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public ValueTask<PipelineItemResult> ExecuteItemAsync(EmptyFlow<TMode> item, bool waiterExecution, CancellationToken cancellationToken)
+        public ValueTask<PipelineItemResult> ExecuteItemAsync(EmptyFlow<TMode> item, bool pipelineTaskRecovery, CancellationToken cancellationToken)
         {
             ((IProtocolFlow)item).Start();
             return ExecuteCore(_protocol.FlowControl, item, cancellationToken);

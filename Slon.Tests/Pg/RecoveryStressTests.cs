@@ -70,7 +70,7 @@ public class RecoveryStressTests
 
     // Recovery dispatch OVERLAPPING the pump's next dispatch - the execute-promise single-pump edge
     // case. A pipeline-task fault drives recovery; when it surfaces as a committed-waiter failure it
-    // routes through RecoverWaiter on the advancer chain (a second dispatch stream, the path that
+    // routes through RecoverInFlightItem on the advancer chain (a second dispatch stream, the path that
     // collided). For a waiter failure the failed flow's write window is already closed, so recovery
     // is a pure read-drain of the inherited RFQs - no Sync, we are not allowed to write anymore.
     // Queuing a follow-on flow back-to-back makes the pump dispatch it while recovery is in flight.

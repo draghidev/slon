@@ -100,7 +100,7 @@ sealed class ResyncRecoveryFlow : PgClientFlow
         //
         // Sequencing against the failed flow's in-flight trailing (it owns the single-producer
         // writer): if outstanding already completed, write inline. Otherwise move the writes to our
-        // trailing phase so the framework reaches the tail-waiter state before we await outstanding.
+        // trailing phase so the framework reaches the pending-tail state before we await outstanding.
         // Required for two reasons:
         //   (a) TCP send-window deadlock: outstanding's flush waits on the send buffer draining,
         //       which needs the peer to read, which needs US to read its responses. Inline await
@@ -108,7 +108,7 @@ sealed class ResyncRecoveryFlow : PgClientFlow
         //       the cycle. Trailing-phase await runs the drain concurrently and unblocks the flush.
         //   (b) Inline-blocking wedges the executor pump half-committed; trailing-phase await keeps
         //       the ExecutingItem invariant intact and recoverable via TrailingExecutionTask.
-        // Write window closed (PipelineTaskWaiter: identity released from the writer): pure read-drain
+        // Write window closed (PipelineTask: identity released from the writer): pure read-drain
         // of the failed flow's inherited RFQs, no resync write. An open transaction left here is
         // backstopped by the next flow's wire-handoff guard.
         if (!_canWrite)

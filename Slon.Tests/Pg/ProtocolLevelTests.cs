@@ -122,7 +122,7 @@ public class ProtocolLevelTests
     // flow, would finish that flow, loop into MoveNextAsync, snipe HandoffSlot on its own
     // (non-caller) thread, process the sync flow on TP, then leave the sync caller stranded
     // waiting for the next park. The sync caller's eventual SetResult would dispatch the
-    // executor's continuation onto a stale/empty state and CompleteWaiter would NRE during
+    // executor's continuation onto a stale/empty state and RetireItem would NRE during
     // protocol shutdown.
     //
     // Fix: HandoffAcked gate on TryTakeHandoff. The executor cannot pick up HandoffSlot until

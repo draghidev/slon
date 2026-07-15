@@ -886,23 +886,23 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public ValueTask<PipelineItemResult> ExecuteItemAsync(PgClientFlow item, bool waiterExecution, CancellationToken cancellationToken)
+        public ValueTask<PipelineItemResult> ExecuteItemAsync(PgClientFlow item, bool pipelineTaskRecovery, CancellationToken cancellationToken)
         {
             item.GetExecutionControl(_control).Start();
 
             // The pooled execute promise is SINGLE-PUMPED: the executor pump serializes its dispatches,
             // so one ExecuteCore releases the promise before the next Starts, and reusing one instance is
-            // safe. A waiter execution (the waiter-drain recovery, off the advancer chain) can run
+            // safe. Pipeline-task recovery can run
             // alongside an in-flight executor dispatch; routing it through the pooled promise would let
             // the two TryStart the one promise at once -> "already executing". The framework tells us
-            // which side issued this, so we read it off waiterExecution, not off item type: most recovery
+            // which side issued this, so we read it off pipelineTaskRecovery, not off item type: most recovery
             // dispatches run INLINE on the executor thread (serialized) and DO use the pooled promise;
-            // only the waiter-side one overlaps. A waiter execution takes the stock async builder so it
+            // only pipeline-task recovery overlaps. It takes the stock async builder so it
             // never touches the shared promise - the two sides become independent by construction. Free:
             // that path's ExecuteAuto (recovery's) completes synchronously, so the stock builder never
             // suspends and never boxes a state machine.
-            if (waiterExecution)
-                return ExecuteWaiter(_control, item, cancellationToken);
+            if (pipelineTaskRecovery)
+                return ExecutePipelineTaskRecovery(_control, item, cancellationToken);
 
             PromiseAsyncValueTaskMethodBuilder<PipelineItemResult>.Promise = _promise;
             try
@@ -927,8 +927,8 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
                 return new PipelineItemResult(tasks.TrailingExecutionTask, tasks.PipelineTask);
             }
 
-            // Stock builder (no shared promise) for a waiter-side dispatch. Body identical to ExecuteCore.
-            static async ValueTask<PipelineItemResult> ExecuteWaiter(
+            // Stock builder (no shared promise) for pipeline-task recovery. Body identical to ExecuteCore.
+            static async ValueTask<PipelineItemResult> ExecutePipelineTaskRecovery(
                 Control control, PgClientFlow item, CancellationToken cancellationToken)
             {
                 var tasks = await control.Execute(item).ConfigureAwait(false);
@@ -1002,17 +1002,17 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
             var failedItemControl = failedItem.GetExecutionControl(_control);
 
             // Substitute-write gate. Both must hold for recovery to inject a terminating Sync:
-            //   - The failure kind hasn't closed the failed flow's write window (PipelineTaskWaiter
+            //   - The failure kind hasn't closed the failed flow's write window (PipelineTask
             //     is the closed-window case, identity already released from the writer).
             //   - The wire isn't already RFQ-terminated. If the last write was Query/Sync the server
             //     emits the inherited RFQs and recovery is pure read-drain; if it ended mid extended-
             //     query, recovery's Sync brings the wire back to a defined state.
-            // canWrite: the failure didn't close the write window (PipelineTaskWaiter = closed-window,
+            // canWrite: the failure didn't close the write window (PipelineTask = closed-window,
             // identity already released from the writer). Recovery writes a ROLLBACK whenever it can,
             // to close any transaction the failed flow left open (including an exclusive scope's, on
             // abort-to-root). canWriteSync additionally injects a Sync to realign the wire when the last
             // write was mid extended-query (no RFQ induced); a Query/Sync last message realigns itself.
-            var canWrite = context.Kind is not PipelineItemFailureKind.PipelineTaskWaiter;
+            var canWrite = context.Kind is not PipelineItemFailureKind.PipelineTask;
             var canWriteSync = canWrite && !failedItemControl.LastMessageInducesRfq;
 
             // The outstanding phase task to sequence against, by failure kind:
@@ -1024,7 +1024,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
             //     wrong message and its late fault re-enters nonexistent recovery-of-recovery.
             var outstandingIsRead = context.Kind is PipelineItemFailureKind.TrailingExecutionTask;
             var outstandingPhase =
-                outstandingIsRead || (canWriteSync && context.Kind is PipelineItemFailureKind.PipelineTask)
+                outstandingIsRead || (canWriteSync && context.Kind is PipelineItemFailureKind.ExecutionPipelineTask)
                     ? context.OutstandingPhaseTask
                     : default;
 

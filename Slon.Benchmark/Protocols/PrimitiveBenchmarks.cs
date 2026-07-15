@@ -45,7 +45,7 @@ public class PrimitiveBenchmarks
         lock (_lock) { }
     }
 
-    /// <summary>Two uncontended lock round-trips (Enqueue + CompleteWaiter).</summary>
+    /// <summary>Two uncontended lock round-trips (Enqueue + RetireItem).</summary>
     [Benchmark]
     public void LockRoundTripX2()
     {
@@ -53,7 +53,7 @@ public class PrimitiveBenchmarks
         lock (_lock) { }
     }
 
-    /// <summary>Three uncontended lock round-trips (Enqueue + CompleteWaiter + WaitForNext).</summary>
+    /// <summary>Three uncontended lock round-trips (Enqueue + RetireItem + WaitForNext).</summary>
     [Benchmark]
     public void LockRoundTripX3()
     {

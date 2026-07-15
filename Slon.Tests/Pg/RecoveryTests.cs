@@ -72,7 +72,7 @@ public class RecoveryTests
 
     // Where the FaultingFlow's body throws. PreReturn = before returning FlowTasks (surfaces
     // as PipelineItemFailureKind.ExecuteItemTask). PipelineTask = the returned pipeline task
-    // faults (PipelineItemFailureKind.PipelineTask or PipelineTaskWaiter). TrailingTask = the
+    // faults (PipelineItemFailureKind.ExecutionPipelineTask or PipelineTask). TrailingTask = the
     // returned trailing execution task faults (PipelineItemFailureKind.TrailingExecutionTask).
     internal enum FaultPhase
     {
