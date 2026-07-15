@@ -385,11 +385,15 @@ readonly struct PgEncoder
     // is the driver.
 
     // Async-path flush deferral. A pipelined async flush isn't followed by a read in the first phase,
-    // so it can be delayed to batch with later writes - but only while the buffer stays under the
-    // writer's flush threshold. Past it the flush must run to bound buffering and apply send-window
-    // backpressure; the resulting (possibly parked) flush rides the trailing slot, drained by the
-    // concurrent read. Sync flushes never defer (see Flush/FlushResumable).
-    bool CanDelayFlush => _executionControl.IsPipelined && _writer.UnflushedBytes < PgProtocolDataWriter.UnflushedBytesFlushThreshold;
+    // so it can be delayed when a successor is already queued to contribute another write. An inline
+    // producer-driven turn flushes instead: reaching that successor requires returning through the
+    // executor's suspension boundary, making the batching delay counterproductive. The buffer threshold
+    // still bounds accumulation and applies send-window backpressure. Sync flushes never defer.
+    bool CanDelayFlush
+        => _executionControl.IsPipelined
+            && _executionControl.HasQueuedFlow
+            && !_executionControl.IsInlineDrive
+            && _writer.UnflushedBytes < PgProtocolDataWriter.UnflushedBytesFlushThreshold;
 
     // Sync flushes always run: a sync flow owns the executor for its duration, so a deferred flush
     // would never be picked up (the source never unwinds to the cross-item pre-flush) and the pipeline

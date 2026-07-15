@@ -99,6 +99,7 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
     /// Backlog: flows enqueued but not yet dispatched. With Pipeline.Depth (in-flight = dispatched -
     /// completed), Depth + Backlog is the total outstanding. Lock-free read, may be stale.
     public int Backlog => _state.Backlog;
+    internal bool IsInlineDrive => _state.InlineOneShot;
 
     static void ThrowCompleted() => throw new InvalidOperationException("The source has been completed.");
 

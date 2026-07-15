@@ -437,6 +437,8 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
         // Any sync flow causes pipeline stalls (blocks execution loop until decoder is available) so effectively can't pipeline.
         public bool IsPipelined => flow is { _supportsPipelining: true, _isAsyncAtBind: true };
         public bool IsAsync => flow.IsAsync;
+        public bool HasQueuedFlow => control.HasQueuedFlow;
+        public bool IsInlineDrive => control.IsInlineDrive;
 
         // Small optimization to allow us to skip the final sync message if we can piggyback on the flow's final rfq.
         public bool LastMessageInducesRfq => flow._lastMessageInducesRfq;

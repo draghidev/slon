@@ -134,6 +134,7 @@ sealed partial class PgClientProtocol
             var first = _innerPipeline is null;
             _innerPipeline = Pipeline.Create<PgClientFlow, Policy, PgClientFlowSource, PgClientFlowSource.Enumerator>(
                 new Policy(protocol, _innerControl), innerSource, _innerPipeline);
+            _innerControl.BindSource(innerSource);
             if (first)
                 _innerControl.BindPipeline(new PipelineFlowSlots<Policy, PgClientFlowSource, PgClientFlowSource.Enumerator>(_innerPipeline));
             return innerSource;

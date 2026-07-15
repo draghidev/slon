@@ -294,6 +294,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
     {
         _source = PgClientFlowSource.Create(this, FlowControl, _options.ExecutionScheduler);
         _pipeline = Pipeline.Create<PgClientFlow, Policy, PgClientFlowSource, PgClientFlowSource.Enumerator>(new Policy(this, FlowControl), _source);
+        FlowControl.BindSource(_source);
         FlowControl.BindPipeline(new PipelineFlowSlots<Policy, PgClientFlowSource, PgClientFlowSource.Enumerator>(_pipeline));
         // Seed the wire's transaction status to Idle before the startup flow is queued. A fresh
         // connection holds no transaction, and StartupFlow's terminating RFQ doesn't route through
@@ -1050,6 +1051,11 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         // (PgDecoder routes messages to it).
         IFlowSlots _slots = null!;
         public void BindPipeline(IFlowSlots slots) => _slots = slots;
+
+        PgClientFlowSource _source;
+        public void BindSource(PgClientFlowSource source) => _source = source;
+        public bool HasQueuedFlow => _source.Backlog != 0;
+        public bool IsInlineDrive => _source.IsInlineDrive;
 
         // The scope's linked close signal, set once for an exclusive-scope inner Control; null for the
         // pool-facing FlowControl (which reads the protocol's _close directly). Inner flows read the
