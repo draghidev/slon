@@ -471,12 +471,12 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
             // lock (WaitForExecutor). Depth is counted at dispatch (executor-single-writer), so there is no
             // producer-side increment to serialize.
             if (!handoff)
-                enqueue = _source.Enqueue(flow);
+                enqueue = _source.Enqueue(flow, inlineEligible: _pipeline.Depth == 0 && _source.Backlog == 0);
             else
                 _source.EnqueueSyncWaiter(flow);
         }
         if (!handoff)
-            enqueue.Execute(runContinuationsAsynchronously: true);
+            enqueue.Execute(runContinuationsAsynchronously: false);
         else
             _source.WaitForExecutor(flow);
         return true;

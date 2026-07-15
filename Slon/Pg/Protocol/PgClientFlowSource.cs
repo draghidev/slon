@@ -37,19 +37,19 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
     /// During a sync-flow handoff, the item is queued but the dispatch is a no-op. The executor will
     /// pick it up after the handoff window closes. Throws InvalidOperationException if the source has
     /// been completed.
-    public EnqueueResult Enqueue(PgClientFlow flow)
+    public EnqueueResult Enqueue(PgClientFlow flow, bool inlineEligible = false)
     {
         if (Volatile.Read(ref _state.IsCompleted))
             ThrowCompleted();
 
-        _state.EnqueueItem(flow);
+        inlineEligible &= _state.EnqueueItem(flow);
         // Release store suffices: the flag's only cross-thread reader is the handoff close-out's
         // compensation, and EnqueueResult.Execute's under-lock gate is the full fence that publishes
         // it in time. A stale TRUE costs at most a spurious compensation wake (the wait re-check peeks
         // the queue, not this flag).
         Volatile.Write(ref _state.QueueNotEmpty, true);
 
-        return new(_state);
+        return new(_state, inlineEligible);
     }
 
     /// Synchronously enqueues a sync-mode flow and blocks until the executor processes it on the
@@ -152,6 +152,11 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
         // under the wake lock, paired with OnExecutorSuspended and the claim sites.
         int _driving;
         bool _redrive;
+        // An async enqueue that claims an idle source may drive its own first item inline. The budget
+        // ends after that item is dispatched: the next pull fake-misses, and RunLoop transfers any
+        // accrued redrive to the scheduler instead of draining later producers on this caller's thread.
+        public bool InlineOneShot;
+        public bool InlineHandBack;
 
         // The Control every flow in this source is bound to. Used to mint a flow's ExecutionControl so the
         // source pulls the handoff MRES through it rather than off a bare flow ref (GetHandoffMres is
@@ -279,6 +284,7 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
             {
                 _driving = 1;
                 _redrive = false;   // fresh runner counts only the re-drives raised during ITS run
+                InlineOneShot = !runAsync;
                 became = true;
             }
             wakeSignal.ReleaseWakeLock();
@@ -306,6 +312,23 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
             {
                 wakeSignal.DispatchClaimed(runContinuationsAsynchronously: false);
                 wakeSignal.AcquireWakeLock();
+                if (InlineOneShot)
+                {
+                    InlineOneShot = false;
+                    _driving = 0;
+                    var transfer = _redrive
+                        && !(ParkedAtSyncHead && !Volatile.Read(ref IsCompleted))
+                        && wakeSignal.TryClaimLocked();
+                    if (transfer)
+                    {
+                        _redrive = false;
+                        _driving = 1;
+                    }
+                    wakeSignal.ReleaseWakeLock();
+                    if (transfer)
+                        wakeSignal.Scheduler.SubmitDetached(static s => ((State)s!).RunLoop(), this);
+                    return;
+                }
                 if (_redrive
                     && !(ParkedAtSyncHead && !Volatile.Read(ref IsCompleted))
                     && wakeSignal.TryClaimLocked())
@@ -412,7 +435,15 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
 
         // Async enqueue (the EnqueueResult / Execute path). Capture the routing async-mode (async here)
         // before publishing - the executor dispatches it rather than holding it for a caller takeover.
-        public void EnqueueItem(PgClientFlow flow) { flow.CaptureAsyncRoutingSnapshot(isAsync: true); _storage.Enqueue(flow); }
+        public bool EnqueueItem(PgClientFlow flow)
+        {
+            flow.CaptureAsyncRoutingSnapshot(isAsync: true);
+            // If no earlier source item or held sync head exists, a successful inline claim is guaranteed
+            // to dispatch this producer's own item. A failed claim means another executor strand is live.
+            var inlineEligible = HeldSyncFlow is null && _storage.Count == 0;
+            _storage.Enqueue(flow);
+            return inlineEligible;
+        }
         public int Backlog => _storage.Count;
 
         // Consumer-side peek used by WaitCore's authoritative not-empty test.
@@ -472,12 +503,17 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
     public readonly struct EnqueueResult
     {
         readonly State? _state;
-        internal EnqueueResult(State? state) => _state = state;
+        readonly bool _inlineEligible;
+        internal EnqueueResult(State? state, bool inlineEligible)
+        {
+            _state = state;
+            _inlineEligible = inlineEligible;
+        }
 
         public void Execute(bool runContinuationsAsynchronously)
         {
             if (_state is null) return;
-            _state.TryClaim(runContinuationsAsynchronously);
+            _state.TryClaim(runContinuationsAsynchronously || !_inlineEligible);
         }
     }
 
@@ -508,6 +544,11 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
         /// primary queue. Items route through State.Current.
         public bool TryGetNext([System.Diagnostics.CodeAnalysis.MaybeNullWhen(false)] out PgClientFlow item)
         {
+            if (_state.InlineHandBack)
+            {
+                item = null;
+                return false;
+            }
             // Sync takeover: the head sync caller's inline pull on its own thread. The first pull dequeues
             // its own flow - now the queue head, every earlier flow drained - then the next pull one-shot
             // fake-misses so the pump parks and hands back to TP rather than draining a later flow here.
@@ -558,6 +599,8 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
                 if (needsArm)
                     gate.ConsumeArm();
                 item = _state.Current;
+                if (_state.InlineOneShot)
+                    _state.InlineHandBack = true;
                 return true;
             }
             item = null;
@@ -588,6 +631,9 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
             var takeoverHandBack = _state.TakeoverActive;
             if (takeoverHandBack)
                 _state.TakeoverActive = false;
+            var inlineHandBack = _state.InlineHandBack;
+            if (inlineHandBack)
+                _state.InlineHandBack = false;
 
             // Completion BEATS the primary queue, including any queued sync flow: once completing, the
             // whole queue drains inert and blocked sync callers bail (Complete wakes them; WaitForExecutor
@@ -616,7 +662,7 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
             // Not completing: park the hand-back. Skips the item-retry branch below on purpose - the
             // one-shot must park even with items queued (hand the pump back to TP rather than draining
             // a later flow on the sync caller's thread).
-            if (takeoverHandBack)
+            if (takeoverHandBack || inlineHandBack)
                 return wakeSignal.Arm();
 
             // A dispatchable item is available - retry to consume it - UNLESS a sync flow is already held

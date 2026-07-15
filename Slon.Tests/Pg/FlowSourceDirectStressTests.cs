@@ -20,6 +20,56 @@ public class FlowSourceDirectStressTests
     static int Iterations => StressEnv.Iterations(fallback: 5_000, cap: 20_000);
 
     [TestMethod]
+    public async Task IdleInlineDrive_IsBoundedToTheEnqueuingItem()
+    {
+        var protocol = PgClientProtocol.Create(new PgClientProtocolOptions(PgTestPool.NewOptions()));
+        var source = PgClientFlowSource.Create(protocol, protocol.FlowControl);
+        var enumerator = source.GetAsyncEnumerator();
+        var first = CommandFlow.CreateUninitialized();
+        var second = CommandFlow.CreateUninitialized();
+        var callerThread = Environment.CurrentManagedThreadId;
+        var firstThread = 0;
+        var secondThread = 0;
+        var secondSeen = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        async Task Consume()
+        {
+            while (true)
+            {
+                if (enumerator.TryGetNext(out var item))
+                {
+                    if (ReferenceEquals(item, first))
+                    {
+                        firstThread = Environment.CurrentManagedThreadId;
+                        // Arrives while the caller owns the one-item runner. It must be transferred to
+                        // the scheduler after the inline hand-back, not consumed on this stack.
+                        source.Enqueue(second).Execute(runContinuationsAsynchronously: false);
+                    }
+                    else if (ReferenceEquals(item, second))
+                    {
+                        secondThread = Environment.CurrentManagedThreadId;
+                        secondSeen.TrySetResult();
+                    }
+                    continue;
+                }
+                if (!await enumerator.WaitForNextAsync())
+                    return;
+            }
+        }
+
+        var consumer = Consume();
+        source.Enqueue(first, inlineEligible: true).Execute(runContinuationsAsynchronously: false);
+
+        Assert.AreEqual(callerThread, firstThread, "The idle claimant did not drive its own item inline.");
+        await secondSeen.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.AreNotEqual(callerThread, secondThread, "A successor escaped the one-item inline budget.");
+
+        enumerator.Complete();
+        await consumer.WaitAsync(TimeSpan.FromSeconds(10));
+        await enumerator.DisposeAsync();
+    }
+
+    [TestMethod]
     public async Task Stress_SourceDispatchVsDrain_SingleConsumerHolds()
     {
         // Uninitialized protocol: the source only reads Protocol.UnflushedBytes on the pull path, which

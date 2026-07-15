@@ -168,7 +168,10 @@ sealed class ExclusiveAccessFlow : PgClientFlow
         // (NeedsSyncHandoff). An async subflow, or an autonomous sync subflow (null handoff MRES), is
         // dispatched so the inner executor drives it instead of holding it for an absent caller.
         if (!subflow.NeedsSyncHandoff)
-            innerSource.Enqueue(subflow).Execute(runContinuationsAsynchronously: true);
+        {
+            var inlineEligible = _state.IsPipelineEmpty(innerSource);
+            innerSource.Enqueue(subflow, inlineEligible).Execute(runContinuationsAsynchronously: false);
+        }
         else
             innerSource.EnqueueSyncWithHandoff(subflow);
         return subflow;

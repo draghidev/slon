@@ -139,6 +139,9 @@ sealed partial class PgClientProtocol
             return innerSource;
         }
 
+        public bool IsPipelineEmpty(PgClientFlowSource source)
+            => source.Backlog == 0 && _innerPipeline!.Depth == 0;
+
         // Trip the scope's CloseSignal only, breaking any subflow parked on a wire read/write via the scope
         // shells' tokens, without touching the protocol's own token (the pooled protocol survives).
         public void AbortScope() => _scopeClose.Abort();
