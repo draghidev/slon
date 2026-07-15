@@ -152,7 +152,11 @@ static class CommandExtensions
         static async ValueTask<(PgError?, RowDescription?)> ReadSimpleAsync(PgDecoder decoder)
         {
             if (!decoder.TryGetNext(out var message))
-                message = await decoder.GetNextAsync().ConfigureAwait(false);
+            {
+                if (!await decoder.MoveNextAsync().ConfigureAwait(false))
+                    ThrowHelper.ThrowInvalidOperation("No more messages");
+                message = decoder.Current;
+            }
             if (message.EnsureExpectedOrError(PgTypes.BackendType.RowDescription, PgTypes.BackendType.NoData)
                     is var result && result.Error is { } describeError)
                 return (describeError, null);
@@ -175,7 +179,11 @@ static class CommandExtensions
             }
 
             if (!decoder.TryGetNext(out message))
-                message = await decoder.GetNextAsync().ConfigureAwait(false);
+            {
+                if (!await decoder.MoveNextAsync().ConfigureAwait(false))
+                    ThrowHelper.ThrowInvalidOperation("No more messages");
+                message = decoder.Current;
+            }
             message.DebugEnsureExpected(PgTypes.BackendType.DataRow, PgTypes.BackendType.CommandComplete);
             return (null, requestedRowDescription);
         }
@@ -187,7 +195,11 @@ static class CommandExtensions
             if (readParse)
             {
                 if (!decoder.TryGetNext(out message))
-                    message = await decoder.GetNextAsync().ConfigureAwait(false);
+                {
+                    if (!await decoder.MoveNextAsync().ConfigureAwait(false))
+                        ThrowHelper.ThrowInvalidOperation("No more messages");
+                    message = decoder.Current;
+                }
                 if (message.EnsureExpectedOrError(PgTypes.BackendType.ParseComplete) is { } parseError)
                     return (parseError, null);
 
@@ -196,7 +208,11 @@ static class CommandExtensions
             }
 
             if (!decoder.TryGetNext(out message))
-                message = await decoder.GetNextAsync().ConfigureAwait(false);
+            {
+                if (!await decoder.MoveNextAsync().ConfigureAwait(false))
+                    ThrowHelper.ThrowInvalidOperation("No more messages");
+                message = decoder.Current;
+            }
             if (message.EnsureExpectedOrError(PgTypes.BackendType.BindComplete) is { } bindError)
                 return (bindError, null);
 
@@ -207,7 +223,11 @@ static class CommandExtensions
             if (readDescribe)
             {
                 if (!decoder.TryGetNext(out message))
-                    message = await decoder.GetNextAsync().ConfigureAwait(false);
+                {
+                    if (!await decoder.MoveNextAsync().ConfigureAwait(false))
+                        ThrowHelper.ThrowInvalidOperation("No more messages");
+                    message = decoder.Current;
+                }
                 if (message.EnsureExpectedOrError(PgTypes.BackendType.RowDescription, PgTypes.BackendType.NoData)
                         is var result && result.Error is { } describeError)
                     return (describeError, null);
@@ -232,7 +252,11 @@ static class CommandExtensions
             if (readExecute)
             {
                 if (!decoder.TryGetNext(out message))
-                    message = await decoder.GetNextAsync().ConfigureAwait(false);
+                {
+                    if (!await decoder.MoveNextAsync().ConfigureAwait(false))
+                        ThrowHelper.ThrowInvalidOperation("No more messages");
+                    message = decoder.Current;
+                }
                 message.DebugEnsureExpected(PgTypes.BackendType.DataRow, PgTypes.BackendType.CommandComplete);
             }
 

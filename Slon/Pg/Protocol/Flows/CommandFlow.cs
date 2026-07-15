@@ -518,7 +518,40 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                 if (!IsDraining && context.IsProtocolClosed && context.ClosedException is { } preReadClose)
                     throw preReadClose;
 
-                if (IsAsync)
+                if (IsAsync && command.Descriptor is { IsPrepared: true, PreparedRowDescription: not null }
+                    && !command.DescribeOnly)
+                {
+                    // Prepared commands with a known description have the compact BindComplete ->
+                    // DataRow/CommandComplete prelude. Await the decoder directly so a read wake resumes
+                    // this outer body rather than a nested parser coroutine; the second message normally
+                    // comes from the same batch and is consumed synchronously.
+                    BackendMessage message;
+                    if (!_decoder.TryGetNext(out message))
+                    {
+                        if (!await _decoder.MoveNextAsync().ConfigureAwait(false))
+                            ThrowHelper.ThrowInvalidOperation("No more messages");
+                        message = _decoder.Current;
+                    }
+
+                    if (message.EnsureExpectedOrError(PgTypes.BackendType.BindComplete) is { } bindError)
+                    {
+                        _pgError = bindError;
+                        _requestedRowDescription = null;
+                    }
+                    else
+                    {
+                        if (!_decoder.TryGetNext(out message))
+                        {
+                            if (!await _decoder.MoveNextAsync().ConfigureAwait(false))
+                                ThrowHelper.ThrowInvalidOperation("No more messages");
+                            message = _decoder.Current;
+                        }
+                        message.DebugEnsureExpected(PgTypes.BackendType.DataRow, PgTypes.BackendType.CommandComplete);
+                        _pgError = null;
+                        _requestedRowDescription = null;
+                    }
+                }
+                else if (IsAsync)
                     (_pgError, _requestedRowDescription) = await command.ReadUntilExecuteAsync(_decoder).ConfigureAwait(false);
                 else
                     (_pgError, _requestedRowDescription) = command.ReadUntilExecute(_decoder);
