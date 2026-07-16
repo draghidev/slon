@@ -54,6 +54,23 @@ public class PipelineBatchTests
             await DrainExpecting(cmds[k], flowAsync, 1);
     }
 
+    [TestMethod]
+    public async Task AsyncFlow_CanSwitchToSynchronousResultAdvancement()
+    {
+        await using var lease = await PgTestPool.LeaseAsync();
+        var flow = lease.Protocol.Queue(new CommandFlow(async: true,
+            Command.Create("select 1"),
+            Command.Create("select 2")));
+        var e = flow.GetAsyncEnumerator();
+
+        Assert.IsTrue(await e.MoveNextAsync(), "first result not delivered asynchronously");
+        await e.Current.DisposeAsync();
+        Assert.IsTrue(e.MoveNext(), "second result not delivered synchronously");
+        e.Current.Dispose();
+        Assert.IsFalse(e.MoveNext(), "a result was delivered past the expected count");
+        e.Dispose();
+    }
+
     // Backstop iteration count for the handoff/shared-promise race guards. The race is structurally
     // fixed (the Interlocked HandoffActive open), so the default is sized for a per-commit backstop, not
     // to reliably reproduce the original bug; SLON_STRESS_ITERATIONS scales it up for a soak.

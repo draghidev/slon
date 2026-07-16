@@ -13,6 +13,11 @@ enum TrackedCommandKind
 
 sealed class TrackedCommand
 {
+    const int AccessSampleMask = 63;
+
+    [ThreadStatic]
+    static int accessSampleCounter;
+
     State _state;
     long _lastAccessedTicks;
 
@@ -25,6 +30,7 @@ sealed class TrackedCommand
 
         // Preserve types to avoid rooting parameters.
         _state = new State(Status.Initialized, CommandDescriptor.Create(descriptor.UnpreparedCommandText, descriptor.ParameterTypes.Preserve(), descriptor.CommandName));
+        _lastAccessedTicks = Environment.TickCount64;
         CommandText = descriptor.UnpreparedCommandText;
         Kind = kind;
     }
@@ -51,8 +57,10 @@ sealed class TrackedCommand
             return false;
         }
 
-        // LRU access stamp, statistical only, tearing protection is the only requirement.
-        Volatile.Write(ref _lastAccessedTicks, Environment.TickCount64);
+        // Sample across this thread's lookups: hot commands remain recent without a clock read and
+        // shared timestamp write on every execution.
+        if ((++accessSampleCounter & AccessSampleMask) is 0)
+            Volatile.Write(ref _lastAccessedTicks, Environment.TickCount64);
         descriptor = state.Descriptor;
         return true;
     }

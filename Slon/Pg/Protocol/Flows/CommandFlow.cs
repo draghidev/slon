@@ -4,8 +4,8 @@ using System.Runtime.CompilerServices;
 using System.Runtime.ExceptionServices;
 using System.Threading.Tasks.Sources;
 using Slon.Runtime.CompilerServices;
-// We use a type that is already used in Execute.Read so we can share the field.
-using FlowCallerInteractionCoreResult = (Slon.Pg.Protocol.PgError, Slon.Pg.RowDescription);
+// A unique result type distinguishes the caller gate from this flow's other IValueTaskSource faces.
+using FlowCallerInteractionCoreResult = System.ValueTuple;
 
 namespace Slon.Pg.Protocol.Flows;
 
@@ -52,6 +52,10 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
     // null in the common no-error path (zero alloc). Only populated when IsDraining (the drain); on the
     // live path the active consumer observes errors per-result, so we do not double-surface.
     System.Collections.Generic.List<PostgresException>? _drainErrors;
+    bool _consumeNonQuery;
+    bool IsConsumingNonQuery => Volatile.Read(ref _consumeNonQuery);
+    bool IsConsumingAutonomously => IsDraining || IsConsumingNonQuery;
+    long _nonQueryRecordsAffected;
 
     // The body's drain-mode switch: once set, the body skips the user-handoff gates and drains the wire to
     // RFQ autonomously (it no longer waits to be driven by MoveNextAsync). Named for the body MODE, not a
@@ -113,12 +117,6 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
     // drain (the consumer is still live and gets the OCE/close at the terminal - so this does NOT set
     // _consumerDisposed, which would suppress that OCE).
     void MarkConsumerGoneByBody() => Volatile.Write(ref _draining, true);
-
-    // Set TRUE around SetResult(result) when delivery runs the caller's await continuation INLINE
-    // on the body's thread. A Dispose/DisposeAsync from that continuation short-circuits
-    // (MarkConsumerGone + return); the body's post-SetResult re-check then drains here.
-    bool _inlineResultDelivery;
-    internal bool IsInlineResultDelivery => Volatile.Read(ref _inlineResultDelivery);
 
     // Result state
     Slon.Threading.Tasks.Sources.ManualResetValueTaskSourceCore<bool> _enumeratorMoveNextTaskSource;
@@ -223,8 +221,31 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
         return new(this);
     }
 
+    protected override ValueTask<FlowTasks> ExecuteAuto(Context context)
+    {
+        if (!IsAsync && _callerInteractionCore.IsWaiting)
+            return ExecuteAfterHandoff(context);
+
+        return new(ExecuteAutoCore(context));
+    }
+
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
-    protected override async ValueTask<FlowTasks> ExecuteAuto(Context context)
+    async ValueTask<FlowTasks> ExecuteAfterHandoff(Context context)
+    {
+        try
+        {
+            await SetContinuationAndUnblockWaiter();
+        }
+        catch (Exception ex)
+        {
+            HandleException(ex);
+            throw;
+        }
+
+        return ExecuteAutoCore(context);
+    }
+
+    FlowTasks ExecuteAutoCore(Context context)
     {
         ValueTask writeTask;
         try
@@ -237,9 +258,6 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
             // stays. Sync flows still unwind so the caller's thread does its own writes:
             //   small window: an executor on a separate thread can reach here before the caller sets
             //   IsWaiting, so we always do the unwind later if we didn't here, to not stall past writing.
-            if (!IsAsync && _callerInteractionCore.IsWaiting)
-                await SetContinuationAndUnblockWaiter();
-
             // All writes captured as a single task. If they back-pressure (TCP send buffer full) the
             // task is pending and the framework awaits it inline between iterations so the next item's
             // writes don't race past. If they fit in the buffer it's sync-completed and the await is a
@@ -252,14 +270,16 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
             // https://github.com/pgjdbc/pgjdbc/issues/194
             // https://github.com/npgsql/npgsql/issues/641
             var encoder = IsAsync ? default : context.GetEncoder();
+            var appendSync = !_options.Commands[CommandCount - 1].WithSync;
+            _readFlowRfq = appendSync;
             if (IsAsync)
             {
-                writeTask = WriteAllCommandsAsync();
+                writeTask = _options.Commands.WriteCommandsAsync(context.GetEncoder(), appendSync, _flowCancellationToken);
             }
             else
             {
                 using (encoder.BeginResumableScope())
-                    writeTask = WriteAllCommandsResumable();
+                    writeTask = _options.Commands.WriteCommandsResumable(encoder, appendSync);
             }
 
             // Observe an already-completed write here so a synchronously-faulted task throws inside
@@ -300,34 +320,6 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
         return new FlowTasks(
             trailingExecutionTask: writeTask,
             pipelineTask: DispatchPipelinedRead(context, context.GetProtocolStatic<ReadState>().ReadPromise));
-
-        async ValueTask WriteAllCommandsAsync()
-        {
-            var encoder = context.GetEncoder();
-            for (var i = 0; i < CommandCount; i++)
-                await _options.Commands[i].WriteAsync(encoder, _flowCancellationToken).ConfigureAwait(false);
-
-            if (!encoder.LastMessageInducesRfq)
-            {
-                _readFlowRfq = true;
-                encoder.WriteSync();
-            }
-            await encoder.FlushAsync(_flowCancellationToken).ConfigureAwait(false);
-        }
-
-        async ValueTask WriteAllCommandsResumable()
-        {
-            var encoder = context.GetEncoder();
-            for (var i = 0; i < CommandCount; i++)
-                await _options.Commands[i].WriteResumable(encoder).ConfigureAwait(false);
-
-            if (!encoder.LastMessageInducesRfq)
-            {
-                _readFlowRfq = true;
-                encoder.WriteSync();
-            }
-            await encoder.FlushResumable().ConfigureAwait(false);
-        }
     }
 
     // Why this exists rather than the simple `using var _ = BeginCallScope(...); return ReadPhase();`
@@ -476,8 +468,13 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
             while (++_commandIndex < CommandCount)
             {
                 _isResultReady = false;
-                ref readonly var command = ref _options.Commands.ItemRef(_commandIndex);
-                _decoder.ReadTimeout = command.Timeout;
+                bool hasPreparedDescription;
+                {
+                    ref readonly var command = ref _options.Commands.ItemRef(_commandIndex);
+                    _decoder.ReadTimeout = command.Timeout;
+                    hasPreparedDescription = command.Descriptor is { IsPrepared: true, PreparedRowDescription: not null }
+                        && !command.DescribeOnly;
+                }
 
                 // CancellationTokens from callers just cancels their enumerator task, we don't cancel I/O unless the timeout hits.
                 // As we execute in a pipeline we must make sure harmless cancellations don't unnecessarily abort the protocol (and already pipelined flows with it).
@@ -506,7 +503,6 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                     _flowCancellationTokenRegistration = _flowCancellationToken.UnsafeRegister(static (state, token)
                         => ((CommandFlow)state!).RequestCancel(token), this);
                 }
-
                 // A flow reading a FRESH command response after the protocol has already CLOSED would consume
                 // a prior flow's leftover wire bytes (a desync: "Unexpected backend message: DataRow, expected
                 // ParseComplete"). When a flow faults under a graceful close it retires WITHOUT draining (an
@@ -518,8 +514,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                 if (!IsDraining && context.IsProtocolClosed && context.ClosedException is { } preReadClose)
                     throw preReadClose;
 
-                if (IsAsync && command.Descriptor is { IsPrepared: true, PreparedRowDescription: not null }
-                    && !command.DescribeOnly)
+                if (IsAsync && hasPreparedDescription)
                 {
                     // Prepared commands with a known description have the compact BindComplete ->
                     // DataRow/CommandComplete prelude. Await the decoder directly so a read wake resumes
@@ -552,9 +547,12 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                     }
                 }
                 else if (IsAsync)
-                    (_pgError, _requestedRowDescription) = await command.ReadUntilExecuteAsync(_decoder).ConfigureAwait(false);
+                {
+                    var read = _options.Commands.ItemRef(_commandIndex).ReadUntilExecuteAsync(_decoder);
+                    (_pgError, _requestedRowDescription) = await read.ConfigureAwait(false);
+                }
                 else
-                    (_pgError, _requestedRowDescription) = command.ReadUntilExecute(_decoder);
+                    (_pgError, _requestedRowDescription) = _options.Commands.ItemRef(_commandIndex).ReadUntilExecute(_decoder);
 
                 // On a consumer-gone drain, a command's ErrorResponse surfaces here (the response read hit
                 // an ErrorResponse instead of the expected message) rather than via a CommandResult the
@@ -562,7 +560,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                 // A command error lands in EITHER _pgError (read phase) OR CompleteError (completion phase),
                 // never both, so capturing in both places does not double-count a single command's error.
                 var capturedThisCommand = false;
-                if (IsDraining && _pgError is { } readError)
+                if (IsConsumingAutonomously && _pgError is { } readError)
                 {
                     (_drainErrors ??= new()).Add(new PostgresException(readError));
                     capturedThisCommand = true;
@@ -575,7 +573,6 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                     await _callerCancellationTokenRegistration.DisposeAsync().ConfigureAwait(false);
                 if (_flowCancellationToken.CanBeCanceled)
                     await _flowCancellationTokenRegistration.DisposeAsync().ConfigureAwait(false);
-
                 // Cancel drain transition. The cancel was latched (by a registration callback, the eager-
                 // write catch, or a token already fired at this point). Do NOT throw and do NOT complete
                 // the source here (mid-body, tenured). Mirror the consumer-gone / StoppingToken drain:
@@ -591,21 +588,33 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                     MarkConsumerGoneByBody();
                 }
 
-                ref readonly var state = ref context.GetProtocolStatic<ReadState>();
-                state.ResultMessageEnumerator.Initialize(this, _decoder);
-                var result = _enumeratorCurrent ?? state.CommandResult;
-
-                command = ref _options.Commands.ItemRef(_commandIndex);
-                var descriptor = command.Descriptor;
+                CommandResult<ResultMessageEnumerator> result;
                 {
+                    ref readonly var readState = ref context.GetProtocolStatic<ReadState>();
+                    readState.ResultMessageEnumerator.Initialize(this, _decoder);
+                    result = _enumeratorCurrent ?? readState.CommandResult;
+
+                    ref readonly var resultCommand = ref _options.Commands.ItemRef(_commandIndex);
+                    var descriptor = resultCommand.Descriptor;
                     // We were preparing and we have no error from parse, make a prepared descriptor.
                     if (!descriptor.IsPrepared && !descriptor.CommandName.IsDefault
                         && (_pgError is not { } err || !err.Expected.Contains(PgTypes.BackendType.ParseComplete)))
                     {
                         descriptor = CommandDescriptor.CreatePrepared(descriptor.CommandName, descriptor.ParameterTypes, _requestedRowDescription);
                     }
+                    result.Initialize(_commandIndex, descriptor, _requestedRowDescription, !resultCommand.DescribeOnly, resultCommand.IsSimple());
                 }
-                result.Initialize(_commandIndex, descriptor, _requestedRowDescription, !command.DescribeOnly, command.IsSimple());
+                if (IsConsumingNonQuery)
+                {
+                    try
+                    {
+                        _options.OnCommandResultAction?.Invoke(result, _options.OnCommandResultActionState);
+                    }
+                    catch
+                    {
+                        // Result observers are advisory and must not interrupt protocol progress.
+                    }
+                }
 
                 // Drain transition. IsDraining (Enumerator.Dispose) is the consumer's opt-out:
                 // skip the user-handoff and drain the wire to RFQ ourselves, no fault on the source.
@@ -623,7 +632,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                     DeliverClose(context.ClosedException!);
                     MarkConsumerGoneByBody();
                 }
-                if (!IsDraining)
+                if (!IsDraining && !IsConsumingNonQuery)
                 {
                     // First result, ASYNC ONLY: re-establish the gate-ordered rendezvous the eager
                     // write removed. The write is now eager (so a batch's deferred flush is not stranded
@@ -637,25 +646,26 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                     // to the caller before result1 exists (Sync_Completes hang). A consumer that disposes
                     // without consuming drives this gate via MoveNextAsync, so the body still drains.
                     if (_commandIndex is 0 && IsAsync)
-                        await AwaitResultGate(context).ConfigureAwait(false);
+                    {
+                        await _callerInteractionCore.GetGateTask(this).ConfigureAwait(false);
+                        HandleStoppingGate();
+                    }
 
-                    if (!IsDraining)
+                    if (!IsDraining && !IsConsumingNonQuery)
                     {
                         _isResultReady = true;
-                        Volatile.Write(ref _inlineResultDelivery, true);
-                        try
-                        {
-                            SetResult(result);
-                        }
-                        finally
-                        {
-                            Volatile.Write(ref _inlineResultDelivery, false);
-                        }
+                        // Result continuations run asynchronously so the body can reach the next gate
+                        // before user code asks for the next result. Buffered batches then advance inline
+                        // from MoveNextAsync instead of suspending one Task state machine per result.
+                        SetResult(result);
 
-                        if (!IsDraining)
+                        if (!IsDraining && !IsConsumingNonQuery)
                         {
                             if (IsAsync)
-                                await AwaitResultGate(context).ConfigureAwait(false);
+                            {
+                                await _callerInteractionCore.GetGateTask(this).ConfigureAwait(false);
+                                HandleStoppingGate();
+                            }
                             else
                                 await SetContinuationAndUnblockWaiter();
 
@@ -692,14 +702,34 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                 // Current is disposed here, something the user might have done, but if not we'll do it here.
                 // This also causes us to pick up any I/O exception thrown during user code that was stored on the resultmessage enumerator.
                 // In drain mode this dispose IS the drain: it reads remaining DataRows + CommandComplete for the current command.
-                state = ref context.GetProtocolStatic<ReadState>();
-                if (IsAsync)
-                    await state.ResultMessageEnumerator.DisposeAsync().ConfigureAwait(false);
+                (PgError Error, TransactionStatus TransactionStatus)? completeError;
+                if (IsConsumingNonQuery)
+                {
+                    while (_decoder.Current.Header.Type is PgTypes.BackendType.DataRow)
+                    {
+                        if (!_decoder.TryGetNext(out _))
+                            await _decoder.GetNextAsync().ConfigureAwait(false);
+                    }
+                    result.CompleteNonQuery(_decoder.Current);
+                    var completion = _options.Commands.ItemRef(_commandIndex).CompleteAsync(_decoder);
+                    completeError = await completion.ConfigureAwait(false);
+                    if (_pgError is null && completeError is null)
+                        _nonQueryRecordsAffected = checked(_nonQueryRecordsAffected + result.RecordsAffected);
+                }
+                else if (IsAsync)
+                {
+                    var resultEnumerator = context.GetProtocolStatic<ReadState>().ResultMessageEnumerator;
+                    await resultEnumerator.DisposeAsync().ConfigureAwait(false);
+                    completeError = resultEnumerator.CompleteError;
+                }
                 else
-                    state.ResultMessageEnumerator.Dispose();
+                {
+                    var resultEnumerator = context.GetProtocolStatic<ReadState>().ResultMessageEnumerator;
+                    resultEnumerator.Dispose();
+                    completeError = resultEnumerator.CompleteError;
+                }
 
                 {
-                    state = ref context.GetProtocolStatic<ReadState>();
                     // CompleteError is non-null only for a FRESHLY-faulted command (a real ErrorResponse on
                     // this command's segment); a command skipped-to-sync by a prior fault returns null. On a
                     // consumer-gone DRAIN, accumulate each fresh error so the terminal can surface them
@@ -709,11 +739,11 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                     // at most one such error (one trailing sync); per-command-sync flows can yield several.
                     // Capture a completion-phase error only if the read phase did not already capture this
                     // command's error (a single command's ErrorResponse can appear in both _pgError and
-                    // CompleteError - dedupe so one fault is one entry). Also skip a command whose result
-                    // was DELIVERED to a live consumer (_isResultReady): the consumer owns that error (it
-                    // throws on GetCommandComplete), so a drain-collect here would double-surface it once
-                    // the consumer consumes-then-disposes (IsDraining flips true after delivery).
-                    if (IsDraining && !_isResultReady && !capturedThisCommand && state.ResultMessageEnumerator.CompleteError is { } err)
+                    // CompleteError - dedupe so one fault is one entry). A drain skips errors already owned
+                    // by a live consumer; direct nonquery consumption has taken that ownership even if it
+                    // raced a result publication.
+                    if ((IsConsumingNonQuery || IsDraining && !_isResultReady)
+                        && !capturedThisCommand && completeError is { } err)
                         (_drainErrors ??= new()).Add(new PostgresException(err.Error));
                 }
             }
@@ -796,7 +826,6 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
             HandleException(ex);
             throw;
         }
-
         void SetResult(CommandResult<ResultMessageEnumerator>? next)
         {
             var completed = next is null;
@@ -865,7 +894,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                 }
                 return;
             }
-            _enumeratorMoveNextTaskSource.SetResult(true, runContinuationsAsynchronously: false);
+            _enumeratorMoveNextTaskSource.SetResult(true, runContinuationsAsynchronously: true);
         }
 
         async ValueTask ReadRfqAsync(PgDecoder decoder)
@@ -971,24 +1000,10 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
         WakePumpOnCompletion();
     }
 
-    // A body parked on a result gate is woken either by the consumer's next MoveNext (which opens the gate)
-    // or, when the consumer can't drive it, by the heartbeat faulting the gate (OnStopping/OnAbort ->
-    // CancelPendingWait). On a GRACEFUL StoppingToken gate-fault the parked body must DRAIN to RFQ - exactly
-    // like the actively-looping 586 check - rather than fault out of the body: otherwise it retires with its
-    // response still on the wire and the next pipelined flow reads OUR leftover (the pipelined-shutdown
-    // desync). We do the SAME consumer-side handling as the 720 throw path (HandleException, NOT DeliverClose:
-    // it latches the close and faults the LIVE generation but no-ops WITHOUT setting _enumeratorCompleted when
-    // our generation was already CONSUMED - so the consumer self-delivers the close on its next rearm and
-    // never re-yields a stale result), then switch to drain instead of throwing. A consumer DISPOSE does not
-    // fire StoppingToken, so its gate-fault stays on the throw->self-deliver path. An ABORT-only gate-fault
-    // likewise falls through to the throw (the wire is torn).
-    async ValueTask AwaitResultGate(Context context)
+    void HandleStoppingGate()
     {
-        try
-        {
-            await _callerInteractionCore.GetGateTask(this).ConfigureAwait(false);
-        }
-        catch (PgClientClosedException close) when (context.StoppingToken.IsCancellationRequested && !IsDraining && !_enumeratorCompleted)
+        if (_callerInteractionCore.CloseException is { } close && _context.StoppingToken.IsCancellationRequested
+            && !IsDraining && !_enumeratorCompleted)
         {
             HandleException(close);
             MarkConsumerGoneByBody();
@@ -1116,7 +1131,19 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
 
     // Same wire-death verdict as OnAbort (graceful-stopping fires first in the graceful Shutdown path, so
     // this is the earlier wake). Idempotent across ticks.
-    protected override void OnStopping(PgClientClosedException exception) => FaultCaller(exception);
+    protected override void OnStopping(PgClientClosedException exception)
+    {
+        if (!_bodyStarted || !IsAsync)
+        {
+            FaultCaller(exception);
+            return;
+        }
+
+        // A graceful stop resumes the gate normally. The body observes the close latch immediately after
+        // the await and switches to drain; abort still faults the gate and escapes through the body catch.
+        _callerInteractionCore.SetCloseLatch(exception);
+        _callerInteractionCore.OpenGate(runContinuationsAsynchronously: true);
+    }
 
     // The close verdict, both reach-paths in one place. A RUNNING body is woken (TrySet on the gate source)
     // so it exits through its own HandleException - the single writer once the body started. A NEVER-RAN
@@ -1129,6 +1156,12 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
         else
             HandleException(exception);
     }
+
+    protected override void OnExecutionCompleted(Exception? exception)
+        => _options.Commands.Return();
+
+    protected override void OnDiscarded()
+        => _options.Commands.Return();
 
     protected override void OnReset()
     {
@@ -1152,6 +1185,8 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
         _cancelDeliverToken = default;
         _deliverCancelOce = false;
         _drainErrors = null;
+        _consumeNonQuery = false;
+        _nonQueryRecordsAffected = 0;
         _consumerDisposed = false;
         _draining = false;
         _drainModeEntered = false;
@@ -1222,6 +1257,8 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
             if (flow is null)
                 return false;
 
+            var takeOverAsyncGate = false;
+
             // Guard-decide-rearm serialized against the body's terminal (see _rearmLock). The using scope
             // ends before the WaitForContinuation drive below (which runs the body inline and would
             // re-enter this non-reentrant lock); try/finally release keeps it lock-safe on any throw.
@@ -1241,6 +1278,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                     if (flow._enumeratorCurrent is null)
                         ThrowHelper.ThrowInvalidOperation("No immediate sync/async mixing is allowed, the first MoveNext{Async} call has to match the async argument passed during initialize.");
                     flow.IsAsync = false;
+                    takeOverAsyncGate = true;
                 }
 
                 // See MoveNextAsync: rearm only on a non-first call; the first-call source is fresh and the
@@ -1256,13 +1294,30 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                 flow.DeliverClose(syncClosed);
                 return flow.EnumeratorMoveNextTask.Result;
             }
+            // The body may already be parked on the async inter-result gate. Once this caller changes
+            // the flow to synchronous driving, open that gate inline so the body can hand its continuation
+            // to the rendezvous below. The edge also covers an in-flight body that has not parked yet.
+            if (takeOverAsyncGate)
+            {
+                flow._callerInteractionCore.OpenGate(runContinuationsAsynchronously: false);
+                var delivered = flow.EnumeratorMoveNextTask;
+                if (delivered.IsCompleted)
+                    return delivered.Result;
+            }
             // Two wake reasons: a continuation was registered (drive the body forward inline)
             // or the body signaled progress (a result, completion, or fault landed on the
             // move-next task source while we were parked). In the progress-only case there is
             // no continuation to invoke. The task is already complete.
             var continuation = flow._callerInteractionCore.WaitForContinuation();
-            continuation?.Invoke();
             var task = flow.EnumeratorMoveNextTask;
+            if (task.IsCompleted)
+            {
+                if (continuation is not null)
+                    flow._callerInteractionCore.DeferContinuation(continuation);
+                return task.Result;
+            }
+            continuation?.Invoke();
+            task = flow.EnumeratorMoveNextTask;
             return task.IsCompleted ? task.Result : task.AsTask().GetAwaiter().GetResult();
         }
 
@@ -1340,6 +1395,26 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
             return flow.EnumeratorMoveNextTask;
         }
 
+        internal ValueTask<long> ConsumeNonQueryAsync()
+        {
+            if (flow is null)
+                return new(0);
+
+            Volatile.Write(ref flow._consumeNonQuery, true);
+            // Cover both sides of the first-result race: release a body already parked on the gate;
+            // a body observing the mode first skips publication and the gate altogether.
+            flow._callerInteractionCore.OpenGate(runContinuationsAsynchronously: false);
+            flow._callerInteractionCore.RequestWake();
+            return AwaitCompletion(flow);
+
+            [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
+            static async ValueTask<long> AwaitCompletion(CommandFlow flow)
+            {
+                _ = await flow.EnumeratorMoveNextTask.ConfigureAwait(false);
+                return flow._nonQueryRecordsAffected;
+            }
+        }
+
         /// <inheritdoc cref="ISyncAsyncEnumerator{T}.Current" />
         public CommandResult Current => flow?._enumeratorCurrent ?? default!;
 
@@ -1354,17 +1429,6 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
             // during foreach's exception unwind.
             if (flow._enumeratorCompleted)
                 return;
-
-            // Inline result-delivery: we're on the body's thread inside SetResult, so it can't
-            // advance until we return - blocking deadlocks. Mark consumer-gone and return; the body's
-            // post-SetResult re-check drains on this thread. Reset returns the move-next source to
-            // awaiting so the body's terminal SetResult(null) doesn't hit a non-awaiting source.
-            if (flow.IsInlineResultDelivery)
-            {
-                flow.MarkConsumerGone();
-                flow._enumeratorMoveNextTaskSource.Reset();
-                return;
-            }
 
             // Async-mode body, sync teardown - a TWO-WAY RENDEZVOUS that drains on THIS (the disposer's)
             // thread. Present as a synchronous driver (IsAsync=false), then:
@@ -1436,23 +1500,6 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                 // before the consumer got here; surface them (WaitForComplete returns immediately, then
                 // AwaitDrainOnDispose throws the accumulated error). Otherwise nothing to do.
                 return flow.WaitForDrainOnDispose ? flow.AwaitDrainOnDispose() : new();
-
-            // Inline result-delivery: caller's await continuation is running on the body's
-            // thread inside SetResult. MarkConsumerGone and return; body's re-check drains
-            // on this same thread before unwinding.
-            if (flow.IsInlineResultDelivery)
-            {
-                if (flow.WaitForDrainOnDispose) flow.MarkConsumerWaitForDrain(); else flow.MarkConsumerGone();
-                // See sync Dispose: Reset returns the move-next source to awaiting so the body's
-                // terminal SetResult(null) doesn't throw and trigger recovery on the next flow's bytes.
-                flow._enumeratorMoveNextTaskSource.Reset();
-                // Under WaitForDrainOnDispose, still surface drain errors / wait for the drain - but do it
-                // ASYNC (AwaitDrainOnDispose awaits WaitForComplete, it does not block), so we don't dead-
-                // lock the body thread we're currently on inside its inline SetResult. The body's
-                // post-SetResult re-check drains (consumer-gone) and completes; AwaitDrainOnDispose then
-                // throws any accumulated ErrorResponse.
-                return flow.WaitForDrainOnDispose ? flow.AwaitDrainOnDispose() : new();
-            }
 
             // Fault and RETURN - do NOT drive or await the wire drain. The body drains autonomously:
             // a read-parked body resumes on bytes; a gate-parked body, once woken, sees IsDraining
@@ -1652,17 +1699,51 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                 }
             }
 
-            [AsyncMethodBuilder(typeof(NonContextRestoringPoolingValueTaskMethodBuilder))]
-            public async ValueTask DisposeAsync()
+            public ValueTask DisposeAsync()
             {
                 _exceptionDispatchInfo?.Throw();
                 if (_disposed)
-                    return;
+                    return new();
                 _disposed = true;
                 try
                 {
                     var decoder = _decoder;
-                    if (decoder.Current.Header.Type is PgTypes.BackendType.DataRow)
+                    if (decoder.Current.Header.Type is not PgTypes.BackendType.DataRow)
+                    {
+                        var completion = Command.CompleteAsync(decoder);
+                        if (completion.IsCompletedSuccessfully)
+                        {
+                            _completeError = completion.Result;
+                            return new();
+                        }
+                        return AwaitCompletion(completion);
+                    }
+                    return DrainRowsAndComplete(decoder);
+                }
+                catch (Exception ex)
+                {
+                    _exceptionDispatchInfo = ExceptionDispatchInfo.Capture(ex);
+                    return ValueTask.FromException(ex);
+                }
+
+                [AsyncMethodBuilder(typeof(NonContextRestoringPoolingValueTaskMethodBuilder))]
+                async ValueTask AwaitCompletion(ValueTask<(PgError, TransactionStatus)?> completion)
+                {
+                    try
+                    {
+                        _completeError = await completion.ConfigureAwait(false);
+                    }
+                    catch (Exception ex)
+                    {
+                        _exceptionDispatchInfo = ExceptionDispatchInfo.Capture(ex);
+                        throw;
+                    }
+                }
+
+                [AsyncMethodBuilder(typeof(NonContextRestoringPoolingValueTaskMethodBuilder))]
+                async ValueTask DrainRowsAndComplete(PgDecoder decoder)
+                {
+                    try
                     {
                         while (true)
                         {
@@ -1673,13 +1754,13 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                             if (message.Header.Type is not PgTypes.BackendType.DataRow)
                                 break;
                         }
+                        _completeError = await Command.CompleteAsync(decoder).ConfigureAwait(false);
                     }
-                    _completeError = await Command.CompleteAsync(_decoder).ConfigureAwait(false);
-                }
-                catch (Exception ex)
-                {
-                    _exceptionDispatchInfo = ExceptionDispatchInfo.Capture(ex);
-                    throw;
+                    catch (Exception ex)
+                    {
+                        _exceptionDispatchInfo = ExceptionDispatchInfo.Capture(ex);
+                        throw;
+                    }
                 }
             }
 

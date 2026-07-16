@@ -136,6 +136,14 @@ struct FlowCallerInteractionCore<TResult>
         }
     }
 
+    // A rendezvous can publish a result and register the body's following continuation before the
+    // caller wakes. The result owns this turn; put the continuation back so the next MoveNext drives it.
+    public void DeferContinuation(Action continuation)
+    {
+        Interlocked.Exchange(ref _wakeContinuation, continuation);
+        GetMres().Set();
+    }
+
     // External wake request from consumer-side state changes (Enumerator.Dispose /
     // DisposeAsync). Spec: WakeProtocol.tla. Fires both wake mechanisms:
     //   - SignalProgress wakes a sync caller blocked in WaitForContinuation.

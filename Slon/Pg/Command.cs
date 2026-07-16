@@ -1,5 +1,7 @@
+using System.Buffers;
 using System.Collections.Immutable;
 using System.Diagnostics.CodeAnalysis;
+using System.Runtime.InteropServices;
 
 namespace Slon.Pg;
 
@@ -23,10 +25,22 @@ readonly struct Command()
 readonly struct CommandList
 {
     readonly Command _command;
-    readonly ImmutableArray<Command> _commands;
+    readonly Command[]? _commands;
+    readonly int _count;
+    readonly bool _isPooled;
+
+    internal CommandList(Command[] commands, int count, bool isPooled)
+    {
+        _commands = commands;
+        _count = count;
+        _isPooled = isPooled;
+    }
 
     public CommandList(ImmutableArray<Command> commands)
-        => _commands = commands;
+    {
+        _commands = ImmutableCollectionsMarshal.AsArray(commands) ?? [];
+        _count = commands.IsDefault ? 0 : commands.Length;
+    }
 
     public CommandList(params ReadOnlySpan<Command> commands)
     {
@@ -36,26 +50,27 @@ readonly struct CommandList
                 _command = commands[0];
                 break;
             default:
-                _commands = [..commands];
+                _commands = commands.ToArray();
+                _count = commands.Length;
                 break;
         }
     }
 
-    public int Count => _commands.IsDefault ? 1 : _commands.Length;
+    public int Count => _commands is null ? 1 : _count;
 
     public Command this[int i] => ItemRef(i);
 
     [UnscopedRef]
     public ref readonly Command ItemRef(int index)
     {
-        if (_commands.IsDefault)
+        if (_commands is null)
         {
             ArgumentOutOfRangeException.ThrowIfNegative(index);
             ArgumentOutOfRangeException.ThrowIfGreaterThan(index, 0);
             return ref _command;
         }
 
-        return ref _commands.ItemRef(index);
+        return ref _commands[index];
     }
 
     [UnscopedRef]
@@ -63,7 +78,17 @@ readonly struct CommandList
 
     [UnscopedRef]
     ReadOnlySpan<Command> AsSpan()
-        => _commands.IsDefault ? new(in _command) : _commands.AsSpan();
+    {
+        if (_commands is null)
+            return new(in _command);
+        return _commands.AsSpan(0, _count);
+    }
+
+    internal void Return()
+    {
+        if (_isPooled)
+            ArrayPool<Command>.Shared.Return(_commands!, clearArray: true);
+    }
 }
 
 readonly struct CommandMetadata

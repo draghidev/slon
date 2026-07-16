@@ -149,6 +149,13 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
     internal bool IsStarted => _started && !_completed;
     internal bool IsPending => !_started;
 
+    internal void DiscardUnqueued()
+    {
+        Debug.Assert(!_started && !_completed);
+        _completed = true;
+        OnDiscarded();
+    }
+
     // Internal completion sync for the dispose drain, Postgres startup wait, and benchmarks.
     // Scheduler-aware: the signal completes through the forked value-task-source core, so the
     // waiter resumes on the ambient scheduler instead of the TCS's unconditional thread-pool
@@ -222,6 +229,8 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
     /// GateTask) override this to wake it so the body short-circuits instead of waiting for
     /// AbortToken. Idempotent across heartbeat ticks (subclasses use TrySet).
     protected virtual void OnStopping(PgClientClosedException exception) {}
+    protected virtual void OnExecutionCompleted(Exception? exception) {}
+    protected virtual void OnDiscarded() {}
     protected virtual void OnReset() {}
     // The per-flow handoff rendezvous primitive for the (wait-list-free) sync source handoff: non-null only
     // for a flow that needs a caller takeover (a sync CommandFlow with a parked caller). The source signals
@@ -687,6 +696,8 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
                 flow._completionCore.TrySetException(exception, runContinuationsAsynchronously: true);
             else
                 flow._completionCore.TrySetResult(flow, runContinuationsAsynchronously: true);
+            try { flow.OnExecutionCompleted(exception); }
+            catch (Exception ex) { /* TODO log */ control.FailProtocol(ex); }
             // The completion callback runs from CompleteItem in the advancer/retirement work-item
             // context: a raw throw would crash that thread unobserved. Don't swallow either - a
             // throwing completion callback means the consumer-side integration is broken, so the

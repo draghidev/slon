@@ -34,6 +34,19 @@ public class AdoErrorSurfacingTests
     }
 
     [TestMethod]
+    public async Task BatchExecuteNonQueryAsync_FailedCommand_Throws()
+    {
+        await using var connection = await AdoTestPool.OpenConnectionAsync();
+        await using var batch = connection.CreateBatch();
+        batch.BatchCommands.Add(batch.CreateBatchCommand("SELECT 1"));
+        batch.BatchCommands.Add(batch.CreateBatchCommand(Failing));
+
+        await Assert.ThrowsExactlyAsync<PostgresException>(async () => await batch.ExecuteNonQueryAsync(CancellationToken.None));
+        await using var command = new SlonCommand(connection, "SELECT 1");
+        Assert.AreEqual(0, await command.ExecuteNonQueryAsync());
+    }
+
+    [TestMethod]
     public void ExecuteScalar_FailedCommand_Throws()
     {
         using var cmd = Failed();

@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
 using Slon.Pg.Protocol;
+using Slon.Runtime.CompilerServices;
 
 namespace Slon.Pg;
 
@@ -136,6 +137,15 @@ abstract class CommandResult : IDisposable, IAsyncDisposable, IEnumerable<Row>, 
             return _recordsAffected;
         }
     }
+
+    internal void CompleteNonQuery(BackendMessage message)
+    {
+        if (message.Header.Type is PgTypes.BackendType.DataRow)
+            ThrowHelper.ThrowInvalidOperation("Cannot complete a command result on a DataRow.");
+        CompleteCommand(message);
+    }
+
+
     public int FieldCount => _rowDescription?.FieldCount ?? 0;
 
     // Disposing the CommandResult skips going through our enumerator, the results won't be accessed anyway.
@@ -155,13 +165,7 @@ abstract class CommandResult : IDisposable, IAsyncDisposable, IEnumerable<Row>, 
                 // SELECT/Call/Other/EmptyQuery don't.
                 var ccm = CommandCompleteMessage.Create(message);
                 _commandCompleteMessage = ccm;
-                _recordsAffected = ccm.StatementType switch
-                {
-                    StatementType.Insert or StatementType.Update or StatementType.Delete or StatementType.Merge
-                        or StatementType.Copy or StatementType.Move or StatementType.Fetch or StatementType.CreateTableAs
-                        => (long)ccm.Rows,
-                    _ => 0,
-                };
+                _recordsAffected = ccm.RecordsAffected;
                 break;
             case PgTypes.BackendType.ErrorResponse:
                 // TODO fill out expected types.
@@ -265,9 +269,7 @@ abstract class CommandResult : IDisposable, IAsyncDisposable, IEnumerable<Row>, 
                     instance.CompleteCommand(current);
                     return false;
                 case PgTypes.BackendType.PortalSuspended when !instance._simpleProtocol:
-                // We don't support this today, but it's a valid protocol response for extended commands.
                 default:
-                    // Should never reach here, message enumerator would be invalid.
                     ThrowHelper.ThrowUnhandledCase(type);
                     return default;
             }
@@ -344,7 +346,8 @@ abstract class CommandResult : IDisposable, IAsyncDisposable, IEnumerable<Row>, 
         => GetAsyncEnumerator(cancellationToken);
 }
 
-sealed class CommandResult<TEnumerator>(TEnumerator enumerator) : CommandResult where TEnumerator : IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMessage>
+sealed class CommandResult<TEnumerator>(TEnumerator enumerator) : CommandResult
+    where TEnumerator : IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMessage>
 {
     TEnumerator _messageEnumerator = enumerator;
 
@@ -364,4 +367,5 @@ sealed class CommandResult<TEnumerator>(TEnumerator enumerator) : CommandResult 
 
     public override void Dispose() => _messageEnumerator.Dispose();
     public override ValueTask DisposeAsync() => _messageEnumerator.DisposeAsync();
-} 
+
+}

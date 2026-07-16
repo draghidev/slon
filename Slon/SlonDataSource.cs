@@ -241,15 +241,31 @@ public sealed class SlonDataSource: DbDataSource
     internal CommandFlow EnqueueCommands(CommandFlowOptions options)
     {
         var flow = new CommandFlow(async: false, options);
-        _connectionPool.Get(static (ctx, f) => ctx.Connection.TryQueue(f), flow, ConnectionTimeout);
-        return flow;
+        try
+        {
+            _connectionPool.Get(static (ctx, f) => ctx.Connection.TryQueue(f), flow, ConnectionTimeout);
+            return flow;
+        }
+        catch
+        {
+            flow.DiscardUnqueued();
+            throw;
+        }
     }
 
     internal async ValueTask<CommandFlow> EnqueueCommandsAsync(CommandFlowOptions options, CancellationToken cancellationToken)
     {
         var flow = new CommandFlow(async: true, options);
-        await _connectionPool.GetAsync(static (ctx, f) => ctx.Connection.TryQueue(f), flow, ConnectionTimeout, cancellationToken).ConfigureAwait(false);
-        return flow;
+        try
+        {
+            await _connectionPool.GetAsync(static (ctx, f) => ctx.Connection.TryQueue(f), flow, ConnectionTimeout, cancellationToken).ConfigureAwait(false);
+            return flow;
+        }
+        catch
+        {
+            flow.DiscardUnqueued();
+            throw;
+        }
     }
 
     internal string SensitiveConnectionString => throw new NotImplementedException();

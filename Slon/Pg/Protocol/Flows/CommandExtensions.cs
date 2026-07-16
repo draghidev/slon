@@ -11,128 +11,156 @@ static class CommandExtensions
     public static bool IsSimple(this in Command command) =>
         command.PreferSimple && command.WithSync && !command.DescribeOnly && !command.Descriptor.IsPrepared && command.Descriptor.ParameterTypes.Count is 0;
 
-    // Sync/async pair at the Command (full composition) level. No *Auto wrapper here.
+    // Sync/async pair at the command-list (full composition) level. No *Auto wrapper here.
     // Callers picking sync vs async make that choice once at this level rather than threading
-    // a mode flag through every encoder helper underneath. WriteAllCommands always picks
-    // WriteAsync for the back-pressure handoff to work. Mode-adaptive callers do
-    // `command.IsAsync ? command.WriteAsync(...) : command.Write(...)` themselves.
-    public static async ValueTask WriteAsync(this Command command, PgEncoder encoder, CancellationToken cancellationToken = default)
+    // a mode flag through every encoder helper underneath. Keeping the list loop in this state
+    // machine avoids one nested async invocation per command while preserving the one-command path.
+    public static ValueTask WriteCommandsAsync(this CommandList commands, PgEncoder encoder, bool appendSync, CancellationToken cancellationToken = default)
     {
-        var descriptor = command.Descriptor;
-        if (descriptor.IsPrepared)
+        for (var i = 0; i < commands.Count; i++)
         {
-            var parameters = command.Parameters;
-            if (parameters.Length != descriptor.ParameterTypes.Count)
-            {
-                if (!command.DescribeOnly)
-                    ThrowHelper.ThrowInvalidOperation($"Prepared command parameter count mismatch with descriptor, expected: ${descriptor.ParameterTypes.Count}.");
+            var command = commands[i];
+            var descriptor = command.Descriptor;
+            if (!descriptor.IsPrepared || command.Parameters.Length is not 0 || descriptor.ParameterTypes.Count is not 0)
+                return WriteCommandsAsyncCore(commands, encoder, appendSync, cancellationToken, i);
 
-                parameters = descriptor.ParameterTypes.ToDbNullParameterList();
-            }
+            encoder.WriteBind(descriptor.CommandName);
+            CompletePreparedWrite(command, descriptor, encoder);
+        }
+        if (appendSync)
+            encoder.WriteSync();
+        return encoder.FlushAsync(cancellationToken);
 
-            await encoder.WriteBindAsync(descriptor.CommandName, parameters: parameters, cancellationToken: cancellationToken).ConfigureAwait(false);
+        static async ValueTask WriteCommandsAsyncCore(CommandList commands, PgEncoder encoder, bool appendSync, CancellationToken cancellationToken, int startIndex)
+        {
+            for (var i = startIndex; i < commands.Count; i++)
+            {
+                var command = commands[i];
+                var descriptor = command.Descriptor;
+                if (descriptor.IsPrepared)
+                {
+                    var parameters = command.Parameters;
+                    if (parameters.Length != descriptor.ParameterTypes.Count)
+                    {
+                        if (!command.DescribeOnly)
+                            ThrowHelper.ThrowInvalidOperation($"Prepared command parameter count mismatch with descriptor, expected: ${descriptor.ParameterTypes.Count}.");
 
-            // We always re-request the description for describe only, even for prepared statements.
-            if (command.DescribeOnly)
-            {
-                encoder.WriteDescribe();
-            }
-            else
-            {
-                // We also need to re-describe if the description returned by the previous preparation was indeterminate.
-                if (descriptor.IsPrepared && descriptor.PreparedRowDescription is null)
+                        parameters = descriptor.ParameterTypes.ToDbNullParameterList();
+                    }
+
+                    await encoder.WriteBindAsync(descriptor.CommandName, parameters: parameters, cancellationToken: cancellationToken).ConfigureAwait(false);
+                    CompletePreparedWrite(command, descriptor, encoder);
+                }
+                else if (command.IsSimple())
+                {
+                    await encoder.WriteQueryAsync(descriptor.UnpreparedCommandText).ConfigureAwait(false);
+                }
+                else
+                {
+                    var parameters = command.Parameters;
+                    if (parameters.Length != descriptor.ParameterTypes.Count)
+                    {
+                        if (!command.DescribeOnly)
+                            ThrowHelper.ThrowInvalidOperation("Parameter count mismatch between descriptor and command, unprepared parameter sources must match.");
+
+                        parameters = descriptor.ParameterTypes.ToDbNullParameterList();
+                    }
+
+                    // Extended unprepared.
+                    await encoder.WriteParseAsync(descriptor.UnpreparedCommandText, descriptor.CommandName, descriptor.ParameterTypes, cancellationToken: cancellationToken).ConfigureAwait(false);
+                    await encoder.WriteBindAsync(descriptor.CommandName, parameters: parameters, cancellationToken: cancellationToken).ConfigureAwait(false);
                     encoder.WriteDescribe();
-
-                encoder.WriteExecute();
+                    if (!command.DescribeOnly)
+                        encoder.WriteExecute();
+                    if (command.WithSync)
+                        encoder.WriteSync();
+                }
             }
-
-            if (command.WithSync)
+            if (appendSync)
                 encoder.WriteSync();
+            await encoder.FlushAsync(cancellationToken).ConfigureAwait(false);
         }
-        else if (command.IsSimple())
-        {
-            await encoder.WriteQueryAsync(descriptor.UnpreparedCommandText).ConfigureAwait(false);
-        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    static void CompletePreparedWrite(in Command command, in CommandDescriptor descriptor, PgEncoder encoder)
+    {
+        if (command.DescribeOnly)
+            encoder.WriteDescribe();
         else
         {
-            var parameters = command.Parameters;
-            if (parameters.Length != descriptor.ParameterTypes.Count)
-            {
-                if (!command.DescribeOnly)
-                    ThrowHelper.ThrowInvalidOperation("Parameter count mismatch between descriptor and command, unprepared parameter sources must match.");
-
-                parameters = descriptor.ParameterTypes.ToDbNullParameterList();
-            }
-
-            // Extended unprepared.
-            await encoder.WriteParseAsync(descriptor.UnpreparedCommandText, descriptor.CommandName, descriptor.ParameterTypes, cancellationToken: cancellationToken).ConfigureAwait(false);
-            await encoder.WriteBindAsync(descriptor.CommandName, parameters: parameters, cancellationToken: cancellationToken).ConfigureAwait(false);
-            encoder.WriteDescribe();
-            if (!command.DescribeOnly)
-                encoder.WriteExecute();
-            if (command.WithSync)
-                encoder.WriteSync();
+            if (descriptor.PreparedRowDescription is null)
+                encoder.WriteDescribe();
+            encoder.WriteExecute();
         }
+
+        if (command.WithSync)
+            encoder.WriteSync();
     }
 
     // Sync coroutine variant, composes the encoder's *Resumable primitives into a single
     // async state machine for the whole command. Any WouldBlock from a mid-message auto-flush
     // (post-serializer) suspends here. The resumption picks up at the exact same composition
     // point with all state intact. Cf. encoder.WriteQueryResumable for the per-message contract.
-    public static async ValueTask WriteResumable(this Command command, PgEncoder encoder)
+    public static async ValueTask WriteCommandsResumable(this CommandList commands, PgEncoder encoder, bool appendSync)
     {
-        var descriptor = command.Descriptor;
-        if (descriptor.IsPrepared)
+        for (var i = 0; i < commands.Count; i++)
         {
-            var parameters = command.Parameters;
-            if (parameters.Length != descriptor.ParameterTypes.Count)
+            var command = commands[i];
+            var descriptor = command.Descriptor;
+            if (descriptor.IsPrepared)
             {
-                if (!command.DescribeOnly)
-                    ThrowHelper.ThrowInvalidOperation($"Prepared command parameter count mismatch with descriptor, expected: ${descriptor.ParameterTypes.Count}.");
+                var parameters = command.Parameters;
+                if (parameters.Length != descriptor.ParameterTypes.Count)
+                {
+                    if (!command.DescribeOnly)
+                        ThrowHelper.ThrowInvalidOperation($"Prepared command parameter count mismatch with descriptor, expected: ${descriptor.ParameterTypes.Count}.");
 
-                parameters = descriptor.ParameterTypes.ToDbNullParameterList();
+                    parameters = descriptor.ParameterTypes.ToDbNullParameterList();
+                }
+
+                await encoder.WriteBindResumable(descriptor.CommandName, parameters: parameters).ConfigureAwait(false);
+
+                if (command.DescribeOnly)
+                    encoder.WriteDescribe();
+                else
+                {
+                    if (descriptor.PreparedRowDescription is null)
+                        encoder.WriteDescribe();
+
+                    encoder.WriteExecute();
+                }
+
+                if (command.WithSync)
+                    encoder.WriteSync();
             }
-
-            await encoder.WriteBindResumable(descriptor.CommandName, parameters: parameters).ConfigureAwait(false);
-
-            if (command.DescribeOnly)
+            else if (command.IsSimple())
             {
-                encoder.WriteDescribe();
+                await encoder.WriteQueryResumable(descriptor.UnpreparedCommandText).ConfigureAwait(false);
             }
             else
             {
-                if (descriptor.IsPrepared && descriptor.PreparedRowDescription is null)
-                    encoder.WriteDescribe();
+                var parameters = command.Parameters;
+                if (parameters.Length != descriptor.ParameterTypes.Count)
+                {
+                    if (!command.DescribeOnly)
+                        ThrowHelper.ThrowInvalidOperation("Parameter count mismatch between descriptor and command, unprepared parameter sources must match.");
 
-                encoder.WriteExecute();
-            }
+                    parameters = descriptor.ParameterTypes.ToDbNullParameterList();
+                }
 
-            if (command.WithSync)
-                encoder.WriteSync();
-        }
-        else if (command.IsSimple())
-        {
-            await encoder.WriteQueryResumable(descriptor.UnpreparedCommandText).ConfigureAwait(false);
-        }
-        else
-        {
-            var parameters = command.Parameters;
-            if (parameters.Length != descriptor.ParameterTypes.Count)
-            {
+                await encoder.WriteParseResumable(descriptor.UnpreparedCommandText, descriptor.CommandName, descriptor.ParameterTypes).ConfigureAwait(false);
+                await encoder.WriteBindResumable(descriptor.CommandName, parameters: parameters).ConfigureAwait(false);
+                encoder.WriteDescribe();
                 if (!command.DescribeOnly)
-                    ThrowHelper.ThrowInvalidOperation("Parameter count mismatch between descriptor and command, unprepared parameter sources must match.");
-
-                parameters = descriptor.ParameterTypes.ToDbNullParameterList();
+                    encoder.WriteExecute();
+                if (command.WithSync)
+                    encoder.WriteSync();
             }
-
-            await encoder.WriteParseResumable(descriptor.UnpreparedCommandText, descriptor.CommandName, descriptor.ParameterTypes).ConfigureAwait(false);
-            await encoder.WriteBindResumable(descriptor.CommandName, parameters: parameters).ConfigureAwait(false);
-            encoder.WriteDescribe();
-            if (!command.DescribeOnly)
-                encoder.WriteExecute();
-            if (command.WithSync)
-                encoder.WriteSync();
         }
+        if (appendSync)
+            encoder.WriteSync();
+        await encoder.FlushResumable().ConfigureAwait(false);
     }
 
     /// Reads the response messages up to (but not including) the actual row stream / CommandComplete.
@@ -434,4 +462,5 @@ static class CommandExtensions
                 : null;
         }
     }
+
 }

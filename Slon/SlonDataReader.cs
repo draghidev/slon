@@ -62,6 +62,7 @@ public sealed partial class SlonDataReader
         /// Processes the current enumerator result and updates relevant information on this instance.
         /// </summary>
         /// <returns>True if the current enumerator result is a suitable target for NextResult{Async}, false if it should be stepped over.</returns>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public bool ProcessCurrent()
         {
             Debug.Assert(_remainingResults is > 0);
@@ -97,22 +98,6 @@ public sealed partial class SlonDataReader
             return next;
         }
 
-        public async Task<bool> NextResultAsync(CancellationToken cancellationToken = default)
-        {
-            if (Current is { } current && !current.TryGetCommandComplete(out var completeMessage))
-                await current.DisposeAsync().ConfigureAwait(false);
-
-            var next = false;
-            while (_remainingResults > 0 && (next = await _enumerator.MoveNextAsync(cancellationToken).ConfigureAwait(false)) && !ProcessCurrent());
-            if (!next)
-            {
-                // Dispose the enumerator right away to allow the pipeline to handle next commands.
-                // This also has the benefit Close/Dispose doesn't have to go async if the user exhausted the reader properly.
-                await DisposeEnumeratorAsync().ConfigureAwait(false);
-            }
-            return next;
-        }
-
         public bool Read()
         {
             Debug.Assert(_singleRowBehavior && _remainingResults is 0 || !_singleRowBehavior);
@@ -138,12 +123,15 @@ public sealed partial class SlonDataReader
             return false;
         }
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public Task<bool> ReadAsync(CancellationToken cancellationToken)
         {
             if (_singleRowBehavior)
                 return SingleRowCore(cancellationToken);
 
-            var task = _rowEnumerator.MoveNextAsync(cancellationToken);
+            var task = cancellationToken.CanBeCanceled
+                ? _rowEnumerator.MoveNextAsync(cancellationToken)
+                : _rowEnumerator.MoveNextAsync();
             return !task.IsCompletedSuccessfully ? task.AsTask() : Task.FromResult(task.Result);
         }
 
@@ -227,7 +215,11 @@ public sealed partial class SlonDataReader
 
             // This is an inline copy of NextResultAsync (minus the 'Current' check) to avoid an extra state machine.
             var next = false;
-            while (core._remainingResults > 0 && (next = await core._enumerator.MoveNextAsync(cancellationToken).ConfigureAwait(false)) && !core.ProcessCurrent());
+            while (core._remainingResults > 0
+                && (next = await (cancellationToken.CanBeCanceled
+                    ? core._enumerator.MoveNextAsync(cancellationToken)
+                    : core._enumerator.MoveNextAsync()).ConfigureAwait(false))
+                && !core.ProcessCurrent());
             if (!next)
             {
                 // Dispose the enumerator right away to allow the pipeline to handle next commands.
@@ -578,7 +570,23 @@ public sealed partial class SlonDataReader : DbDataReader, IDbColumnSchemaGenera
         if (GetExceptionIfClosedOrDisposed() is { } exception)
             return Task.FromException<bool>(exception);
 
-        return _core.NextResultAsync(cancellationToken);
+        return NextResultAsyncCore(cancellationToken);
+    }
+
+    async Task<bool> NextResultAsyncCore(CancellationToken cancellationToken)
+    {
+        if (_core.Current is { IsComplete: false } current)
+            await current.DisposeAsync().ConfigureAwait(false);
+
+        var next = false;
+        while (_core._remainingResults > 0
+            && (next = await (cancellationToken.CanBeCanceled
+                ? _core._enumerator.MoveNextAsync(cancellationToken)
+                : _core._enumerator.MoveNextAsync()).ConfigureAwait(false))
+            && !_core.ProcessCurrent()) { }
+        if (!next)
+            await _core.DisposeEnumeratorAsync().ConfigureAwait(false);
+        return next;
     }
 
     /// <inheritdoc/>
@@ -589,6 +597,7 @@ public sealed partial class SlonDataReader : DbDataReader, IDbColumnSchemaGenera
     }
 
     /// <inheritdoc/>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public override Task<bool> ReadAsync(CancellationToken cancellationToken)
     {
         if (GetExceptionIfClosedOrDisposed() is { } exception)

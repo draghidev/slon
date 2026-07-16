@@ -49,6 +49,29 @@ public class AutoPrepareWireTests
     }
 
     [TestMethod]
+    public async Task SameSqlBatch_RidesSingleInBatchPreparation()
+    {
+        await using var ds = CreateDataSource(maxAutoPreparations: 10, autoMinimumUses: 5);
+        await using var conn = await ds.OpenConnectionAsync(CancellationToken.None);
+        await using var batch = conn.CreateBatch();
+        for (var i = 0; i < 8; i++)
+            batch.BatchCommands.Add(batch.CreateBatchCommand("select 1"));
+
+        await using var reader = await batch.ExecuteReaderAsync(CancellationToken.None);
+        var results = 0;
+        var rows = 0;
+        do
+        {
+            results++;
+            while (await reader.ReadAsync(CancellationToken.None))
+                rows++;
+        } while (await reader.NextResultAsync(CancellationToken.None));
+
+        Assert.AreEqual(8, results);
+        Assert.AreEqual(8, rows);
+    }
+
+    [TestMethod]
     public async Task DoesNotPrepare_Below_Threshold()
     {
         await using var ds = CreateDataSource(maxAutoPreparations: 10, autoMinimumUses: 5);

@@ -80,7 +80,10 @@ sealed class AdoConnectionProxy : IDisposable, IAsyncDisposable
     public void Enqueue(PgClientFlow flow)
     {
         if (!TryQueue(flow))
+        {
+            flow.DiscardUnqueued();
             ThrowHelper.ThrowInvalidOperation("Could not enqueue flow.");
+        }
     }
 
     // Sync delegate-based enqueue, sibling to the async variant: snapshots the current PgConnection
@@ -93,7 +96,10 @@ sealed class AdoConnectionProxy : IDisposable, IAsyncDisposable
         var connection = _pgConnection;
         var flow = flowFactory(connection, arg);
         if (!TryQueueOn(connection, flow))
+        {
+            flow.DiscardUnqueued();
             ThrowHelper.ThrowInvalidOperation("Could not enqueue flow.");
+        }
         return flow;
     }
 
@@ -101,7 +107,10 @@ sealed class AdoConnectionProxy : IDisposable, IAsyncDisposable
     public ValueTask<TFlow> EnqueueAsync<TFlow>(TFlow flow, CancellationToken cancellationToken) where TFlow : PgClientFlow
     {
         if (!TryQueue(flow))
+        {
+            flow.DiscardUnqueued();
             ThrowHelper.ThrowInvalidOperation("Could not enqueue flow.");
+        }
 
         return new(flow);
     }
@@ -120,7 +129,10 @@ sealed class AdoConnectionProxy : IDisposable, IAsyncDisposable
         var connection = _pgConnection;
         var flow = flowFactory(connection, arg);
         if (!TryQueueOn(connection, flow))
+        {
+            flow.DiscardUnqueued();
             ThrowHelper.ThrowInvalidOperation("Could not enqueue flow.");
+        }
         return new(flow);
     }
 
