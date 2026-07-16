@@ -66,6 +66,7 @@ sealed class PgProtocolDataWriter
 
     internal const long UnflushedBytesFlushThreshold = WriteChannel.UnflushedBytesFlushThreshold;
 
+    internal void StartMessage(byte type, int bodyLength) => _channel.StartMessage(type, bodyLength);
     internal void StartMessage(int totalLength) => _channel.StartMessage(totalLength);
 
     internal int CompleteCurrentMessageWithPadding() => _channel.CompleteCurrentMessageWithPadding();

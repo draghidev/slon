@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -64,7 +65,10 @@ sealed class WriteChannel
     public void WaitWritable() => _waitWritable();
 
     internal void CopyFrom<TBuffer>(TBuffer buffer) where TBuffer : ICopyableBuffer<byte>
-        => buffer.CopyTo(_writer);
+    {
+        buffer.CopyTo(_writer);
+        _bufferingWriter.RefreshUnflushedBytes();
+    }
 
     internal Func<PgTypeId, Oid> OidLookup { get; } = static pgTypeId => PgTypeCatalog.Default.GetOid(pgTypeId);
     internal Encoding ClientEncoding { get; set; }
@@ -76,19 +80,34 @@ sealed class WriteChannel
     // (PgEncoder.CanDelayFlush) and the source's arm gate (PgClientFlowSource) both key off it.
     internal const long UnflushedBytesFlushThreshold = 1000;
 
-    // Arms message-length tracking for a new message. `totalLength` is the on-wire size of the
-    // full message (type byte + length field + body, e.g. 5 + bodyLength for normal frontend
-    // messages). Validates the previous message wrote exactly its declared length before
-    // accepting the new one - the check fires at the next StartMessage boundary so per-write
-    // calls stay free. Mid-message flushes are handled by AdvanceMessageBytesFlushed maintaining
-    // _messageBytesFlushed as the "bytes already pushed past the buffer" counter for the current
-    // message, so the cross-message algebra holds without a flush per message.
-    internal void StartMessage(int totalLength)
+    // Validates the previous message, arms length tracking for the new one, then writes its
+    // five-byte header directly into the buffered span. Keeping these together avoids a second
+    // shell traversal and a temporary header copy. Mid-message flushes are handled by
+    // AdvanceMessageBytesFlushed maintaining _messageBytesFlushed as the bytes already pushed
+    // past the buffer, so the cross-message algebra holds without a flush per message.
+    internal void StartMessage(byte type, int bodyLength)
     {
+        var totalLength = checked(sizeof(byte) + sizeof(uint) + bodyLength);
         var unflushed = checked((int)_bufferingWriter.UnflushedBytes);
         // bytesWrittenForPrevious = unflushed + _messageBytesFlushed; the cross-flush case adds
         // _messageBytesFlushed (negative at start, positive after advances). The previous message
         // is fully written iff that equals _messageLength.
+        if (_messageLength is { } prev && unflushed + _messageBytesFlushed != prev)
+            ThrowUnderwritten(prev, unflushed + _messageBytesFlushed);
+        _messageBytesFlushed = -unflushed;
+        _messageLength = totalLength;
+
+        var header = _bufferingWriter.GetSpan(sizeof(byte) + sizeof(uint));
+        header[0] = type;
+        BinaryPrimitives.WriteUInt32BigEndian(header.Slice(1), checked(sizeof(uint) + (uint)bodyLength));
+        _bufferingWriter.Advance(sizeof(byte) + sizeof(uint));
+    }
+
+    // Raw budget seam used by recovery-focused tests and any preframed writer. Unlike the
+    // frontend-message overload, this arms tracking without emitting bytes.
+    internal void StartMessage(int totalLength)
+    {
+        var unflushed = checked((int)_bufferingWriter.UnflushedBytes);
         if (_messageLength is { } prev && unflushed + _messageBytesFlushed != prev)
             ThrowUnderwritten(prev, unflushed + _messageBytesFlushed);
         _messageBytesFlushed = -unflushed;
@@ -198,6 +217,7 @@ sealed class WriteChannel
         if (task.IsCompletedSuccessfully)
         {
             task.GetAwaiter().GetResult();
+            _bufferingWriter.RefreshUnflushedBytes();
             CommitMessageBytesFlushed(before - checked((int)_bufferingWriter.UnflushedBytes));
             return ValueTask.CompletedTask;
         }
@@ -211,34 +231,46 @@ sealed class WriteChannel
             }
             finally
             {
+                self._bufferingWriter.RefreshUnflushedBytes();
                 self.CommitMessageBytesFlushed(before - checked((int)self._bufferingWriter.UnflushedBytes));
             }
         }
     }
 
     // Wrapper to shield callers from slow writers (e.g. PipeWriter).
-    struct BufferingWriter(IOutputWriter<byte> writer) : IOutputWriter<byte>
+    struct BufferingWriter : IOutputWriter<byte>
     {
+        readonly IOutputWriter<byte> _writer;
         Memory<byte> _memory;
         ArraySegment<byte> _memoryArray;
         int _remaining;
+        long _unflushedBytes;
+
+        public BufferingWriter(IOutputWriter<byte> writer)
+        {
+            _writer = writer;
+            _unflushedBytes = writer.UnflushedBytes;
+        }
 
         int Consumed => _memory.Length - _remaining;
 
-        public long UnflushedBytes => Consumed + writer.UnflushedBytes;
+        public long UnflushedBytes => _unflushedBytes;
+
+        public void RefreshUnflushedBytes() => _unflushedBytes = _writer.UnflushedBytes;
 
         public void Advance(int count)
         {
             ArgumentOutOfRangeException.ThrowIfGreaterThan(count, _remaining);
             _remaining -= count;
+            _unflushedBytes += count;
         }
 
         public Memory<byte> GetMemory(int sizeHint = 0)
         {
             if (_remaining < sizeHint)
             {
-                writer.Advance(Consumed);
-                _memory = writer.GetMemory(sizeHint);
+                _writer.Advance(Consumed);
+                _memory = _writer.GetMemory(sizeHint);
                 MemoryMarshal.TryGetArray(_memory, out _memoryArray);
                 _remaining = _memory.Length;
             }
@@ -250,8 +282,8 @@ sealed class WriteChannel
         {
             if (_remaining < sizeHint)
             {
-                writer.Advance(Consumed);
-                _memory = writer.GetMemory(sizeHint);
+                _writer.Advance(Consumed);
+                _memory = _writer.GetMemory(sizeHint);
                 MemoryMarshal.TryGetArray(_memory, out _memoryArray);
                 _remaining = _memory.Length;
             }
@@ -264,20 +296,27 @@ sealed class WriteChannel
 
         public void Flush(TimeSpan timeout = default)
         {
-            writer.Advance(Consumed);
+            _writer.Advance(Consumed);
             _memory = default;
             _memoryArray = default;
             _remaining = 0;
-            writer.Flush(timeout);
+            try
+            {
+                _writer.Flush(timeout);
+            }
+            finally
+            {
+                RefreshUnflushedBytes();
+            }
         }
 
         public ValueTask FlushAsync(CancellationToken cancellationToken = default)
         {
-            writer.Advance(Consumed);
+            _writer.Advance(Consumed);
             _memory = default;
             _memoryArray = default;
             _remaining = 0;
-            return writer.FlushAsync(cancellationToken);
+            return _writer.FlushAsync(cancellationToken);
         }
     }
 }

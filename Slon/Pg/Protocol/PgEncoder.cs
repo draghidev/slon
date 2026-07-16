@@ -1,5 +1,4 @@
 using System.Buffers;
-using System.Buffers.Binary;
 using System.Collections.Immutable;
 using System.Security.Cryptography;
 using System.Text;
@@ -188,6 +187,18 @@ readonly struct PgEncoder
     public ValueTask WriteBindResumable(EncodedString commandName = default, EncodedString portalName = default, ImmutableArray<Parameter> parameters = default)
         => WriteBindAsync(commandName, portalName, parameters);
 
+    public void WriteBind(EncodedString commandName)
+    {
+        var commandNameBytes = commandName.AsNullTerminatedSpan(ClientEncoding);
+        StartMessage(FrontendType.Bind, bodyLength: commandNameBytes.Length + 1 + 4 * sizeof(ushort));
+        _writer.WriteByte(0); // unnamed portal
+        _writer.WriteRaw(commandNameBytes);
+        _writer.WriteUShort(0); // parameter format codes
+        _writer.WriteUShort(0); // parameters
+        _writer.WriteUShort(1); // result format codes
+        _writer.WriteUShort(1); // all binary
+    }
+
     public void WriteBind(EncodedString commandName = default, EncodedString portalName = default, ImmutableArray<Parameter> parameters = default)
     {
         // The signature invites `default` for the no-parameters case; a default ImmutableArray
@@ -274,7 +285,14 @@ readonly struct PgEncoder
         _writer.WriteRaw(nameBytes);
     }
 
-    public void WriteExecute(EncodedString portalName = default)
+    public void WriteExecute()
+    {
+        StartMessage(FrontendType.Execute, bodyLength: sizeof(byte) + sizeof(int));
+        _writer.WriteByte(0); // unnamed portal
+        _writer.WriteUInt(0); // all rows
+    }
+
+    public void WriteExecute(EncodedString portalName)
     {
         var portalNameBytes = portalName.AsNullTerminatedSpan(ClientEncoding);
         StartMessage(FrontendType.Execute, bodyLength:
@@ -364,12 +382,7 @@ readonly struct PgEncoder
         // declared-vs-written check fires at this boundary (it reads UnflushedBytes, which the
         // header bytes about to be written would otherwise contaminate). totalLength is on-wire
         // size: 1 (type) + sizeof(uint) (length field including itself) + bodyLength.
-        _writer.StartMessage(checked(sizeof(byte) + sizeof(uint) + bodyLength));
-
-        Span<byte> header = stackalloc byte[sizeof(byte) + sizeof(int)];
-        header[0] = type.ToByte();
-        BinaryPrimitives.WriteUInt32BigEndian(header.Slice(1), checked(sizeof(uint) + (uint)bodyLength));
-        _writer.WriteRaw(header);
+        _writer.StartMessage(type.ToByte(), bodyLength);
 
         _executionControl.OnMessageWrite(type);
     }
