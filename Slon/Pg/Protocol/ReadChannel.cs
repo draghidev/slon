@@ -23,7 +23,8 @@ sealed class ReadChannel
     public BackendMessage Current => _messageContext.Current;
 
     public bool TryMoveNext() => _messageContext.TryMoveNext();
-    public bool TryPeekNext(out BackendMessage message) => _messageContext.TryPeekNext(out message);
+    public bool TryPeekNext(out BackendHeader header) => _messageContext.TryPeekNext(out header);
+    public BackendMessage Peeked => _messageContext.Peeked;
 
     public bool TryMoveNextBatch(out bool completed)
     {

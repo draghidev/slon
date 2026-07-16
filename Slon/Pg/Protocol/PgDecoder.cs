@@ -375,10 +375,18 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
         // only when the handler needs I/O, where we bail and the caller falls back to MoveNextAsync.
         while (true)
         {
-            while (_channel.TryPeekNext(out var peeked))
+            while (_channel.TryPeekNext(out var header))
             {
-                if (!CurrentExecutionControl.TryHandleMessage(peeked, out var handled))
+                var handled = false;
+                if (header.Type
+                    is PgTypes.BackendType.ReadyForQuery
+                    or PgTypes.BackendType.NoticeResponse
+                    or PgTypes.BackendType.NotificationResponse
+                    or PgTypes.BackendType.ParameterStatus
+                    && !CurrentExecutionControl.TryHandleMessage(_channel.Peeked, out handled))
+                {
                     goto unavailable;
+                }
                 _channel.TryMoveNext();
                 if (handled)
                     continue;
@@ -538,22 +546,24 @@ sealed class BackendMessageContext
     // slot and the follow-up TryMoveNext picks it up without re-parsing. The returned
     // BackendMessage is valid until the next TryMoveNext (which bumps the version token);
     // use it immediately, don't store it.
-    public bool TryPeekNext(out BackendMessage message)
+    public bool TryPeekNext(out BackendHeader header)
     {
         if (_hasPeeked)
         {
-            message = new BackendMessage(_peekedHeader, _peekedBuffer, this, _version);
+            header = _peekedHeader;
             return true;
         }
         if (!_remainingBatch.TryReadNextInPlace(out _peekedHeader, out _peekedBuffer, out _))
         {
-            message = default;
+            header = default;
             return false;
         }
         _hasPeeked = true;
-        message = new BackendMessage(_peekedHeader, _peekedBuffer, this, _version);
+        header = _peekedHeader;
         return true;
     }
+
+    public BackendMessage Peeked => new(_peekedHeader, _peekedBuffer, this, _version);
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void SetBatch(BackendMessageBatch batch)
@@ -799,6 +809,11 @@ readonly struct CommandCompleteMessage
     public StatementType StatementType { get; }
     public uint Oid { get; }
     public ulong Rows { get; }
+    public long RecordsAffected => StatementType is
+        StatementType.Insert or StatementType.Update or StatementType.Delete or StatementType.Merge
+        or StatementType.Copy or StatementType.Move or StatementType.Fetch or StatementType.CreateTableAs
+            ? (long)Rows
+            : 0;
 
     CommandCompleteMessage(StatementType statementType, uint oid, ulong rows)
     {
