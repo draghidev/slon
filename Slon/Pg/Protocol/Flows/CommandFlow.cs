@@ -419,7 +419,13 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                         {
                             flow._executePipelinedCore.SetException(ex);
                         }
-                    }, flow, promise.Token, ValueTaskSourceOnCompletedFlags.FlowExecutionContext);
+                    // ENGINE-INTERNAL registration: the continuation is our own bridge code
+                    // (consume + complete), no user code runs under it, and downstream user-facing
+                    // cores carry their own per-registration captured contexts - so no EC flow.
+                    // (The correctly-scoped version of the reverted strand-wide suppression: this
+                    // kills the bridge hop's RunInternal/barrier share without touching the
+                    // ambient semantics of any thread users resume on.)
+                    }, flow, promise.Token, ValueTaskSourceOnCompletedFlags.None);
                 }
                 else
                 {
