@@ -37,6 +37,7 @@ sealed class PgClientProtocolOptions
         ReadTimeout = options.ReadTimeout;
         HeartbeatInterval = options.HeartbeatInterval;
         FlowActivationTimeout = options.ConnectionTimeout;
+        ScopeReset = options.ScopeReset.Snapshot();
     }
 
     public TimeProvider TimeProvider { get; set; } = TimeProvider.System;
@@ -53,6 +54,7 @@ sealed class PgClientProtocolOptions
     public TimeSpan FlowActivationTimeout { get; set; }
     public TimeSpan HeartbeatInterval { get; set; } = TimeSpan.FromSeconds(1);
     public TimeSpan ReadTimeout { get; set; } = Timeout.InfiniteTimeSpan;
+    public ScopeResetOptions ScopeReset { get; set; } = new();
 
     /// Cancel-request sender for the protocol's side-channel CancelRequest. Receives
     /// (processId, secretKey, cancellationToken); the implementation opens a fresh transport,
@@ -64,6 +66,7 @@ sealed class PgClientProtocolOptions
 sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
 {
     readonly PgClientProtocolOptions _options;
+    readonly ScopeResetOptions _scopeReset;
     TransportConnection _connection = null!;
     IOutputWriter<byte> _pipeWriter = null!;
     PgProtocolDataWriter _protocolDataWriter = null!;
@@ -132,6 +135,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
     PgClientProtocol(PgClientProtocolOptions options)
     {
         _options = options;
+        _scopeReset = options.ScopeReset.Snapshot();
         _close = CloseSignal.CreateRoot(options.TimeProvider);
         FlowControl = new Control(this, poolFacing: true);
     }
@@ -181,6 +185,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
     // clean-vs-faulted and the value tells why. No separate status is needed: a faulted connection still
     // reaches Completed, so IsCompleted already evicts it.
     internal Exception? CompletionException => _close.Reason?.InnerException;
+    internal string? ScopeResetCommand => _scopeReset.ResolveCommand();
     internal int CompareTo(PgClientProtocol? other)
     {
         // null instances are always better, they represent empty connection slots.
@@ -870,6 +875,9 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
             }
             finally
             {
+                if (exception is not null)
+                    _control.FailProtocol(exception);
+
                 // A resyncRecovery's completion ends its supplanted flow's extended lifetime: the wire is
                 // resynced (or dead) and nothing references the failed tenure. The supplanted flow
                 // completes on EVERY exit (including the resyncRecovery's own fault), or its caller strands.
@@ -1063,6 +1071,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         public void BindSource(PgClientFlowSource source) => _source = source;
         public bool HasQueuedFlow => _source.Backlog != 0;
         public bool IsInlineDrive => _source.IsInlineDrive;
+        internal string? ScopeResetCommand => protocol.ScopeResetCommand;
 
         // The scope's linked close signal, set once for an exclusive-scope inner Control; null for the
         // pool-facing FlowControl (which reads the protocol's _close directly). Inner flows read the

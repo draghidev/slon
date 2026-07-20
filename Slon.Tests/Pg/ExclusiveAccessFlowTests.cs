@@ -58,6 +58,139 @@ public class ExclusiveAccessFlowTests
         }
     }
 
+    [TestMethod]
+    public async Task Scope_Release_ResetsSessionState()
+    {
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
+        var suffix = Guid.NewGuid().ToString("N");
+        var tempTable = "slon_reset_" + suffix;
+        var channel = "slon_reset_" + suffix;
+
+        var first = protocol.BeginExclusiveScope(async: true);
+        await first.HandoffReady;
+        try
+        {
+            await DrainSuccessfullyAsync(first.Queue(new CommandFlow(async: true, Command.Create($"CREATE TEMP TABLE {tempTable}(value integer)"))));
+            await DrainSuccessfullyAsync(first.Queue(new CommandFlow(async: true, Command.Create("SET application_name = 'slon-reset-probe'"))));
+            await DrainSuccessfullyAsync(first.Queue(new CommandFlow(async: true, Command.Create($"LISTEN {channel}"))));
+        }
+        finally
+        {
+            await first.CompleteScopeAsync();
+        }
+
+        var second = protocol.BeginExclusiveScope(async: true);
+        await second.HandoffReady;
+        try
+        {
+            Assert.AreEqual(TransactionStatus.Idle, protocol.TransactionStatus);
+            await DrainSuccessfullyAsync(second.Queue(new CommandFlow(async: true, Command.Create(
+                $"DO $$ BEGIN IF to_regclass('pg_temp.{tempTable}') IS NOT NULL THEN RAISE EXCEPTION 'temp table survived reset'; END IF; END $$"))));
+            await DrainSuccessfullyAsync(second.Queue(new CommandFlow(async: true, Command.Create(
+                "DO $$ BEGIN IF current_setting('application_name') = 'slon-reset-probe' THEN RAISE EXCEPTION 'GUC survived reset'; END IF; END $$"))));
+            await DrainSuccessfullyAsync(second.Queue(new CommandFlow(async: true, Command.Create(
+                $"DO $$ BEGIN IF EXISTS (SELECT FROM pg_listening_channels() channel_name WHERE channel_name = '{channel}') THEN RAISE EXCEPTION 'LISTEN survived reset'; END IF; END $$"))));
+        }
+        finally
+        {
+            await second.CompleteScopeAsync();
+        }
+
+        static async Task DrainSuccessfullyAsync(CommandFlow flow)
+        {
+            var enumerator = flow.GetAsyncEnumerator();
+            while (await enumerator.MoveNextAsync())
+            {
+                var rows = enumerator.Current.GetAsyncEnumerator();
+                while (await rows.MoveNextAsync()) { }
+                await rows.DisposeAsync();
+                enumerator.Current.GetCommandComplete();
+            }
+            await enumerator.DisposeAsync();
+        }
+    }
+
+    [TestMethod]
+    public async Task Scope_Release_CanPreserveTemporaryObjects()
+    {
+        var protocol = await PgTestPool.NewIsolatedAsync(
+            options => options.ScopeReset.DropTemporaryObjects = false);
+        var table = "slon_preserved_" + Guid.NewGuid().ToString("N");
+        try
+        {
+            var first = protocol.BeginExclusiveScope(async: true);
+            await first.HandoffReady;
+            await DrainAsync(first.Queue(new CommandFlow(async: true, Command.Create(
+                $"CREATE TEMP TABLE {table}(value integer)"))));
+            await first.CompleteScopeAsync();
+
+            var second = protocol.BeginExclusiveScope(async: true);
+            await second.HandoffReady;
+            await DrainAsync(second.Queue(new CommandFlow(async: true, Command.Create(
+                $"INSERT INTO {table} VALUES (1)"))));
+            await DrainAsync(second.Queue(new CommandFlow(async: true, Command.Create(
+                $"DROP TABLE {table}"))));
+            await second.CompleteScopeAsync();
+        }
+        finally
+        {
+            await protocol.CompleteAsync();
+        }
+    }
+
+    [TestMethod]
+    public async Task Scope_Release_WithOpenTransaction_FailsAndRecoversWire()
+    {
+        await using var lease = await PgTestPool.LeaseAsync();
+        var protocol = lease.Protocol;
+        var scope = protocol.BeginExclusiveScope(async: true);
+        await scope.HandoffReady;
+
+        await DrainAsync(scope.Queue(new CommandFlow(async: true, Command.Create("BEGIN"))));
+
+        var exception = await Assert.ThrowsExactlyAsync<InvalidOperationException>(
+            async () => await scope.CompleteScopeAsync());
+        StringAssert.Contains(exception.Message, "must be committed or rolled back");
+        Assert.AreEqual(TransactionStatus.Idle, protocol.TransactionStatus);
+
+        var next = protocol.BeginExclusiveScope(async: true);
+        await next.HandoffReady;
+        await DrainAsync(next.Queue(new CommandFlow(async: true, Command.Create("select 1"))));
+        await next.CompleteScopeAsync();
+    }
+
+    [TestMethod]
+    public async Task Scope_Recovery_WithResetDisabled_DrainsOnlyRollback()
+    {
+        var protocol = await PgTestPool.NewIsolatedAsync(options =>
+        {
+            var reset = options.ScopeReset;
+            reset.CloseCursors = false;
+            reset.ResetSessionAuthorization = false;
+            reset.ResetParameters = false;
+            reset.ClearListeners = false;
+            reset.ReleaseAdvisoryLocks = false;
+            reset.DropTemporaryObjects = false;
+        });
+        try
+        {
+            var scope = protocol.BeginExclusiveScope(async: true);
+            await scope.HandoffReady.WaitAsync(TimeSpan.FromSeconds(5));
+            await DrainAsync(scope.Queue(new CommandFlow(async: true, Command.Create("BEGIN"))));
+            await Assert.ThrowsExactlyAsync<InvalidOperationException>(
+                async () => await scope.CompleteScopeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(5)));
+
+            var next = protocol.BeginExclusiveScope(async: true);
+            await next.HandoffReady.WaitAsync(TimeSpan.FromSeconds(5));
+            await DrainAsync(next.Queue(new CommandFlow(async: true, Command.Create("select 1"))));
+            await next.CompleteScopeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(5));
+        }
+        finally
+        {
+            await protocol.CompleteAsync();
+        }
+    }
+
     // The cascade (verification step 4): a protocol shutdown while a scope is OPEN must drive the inner
     // pipeline to teardown instead of stranding its idle inner executor. Open a scope, run a command to
     // completion (so the inner executor is parked idle, the scope still held), then gracefully

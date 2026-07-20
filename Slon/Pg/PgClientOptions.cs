@@ -1,5 +1,6 @@
 using System.Net;
 using System.Text;
+using Slon.Pg.Protocol;
 
 namespace Slon.Pg;
 
@@ -21,6 +22,7 @@ sealed class PgClientOptions
     public TimeSpan ConnectionTimeout { get; init; } = Timeout.InfiniteTimeSpan;
 
     public int PoolSize { get; init; }
+    internal ScopeResetOptions ScopeReset { get; init; } = new();
 
     // Hardcoded to UTF8 until a use for another encoding comes up.
     internal Encoding Encoding => Encoding.UTF8;

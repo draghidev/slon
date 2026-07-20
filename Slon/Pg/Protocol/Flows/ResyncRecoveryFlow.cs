@@ -7,6 +7,7 @@ namespace Slon.Pg.Protocol.Flows;
 // obligation, pads any torn outgoing frame, then runs the resync move (realigning Sync when needed +
 // a ROLLBACK to close any open transaction; see WriteResync), flushing it with the failed flow's
 // buffered work and draining the resulting RFQs (inherited + the resync move's, 0-2).
+// Recovery of an ExclusiveAccessFlow appends its checked session reset to the same write batch.
 //
 // Substitution-substrate contract: recovery REPLACES the failed flow's executor slot, but the
 // failed flow's lifetime extends through this substitute via FailedFlow and the gate permissivity
@@ -25,6 +26,9 @@ sealed class ResyncRecoveryFlow : PgClientFlow
     bool _outstandingIsRead;
     bool _canWriteSync;
     bool _canWrite;
+    // Captured with the recovery tenure so the written query and its RFQ accounting cannot observe
+    // different reset-plan revisions.
+    string? _scopeResetCommand;
     PgClientProtocol.Control? _control;
 
     /// The flow this recovery supplanted, carried so the policy can complete it when the
@@ -66,9 +70,12 @@ sealed class ResyncRecoveryFlow : PgClientFlow
         recovery._outstandingIsRead = outstandingIsRead;
         recovery._canWriteSync = canWriteSync;
         recovery._canWrite = canWrite;
+        recovery._scopeResetCommand = failedFlow is ExclusiveAccessFlow ? control.ScopeResetCommand : null;
         // drainCount = inheritedRfqCount + the resync move's RFQs (WriteResync): the realigning Sync
-        // when canWriteSync, plus the always-written ROLLBACK when canWrite.
-        recovery._drainCount = inheritedRfqCount + (canWriteSync ? 1 : 0) + (canWrite ? 1 : 0);
+        // when canWriteSync, the always-written ROLLBACK when canWrite, and the reset query when the
+        // failed item was an exclusive scope.
+        recovery._drainCount = inheritedRfqCount + (canWriteSync ? 1 : 0) + (canWrite ? 1 : 0)
+            + (canWrite && recovery._scopeResetCommand is not null ? 1 : 0);
         return recovery;
     }
 
@@ -82,6 +89,7 @@ sealed class ResyncRecoveryFlow : PgClientFlow
         _outstandingIsRead = false;
         _canWriteSync = false;
         _canWrite = false;
+        _scopeResetCommand = null;
         _control = null;
         FailedFlow = null;
         FailureException = null;
@@ -153,18 +161,25 @@ sealed class ResyncRecoveryFlow : PgClientFlow
                 // The read may have crossed inherited RFQs after Create snapshotted the count,
                 // decrementing the failed flow's own counter. Reconcile against its now-final live
                 // count so we drain only what remains, not what the read already consumed.
-                _drainCount = FailedFlow!.GetExecutionControl(_control!).RfqCount + (_canWriteSync ? 1 : 0) + (_canWrite ? 1 : 0);
+                _drainCount = FailedFlow!.GetExecutionControl(_control!).RfqCount
+                    + (_canWriteSync ? 1 : 0)
+                    + (_canWrite ? 1 : 0)
+                    + (_canWrite && _scopeResetCommand is not null ? 1 : 0);
             }
             var decoder = await context.GetDecoderAsync().ConfigureAwait(false);
             int remaining = _drainCount;
+            PgError? resetError = null;
             while (remaining > 0)
             {
                 var message = await decoder.GetNextAsync().ConfigureAwait(false);
+                if (FailedFlow is ExclusiveAccessFlow && remaining == 1 && message.TryCreateError(out var error))
+                    resetError ??= error;
                 // HandleMessageAutoCore decrements _rfqCount internally; the local counter drives
                 // the loop exit independently of the auto-handler's count semantics.
                 if (message.Header.Type is BackendType.ReadyForQuery)
                     remaining--;
             }
+            ExclusiveAccessFlow.ThrowSessionResetError(resetError);
         }
     }
 
@@ -180,6 +195,8 @@ sealed class ResyncRecoveryFlow : PgClientFlow
     //   3. Query("ROLLBACK") - rolls back the now-explicit (or already-explicit) transaction; a
     //      no-op-with-notice when already Idle. When canWriteSync is false the flow's own Query/Sync
     //      already terminated its block, so this is the only message - closing any open BEGIN it left.
+    //   4. For an exclusive flow, append the session reset after ROLLBACK. It needs no response-dependent
+    //      write, so DrainPhase can consume its additional RFQ and preserve any reset error.
     // BEGIN/ROLLBACK notices and CommandCompletes are non-RFQ and discarded by DrainPhase (counts RFQs).
     void WriteResync(PgEncoder encoder)
     {
@@ -194,5 +211,6 @@ sealed class ResyncRecoveryFlow : PgClientFlow
             encoder.WriteQuery("BEGIN -- Slon connection recovery");
         // Closes the now-explicit (or already-explicit) transaction; a no-op-with-notice when Idle.
         encoder.WriteQuery("ROLLBACK -- Slon connection recovery");
+        ExclusiveAccessFlow.WriteScopeReset(encoder, _scopeResetCommand);
     }
 }

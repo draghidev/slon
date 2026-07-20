@@ -19,9 +19,8 @@ public class ExclusiveScopeAdoTests
     }
 
     // Prove the current lease holds a real wire and runs session-local state on it: a uniquely-named TEMP
-    // table whose INSERT succeeds only if the CREATE landed on this same held wire. Unique name + DROP so it
-    // is robust to pool return not DISCARDing temp tables (a reused wire would otherwise collide on a fixed
-    // name) and leaves the wire clean for the next lease.
+    // table whose INSERT succeeds only if the CREATE landed on this same held wire. Unique name + DROP keeps
+    // the assertion local to this lease rather than relying on release-time session reset.
     static async Task ProveHeldWire(SlonConnection conn)
     {
         var t = "slon_held_" + Guid.NewGuid().ToString("N");

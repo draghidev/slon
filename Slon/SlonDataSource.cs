@@ -47,6 +47,8 @@ public record SlonDataSourceOptions
     public TimeSpan CommandTimeout { get; init; } = DefaultCommandTimeout;
     public int AutoPreparationMinimumUses { get; set; } = 5;
     public int MaxActiveAutoPreparations { get; set; }
+    /// <summary>Configures which connection state is reset when an exclusive scope is released.</summary>
+    public ScopeResetOptions ScopeReset { get; init; } = new();
 
     // Internal, tests need to override these to drive maintenance flows on a tight loop. Public
     // surface would require thinking through "what's a sensible knob for end users."
@@ -61,6 +63,7 @@ public record SlonDataSourceOptions
         Password = Password,
         HeartbeatInterval = HeartbeatInterval,
         MaintenanceInterval = MaintenanceInterval,
+        ScopeReset = ScopeReset.Snapshot(),
     };
 
     internal bool Validate()

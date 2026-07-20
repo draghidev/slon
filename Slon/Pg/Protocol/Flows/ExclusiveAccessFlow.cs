@@ -177,8 +177,7 @@ sealed class ExclusiveAccessFlow : PgClientFlow
         return subflow;
     }
 
-    /// End the exclusive scope: drain the inner pipeline, let the body return, and await this flow's
-    /// retirement so the wire is provably released (and the outer pipeline advanced) on return.
+    /// End the exclusive scope: drain its pipeline and await session reset plus outer retirement.
     public async ValueTask CompleteScopeAsync()
     {
         // Caller-initiated end: the caller has already drained its subflows, so a graceful inner drain
@@ -195,6 +194,14 @@ sealed class ExclusiveAccessFlow : PgClientFlow
         // before the done-signal), so on return the prior tenure is provably fully torn down and the
         // flyweight is safe for the next BeginExclusiveScope to re-Initialize.
         await completion.ConfigureAwait(false);
+    }
+
+    internal static bool WriteScopeReset(PgEncoder encoder, string? command)
+    {
+        if (command is null)
+            return false;
+        encoder.WriteQuery(command);
+        return true;
     }
 
     protected override async ValueTask<FlowTasks> ExecuteAuto(Context context)
@@ -242,7 +249,45 @@ sealed class ExclusiveAccessFlow : PgClientFlow
         var ended = await Task.WhenAny(_scopeEnded.Task, _consumerGone.Task).ConfigureAwait(false);
         if (ended == _consumerGone.Task && Volatile.Read(ref _acquired))
             await _completeInner(null).ConfigureAwait(false);
+        if (_protocol.TransactionStatus is not TransactionStatus.Idle)
+            throw new InvalidOperationException(
+                $"The exclusive scope completed leaving the connection in transaction status '{_protocol.TransactionStatus}'. " +
+                "The transaction must be committed or rolled back before completing the scope.");
+        if (_protocol.ScopeResetCommand is { } resetCommand)
+            await ResetSession(context, resetCommand).ConfigureAwait(false);
         return ValueTask.CompletedTask;
+    }
+
+    static async ValueTask ResetSession(Context context, string command)
+    {
+        var encoder = context.GetEncoder();
+        var decoder = await context.GetDecoderAsync().ConfigureAwait(false);
+        await ResetSession(encoder, decoder, command).ConfigureAwait(false);
+    }
+
+    static async ValueTask ResetSession(PgEncoder encoder, PgDecoder decoder, string? command)
+    {
+        if (!WriteScopeReset(encoder, command))
+            return;
+        await encoder.FlushAsync().ConfigureAwait(false);
+
+        PgError? error = null;
+        while (true)
+        {
+            var message = await decoder.GetNextAsync().ConfigureAwait(false);
+            if (message.TryCreateError(out var currentError))
+                error ??= currentError;
+            if (message.Header.Type is PgTypes.BackendType.ReadyForQuery)
+                break;
+        }
+
+        ThrowSessionResetError(error);
+    }
+
+    internal static void ThrowSessionResetError(PgError? error)
+    {
+        if (error is not null)
+            PostgresException.Throw(error);
     }
 
     // Cascade hooks: the wire-death verdict reaching this flow. For a DISPATCHED scope flow they run from
