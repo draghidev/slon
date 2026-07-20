@@ -1704,6 +1704,12 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                 _exceptionDispatchInfo?.Throw();
                 if (_disposed)
                     return new();
+
+                return DisposeAsyncCore();
+            }
+
+            ValueTask DisposeAsyncCore()
+            {
                 _disposed = true;
                 try
                 {
