@@ -43,9 +43,15 @@ readonly struct BackendMessage
         }
 
         Unsafe.SkipInit(out message);
-        var value = new BackendMessage(header, buffer, context, token, bufferLength >= header.Length);
-        WriteGranularly(ref message, in value, destinationIsZero: false);
+        Initialize(ref message, header, buffer, context, token, bufferLength >= header.Length);
         return true;
+    }
+
+    internal static void Initialize(ref BackendMessage destination, BackendHeader header, ReadOnlySequence<byte> buffer,
+        BackendMessageContext context, short token, bool buffered)
+    {
+        var value = new BackendMessage(header, buffer, context, token, buffered);
+        WriteGranularly(ref destination, in value, destinationIsZero: false);
     }
 
     // The JIT should have a phase for picking granular writes (and write barriers) over full struct assignments.
@@ -56,14 +62,35 @@ readonly struct BackendMessage
         if ((destinationIsZero && value._context is not null) || !ReferenceEquals(destination._context, value._context))
             Unsafe.AsRef(in destination._context) = value._context!;
 
-        // TODO attempt to write readonly sequence granularly.
-        Unsafe.AsRef(in destination._buffer) = value._buffer;
+        WriteGranularly(ref Unsafe.AsRef(in destination._buffer), in value._buffer);
 
         Unsafe.AsRef(in destination._buffered) = value._buffered;
         Unsafe.AsRef(in destination._type) = value._type;
         Unsafe.AsRef(in destination._token) = value._token;
         Unsafe.AsRef(in destination._length) = value._length;
     }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    static void WriteGranularly(ref ReadOnlySequence<byte> destination, in ReadOnlySequence<byte> value)
+    {
+        ref var source = ref Unsafe.AsRef(in value);
+        ref var destinationStartObject = ref StartObject(ref destination);
+        var sourceStartObject = StartObject(ref source);
+        if (!ReferenceEquals(destinationStartObject, sourceStartObject))
+            destinationStartObject = sourceStartObject;
+
+        ref var destinationEndObject = ref EndObject(ref destination);
+        var sourceEndObject = EndObject(ref source);
+        if (!ReferenceEquals(destinationEndObject, sourceEndObject))
+            destinationEndObject = sourceEndObject;
+
+        StartInteger(ref destination) = StartInteger(ref source);
+        EndInteger(ref destination) = EndInteger(ref source);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static void SetSequence(ref ReadOnlySequence<byte> destination, in ReadOnlySequence<byte> value)
+        => WriteGranularly(ref destination, in value);
 
     BackendType Type => _type;
 
@@ -81,6 +108,45 @@ readonly struct BackendMessage
 
     public ReadOnlySequence<byte> GetSequence()
         => GetSequence(0);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public bool TryGetFirstSpan(int offset, out ReadOnlySpan<byte> span)
+    {
+        offset += BackendHeader.ByteCount;
+        ref var buffer = ref Unsafe.AsRef(in _buffer);
+        var startObject = StartObject(ref buffer);
+        ReadOnlySpan<byte> firstSpan;
+        if (startObject is not null && startObject.GetType() == typeof(byte[]))
+        {
+            Debug.Assert(buffer.IsSingleSegment);
+            var start = StartInteger(ref buffer);
+            firstSpan = Unsafe.As<byte[]>(startObject).AsSpan(start, buffer.End.GetInteger() - start);
+        }
+        else
+        {
+            firstSpan = buffer.FirstSpan;
+        }
+        if ((uint)offset <= (uint)firstSpan.Length)
+        {
+            span = firstSpan.Slice(offset);
+            return true;
+        }
+
+        span = default;
+        return false;
+    }
+
+    [UnsafeAccessor(UnsafeAccessorKind.Field, Name = "_startObject")]
+    static extern ref object? StartObject(ref ReadOnlySequence<byte> buffer);
+
+    [UnsafeAccessor(UnsafeAccessorKind.Field, Name = "_startInteger")]
+    static extern ref int StartInteger(ref ReadOnlySequence<byte> buffer);
+
+    [UnsafeAccessor(UnsafeAccessorKind.Field, Name = "_endObject")]
+    static extern ref object? EndObject(ref ReadOnlySequence<byte> buffer);
+
+    [UnsafeAccessor(UnsafeAccessorKind.Field, Name = "_endInteger")]
+    static extern ref int EndInteger(ref ReadOnlySequence<byte> buffer);
 
     public SequenceReader<byte> BodyReader => new(GetSequence());
 

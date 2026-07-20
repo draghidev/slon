@@ -1,5 +1,6 @@
 using System.Buffers.Binary;
 using System.Net.Sockets;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text;
 using Slon.Buffers;
@@ -85,6 +86,7 @@ sealed class WriteChannel
     // shell traversal and a temporary header copy. Mid-message flushes are handled by
     // AdvanceMessageBytesFlushed maintaining _messageBytesFlushed as the bytes already pushed
     // past the buffer, so the cross-message algebra holds without a flush per message.
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal void StartMessage(byte type, int bodyLength)
     {
         var totalLength = checked(sizeof(byte) + sizeof(uint) + bodyLength);

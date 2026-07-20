@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Buffers.Binary;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Text;
@@ -12,37 +13,44 @@ sealed class Row
     BackendMessage.Accessor _messageAccessor;
     RowDescription _rowDescription = null!;
 
-    // We don't store the first column as it's always easily derivable.
-    // TODO assign once we support seeking backwards.
-#pragma warning disable CS0649 // Field is never assigned to, and will always have its default value
-    int[]? _tailColumnPositions;
-#pragma warning restore CS0649 // Field is never assigned to, and will always have its default value
     int _column = -1;
+    int _columnOffset;
 
     BackendMessage Message => _messageAccessor.Message;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    SequenceReader<byte> GetColumnReader(out int columnIndex)
+    SequenceReader<byte> GetColumnReader(int ordinal, out int columnIndex, out int columnOffset)
     {
         Debug.Assert(_column >= 0);
-        var offset = sizeof(short);
-        if (_column is 0 || _tailColumnPositions is null)
+        if (_column <= ordinal)
         {
-            columnIndex = 0;
+            columnIndex = _column;
+            columnOffset = _columnOffset;
         }
         else
         {
-            offset += _tailColumnPositions[_column - 1];
-            columnIndex = _column;
+            columnIndex = 0;
+            columnOffset = sizeof(short);
         }
 
-        return new(Message.GetSequence(offset));
+        return new(Message.GetSequence(columnOffset));
     }
 
     public T GetValue<T>(int ordinal)
     {
-        var reader = GetColumnReader(out var columnIndex);
-        _ = TrySeek(ref reader, columnIndex, ordinal, out var length);
+        if (TryGetFieldSpan(ordinal, out var field))
+            return Decode<T>(field);
+
+        return GetValueSlow<T>(ordinal);
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    T GetValueSlow<T>(int ordinal)
+    {
+        var reader = GetColumnReader(ordinal, out var columnIndex, out var columnOffset);
+        _ = TrySeek(ref reader, ref columnIndex, ordinal, ref columnOffset, out var length);
+        _column = columnIndex;
+        _columnOffset = columnOffset;
         if (typeof(T) == typeof(int))
         {
             if (reader.TryPeekBigEndian(out int value))
@@ -75,8 +83,120 @@ sealed class Row
         return default;
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    static T Decode<T>(ReadOnlySpan<byte> field)
+    {
+        if (typeof(T) == typeof(int))
+        {
+            if (field.Length >= sizeof(int))
+                return (T)(object)BinaryPrimitives.ReadInt32BigEndian(field);
+
+            ThrowHelper.ThrowInvalidOperation();
+        }
+
+        if (typeof(T) == typeof(byte[]))
+            return (T)(object)field.ToArray();
+
+        if (typeof(T) == typeof(string))
+            return (T)(object)Encoding.UTF8.GetString(field);
+
+        ThrowHelper.ThrowInvalidOperation();
+        return default;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    bool TryGetFieldSpan(int ordinal, out ReadOnlySpan<byte> field)
+    {
+        var columnIndex = _column <= ordinal ? _column : 0;
+        var columnOffset = _column <= ordinal ? _columnOffset : sizeof(short);
+        if (!Message.TryGetFirstSpan(columnOffset, out var remaining))
+        {
+            field = default;
+            return false;
+        }
+
+        while (columnIndex++ < ordinal)
+        {
+            if (remaining.Length < sizeof(int))
+            {
+                field = default;
+                return false;
+            }
+
+            var length = BinaryPrimitives.ReadInt32BigEndian(remaining);
+            var fieldSize = sizeof(int) + (length <= 0 ? 0 : length);
+            if ((uint)fieldSize > (uint)remaining.Length)
+            {
+                field = default;
+                return false;
+            }
+
+            remaining = remaining.Slice(fieldSize);
+            columnOffset += fieldSize;
+        }
+
+        if (remaining.Length < sizeof(int))
+        {
+            field = default;
+            return false;
+        }
+
+        var fieldLength = BinaryPrimitives.ReadInt32BigEndian(remaining);
+        if (fieldLength < 0 || fieldLength > remaining.Length - sizeof(int))
+        {
+            field = default;
+            return false;
+        }
+
+        _column = columnIndex;
+        _columnOffset = columnOffset + sizeof(int) + fieldLength;
+        field = remaining.Slice(sizeof(int), fieldLength);
+        return true;
+    }
+
     public ValueTask<T> GetValueAsync<T>(int ordinal, CancellationToken cancellationToken = default)
         => new(GetValue<T>(ordinal));
+
+    public Reader GetReader() => new(this);
+
+    public ref struct Reader
+    {
+        readonly Row _row;
+        ReadOnlySpan<byte> _remaining;
+        int _ordinal;
+
+        internal Reader(Row row)
+        {
+            _row = row;
+            _ordinal = 0;
+            if (!row.Message.TryGetFirstSpan(sizeof(short), out _remaining))
+                _remaining = default;
+        }
+
+        public T Read<T>()
+        {
+            var ordinal = _ordinal++;
+            if (_remaining.IsEmpty)
+                return _row.GetValue<T>(ordinal);
+
+            if (_remaining.Length < sizeof(int))
+            {
+                _remaining = default;
+                return _row.GetValue<T>(ordinal);
+            }
+
+            var length = BinaryPrimitives.ReadInt32BigEndian(_remaining);
+            if (length < 0 || length > _remaining.Length - sizeof(int))
+            {
+                _remaining = default;
+                return _row.GetValue<T>(ordinal);
+            }
+
+            var field = _remaining.Slice(sizeof(int), length);
+            _remaining = _remaining.Slice(sizeof(int) + length);
+            return Decode<T>(field);
+        }
+    }
 
     internal void Initialize(RowDescription rowDescription)
     {
@@ -88,62 +208,30 @@ sealed class Row
     {
         Debug.Assert(row.Buffered, "Column streaming is not implemented yet");
         _column = 0;
+        _columnOffset = sizeof(short);
         BackendMessage.Accessor.WriteGranularly(ref _messageAccessor, row.GetAccessor());
     }
 
     // Returns false when the seek was exhausted, true if positioned correctly, and throws if the seek is invalid.
-    static bool TrySeek(ref SequenceReader<byte> reader, int columnIndex, int ordinal, out int length)
+    static bool TrySeek(ref SequenceReader<byte> reader, ref int columnIndex, int ordinal, ref int columnOffset, out int length)
     {
-        if (columnIndex <= ordinal)
+        length = 0;
+        while (columnIndex++ < ordinal)
         {
-            length = 0;
-            while (columnIndex++ < ordinal)
-            {
-                if (!reader.TryPeekBigEndian(out length))
-                    return false;
-
-                reader.Advance(sizeof(int) + (length <= 0 ? 0 : length));
-            }
-
             if (!reader.TryPeekBigEndian(out length))
                 return false;
 
-            reader.Advance(sizeof(int));
-            return true;
+            var fieldSize = sizeof(int) + (length <= 0 ? 0 : length);
+            reader.Advance(fieldSize);
+            columnOffset += fieldSize;
         }
 
-        if (columnIndex > ordinal)
-        {
-            length = SeekBackwards(ordinal);
-            return true;
-        }
+        if (!reader.TryPeekBigEndian(out length))
+            return false;
 
-        ThrowHelper.ThrowInvalidOperation();
-        length = default;
-        return false;
-
-        // On the first call to SeekBackwards we'll fill up the columns list as we may need seek positions more than once.
-        [MethodImpl(MethodImplOptions.NoInlining)]
-        int SeekBackwards(int ordinal)
-        {
-            throw new NotSupportedException();
-            // var buffer = Buffer;
-            // var columns = _columns;
-            //
-            // (buffer.ReadPosition, var columnLength) = columns.Count is 0
-            //     ? (_columnsStartPos, 0)
-            //     : columns[Math.Min(columns.Count -1, ordinal)];
-            //
-            // while (columns.Count <= ordinal)
-            // {
-            //     if (columnLength > 0)
-            //         buffer.Skip(columnLength);
-            //     columnLength = buffer.ReadInt32();
-            //     columns.Add((buffer.ReadPosition, columnLength));
-            // }
-            //
-            // return columnLength;
-        }
+        reader.Advance(sizeof(int));
+        columnOffset += sizeof(int) + (length <= 0 ? 0 : length);
+        return true;
     }
 
 }

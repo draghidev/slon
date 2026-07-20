@@ -510,8 +510,9 @@ sealed class BackendMessageContext
     short _version;
 
     // Peek slot: TryPeekNext advances the real batch cursor into here, so the header parse
-    // happens at peek time and a follow-up TryMoveNext can publish without re-parsing. Cleared
-    // by TryMoveNext on commit or by SetBatch (a fresh batch retires any prior peek).
+    // happens at peek time and a follow-up TryMoveNext can publish without re-parsing. _hasPeeked
+    // alone owns validity; leaving the inactive buffer populated avoids a redundant clear and lets
+    // the next peek usually reuse the same backing objects without write barriers.
     bool _hasPeeked;
     BackendHeader _peekedHeader;
     ReadOnlySequence<byte> _peekedBuffer;
@@ -534,8 +535,8 @@ sealed class BackendMessageContext
         if (_hasPeeked)
         {
             _hasPeeked = false;
-            _current = new BackendMessage(_peekedHeader, _peekedBuffer, this, ++_version);
-            _peekedBuffer = default;
+            BackendMessage.Initialize(ref _current, _peekedHeader, _peekedBuffer, this, ++_version,
+                _peekedBuffer.Length >= _peekedHeader.Length);
             return true;
         }
         return BackendMessage.TryCreateFromBatch(ref _remainingBatch, this, ++_version, out _current);
@@ -553,11 +554,12 @@ sealed class BackendMessageContext
             header = _peekedHeader;
             return true;
         }
-        if (!_remainingBatch.TryReadNextInPlace(out _peekedHeader, out _peekedBuffer, out _))
+        if (!_remainingBatch.TryReadNextInPlace(out _peekedHeader, out var buffer, out _))
         {
             header = default;
             return false;
         }
+        BackendMessage.SetSequence(ref _peekedBuffer, in buffer);
         _hasPeeked = true;
         header = _peekedHeader;
         return true;
@@ -568,9 +570,9 @@ sealed class BackendMessageContext
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void SetBatch(BackendMessageBatch batch)
     {
-        // A fresh batch retires the peeked-from-previous-batch state.
+        // A fresh batch retires the prior peek. The inactive buffer may stay populated because
+        // _hasPeeked owns validity and the next peek overwrites it.
         _hasPeeked = false;
-        _peekedBuffer = default;
         _remainingBatch = batch;
     }
 }
@@ -825,26 +827,32 @@ readonly struct CommandCompleteMessage
     /// EmptyQueryResponse: the portal was created from an empty query string. No tag, no rows.
     public bool IsEmptyQuery => StatementType is StatementType.Empty;
 
-    public static CommandCompleteMessage Create(BackendMessage message)
+    public static CommandCompleteMessage Create(in BackendMessage message)
     {
         message.EnsureExpected(PgTypes.BackendType.EmptyQueryResponse, PgTypes.BackendType.CommandComplete);
         message.EnsureBuffered();
-        return message.Header.Type is PgTypes.BackendType.EmptyQueryResponse
-            ? new(StatementType.Empty, 0, 0)
-            : Parse(message.GetSequence());
+        if (message.Header.Type is PgTypes.BackendType.EmptyQueryResponse)
+            return new(StatementType.Empty, 0, 0);
+
+        Span<byte> scratch = stackalloc byte[64];
+        var bodyLength = message.Header.BodyLength;
+        var bytes = message.TryGetFirstSpan(0, out var first) && first.Length >= bodyLength
+            ? first[..bodyLength]
+            : CopyToScratch(message.GetSequence(), scratch);
+        return Parse(bytes);
     }
 
     // Test seam: build directly from a raw command-tag body (the null-terminated tag bytes), bypassing
     // the BackendMessage wrapper, so the tag parser can be exercised without a live connection. Exposed
     // via InternalsVisibleTo (Slon.Tests).
-    internal static CommandCompleteMessage FromTag(ReadOnlySequence<byte> tagBody) => Parse(tagBody);
-
-    static CommandCompleteMessage Parse(ReadOnlySequence<byte> body)
+    internal static CommandCompleteMessage FromTag(ReadOnlySequence<byte> tagBody)
     {
-        // Tags are tiny (a keyword + a couple of decimals); single-segment is the norm. Copy the rare
-        // multi-segment tag to the stack.
         Span<byte> scratch = stackalloc byte[64];
-        var bytes = body.IsSingleSegment ? body.FirstSpan : CopyToScratch(body, scratch);
+        return Parse(tagBody.IsSingleSegment ? tagBody.FirstSpan : CopyToScratch(tagBody, scratch));
+    }
+
+    static CommandCompleteMessage Parse(ReadOnlySpan<byte> bytes)
+    {
         if (bytes.IsEmpty)
             return new(StatementType.Other, 0, 0);
         if (bytes[^1] is 0)
@@ -899,13 +907,21 @@ readonly struct ReadyForQueryMessage
         TransactionStatus = transactionStatus;
     }
 
-    public static ReadyForQueryMessage Create(BackendMessage message)
+    public static ReadyForQueryMessage Create(in BackendMessage message)
     {
         message.EnsureExpected(PgTypes.BackendType.ReadyForQuery);
         message.EnsureBuffered();
 
-        byte status = 0;
-        message.BodyReader.TryCopyTo(new Span<byte>(ref status));
+        byte status;
+        if (message.TryGetFirstSpan(0, out var body) && !body.IsEmpty)
+        {
+            status = body[0];
+        }
+        else
+        {
+            status = 0;
+            message.BodyReader.TryCopyTo(new Span<byte>(ref status));
+        }
         var transactionStatus = (TransactionStatus)status;
         switch (transactionStatus)
         {

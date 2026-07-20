@@ -1,5 +1,6 @@
 using System.Buffers;
 using System.Collections.Immutable;
+using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
 using System.Text;
 using Slon.Buffers;
@@ -424,6 +425,7 @@ readonly struct PgEncoder
         _writer.Flush();
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public ValueTask FlushAsync(CancellationToken cancellationToken = default)
     {
         _executionControl.ThrowIfCannotWrite();
