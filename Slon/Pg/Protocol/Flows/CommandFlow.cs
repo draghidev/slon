@@ -648,7 +648,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                     if (_commandIndex is 0 && IsAsync)
                     {
                         await _callerInteractionCore.GetGateTask(this).ConfigureAwait(false);
-                        HandleStoppingGate();
+                        HandleStoppingGate(context);
                     }
 
                     if (!IsDraining && !IsConsumingNonQuery)
@@ -664,7 +664,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                             if (IsAsync)
                             {
                                 await _callerInteractionCore.GetGateTask(this).ConfigureAwait(false);
-                                HandleStoppingGate();
+                                HandleStoppingGate(context);
                             }
                             else
                                 await SetContinuationAndUnblockWaiter();
@@ -1000,9 +1000,9 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
         WakePumpOnCompletion();
     }
 
-    void HandleStoppingGate()
+    void HandleStoppingGate(Context context)
     {
-        if (_callerInteractionCore.CloseException is { } close && _context.StoppingToken.IsCancellationRequested
+        if (_callerInteractionCore.CloseException is { } close && context.StoppingToken.IsCancellationRequested
             && !IsDraining && !_enumeratorCompleted)
         {
             HandleException(close);
