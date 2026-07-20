@@ -188,7 +188,12 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
             ThrowHelper.ThrowArgumentException(nameof(parametersSpan), "The number of parameter collections must match the number of commands.");
 
         var commands = _commands.AsSpan();
-        var commandArray = commands.Length > 1 ? ArrayPool<Command>.Shared.Rent(commands.Length) : null;
+        var pendingPrefix = connection?.TakePendingTransactionStatement();
+        var commandOffset = pendingPrefix is null ? 0 : 1;
+        var commandCount = commands.Length + commandOffset;
+        var commandArray = commandCount > 1 ? ArrayPool<Command>.Shared.Rent(commandCount) : null;
+        if (pendingPrefix is not null)
+            commandArray![0] = Command.Create(pendingPrefix);
         (Command Command, TrackerResult TrackerResult) result = default;
         Action<CommandResult, object?>? onResultAction = null;
         object? onResultActionState = null;
@@ -335,9 +340,9 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
                     {
                         if (completionArray is null)
                         {
-                            completionArray = new (Action<CommandResult, object?>, object?)?[_commands.Count];
+                            completionArray = new (Action<CommandResult, object?>, object?)?[commandCount];
                             if (onResultAction is not null)
-                                completionArray[0] = (onResultAction, onResultActionState);
+                                completionArray[commandOffset] = (onResultAction, onResultActionState);
 
                             onResultAction = static (result, state) =>
                             {
@@ -347,10 +352,10 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
                             };
                             onResultActionState = completionArray;
                         }
-                        completionArray[i] = (thisCompletion, thisCompletionState);
+                        completionArray[i + commandOffset] = (thisCompletion, thisCompletionState);
                     }
 
-                    commandArray[i] = result.Command;
+                    commandArray[i + commandOffset] = result.Command;
                 }
             }
 
@@ -358,13 +363,16 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
             {
                 OnCommandResultAction = onResultAction,
                 OnCommandResultActionState = onResultActionState,
-                Commands = commandArray is null ? new(result.Command) : new(commandArray, commands.Length, isPooled: true)
+                Commands = commandArray is null ? new(result.Command) : new(commandArray, commandCount, isPooled: true),
+                LeadingResultCount = commandOffset
             };
         }
         catch
         {
             if (commandArray is not null)
                 ArrayPool<Command>.Shared.Return(commandArray, clearArray: true);
+            if (pendingPrefix is not null)
+                connection!.RestorePendingTransactionStatement(pendingPrefix);
             throw;
         }
     }
@@ -431,7 +439,15 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
         List<(int, Exception)>? exceptions = null;
         try
         {
-            enumerator = Enqueue(parameters, CommandBehavior.SchemaOnly).GetEnumerator();
+            var flow = Enqueue(parameters, CommandBehavior.SchemaOnly);
+            enumerator = flow.GetEnumerator();
+            for (var i = 0; i < flow.LeadingResultCount; i++)
+            {
+                if (!enumerator.MoveNext())
+                    ThrowHelper.ThrowUnexpected("The flow returned fewer infrastructure results than expected.");
+                foreach (var _ in enumerator.Current) { }
+                enumerator.Current.GetCommandComplete();
+            }
             var span = _commands.AsSpan();
             for (var i = 0; i < span.Length; i++)
             {
@@ -487,7 +503,23 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
         List<(int, Exception)>? exceptions = null;
         try
         {
-            enumerator = (await thisRef.EnqueueAsync(parameters, CommandBehavior.SchemaOnly, cancellationToken).ConfigureAwait(false)).GetAsyncEnumerator(cancellationToken);
+            var flow = await thisRef.EnqueueAsync(parameters, CommandBehavior.SchemaOnly, cancellationToken).ConfigureAwait(false);
+            enumerator = flow.GetAsyncEnumerator(cancellationToken);
+            for (var i = 0; i < flow.LeadingResultCount; i++)
+            {
+                if (!await enumerator.MoveNextAsync(cancellationToken).ConfigureAwait(false))
+                    ThrowHelper.ThrowUnexpected("The flow returned fewer infrastructure results than expected.");
+                var rows = enumerator.Current.GetAsyncEnumerator(cancellationToken);
+                try
+                {
+                    while (await rows.MoveNextAsync().ConfigureAwait(false)) { }
+                }
+                finally
+                {
+                    await rows.DisposeAsync().ConfigureAwait(false);
+                }
+                enumerator.Current.GetCommandComplete();
+            }
             for (var i = 0; i < fieldRef.Invoke()._commands.AsSpan().Length; i++)
             {
                 try

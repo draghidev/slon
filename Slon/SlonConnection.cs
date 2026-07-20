@@ -170,6 +170,7 @@ public sealed partial class SlonConnection : IAdoConnection
 
     internal TimeSpan DefaultCommandTimeout => DbDataSource.DefaultCommandTimeout;
     internal SlonTransaction? CurrentTransaction { get; private set; }
+    string? _pendingTransactionStatement;
 
     void DisposeCore()
     {
@@ -242,7 +243,7 @@ public sealed partial class SlonConnection : IAdoConnection
     {
         EnsureConnected();
         ThrowIfTransactionActive();
-        ExecuteTransactionStatement(BeginTransactionSql(isolationLevel));
+        _pendingTransactionStatement = BeginTransactionSql(isolationLevel);
         return CurrentTransaction = new SlonTransaction(this, isolationLevel);
     }
 
@@ -252,10 +253,20 @@ public sealed partial class SlonConnection : IAdoConnection
         Debug.Assert(typeof(TTransaction) == typeof(DbTransaction) || typeof(TTransaction) == typeof(SlonTransaction));
         EnsureConnected();
         ThrowIfTransactionActive();
-        await ExecuteTransactionStatementAsync(BeginTransactionSql(isolationLevel), cancellationToken).ConfigureAwait(false);
+        cancellationToken.ThrowIfCancellationRequested();
+        _pendingTransactionStatement = BeginTransactionSql(isolationLevel);
         var transaction = new SlonTransaction(this, isolationLevel);
         CurrentTransaction = transaction;
         return (TTransaction)(object)transaction;
+    }
+
+    internal string? TakePendingTransactionStatement()
+        => Interlocked.Exchange(ref _pendingTransactionStatement, null);
+
+    internal void RestorePendingTransactionStatement(string statement)
+    {
+        if (Interlocked.CompareExchange(ref _pendingTransactionStatement, statement, null) is not null)
+            ThrowHelper.ThrowInvalidOperation("The pending transaction statement was replaced unexpectedly.");
     }
 
     void ThrowIfTransactionActive()
@@ -539,6 +550,7 @@ public sealed partial class SlonConnection : IAdoConnection
             _breakException = exception;
         }
     }
+
 }
 
 // Public surface & ADO.NET

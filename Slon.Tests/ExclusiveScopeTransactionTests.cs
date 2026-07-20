@@ -2,8 +2,8 @@ using System.Data;
 
 namespace Slon.Tests;
 
-// Transaction SQL emission on the held exclusive scope: BeginTransaction emits BEGIN, Commit/Rollback emit
-// COMMIT/ROLLBACK, all as ordinary commands serial on the connection's held wire. Verified by effect - a
+// Transaction SQL emission on the held exclusive scope: BEGIN is prepended to the first command while
+// Commit/Rollback emit COMMIT/ROLLBACK, all as ordinary commands serial on the connection's held wire. Verified by effect - a
 // TEMP table created OUTSIDE the tx (so it survives a rollback), an INSERT inside it, then a DELETE whose
 // affected-row count reveals whether the INSERT persisted (commit) or was discarded (rollback / dispose).
 [TestClass]
@@ -20,6 +20,27 @@ public class ExclusiveScopeTransactionTests
     {
         using var cmd = new SlonCommand(conn, sql);
         return cmd.ExecuteNonQuery();
+    }
+
+    [TestMethod]
+    public async Task Async_BeginIsDeferred_FirstReaderStartsAtUserResult()
+    {
+        await using var ds = AdoTestPool.NewIsolatedDataSource();
+        await using var conn = await ds.OpenConnectionAsync(CancellationToken.None);
+
+        var begin = conn.BeginTransactionAsync();
+        Assert.IsTrue(begin.IsCompletedSuccessfully, "BEGIN should be deferred to the first command.");
+        await using var tx = await begin;
+
+        await using (var cmd = new SlonCommand(conn, "select 42"))
+        await using (var reader = await cmd.ExecuteReaderAsync())
+        {
+            Assert.IsTrue(await reader.ReadAsync());
+            Assert.AreEqual(42, reader.GetInt32(0));
+            Assert.IsFalse(await reader.NextResultAsync());
+        }
+
+        await tx.RollbackAsync();
     }
 
     [TestMethod]

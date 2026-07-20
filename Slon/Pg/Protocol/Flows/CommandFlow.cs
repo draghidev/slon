@@ -14,6 +14,7 @@ readonly struct CommandFlowOptions
     public Action<CommandResult, object?>? OnCommandResultAction { get; init; }
     public object? OnCommandResultActionState { get; init; }
     public CommandList Commands { get; init; }
+    public int LeadingResultCount { get; init; }
 }
 
 sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSource<FlowCallerInteractionCoreResult>, IValueTaskSource
@@ -196,6 +197,8 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
             : _flowCancellationToken;
 
     public int CommandCount => _options.Commands.Count;
+    internal int LeadingResultCount => _options.LeadingResultCount;
+    internal int VisibleCommandCount => CommandCount - LeadingResultCount;
     public bool IsResultReady => _isResultReady;
 
     public Enumerator GetEnumerator()
