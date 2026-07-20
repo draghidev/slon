@@ -65,16 +65,14 @@ public class CommandUserCancellationTests
     [DoNotParallelize]
     public async Task UserCt_FiresMidRead_SurfacesOce_ProtocolUsable()
     {
-        var advisoryLock = Random.Shared.NextInt64(1, long.MaxValue);
-        await using var blocker = await PgTestPool.NewIsolatedAsync();
-        await PgTestPool.RunAsync(blocker, $"select pg_advisory_lock({advisoryLock})");
+        await using var blocker = await PgAdvisoryLock.AcquireAsync();
 
         await using var lease = await PgTestPool.LeaseAsync();
         var protocol = lease.Protocol;
 
         var flow = new CommandFlow(async: true,
             Command.Create("select 1") with { WithSync = true },
-            Command.Create($"select pg_advisory_lock({advisoryLock})"),
+            blocker.WaitCommand,
             Command.Create("select 'three'"));
         Assert.IsTrue(protocol.TryQueue(flow));
 
@@ -87,7 +85,7 @@ public class CommandUserCancellationTests
 
         var moveNextTask = e.MoveNextAsync(cts.Token).AsTask();
         cts.Cancel();
-        await PgTestPool.RunAsync(blocker, $"select pg_advisory_unlock({advisoryLock})");
+        await blocker.ReleaseAsync();
 
         var oce = await Assert.ThrowsExactlyAsync<OperationCanceledException>(
             async () => await moveNextTask.WaitAsync(TimeSpan.FromSeconds(10)));

@@ -128,31 +128,25 @@ public class CommandDrainTests
     public async Task InFlightCompletion_RacesSyncDispose_PumpNeverStrands_Stress()
     {
         var cap = TimeSpan.FromSeconds(10);
-        // Each iteration is a full connect + force-abort cycle (~15ms) that churns a connection AND leaves a
-        // lingering pg_sleep backend (a force-aborted backend ignores the RST until its sleep ends), so this
-        // does NOT scale - thousands of iterations just exhaust max_connections. HARD cap at 300, deliberately
-        // NOT routed through StressEnv/SLON_UNCAPPED: uncapping only buys "too many clients", never more signal
-        // (this is path coverage with no teeth on the fence). The floor of 100 keeps it a meaningful soak.
+        // Each iteration is a full connect + force-abort cycle. Cap it because this is path coverage,
+        // not a throughput soak.
         var stress = StressEnv.Iterations(fallback: 0, cap: int.MaxValue);
         var iters = Math.Min(Math.Max(stress, 10), 300);
+        await using var blocker = await PgAdvisoryLock.AcquireAsync();
         for (var i = 0; i < iters; i++)
         {
+            await blocker.HoldAsync();
             var protocol = await PgTestPool.NewIsolatedAsync();
-            // pg_sleep withholds its response, so the body's read is genuinely in-flight (async, on a pool
-            // thread), not handed off, when the dispose + abort race below. Keep it SHORT: a force-aborted
-            // backend lingers until the sleep ends (it doesn't notice the RST mid-sleep), so a long sleep
-            // piles up connections (max_clients) as iterations open fresh ones - 0.2s bounds the overlap.
-            var flow = new CommandFlow(async: true, Command.Create("select pg_sleep(0.2)"));
+            var flow = new CommandFlow(async: true, blocker.WaitCommand);
             Assert.IsTrue(protocol.TryQueue(flow));
             var e = flow.GetAsyncEnumerator();
-            var moveNext = e.MoveNextAsync().AsTask(); // in-flight on the withheld response
-
-            await Task.Delay(10); // let the read reach the wire and park
+            var moveNext = e.MoveNextAsync().AsTask();
 
             // Race the sync-dispose pump against a forceful abort (closes the socket -> in-flight read faults
             // cross-thread, completing the body off the disposer's thread while it is parked in the pump).
             var disposeTask = Task.Run(() => { try { e.Dispose(); } catch { /* abort surfaces; we assert no-hang */ } });
             var abortTask = Task.Run(async () => { try { await protocol.DisposeAsync(); } catch { } });
+            await blocker.ReleaseAsync();
 
             try { await Task.WhenAll(disposeTask, abortTask).WaitAsync(cap); }
             catch (TimeoutException) { Assert.Fail($"iter {i}: sync-dispose pump stranded - WakeHandshake lost-wake."); }

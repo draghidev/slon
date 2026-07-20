@@ -9,9 +9,8 @@ namespace Slon.Tests.Pg;
 // DisposeAsync, Dispose, FailProtocol. Verifies graceful vs forceful semantics, idempotency,
 // and the heartbeat-based parked-flow propagation that fails activation sources when AbortToken
 // fires on a flow that's enqueued but not yet activated.
-// Class-serial: every test runs with a 50ms HeartbeatInterval to narrow the parked-flow
-// propagation window. Method-level parallelism would multiply concurrent fast-tick
-// heartbeats within this class and starve the TP, masking the timing the tests measure.
+// Class-serial: every test runs with a 50ms HeartbeatInterval to narrow parked-flow
+// propagation. Method-level parallelism would multiply concurrent fast-tick heartbeats.
 [TestClass]
 [DoNotParallelize]
 public class ProtocolCompletionTests
@@ -132,14 +131,14 @@ public class ProtocolCompletionTests
     public async Task CompleteAsync_WithInFlightFlow_DrainsCleanly()
     {
         var protocol = await ConnectAsync();
-        var flow = new CommandFlow(async: true, Command.Create("select pg_sleep(0.05)"));
+        await using var blocker = await PgAdvisoryLock.AcquireAsync();
+        var flow = new CommandFlow(async: true, blocker.WaitCommand);
         Assert.IsTrue(protocol.TryQueue(flow));
 
         // Graceful close while a consumer is mid-iteration: the move-next source faults with
         // PgClientClosedException so the consumer's MoveNextAsync surfaces it (input-commands-
         // equals-output-results coherence rule). The consumer disposes on the exception path.
-        // reading fires once the consumer is scheduled and about to pull, so CompleteAsync lands on a
-        // live consumer rather than racing a 10ms guess that it has started.
+        // The advisory lock keeps the command incomplete after the consumer starts pulling.
         var reading = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var runTask = Task.Run(async () =>
         {
@@ -155,6 +154,7 @@ public class ProtocolCompletionTests
 
         await reading.Task;
         var completeTask = protocol.CompleteAsync();
+        await blocker.ReleaseAsync();
 
         await runTask;
         await completeTask;
@@ -166,12 +166,12 @@ public class ProtocolCompletionTests
     public async Task DisposeAsync_WithInFlightFlow_FlowSeesClosedException()
     {
         var protocol = await ConnectAsync();
-        var flow = new CommandFlow(async: true, Command.Create("select pg_sleep(0.5)"));
+        await using var blocker = await PgAdvisoryLock.AcquireAsync();
+        var flow = new CommandFlow(async: true, blocker.WaitCommand);
         Assert.IsTrue(protocol.TryQueue(flow));
 
-        // reading fires once the consumer is scheduled and about to pull, so DisposeAsync lands on a
-        // live consumer rather than racing a 10ms guess. The forceful abort cascades through the
-        // in-flight read either way (single command, 0.5s server-side window).
+        // The advisory lock keeps the command incomplete after the consumer starts pulling.
+        // The forceful abort then cascades through the in-flight read.
         var reading = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var runTask = Task.Run<Exception?>(async () =>
         {
@@ -190,7 +190,9 @@ public class ProtocolCompletionTests
         });
 
         await reading.Task;
-        await protocol.DisposeAsync();
+        var disposeTask = protocol.DisposeAsync().AsTask();
+        await blocker.ReleaseAsync();
+        await disposeTask;
 
         var observed = await runTask;
         Assert.IsNotNull(observed, "Flow should have observed a tear-down exception.");
@@ -213,10 +215,12 @@ public class ProtocolCompletionTests
     [TestMethod]
     public async Task CompleteAsync_RacingDisposeAsync_ConvergesCleanly()
     {
+        await using var blocker = await PgAdvisoryLock.AcquireAsync();
         for (var i = 0; i < 50; i++)
         {
+            await blocker.HoldAsync();
             var protocol = await ConnectAsync();
-            var flow = new CommandFlow(async: true, Command.Create("select pg_sleep(0.02)"));
+            var flow = new CommandFlow(async: true, blocker.WaitCommand);
             Assert.IsTrue(protocol.TryQueue(flow));
 
             var runTask = Task.Run(async () =>
@@ -246,6 +250,7 @@ public class ProtocolCompletionTests
                 await protocol.DisposeAsync();
             });
             gate.Set();
+            await blocker.ReleaseAsync();
 
             await WhenAllOrDump(protocol, $"iteration {i}: racing teardown did not converge", TimeSpan.FromSeconds(10),
                 ("complete", complete), ("dispose", dispose), ("runTask", runTask));
@@ -259,11 +264,13 @@ public class ProtocolCompletionTests
     [TestMethod]
     public async Task CompleteAsync_RacingDisposeAsync_MultiCommand_ConvergesCleanly()
     {
+        await using var blocker = await PgAdvisoryLock.AcquireAsync();
         for (var i = 0; i < 30; i++)
         {
+            await blocker.HoldAsync();
             var protocol = await ConnectAsync();
             var flow = new CommandFlow(async: true,
-                Command.Create("select pg_sleep(0.01)"), Command.Create("select 2"), Command.Create("select 3"));
+                blocker.WaitCommand, Command.Create("select 2"), Command.Create("select 3"));
             Assert.IsTrue(protocol.TryQueue(flow));
             var runTask = Task.Run(async () =>
             {
@@ -281,6 +288,7 @@ public class ProtocolCompletionTests
             var complete = Task.Run(async () => { gate.Wait(); await protocol.CompleteAsync(); });
             var dispose = Task.Run(async () => { gate.Wait(); await protocol.DisposeAsync(); });
             gate.Set();
+            await blocker.ReleaseAsync();
             await WhenAllOrDump(protocol, $"iteration {i}: racing teardown did not converge", TimeSpan.FromSeconds(10),
                 ("complete", complete), ("dispose", dispose), ("runTask", runTask));
             Assert.IsTrue(protocol.IsCompleted, $"iteration {i}: protocol did not reach Completed");
@@ -293,14 +301,17 @@ public class ProtocolCompletionTests
     [TestMethod]
     public async Task CompleteAsync_RacingDisposeAsync_Pipelined_ConvergesCleanly()
     {
+        await using var blocker = await PgAdvisoryLock.AcquireAsync();
         for (var i = 0; i < 20; i++)
         {
+            await blocker.HoldAsync();
             var protocol = await ConnectAsync();
             const int batch = 5;
             var flows = new CommandFlow[batch];
             for (int k = 0; k < batch; k++)
             {
-                flows[k] = new CommandFlow(async: true, Command.Create("select pg_sleep(0.01)"));
+                flows[k] = new CommandFlow(async: true,
+                    k == 0 ? blocker.WaitCommand : Command.Create("select 1"));
                 Assert.IsTrue(protocol.TryQueue(flows[k]));
             }
             var runTask = Task.Run(async () =>
@@ -324,6 +335,7 @@ public class ProtocolCompletionTests
             var complete = Task.Run(async () => { gate.Wait(); await protocol.CompleteAsync(); });
             var dispose = Task.Run(async () => { gate.Wait(); await protocol.DisposeAsync(); });
             gate.Set();
+            await blocker.ReleaseAsync();
             await WhenAllOrDump(protocol, $"iteration {i}: racing teardown did not converge", TimeSpan.FromSeconds(10),
                 ("complete", complete), ("dispose", dispose), ("runTask", runTask));
             Assert.IsTrue(protocol.IsCompleted, $"iteration {i}: protocol did not reach Completed");
@@ -337,10 +349,12 @@ public class ProtocolCompletionTests
     [TestMethod]
     public async Task CompleteAsync_RacingDisposeAsync_SyncFlow_ConvergesCleanly()
     {
+        await using var blocker = await PgAdvisoryLock.AcquireAsync();
         for (var i = 0; i < 30; i++)
         {
+            await blocker.HoldAsync();
             var protocol = await ConnectAsync();
-            var flow = new CommandFlow(async: false, Command.Create("select pg_sleep(0.02)"));
+            var flow = new CommandFlow(async: false, blocker.WaitCommand);
             Assert.IsTrue(protocol.TryQueue(flow));
             var runTask = Task.Run(() =>
             {
@@ -358,6 +372,7 @@ public class ProtocolCompletionTests
             var complete = Task.Run(async () => { gate.Wait(); await protocol.CompleteAsync(); });
             var dispose = Task.Run(async () => { gate.Wait(); await protocol.DisposeAsync(); });
             gate.Set();
+            await blocker.ReleaseAsync();
             await WhenAllOrDump(protocol, $"iteration {i}: racing teardown did not converge", TimeSpan.FromSeconds(10),
                 ("complete", complete), ("dispose", dispose), ("runTask", runTask));
             Assert.IsTrue(protocol.IsCompleted, $"iteration {i}: protocol did not reach Completed");
@@ -379,10 +394,12 @@ public class ProtocolCompletionTests
     [TestMethod]
     public async Task CompleteAsync_ThenDisposeAsync_MidSyncFlowBody_ConvergesCleanly()
     {
+        await using var blocker = await PgAdvisoryLock.AcquireAsync();
         for (var i = 0; i < 30; i++)
         {
+            await blocker.HoldAsync();
             var protocol = await ConnectAsync();
-            var flow = new CommandFlow(async: false, Command.Create("select pg_sleep(0.02)"));
+            var flow = new CommandFlow(async: false, blocker.WaitCommand);
             Assert.IsTrue(protocol.TryQueue(flow));
             using var consumerStarted = new ManualResetEventSlim(false);
             var runTask = Task.Run(() =>
@@ -399,11 +416,9 @@ public class ProtocolCompletionTests
                 e.Dispose();
             });
             consumerStarted.Wait();
-            // 0-14ms across a ~20ms body: early iterations land before/at takeover, the middle of
-            // the sweep lands inside the body window, late ones after it.
-            await Task.Delay(i % 15);
             var complete = protocol.CompleteAsync();
             var dispose = protocol.DisposeAsync().AsTask();
+            await blocker.ReleaseAsync();
             await WhenAllOrDump(protocol, $"iteration {i}: mid-body teardown did not converge", TimeSpan.FromSeconds(10),
                 ("complete", complete), ("dispose", dispose), ("runTask", runTask));
             Assert.IsTrue(protocol.IsCompleted, $"iteration {i}: protocol did not reach Completed");
@@ -418,7 +433,8 @@ public class ProtocolCompletionTests
     public async Task CompleteAsync_WithParkedFlow_HeartbeatPropagatesClosedException()
     {
         var protocol = await ConnectAsync();
-        var blockingFlow = new CommandFlow(async: true, Command.Create("select pg_sleep(0.5)"));
+        await using var blocker = await PgAdvisoryLock.AcquireAsync();
+        var blockingFlow = new CommandFlow(async: true, blocker.WaitCommand);
         Assert.IsTrue(protocol.TryQueue(blockingFlow));
 
         var parked = new CommandFlow(async: true, Command.Create("select 1"));
@@ -439,7 +455,7 @@ public class ProtocolCompletionTests
             }
         });
 
-        // The blocking flow holds the single executor (parked on pg_sleep) so parked stays
+        // The blocking flow holds the single executor at the advisory lock so parked stays
         // enqueued-not-activated. reading fires once its consumer is scheduled and about to pull, so
         // DisposeAsync fires against a live holder rather than racing a 10ms head start - and since
         // parked was queued second it can never activate ahead of the blocking flow regardless.
@@ -457,7 +473,9 @@ public class ProtocolCompletionTests
         });
 
         await reading.Task;
-        await protocol.DisposeAsync();
+        var disposeTask = protocol.DisposeAsync().AsTask();
+        await blocker.ReleaseAsync();
+        await disposeTask;
         await runBlocking;
 
         var observed = await runParked;

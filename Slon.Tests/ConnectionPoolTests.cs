@@ -5,6 +5,7 @@ using Slon.Pg;
 using Slon.Pg.Protocol;
 using Slon.Pg.Protocol.Flows;
 using Slon.Pools;
+using Slon.Tests.Pg;
 using Slon.Transport;
 
 namespace Slon.Tests;
@@ -382,20 +383,28 @@ public class ConnectionPoolTests
 
         await RunAsyncOn(conn, "select 1"); // warm
 
-        var slow = new CommandFlow(async: true, Command.Create("select pg_sleep(0.05)"));
+        await using var blocker = await PgAdvisoryLock.AcquireAsync();
+        var slow = new CommandFlow(async: true,
+            Command.Create("select 1") with { WithSync = true }, blocker.WaitCommand);
         Assert.IsTrue(conn.TryQueue(slow));
         var slowEnum = slow.GetAsyncEnumerator();
+        Assert.IsTrue(await slowEnum.MoveNextAsync());
         var slowTask = DrainAsync(slowEnum);
 
-        var sw = Stopwatch.StartNew();
-        await RunSyncOn(conn, "select 1");
-        var syncElapsed = sw.Elapsed;
+        var sync = new CommandFlow(async: false, Command.Create("select 1"));
+        Assert.IsTrue(conn.TryQueue(sync));
+        var syncTask = Task.Run(async () =>
+        {
+            var e = sync.GetEnumerator();
+            while (e.MoveNext()) { }
+            await e.DisposeAsync();
+        });
+
+        await blocker.ReleaseAsync();
+        await syncTask.WaitAsync(TimeSpan.FromSeconds(2));
 
         await slowTask;
         await slowEnum.DisposeAsync();
-
-        Assert.IsTrue(syncElapsed < TimeSpan.FromSeconds(2),
-            $"sync took {syncElapsed.TotalMilliseconds:F1}ms — expected ≤2s");
     }
 
     static readonly TimeSpan Cap = TimeSpan.FromSeconds(10);
@@ -448,18 +457,20 @@ public class ConnectionPoolTests
     {
         await using var pool = NewPool(maxConnections: 1);
         var conn = await pool.GetConnectionAsync(0L, Cap);
+        await using var blocker = await PgAdvisoryLock.AcquireAsync();
 
         const int N = 8;
         var enums = new CommandFlow.Enumerator[N];
         for (var i = 0; i < N; i++)
         {
-            // pg_sleep keeps the head occupied so the rest genuinely stay queued behind it at abort time.
-            var flow = new CommandFlow(async: true, Command.Create("select pg_sleep(10)"));
+            var flow = new CommandFlow(async: true, i == 0 ? blocker.WaitCommand : Command.Create("select 1"));
             Assert.IsTrue(conn.TryQueue(flow));
             enums[i] = flow.GetAsyncEnumerator();
         }
 
-        await conn.Protocol.DisposeAsync(); // forceful terminal abort while all N are outstanding
+        var abort = conn.Protocol.DisposeAsync().AsTask();
+        await blocker.ReleaseAsync();
+        await abort; // forceful terminal abort while all N are outstanding
 
         for (var i = 0; i < N; i++)
         {

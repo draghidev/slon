@@ -117,7 +117,7 @@ public class ProtocolLevelTests
         await PgTestPool.RunSync(lease.Protocol, "select 1");
     }
 
-    // Async pg_sleep started on protocol, sync issued WHILE the async drain is in flight.
+    // A blocked async command is active on the protocol while a sync command queues behind it.
     // Exposes (and previously triggered) a bug where the executor, busy processing the async
     // flow, would finish that flow, loop into MoveNextAsync, snipe HandoffSlot on its own
     // (non-caller) thread, process the sync flow on TP, then leave the sync caller stranded
@@ -135,20 +135,28 @@ public class ProtocolLevelTests
 
         await PgTestPool.RunAsync(protocol, "select 1"); // warm
 
-        var slow = new CommandFlow(async: true, Command.Create("select pg_sleep(0.05)"));
+        await using var blocker = await PgAdvisoryLock.AcquireAsync();
+        var slow = new CommandFlow(async: true,
+            Command.Create("select 1") with { WithSync = true }, blocker.WaitCommand);
         Assert.IsTrue(protocol.TryQueue(slow));
         var slowEnum = slow.GetAsyncEnumerator();
+        Assert.IsTrue(await slowEnum.MoveNextAsync());
         var slowTask = DrainAsync(slowEnum);
 
-        var sw = Stopwatch.StartNew();
-        await PgTestPool.RunSync(protocol, "select 1");
-        var syncElapsed = sw.Elapsed;
+        var sync = new CommandFlow(async: false, Command.Create("select 1"));
+        Assert.IsTrue(protocol.TryQueue(sync));
+        var syncTask = Task.Run(() =>
+        {
+            var e = sync.GetEnumerator();
+            while (e.MoveNext()) { }
+            e.Dispose();
+        });
+
+        await blocker.ReleaseAsync();
+        await syncTask.WaitAsync(TimeSpan.FromSeconds(2));
 
         await slowTask;
         await slowEnum.DisposeAsync();
-
-        Assert.IsTrue(syncElapsed < TimeSpan.FromSeconds(2),
-            $"sync took {syncElapsed.TotalMilliseconds:F1}ms — expected ≤2s");
     }
 
     static async Task DrainAsync(CommandFlow.Enumerator enumerator)

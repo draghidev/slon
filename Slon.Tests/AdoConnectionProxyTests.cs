@@ -2,6 +2,7 @@ using System.Diagnostics;
 using Slon.Pg;
 using Slon.Pg.Protocol.Flows;
 using Slon.Pools;
+using Slon.Tests.Pg;
 using Slon.Transport;
 
 namespace Slon.Tests;
@@ -87,19 +88,27 @@ public class AdoConnectionProxyTests
 
         await RunAsyncOn(proxy, "select 1"); // warm
 
-        var slow = new CommandFlow(async: true, Command.Create("select pg_sleep(0.05)"));
+        await using var blocker = await PgAdvisoryLock.AcquireAsync();
+        var slow = new CommandFlow(async: true,
+            Command.Create("select 1") with { WithSync = true }, blocker.WaitCommand);
         proxy.Enqueue(slow);
         var slowEnum = slow.GetAsyncEnumerator();
+        Assert.IsTrue(await slowEnum.MoveNextAsync());
         var slowTask = DrainAsync(slowEnum);
 
-        var sw = Stopwatch.StartNew();
-        await RunSyncOn(proxy, "select 1");
-        var syncElapsed = sw.Elapsed;
+        var sync = new CommandFlow(async: false, Command.Create("select 1"));
+        proxy.Enqueue(sync);
+        var syncTask = Task.Run(async () =>
+        {
+            var e = sync.GetEnumerator();
+            while (e.MoveNext()) { }
+            await e.DisposeAsync();
+        });
+
+        await blocker.ReleaseAsync();
+        await syncTask.WaitAsync(TimeSpan.FromSeconds(2));
 
         await slowTask;
         await slowEnum.DisposeAsync();
-
-        Assert.IsTrue(syncElapsed < TimeSpan.FromSeconds(2),
-            $"sync took {syncElapsed.TotalMilliseconds:F1}ms — expected ≤2s");
     }
 }

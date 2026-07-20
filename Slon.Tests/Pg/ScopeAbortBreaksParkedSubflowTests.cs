@@ -34,11 +34,11 @@ public class ScopeAbortBreaksParkedSubflowTests
         var protocol = await ConnectAsync();
         try
         {
+            await using var blocker = await PgAdvisoryLock.AcquireAsync();
             var scope = protocol.BeginExclusiveScope(async: true);
             await scope.HandoffReady;
 
-            // pg_sleep keeps the subflow's body parked on a wire read (awaiting the row/RFQ).
-            var sub = scope.Queue(new CommandFlow(async: true, Command.Create("select pg_sleep(5)")));
+            var sub = scope.Queue(new CommandFlow(async: true, blocker.WaitCommand));
 
             var runTask = Task.Run(async () =>
             {
@@ -55,9 +55,8 @@ public class ScopeAbortBreaksParkedSubflowTests
                 }
             });
 
-            // Let the subflow reach its parked read before tripping the scope-only abort.
-            await Task.Delay(50);
             protocol.AbortActiveScope();
+            await blocker.ReleaseAsync();
 
             var observed = await runTask.WaitAsync(TimeSpan.FromSeconds(10));
             Assert.IsNotNull(observed, "Scope-only abort should have broken the parked read.");
