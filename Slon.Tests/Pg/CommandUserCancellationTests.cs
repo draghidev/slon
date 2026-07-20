@@ -65,29 +65,29 @@ public class CommandUserCancellationTests
     [DoNotParallelize]
     public async Task UserCt_FiresMidRead_SurfacesOce_ProtocolUsable()
     {
+        var advisoryLock = Random.Shared.NextInt64(1, long.MaxValue);
+        await using var blocker = await PgTestPool.NewIsolatedAsync();
+        await PgTestPool.RunAsync(blocker, $"select pg_advisory_lock({advisoryLock})");
+
         await using var lease = await PgTestPool.LeaseAsync();
         var protocol = lease.Protocol;
 
         var flow = new CommandFlow(async: true,
-            Command.Create("select 1"),
-            Command.Create("select pg_sleep(0.1)"),
+            Command.Create("select 1") with { WithSync = true },
+            Command.Create($"select pg_advisory_lock({advisoryLock})"),
             Command.Create("select 'three'"));
         Assert.IsTrue(protocol.TryQueue(flow));
 
         using var cts = new CancellationTokenSource();
         var e = flow.GetAsyncEnumerator(cts.Token);
 
-        // Consuming the first result is the deterministic park signal. The body has finished command
-        // one, and the next pull reads toward pg_sleep, which cannot deliver for ~100ms, so there is no
-        // sleep-and-hope window racing the cancel.
+        // The first command's Sync makes its result observable before PostgreSQL enters the blocked
+        // second command. The lock then prevents suite scheduling from letting result two win.
         Assert.IsTrue(await e.MoveNextAsync(cts.Token), "first command result not delivered");
 
-        // The pull that parks on the slow read. Cancel hits it while it is outstanding. Whether or not
-        // it has reached the wire read, the cancel is never lost (see the *_NeverLosesWake stress
-        // tests), so the outcome is OCE, and the ~100ms-away result cannot preempt the synchronous
-        // Cancel below.
         var moveNextTask = e.MoveNextAsync(cts.Token).AsTask();
         cts.Cancel();
+        await PgTestPool.RunAsync(blocker, $"select pg_advisory_unlock({advisoryLock})");
 
         var oce = await Assert.ThrowsExactlyAsync<OperationCanceledException>(
             async () => await moveNextTask.WaitAsync(TimeSpan.FromSeconds(10)));
