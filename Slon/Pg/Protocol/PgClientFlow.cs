@@ -644,19 +644,20 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
             if (control.StoppingToken.IsCancellationRequested && !flow._completed)
                 flow.OnStopping(control.ClosedException!);
 
-            // Same sentinel guard as PgDecoder.OnHeartbeat: InfiniteTimeSpan and Zero both mean "no
-            // activation timeout". Without it an infinite budget reads as instantly expired and the
-            // first heartbeat tick times out any flow still pending activation.
-            // Wrong-tenure hazard if a timeout-armed flow is ever pooled (this TrySetException is
-            // generation-agnostic). Enforced against in PgClientFlow.Reset; the gen-checked completer
-            // lands here.
+            OnActivationHeartbeat(interval);
+
+            flow._decoderOnHeartbeatAction?.Invoke(interval);
+            flow.OnHeartbeat(interval);
+        }
+
+        public void OnActivationHeartbeat(TimeSpan interval)
+        {
+            // InfiniteTimeSpan and Zero mean no activation timeout. Timeout-armed flows cannot be
+            // pooled, so a concurrent observer cannot fault a later tenant through a stale reference.
             if (flow._remainingActivationTimeout != Timeout.InfiniteTimeSpan && flow._remainingActivationTimeout != TimeSpan.Zero
                 && flow._activationTaskSource.GetStatus(flow._activationTaskSource.Version) is ValueTaskSourceStatus.Pending
                 && (flow._remainingActivationTimeout -= interval) <= TimeSpan.Zero)
                 flow._activationTaskSource.TrySetException(new TimeoutException("Operation timed out waiting for activation."), runContinuationsAsynchronously: true);
-
-            flow._decoderOnHeartbeatAction?.Invoke(interval);
-            flow.OnHeartbeat(interval);
         }
 
         /// Fail a never-started flow drained from the backlog at shutdown with the wire-death reason. The

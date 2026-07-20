@@ -111,6 +111,28 @@ public class SlotEscalatingQueueTests
     }
 
     [TestMethod]
+    public void Enumerator_WalksSlotThenQueue_WithoutConsuming()
+    {
+        var q = new SlotEscalatingQueue<string>();
+        q.Enqueue("a");
+        q.Enqueue("b");
+        q.Enqueue("c");
+
+        var got = new List<string>();
+        var enumerator = q.GetEnumerator();
+        while (enumerator.MoveNext())
+            got.Add(enumerator.Current);
+
+        CollectionAssert.AreEqual(new[] { "a", "b", "c" }, got);
+        Assert.IsTrue(q.TryDequeue(out var a));
+        Assert.AreEqual("a", a);
+        Assert.IsTrue(q.TryDequeue(out var b));
+        Assert.AreEqual("b", b);
+        Assert.IsTrue(q.TryDequeue(out var c));
+        Assert.AreEqual("c", c);
+    }
+
+    [TestMethod]
     public void DrainInert_SlotOnly()
     {
         var q = new SlotEscalatingQueue<string>();

@@ -100,6 +100,41 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
     /// completed), Depth + Backlog is the total outstanding. Lock-free read, may be stale.
     public int Backlog => _state.Backlog;
     internal bool IsInlineDrive => _state.InlineOneShot;
+    internal BacklogEnumerator GetBacklogEnumerator() => _state.GetBacklogEnumerator();
+
+    internal void OnActivationHeartbeat(TimeSpan period) => _state.OnActivationHeartbeat(period);
+
+    internal struct BacklogEnumerator
+    {
+        readonly PgClientFlow? _held;
+        SlotEscalatingQueue<PgClientFlow>.Enumerator _storage;
+        bool _yieldHeld;
+
+        internal BacklogEnumerator(PgClientFlow? held, ref SlotEscalatingQueue<PgClientFlow> storage)
+        {
+            _held = held;
+            _storage = storage.GetEnumerator();
+            _yieldHeld = _held is not null;
+        }
+
+        public PgClientFlow Current { get; private set; } = null!;
+
+        public bool MoveNext()
+        {
+            if (_yieldHeld)
+            {
+                _yieldHeld = false;
+                Current = _held!;
+                return true;
+            }
+            if (_storage.MoveNext())
+            {
+                Current = _storage.Current;
+                return true;
+            }
+            return false;
+        }
+    }
 
     static void ThrowCompleted() => throw new InvalidOperationException("The source has been completed.");
 
@@ -163,6 +198,15 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
         // source pulls the handoff MRES through it rather than off a bare flow ref (GetHandoffMres is
         // protected on PgClientFlow).
         readonly PgClientProtocol.Control _control;
+
+        internal BacklogEnumerator GetBacklogEnumerator() => new(HeldSyncFlow, ref _storage);
+
+        internal void OnActivationHeartbeat(TimeSpan period)
+        {
+            var backlog = GetBacklogEnumerator();
+            while (backlog.MoveNext())
+                backlog.Current.GetExecutionControl(_control).OnActivationHeartbeat(period);
+        }
 
         public State(PgClientProtocol protocol, PgClientProtocol.Control control, PipelineScheduler scheduler)
         {

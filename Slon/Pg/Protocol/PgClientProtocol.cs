@@ -781,8 +781,15 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         }
 
         var control = FlowControl;
-        // Wrong-tenure hazard if a timeout-armed flow is ever pooled (enforced against in
-        // PgClientFlow.Reset). The fix's per-flow placement-stamp capture lands here.
+        try
+        {
+            _source.OnActivationHeartbeat(period);
+        }
+        catch (Exception)
+        {
+            // TODO log it
+        }
+
         foreach (var flow in GetFlows())
         {
             try

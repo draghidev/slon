@@ -49,6 +49,43 @@ struct SlotEscalatingQueue<T> where T : class
         }
     }
 
+    public Enumerator GetEnumerator() => new(ref this);
+
+    public struct Enumerator
+    {
+        readonly T? _slot;
+        SingleProducerSingleConsumerQueue<T>.Enumerator _queue;
+        bool _yieldSlot;
+
+        internal Enumerator(ref SlotEscalatingQueue<T> storage)
+        {
+            // Read the queue first: if escalation is observed, its acquire also publishes the
+            // head that was left in the slot. Missing a later escalation is a valid snapshot.
+            var queue = Volatile.Read(ref storage._queue);
+            _slot = Volatile.Read(ref storage._slot);
+            _queue = queue is null ? default : queue.GetEnumerator();
+            _yieldSlot = _slot is not null;
+        }
+
+        public T Current { get; private set; } = default!;
+
+        public bool MoveNext()
+        {
+            if (_yieldSlot)
+            {
+                _yieldSlot = false;
+                Current = _slot!;
+                return true;
+            }
+            if (_queue.MoveNext())
+            {
+                Current = _queue.Current;
+                return true;
+            }
+            return false;
+        }
+    }
+
     /// Producer (single thread). Latched: straight to the queue. Else fill the empty slot, or
     /// escalate on overlap - leaving the head in the slot (no move, no claim race), queuing only the
     /// overflow, publishing (release) so the consumer's acquire sees it, then latching.
