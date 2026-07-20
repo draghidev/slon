@@ -33,7 +33,8 @@ abstract class StreamPipeReader : PipeReader
         ArgumentNullException.ThrowIfNull(options);
 
         Stream = readingStream;
-        Segments = new(options.Pool, options.BufferSize, options.MinimumReadSize);
+        Segments = new(options.Pool, options.BufferSize, options.MinimumReadSize,
+            retainBufferOnEmpty: !options.UseZeroByteReads);
         LeaveOpen = options.LeaveOpen;
         PendingReadTokenSource = supportCancelPending ? new() : null;
         UseZeroByteReads = options.UseZeroByteReads;
@@ -94,6 +95,12 @@ abstract class StreamPipeReader : PipeReader
     }
 
     public virtual bool CanTimeout { get; }
+
+    protected internal bool RetainBuffer
+    {
+        get => Segments.RetainBufferOnEmpty;
+        set => Segments.RetainBufferOnEmpty = value;
+    }
 
     public virtual ReadResult Read(TimeSpan timeout = default)
     {

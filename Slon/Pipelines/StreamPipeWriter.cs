@@ -61,6 +61,12 @@ abstract class StreamPipeWriter : PipeWriter
 
     public virtual bool CanTimeout { get; }
 
+    protected internal bool RetainBuffer
+    {
+        get => Segments.RetainBufferOnEmpty;
+        set => Segments.RetainBufferOnEmpty = value;
+    }
+
     /// <inheritdoc />
     public override bool CanGetUnflushedBytes => true;
 

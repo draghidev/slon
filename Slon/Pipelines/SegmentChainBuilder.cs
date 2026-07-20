@@ -23,6 +23,7 @@ sealed class SegmentChainBuilder : IDisposable
 
     // Used when bytes have been consolidated into a single segment, the previous segment still has to be returned.
     readonly int _maxConsolidationSize;
+    bool _retainBufferOnEmpty;
     BufferSegment? _consolidated;
     int _consolidatedIndex;
 
@@ -33,7 +34,8 @@ sealed class SegmentChainBuilder : IDisposable
     long _bufferedBytes;
     bool _disposed;
 
-    public SegmentChainBuilder(MemoryPool<byte> memoryPool, int minimumBufferSize, int minimumReserveSize = 0)
+    public SegmentChainBuilder(MemoryPool<byte> memoryPool, int minimumBufferSize, int minimumReserveSize = 0,
+        bool retainBufferOnEmpty = false)
     {
         ArgumentNullException.ThrowIfNull(memoryPool);
         ArgumentOutOfRangeException.ThrowIfGreaterThan(minimumBufferSize, MaxBufferSize);
@@ -55,11 +57,29 @@ sealed class SegmentChainBuilder : IDisposable
         MinimumBufferSize = minimumBufferSize;
         Pool = memoryPool;
         MinimumReserveSize = minimumReserveSize;
+        _retainBufferOnEmpty = retainBufferOnEmpty;
     }
 
     public int MaximumBufferSize => MaxBufferSize;
 
     public long BufferedBytes => _bufferedBytes;
+
+    public bool RetainBufferOnEmpty
+    {
+        get => _retainBufferOnEmpty;
+        set
+        {
+            _retainBufferOnEmpty = value;
+            if (!value && _bufferedBytes is 0 && _head is { } segment)
+            {
+                Debug.Assert(ReferenceEquals(segment, _tail));
+                _head = _tail = null;
+                segment.Reset();
+                if (_bufferSegmentPool.Count < MaxSegmentPoolCapacity)
+                    _bufferSegmentPool.Push(segment);
+            }
+        }
+    }
 
     public (BufferSegment? Head, int Index) HeadInfo => (_head, _index);
 
@@ -175,9 +195,18 @@ sealed class SegmentChainBuilder : IDisposable
             var returnEnd = consumedSegment;
             if (_bufferedBytes is 0)
             {
-                returnEnd = null;
-                _head = null;
-                _tail = null;
+                if (_retainBufferOnEmpty && consumedSegment.IsBaselineAllocation)
+                {
+                    returnEnd = consumedSegment;
+                    _head = _tail = consumedSegment;
+                    consumedSegment.ResetForReuse();
+                }
+                else
+                {
+                    returnEnd = null;
+                    _head = null;
+                    _tail = null;
+                }
                 _index = 0;
             }
             else if (consumedIndex == returnEnd.WrittenBytes)
@@ -294,6 +323,7 @@ sealed class SegmentChainBuilder : IDisposable
         BufferSegment AllocateSegment(int minimumSize)
         {
             var nextSegment = _bufferSegmentPool.TryPop(out var segment) ? segment : new();
+            nextSegment.IsBaselineAllocation = minimumSize <= MinimumBufferSize;
 
             if (minimumSize <= _maxPooledSize)
             {

@@ -47,6 +47,7 @@ sealed class BufferSegment : ReadOnlySequenceSegment<byte>
 
     // When the memory is backed by a managed array, it can be retrieved here.
     public byte[]? Array { get; private set; }
+    public bool IsBaselineAllocation { get; set; }
 
     public void SetOwnedMemory(IMemoryOwner<byte> memoryOwner)
     {
@@ -67,6 +68,17 @@ sealed class BufferSegment : ReadOnlySequenceSegment<byte>
     {
         ResetMemory();
 
+        ResetLinks();
+    }
+
+    public void ResetForReuse()
+    {
+        End = 0;
+        ResetLinks();
+    }
+
+    void ResetLinks()
+    {
         Next = null;
         RunningIndex = 0;
         _next = null;
@@ -93,6 +105,7 @@ sealed class BufferSegment : ReadOnlySequenceSegment<byte>
         _end = 0;
         AvailableMemory = default;
         Array = null;
+        IsBaselineAllocation = false;
     }
 
     // Exposed for testing
