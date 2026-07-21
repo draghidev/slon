@@ -225,7 +225,7 @@ public sealed class SlonCommand: DbCommand
     /// <inheritdoc/>
     public override void Cancel()
     {
-        // We can't throw in connectionless scenarios as dapper etc expect this method to work.
+        // Callers may cancel before assigning a connection.
         if (_batchCore.TryGetDataSource(out _, out var connection))
             return;
 

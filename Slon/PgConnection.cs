@@ -5,11 +5,8 @@ using Slon.Transport;
 
 namespace Slon;
 
-// Per-session tracked status of a workload-known TrackedCommand. None (= missing from the map)
-// means no Parse has been issued for this name on this session. Preparing means a Parse flow has
-// been enqueued and hasn't completed. Pipeline FIFO ordering lets follower flows enqueue their
-// Bind/Execute behind the Parse without re-issuing it. Tracked means the Parse succeeded and the
-// name is ready to use.
+// Per-session prepared-statement presence. FIFO ordering lets followers use a Preparing statement
+// behind its Parse without a separate completion promise.
 enum TrackedStatus
 {
     None,
@@ -17,88 +14,59 @@ enum TrackedStatus
     Tracked,
 }
 
-// Maintenance work pushed by upstream producers (eviction, salvage, future keepalive). Discrete
-// kinds let the MaintenanceFlow handle each shape during drain. Optional Completion TCS lets
-// callers await batch completion, typically only set on the LAST item of a producer's batch
-// since FIFO ordering means its completion guarantees all earlier items also landed.
-//
-// Intrusive linked list: each MaintenanceWork holds its own Next pointer. PgConnection's queue
-// is just head/tail refs. Nodes themselves are the storage. Avoids the "List<T> retains peak
-// capacity for the connection's lifetime" issue, drained nodes are GC'd, memory returns.
+// Intrusive maintenance work. A completion on the final FIFO item also covers preceding work.
 abstract class MaintenanceWork
 {
     public TaskCompletionSource? Completion { get; init; }
     internal MaintenanceWork? Next { get; set; }
 }
 
-// LRU-evicted TrackedCommand whose server-side prepared statement needs to be DEALLOCATEd. Filled
-// out by CommandTracker.OnEvict once it has fanned out across the registered connections. The
-// flow does RemoveTracked after CloseComplete so presence stays consistent with wire state.
+// LRU eviction whose presence is removed after the server confirms DEALLOCATE.
 sealed class EvictDeallocate(TrackedCommand tracked) : MaintenanceWork
 {
     public TrackedCommand Tracked { get; } = tracked;
     public EncodedString Name { get; } = tracked.StoredCommandName;
 }
 
-// Server-side prepared statement that needs to be DEALLOCATEd by name only, no TrackedCommand
-// available (e.g. leak salvage where the owning command's tracker has been finalized). Pure wire
-// cleanup. Presence already absent (or was never the producer's concern).
+// Name-only DEALLOCATE, typically for leaked ownership whose presence is already absent.
 sealed class CloseStatement(EncodedString name) : MaintenanceWork
 {
     public EncodedString Name { get; } = name;
 }
 
-// Batched variant of CloseStatement for producers (e.g. UnprepareAll) that want to enqueue many
-// names as a single node, one allocation, one optional completion TCS, all closes go in the
-// same Sync window.
+// Multiple DEALLOCATEs sharing one maintenance node and Sync window.
 sealed class CloseStatements(EncodedString[] names) : MaintenanceWork
 {
     public EncodedString[] Names { get; } = names;
 }
 
-// ADO-layer wrapper around a PgClientProtocol that owns prepared-statement presence and
-// maintenance state. The protocol package stays Slon-agnostic. This is where the ADO layer hangs
-// its bookkeeping. Pool unit (replaces PgClientProtocol in IPoolConnection<T>) so presence +
-// maintenance survive lease boundaries naturally, one instance per protocol-session lifetime.
+// ADO-owned session state around the protocol. Prepared presence and maintenance survive pool leases.
 sealed class PgConnection : IPoolConnection<PgConnection>
 {
     readonly PgClientProtocol _protocol;
     readonly CommandTracker? _tracker;
-    // Per-session map of which TrackedCommands have been (or are being) Parsed on this connection.
-    // Synchronization between Preparing and follower use is provided by pipeline FIFO order,
-    // not by an explicit promise, followers see Preparing and enqueue their use behind the
-    // winner's Parse flow.
+    // FIFO ordering synchronizes Preparing followers behind the winning Parse.
     readonly System.Collections.Concurrent.ConcurrentDictionary<TrackedCommand, TrackedStatus> _tracked = new();
 
-    // Maintenance: intrusive linked list (head/tail refs, nodes are MaintenanceWork). The in-flight
-    // flow captures (head, tail) and processes that range. Producers append beyond tail during
-    // execution and stay for the next flow. Commits clear Next pointers on the processed prefix
-    // so the GC can reclaim them, capacity tracks live size, not historical peak.
+    // A flow captures and drains a list prefix while producers may append the next prefix.
     MaintenanceWork? _maintenanceHead;
     MaintenanceWork? _maintenanceTail;
     readonly Lock _maintenanceLock = new();
     int _maintenanceArmed;
     MaintenanceFlow? _cachedMaintenanceFlow;
-    // Heartbeat-driven maintenance interval. Ticks accumulate and only fire maintenance once the
-    // accumulator reaches this interval, time-based so it survives heartbeat-interval changes.
+    // Time-based maintenance cadence independent of heartbeat frequency.
     readonly TimeSpan _maintenanceInterval;
     TimeSpan _maintenanceAccum;
-    // Used in non-pool mode where we own the heartbeat tick ourselves. In pool mode the pool's
-    // heartbeat dispatcher drives OnHeartbeat and this stays null.
+    // Standalone protocols own this heartbeat; pooled protocols use the pool dispatcher.
     Heartbeat? _selfHeartbeat;
     IDisposable? _poolHeartbeatRegistration;
     int _sessionLifetimeReleased;
-    // Per-session monotonic counter for explicit-prepare names. Lives here (not on CommandTracker)
-    // so successive SlonConnections that share this PgConnection through the pool can't collide
-    // on `_ep{N}`. The counter persists for the protocol-session lifetime.
+    // Session-wide explicit-prepare names remain unique across successive leases.
     int _explicitPrepareCounter;
 
     public string MintExplicitPrepareName() => $"_ep{Interlocked.Increment(ref _explicitPrepareCounter)}";
 
-    // Pool's idle-signal closure, captured during Start. Invoked via SignalIdleIfStarted, which
-    // gates on _isStarted so the connection's startup-time idle transition doesn't publish to
-    // the idle channel before the create-path has committed the lease (otherwise a concurrent
-    // OpenConnectionAsync would grab the channel-published conn and end up sharing the wire).
+    // Startup suppresses idle publication until the create path has committed the initial lease.
     Action? _underlyingPoolIdleSignal;
     int _isStarted;
 
@@ -113,19 +81,8 @@ sealed class PgConnection : IPoolConnection<PgConnection>
 
     public PgClientProtocol Protocol => _protocol;
 
-    // Static factories: combine constructor + protocol-startup + idle-signal wiring into one
-    // atomic creation step. Callers can't get a half-initialized PgConnection.
-    //
-    // Wires the pool's idle signal + heartbeat onto the protocol, then drives protocol startup.
-    // PgClientProtocol stays Slon.Pools-oblivious. The typed callbacks land here. The
-    // heartbeat goes through OnHeartbeat (not protocol.Heartbeat directly) so we get a periodic
-    // tick to check pending maintenance. In non-pool mode we own the tick ourselves.
-    //
-    // The returned connection is fully open but NOT yet started. That's <see cref="Start"/>'s
-    // job, called by the pool after the create-path commits the lease (or by the caller
-    // directly in the no-pool case). Until Start fires, idle-channel publication is suppressed
-    // so the connection's startup-time depth-to-zero transition can't race itself into the
-    // channel before its first lease is assigned.
+    // Creates a fully open but unpublished connection. Start enables idle publication only after
+    // the pool commits the initial lease. Heartbeats route through this wrapper for maintenance.
     public static PgConnection Create(PgClientProtocolOptions protocolOptions, PgClientOptions clientOptions, TransportConnection transport, CommandTracker? tracker = null, ConnectionPoolContext<PgConnection>? poolContext = null, TimeSpan timeout = default)
     {
         var protocol = PgClientProtocol.Create(protocolOptions);
@@ -152,13 +109,10 @@ sealed class PgConnection : IPoolConnection<PgConnection>
             _underlyingPoolIdleSignal!();
     }
 
-    // Lifecycle gate: the pool calls this after installing the fully-started connection and
-    // before scheduling initial work. Every subsequent depth-to-zero edge may publish.
+    // Enables depth-to-zero publication after installation and initial lease assignment.
     public void Start() => Volatile.Write(ref _isStarted, 1);
 
-    // Passed to protocol.Start when not pooled, the protocol uses "onIdle is non-null" as the
-    // "external orchestrator present, stay passive about heartbeat" signal. There's nothing for
-    // us to actually do on idle in the non-pool case.
+    // A non-null callback tells the protocol that this wrapper supplies heartbeat orchestration.
     static readonly Action NoopOnIdle = static () => { };
 
     void WireHeartbeat(PgClientOptions options, ConnectionPoolContext<PgConnection>? poolContext)
@@ -188,10 +142,7 @@ sealed class PgConnection : IPoolConnection<PgConnection>
             Interlocked.Exchange(ref _selfHeartbeat, null)?.Dispose();
     }
 
-    // Heartbeat tick: opportunity to start a maintenance flow if work has accumulated, then drive
-    // the protocol's own heartbeat (flow activation timeouts etc.). Time-based subsampling. When
-    // _maintenanceInterval is positive, ticks accumulate and only fire maintenance once the
-    // accumulator reaches the interval. Default (TimeSpan.Zero) fires every tick.
+    // Starts due maintenance before advancing protocol heartbeat duties.
     ValueTask OnHeartbeat(TimeSpan interval)
     {
         _maintenanceAccum += interval;

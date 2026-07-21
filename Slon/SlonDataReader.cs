@@ -104,8 +104,7 @@ public sealed partial class SlonDataReader
             _remainingResults--;
             if (!current.CanHaveRows)
             {
-                // We don't use checked addition here, it's the better trade-off to allow the reader to complete in the face of this overflow
-                // than aiming for complete RecordsAffected correctness (either way the overflow of a long is unimaginably unlikely).
+                // Prefer completing the reader over detecting a practically unreachable row-count overflow.
                 _recordsAffected += current.RecordsAffected;
                 _rowEnumerator = default;
                 return EnumerateCommands;
@@ -124,7 +123,7 @@ public sealed partial class SlonDataReader
             while (_remainingResults > 0 && (next = _enumerator.MoveNext()) && !ProcessCurrent());
             if (!next)
             {
-                // Dispose the enumerator right away to allow the pipeline to handle the next command.
+                // Release the flow as soon as its results end.
                 DisposeEnumerator();
             }
             return next;
@@ -135,7 +134,7 @@ public sealed partial class SlonDataReader
             Debug.Assert(_singleRowBehavior && _remainingResults is 0 || !_singleRowBehavior);
             if (_singleRowBehavior)
             {
-                // Single row behavior, once the row is enumerated, will just fall into the remaining results disposal logic.
+                // After one row, normal result disposal drains the remainder.
                 if (!_enumeratedSingleRow && _rowEnumerator.MoveNext())
                 {
                     _enumeratedSingleRow = true;
@@ -148,10 +147,6 @@ public sealed partial class SlonDataReader
                     return true;
             }
 
-            // // Don't try to dispose synchronously if the reader was started async and count may not reflect actual remaining.
-            // // This prevents problematic sync over async issues, as certain (micro) ORMs still read rows synchronously in async invocations.
-            // if (_remainingResults is 0 && !(_asyncExecute && !_remainingReflectsActual))
-            //     DisposeEnumerator();
             return false;
         }
 
@@ -567,8 +562,7 @@ public sealed partial class SlonDataReader : DbDataReader, IDbColumnSchemaGenera
         return GetColumnSchemaCore<DbColumn>(async: true, cancellationToken).AsTask();
     }
 
-    // These methods try to paper over the api design 'mishap' preventing us from changing the return type of GetColumnSchemaAsync.
-    // Instead we expose two new methods that return our derived column type, synchronous method is exposed under the similar name for symmetry.
+    // DbDataReader cannot specialize GetColumnSchemaAsync's return type, so expose typed counterparts.
     /// <summary>Gets the column schema (<see cref="T:Slon.SlonDbColumn" /> collection).</summary>
     /// <returns>The column schema (<see cref="T:Slon.SlonDbColumn" /> collection).</returns>
     public ReadOnlyCollection<SlonDbColumn> GetSlonColumnSchema()
@@ -579,8 +573,6 @@ public sealed partial class SlonDataReader : DbDataReader, IDbColumnSchemaGenera
         return task.Result;
     }
 
-    // These methods try to paper over the api design 'mishap' preventing us from changing the return type of GetColumnSchemaAsync.
-    // Instead we expose two new methods that return our derived column type, synchronous method is exposed under the similar name for symmetry.
     /// <summary>Gets the column schema (<see cref="T:Slon.SlonDbColumn" /> collection).</summary>
     /// <returns>The column schema (<see cref="T:Slon.SlonDbColumn" /> collection).</returns>
     public Task<ReadOnlyCollection<SlonDbColumn>> GetSlonColumnSchemaAsync(CancellationToken cancellationToken = default)

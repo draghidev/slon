@@ -26,8 +26,7 @@ public sealed partial class SlonConnection : IAdoConnection
     bool _closingConnection;
     bool _stateChangeEventHandlerAdded;
 
-    // Test/diagnostic access to the underlying substrate. Exposed via InternalsVisibleTo so tests
-    // can verify auto-prepare / presence behavior without round-tripping through pg_prepared_statements.
+    // Test access to auto-prepare and connection state without a server query.
     internal AdoConnectionProxy? UnderlyingProxy => _proxy;
     internal PgConnection? UnderlyingPgConnection => _proxy?.PgConnection;
 

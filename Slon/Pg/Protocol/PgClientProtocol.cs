@@ -72,18 +72,11 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
     PgDecoder _pgDecoder = null!;
 
     int _pipelineStalls;
-    // Scoring inputs (the stall count, and the tick/age/throughput counters added for load scoring) are
-    // a POOL concern: a standalone protocol has no pool consuming CompareTo, so it shouldn't pay to
-    // maintain them. Set from onIdle in Initialize - non-null means an orchestrator (pool) drives us.
+    // Standalone protocols do not maintain pool-scoring inputs.
     bool _scoringEnabled;
-    // Coarse monotonic clock for load scoring: incremented once per heartbeat tick (~HeartbeatInterval),
-    // so flow-age and throughput are measured in ticks with no wall-clock reads on any hot path. Single
-    // writer (the heartbeat); readers (flow-dispatch stamp, CompareTo) use a plain atomic int read.
+    // Heartbeat ticks provide a coarse scoring clock without hot-path time reads.
     int _heartbeatTick;
-    // Throughput (completions per tick), EWMA-smoothed in the heartbeat so a single quiet tick doesn't
-    // tank the rate. _completionCount is the running total (bumped at retirement); the heartbeat diffs it
-    // against _lastTickCompletions and folds the delta in. _currentFlowStartTick is the active (head)
-    // flow's start tick - currentTick minus it is the head's age, the "stuck on a long query" signal.
+    // Completion rate is heartbeat-smoothed; head age detects a long-running active flow.
     int _completionCount;
     int _lastTickCompletions;
     double _throughputPerTick;
@@ -91,37 +84,18 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
     Heartbeat? _heartbeat;
     Action? _poolConnectionIdleSignal;
 
-    // Backend identity from BackendKeyData (received during StartupFlow). Kept as two separate
-    // fields rather than a struct because the consumers differ: process id is for diagnostics,
-    // secret key is only ever payload for the side-channel CancelRequest. Both default to 0
-    // pre-startup; the cancel arm site asserts non-zero process id before issuing.
+    // BackendKeyData used for diagnostics and side-channel cancellation.
     int _backendProcessId;
     int _backendSecretKey;
-    // The wire's last-seen transaction status (from every flow's terminating ReadyForQuery). Connection-
-    // wide: one wire, one transaction state, so it lives here (single) - inner-scope and outer flows both
-    // route their RFQ through Control.OnFlowRfq to this field, never a per-Control copy. Surfaced via
-    // Control.TransactionStatus. Unknown until the first RFQ (startup sets it Idle).
+    // Last transaction status observed at RFQ, shared by outer and nested flows on this wire.
     TransactionStatus _transactionStatus;
 
-    // Two-token cancellation cascade:
-    // StoppingToken = graceful drain signal. Body polls at handoff/coordination boundaries and
-    // switches to drain mode. I/O keeps running so the wire reaches a clean state. Fired by
-    // Shutdown on the graceful path.
-    // AbortToken = forceful "wire dead" signal. I/O ops observe via construction-time wiring.
-    // Body is passive: catches OCE, attributes via ex.CancellationToken == AbortToken, propagates.
-    // Fired immediately by Shutdown on the forceful path, or after CompletionTimeout on the
-    // graceful path's escalation.
-    // Owns the close reason + the stopping/abort tokens as one object so "materialize the reason before
-    // tripping any token" is structural. The canonical PgClientClosedException (materialized once on
-    // Shutdown entry, wrapping the closeReason) is _close.Reason.
+    // Stopping requests an orderly drain; abort terminates wire I/O. CloseSignal publishes the reason
+    // before either token fires, so token-driven observers always see the matching close state.
     readonly CloseSignal _close;
     Pipeline<PgClientFlow, Policy, PgClientFlowSource, PgClientFlowSource.Enumerator> _pipeline = null!;
     PgClientFlowSource _source;
-    // Cached exclusive-scope flyweight, collapsed into one reusable state object (inner control, inner
-    // pipeline, scope CloseSignal, the per-scope decoder/writer shells, the pooled hosting flow). On the
-    // common ADO path an open connection is an exclusive scope, so allocating per scope would tax every
-    // execute. One per connection: the outer pipeline stalls for the whole scope, so a second concurrent
-    // state would have nothing to run.
+    // Reused exclusive-scope state. The outer pipeline admits only one such scope at a time.
     ExclusiveScopeState? _exclusiveScope;
     readonly Lock _syncRoot = new();
     ProtocolStatus _status = ProtocolStatus.Created;
@@ -143,48 +117,32 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
     CancellationToken AbortToken => _close.AbortToken;
     CancellationToken StoppingToken => _close.StoppingToken;
     public int PipelineDepth => _pipeline.Depth;
-    // Flows enqueued but not yet dispatched (the source's queue). PipelineDepth + Backlog is the total
-    // outstanding work on this protocol - the load-scoring L and a diagnostics gauge. Stale-tolerant
-    // lock-free reads, same post-Initialize contract as PipelineDepth.
+    // Undispatched source work. Together with depth, this is the protocol's outstanding load.
     public int Backlog => _source.Backlog;
     public int Outstanding => _pipeline.Depth + _source.Backlog;
     ProtocolStatus Status => _status;
 
-    // Source-side accessors. The PgClientFlowSource's pre-park hook reads these to decide whether
-    // it must flush before the executor goes idle. Null-safe for the pre-Initialize window: a
-    // protocol not yet wired to a transport has zero unflushed bytes by definition.
+    // Used by the source before parking; pre-initialization has no unflushed bytes.
     internal long UnflushedBytes => _protocolDataWriter?.UnflushedBytes ?? 0;
     internal ValueTask FlushAsync(CancellationToken cancellationToken) => _protocolDataWriter.FlushAsync(cancellationToken);
 
-    // Pool-unit accessors. PgConnection forwards its IPoolConnection<PgConnection> implementation
-    // to these. Keeps the protocol package decoupled from Slon.Pools' typed context.
-    // Outstanding, not just in-flight: a connection sitting on undispatched backlog is not idle (the
-    // pool's idle fast path must not grab it as free while LoadScore counts that backlog as load).
+    // Pool-facing state. Idle includes undispatched backlog, not only pipeline depth.
     internal bool IsIdle => Outstanding is 0;
     internal bool IsCompleted => Status is ProtocolStatus.Completed;
-    // Draining-or-later: visible within the first statement of RunShutdownAsync, a full drain
-    // ahead of the Completed latch - the pool's scheduling veto reads this so a stopping
-    // protocol stops winning placement races it can only fault-and-rebind.
+    // Draining immediately vetoes new pool placement, before terminal completion.
     internal bool IsDraining => Status is ProtocolStatus.Draining or ProtocolStatus.Completed;
     internal bool IsSchedulable => Status is ProtocolStatus.Ready;
 
-    // Non-null the instant shutdown has begun: the reason is materialized under the Shutdown gate
-    // BEFORE any close token fires, so a cascade-driven observer (whose schedule is causally
-    // downstream of those tokens) can never read null on a shutdown it was itself created by.
+    // Published before close tokens fire.
     internal PgClientClosedException? CloseReason => _close.Reason;
-    // The wire's last-seen transaction status (Idle / Transaction / Error). For connection-state queries,
-    // recovery's status-gated ROLLBACK, and pool steering (an open-transaction wire is a hard-skip).
+    // Used by state queries, recovery, and pool steering.
     internal TransactionStatus TransactionStatus => _transactionStatus;
-    // The cause that closed the protocol, or null if it completed cleanly. _closedException wraps the
-    // shutdown's closeReason as its inner; the inner is the raw cause (a fault from FailProtocol / wire
-    // death), null for a graceful CompleteAsync or a clean forceful DisposeAsync. A null check tells
-    // clean-vs-faulted and the value tells why. No separate status is needed: a faulted connection still
-    // reaches Completed, so IsCompleted already evicts it.
+    // Raw shutdown cause, or null after clean completion.
     internal Exception? CompletionException => _close.Reason?.InnerException;
     internal string? ScopeResetCommand => _scopeReset.ResolveCommand();
     internal int CompareTo(PgClientProtocol? other)
     {
-        // null instances are always better, they represent empty connection slots.
+        // Empty slots are preferred.
         if (other is null)
             return 1;
 
@@ -193,13 +151,8 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         return score < otherScore ? -1 : score == otherScore ? 0 : 1;
     }
 
-    // Estimated wait in ticks (lower = better target). Little's Law core: expected wait = outstanding /
-    // throughput (W = L/λ), where L is in-flight depth PLUS undispatched backlog - all the work that has
-    // to run on this wire - so a deep-but-fast connection scores lower than a shallow-but-stuck one. The
-    // throughput floor turns a zero-rate-with-work connection into a large W (correctly "stuck"); an idle
-    // connection short-circuits to 0. Stalls (non-pipelined flows serialize the wire) and a head flow
-    // running past the age threshold (stuck on a long op) add tick-equivalent penalties on top. All knobs
-    // are deliberately rough - power-of-two selection only needs the comparison to be directionally right.
+    // Estimated wait in ticks: outstanding / throughput, plus serialization and head-age penalties.
+    // Power-of-two selection needs directional accuracy rather than a precise latency model.
     double LoadScore()
     {
         var outstanding = Outstanding;
@@ -426,9 +379,9 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
     // shared Read/WriteChannel carry the scope's token, so a scope-only abort breaks a subflow parked on
     // a wire read/write while the pooled protocol survives. The shells are created once here alongside the
     // flyweight and reused across scopes.
-    internal Flows.ExclusiveAccessFlow BeginExclusiveScope(bool async)
+    internal ExclusiveAccessFlow BeginExclusiveScope(bool async)
     {
-        Flows.ExclusiveAccessFlow flow;
+        ExclusiveAccessFlow flow;
         PgClientFlowSource.EnqueueResult enqueue = default;
         bool handoff;
         lock (_syncRoot)
@@ -1023,7 +976,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
             // Recovery-on-recovery does not exist (the framework guarantees it: a committed
             // recovery's late fault travels as a marker exception and completes directly,
             // never consulted here).
-            System.Diagnostics.Debug.Assert(failedItem is not ResyncRecoveryFlow,
+            Debug.Assert(failedItem is not ResyncRecoveryFlow,
                 "Recovery item routed back into TryRecoverItemFailure - recovery-on-recovery must not exist.");
 
             // Pipeline is ABORTING: skip recovery and let the framework propagate the failure. Gate on the
