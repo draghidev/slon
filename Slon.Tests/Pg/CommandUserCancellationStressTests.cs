@@ -30,10 +30,15 @@ public class CommandUserCancellationStressTests
 
     // Drive one MoveNextAsync under the hang cap; returns the caught exception (or null on a delivered
     // result). A TimeoutException is the lost-wake failure and is asserted here so callers don't repeat it.
-    static async Task<Exception?> MoveNextGuarded(CommandFlow.Enumerator e, CancellationToken ct, int i)
+    static async Task<Exception?> MoveNextGuarded(PgClientProtocol protocol, CommandFlow.Enumerator e, CancellationToken ct, int i)
     {
         try { await e.MoveNextAsync(ct).AsTask().WaitAsync(HangCap); return null; }
-        catch (TimeoutException) { Assert.Fail($"iter {i}: MoveNextAsync never completed (lost wake)."); throw; }
+        catch (TimeoutException)
+        {
+            Assert.Fail($"iter {i}: MoveNextAsync never completed (lost wake).\n" +
+                $"{ProtocolDiag.Gauges(protocol)}\nsource: {ProtocolDiag.SourceState(protocol)}");
+            throw;
+        }
         catch (Exception ex) { return ex; }
     }
 
@@ -107,7 +112,7 @@ public class CommandUserCancellationStressTests
         Assert.IsTrue(protocol.TryQueue(flow, cancellationToken: cts.Token));
         var e = flow.GetAsyncEnumerator(cts.Token);
         Assert.IsInstanceOfType<OperationCanceledException>(
-            await MoveNextGuarded(e, cts.Token, i),
+            await MoveNextGuarded(protocol, e, cts.Token, i),
             $"iter {i}: submit-bound pre-fired token must surface OCE, not a result");
         return e;
     });
@@ -122,7 +127,7 @@ public class CommandUserCancellationStressTests
         var cts = new CancellationTokenSource();
         cts.Cancel();
         var e = flow.GetAsyncEnumerator(cts.Token);
-        AssertCancelOrClose(await MoveNextGuarded(e, cts.Token, i), i);
+        AssertCancelOrClose(await MoveNextGuarded(protocol, e, cts.Token, i), i);
         return e;
     });
 
@@ -136,7 +141,7 @@ public class CommandUserCancellationStressTests
         var cts = new CancellationTokenSource();
         cts.CancelAfter(TimeSpan.FromTicks((i % 7) * 5000));
         var e = flow.GetAsyncEnumerator(cts.Token);
-        AssertCancelOrClose(await MoveNextGuarded(e, cts.Token, i), i);
+        AssertCancelOrClose(await MoveNextGuarded(protocol, e, cts.Token, i), i);
         return e;
     });
 
@@ -174,8 +179,8 @@ public class CommandUserCancellationStressTests
                         try
                         {
                             await Task.WhenAll(
-                                MoveNextGuarded(ea, ctsA.Token, i),
-                                MoveNextGuarded(eb, ctsB.Token, i));
+                                MoveNextGuarded(protocol, ea, ctsA.Token, i),
+                                MoveNextGuarded(protocol, eb, ctsB.Token, i));
                         }
                         finally
                         {
@@ -211,7 +216,7 @@ public class CommandUserCancellationStressTests
         Assert.IsTrue(protocol.TryQueue(flow));
 
         var e = flow.GetAsyncEnumerator();
-        Assert.IsNull(await MoveNextGuarded(e, default, i), $"iter {i}: result 1 should be delivered");
+        Assert.IsNull(await MoveNextGuarded(protocol, e, default, i), $"iter {i}: result 1 should be delivered");
 
         // This test disposes mid-body (the dispose-then-reuse contract is the point), so do it here and
         // hand RaceLoop a default(Enumerator) - its trailing dispose then no-ops (flow == null).
@@ -245,7 +250,7 @@ public class CommandUserCancellationStressTests
         Assert.IsTrue(protocol.TryQueue(flow, cancellationToken: cts.Token));
 
         var e = flow.GetAsyncEnumerator(cts.Token);
-        AssertCancelOrClose(await MoveNextGuarded(e, cts.Token, i), i);  // OCE/close/result all fine
+        AssertCancelOrClose(await MoveNextGuarded(protocol, e, cts.Token, i), i);  // OCE/close/result all fine
 
         await DisposeGuarded(e, i, "token-bounded DisposeAsync");  // disposed mid-body; RaceLoop no-ops on default
         try { await PgTestPool.RunAsync(protocol, "select 1").WaitAsync(HangCap); }

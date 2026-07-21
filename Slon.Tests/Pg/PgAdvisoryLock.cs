@@ -5,6 +5,7 @@ namespace Slon.Tests.Pg;
 
 sealed class PgAdvisoryLock : IAsyncDisposable
 {
+    static int s_nextKey;
     readonly PgClientProtocol _owner;
     bool _held = true;
 
@@ -16,11 +17,11 @@ sealed class PgAdvisoryLock : IAsyncDisposable
 
     public long Key { get; }
 
-    public Command WaitCommand => Command.Create($"select pg_advisory_lock({Key})");
+    public Command WaitCommand => Command.Create($"select pg_advisory_xact_lock({Key})");
 
     public static async Task<PgAdvisoryLock> AcquireAsync()
     {
-        var key = Random.Shared.NextInt64(1, long.MaxValue);
+        var key = ((long)(uint)Environment.ProcessId << 32) | (uint)Interlocked.Increment(ref s_nextKey);
         var owner = await PgTestPool.NewIsolatedAsync();
         try
         {
@@ -51,6 +52,19 @@ sealed class PgAdvisoryLock : IAsyncDisposable
         await PgTestPool.RunAsync(_owner, $"select pg_advisory_unlock({Key})");
         _held = false;
     }
+
+    public Task WaitUntilContendedAsync(int backendProcessId)
+        => PgTestPool.RunAsync(_owner, $$"""
+            do $$
+            begin
+                while not exists (
+                    select 1 from pg_stat_activity
+                    where pid = {{backendProcessId}} and wait_event = 'advisory')
+                loop
+                    perform pg_sleep(0.001);
+                end loop;
+            end $$
+            """);
 
     public async ValueTask DisposeAsync()
     {

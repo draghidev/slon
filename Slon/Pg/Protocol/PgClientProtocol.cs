@@ -56,11 +56,9 @@ sealed class PgClientProtocolOptions
     public TimeSpan ReadTimeout { get; set; } = Timeout.InfiniteTimeSpan;
     public ScopeResetOptions ScopeReset { get; set; } = new();
 
-    /// Cancel-request sender for the protocol's side-channel CancelRequest. Receives
-    /// (processId, secretKey, cancellationToken); the implementation opens a fresh transport,
-    /// sends via <see cref="CancelRequest.SendAsync"/>, and disposes it. Null = no sender wired,
-    /// cancel feature unavailable.
-    public Func<int, int, CancellationToken, ValueTask>? CancelSender { get; set; }
+    /// Sends a side-channel CancelRequest and classifies whether request bytes may have reached
+    /// PostgreSQL. The attempt must have ended before it returns. Null disables server cancellation.
+    public Func<int, int, CancellationToken, ValueTask<CancelRequestDelivery>>? CancelSender { get; set; }
 }
 
 sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
@@ -99,7 +97,6 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
     // pre-startup; the cancel arm site asserts non-zero process id before issuing.
     int _backendProcessId;
     int _backendSecretKey;
-
     // The wire's last-seen transaction status (from every flow's terminating ReadyForQuery). Connection-
     // wide: one wire, one transaction state, so it lives here (single) - inner-scope and outer flows both
     // route their RFQ through Control.OnFlowRfq to this field, never a per-Control copy. Surfaced via
@@ -165,7 +162,6 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
     // pool's idle fast path must not grab it as free while LoadScore counts that backlog as load).
     internal bool IsIdle => Outstanding is 0;
     internal bool IsCompleted => Status is ProtocolStatus.Completed;
-
     // Draining-or-later: visible within the first statement of RunShutdownAsync, a full drain
     // ahead of the Completed latch - the pool's scheduling veto reads this so a stopping
     // protocol stops winning placement races it can only fault-and-rebind.
@@ -506,6 +502,8 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
 
             if (predicate?.Invoke(state) == false)
                 return false;
+
+            AssignCancellationBoundary(FlowControl, flow);
 
             // Both modes write the SPSC storage, so the enqueue must serialize with concurrent
             // same-protocol producers (single-producer contract). The sync flow goes in at its real FIFO
@@ -1086,6 +1084,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
             // before the instance can be reused.
             recoveryItem = ResyncRecoveryFlow.Create(
                 _control, failedItem, context.Exception, outstandingPhase, outstandingIsRead, failedItemControl.RfqCount, canWriteSync, canWrite);
+            _control.OnFlowSubstituted(failedItem, recoveryItem);
             return true;
         }
 
@@ -1107,6 +1106,13 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         public void BindSource(PgClientFlowSource source) => _source = source;
         public bool HasQueuedFlow => _source.Backlog != 0;
         public bool IsInlineDrive => _source.IsInlineDrive;
+        // Cancellation needs a proof-quality idle level; the slot reads are deliberately stale-tolerant.
+        bool _isIdle = true;
+        public bool IsIdle => Volatile.Read(ref _isIdle);
+        public void RequestServerCancellation(PgClientFlow instigator)
+            => protocol.RequestServerCancellation(instigator, this);
+        public void OnFlowSubstituted(PgClientFlow from, PgClientFlow to)
+            => protocol.OnFlowSubstituted(this, from, to);
         internal string? ScopeResetCommand => protocol.ScopeResetCommand;
 
         // The scope's linked close signal, set once for an exclusive-scope inner Control; null for the
@@ -1270,8 +1276,11 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
 
         // Connection-wide transaction-state bookkeeping. Routes to the single protocol field (NOT a
         // per-Control copy) so inner-scope and outer flows keep one consistent view of the one wire.
-        public void OnFlowRfq(BackendMessage message)
-            => protocol._transactionStatus = ReadyForQueryMessage.Create(message).TransactionStatus;
+        public void OnFlowRfq(PgClientFlow flow, BackendMessage message)
+        {
+            protocol._transactionStatus = ReadyForQueryMessage.Create(message).TransactionStatus;
+            protocol.OnFlowRfq(this, flow);
+        }
 
         // Wire-handoff guard, called from Policy.CompleteItem when a flow retires. The OUTER multiplexed
         // pipeline (poolFacing) hands the wire between INDEPENDENT flows, so a flow must leave it Idle -
@@ -1307,11 +1316,13 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         // against a depth-0-cleared slot.
         internal void BindDecoder(PgClientFlow flow)
         {
+            Volatile.Write(ref _isIdle, false);
             // Stamp the head flow's start tick at activation (this is the active reader). currentTick
             // minus it gives the head's running age for the load score.
             if (protocol._scoringEnabled)
                 protocol._currentFlowStartTick = protocol._heartbeatTick;
             Decoder.Initialize(this);
+            protocol.OnFlowActivated(this, flow);
         }
 
         // Wake the flow's body with the bound decoder. Resumes the body inline, so async flows run this
@@ -1325,6 +1336,9 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
 
         internal void OnCompleted(PgClientFlow flow, int remainingDepth)
         {
+            if (remainingDepth is 0)
+                Volatile.Write(ref _isIdle, true);
+            protocol.OnFlowCompleted(this, flow, remainingDepth);
             // Scoring inputs maintained at retirement (the universal completion point, fires for every
             // flow including ones faulted before bind). Throughput: every retirement counts. Stalls: a
             // non-pipelined flow held the wire serialized from queue until its RFQ here (not just until

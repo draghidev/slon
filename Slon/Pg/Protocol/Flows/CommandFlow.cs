@@ -33,6 +33,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
     CancellationToken _flowCancellationToken;
     CancellationTokenRegistration _callerCancellationTokenRegistration;
     CancellationTokenRegistration _flowCancellationTokenRegistration;
+    PgClientProtocol.CancellationRequester _cancellationRequester;
     // Cancel intent latches set by the (non-completing) registration callbacks. The callback NEVER
     // completes the move-next source: completing it mid-body, while this flow holds the shared pipeline
     // promise (or a concurrent pipelined flow does), drives ExecuteSource into a TryStart over a tenured
@@ -252,6 +253,11 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
 
     FlowTasks ExecuteAutoCore(Context context)
     {
+        _cancellationRequester = context.CancellationRequester;
+        if (_flowCancellationToken.IsCancellationRequested)
+            RequestCancel(_flowCancellationToken);
+        else if (Volatile.Read(ref _cancelRequested))
+            _cancellationRequester.Request();
         ValueTask writeTask;
         try
         {
@@ -279,7 +285,10 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
             _readFlowRfq = appendSync;
             if (IsAsync)
             {
-                writeTask = _options.Commands.WriteCommandsAsync(context.GetEncoder(), appendSync, _flowCancellationToken);
+                // Caller cancellation never cancels wire I/O. A partially cancelled write requires
+                // protocol recovery and can strand already-pipelined successors; the body instead
+                // observes the latched intent and drains every written command to RFQ.
+                writeTask = _options.Commands.WriteCommandsAsync(context.GetEncoder(), appendSync, default);
             }
             else
             {
@@ -296,18 +305,6 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                 writeTask.GetAwaiter().GetResult();
             else if (!IsAsync)
                 writeTask = encoder.RunResumableTask(writeTask);
-        }
-        catch (OperationCanceledException ex) when (ex.CancellationToken == _flowCancellationToken)
-        {
-            // Flow-scoped cancel observed by the EAGER WRITE (a pre-fired submit-bound token). The command
-            // bytes may already be on the wire, so the read must still drain to RFQ. Do NOT route through
-            // HandleException: that both faults the move-next source from this (write-phase) stack and
-            // tears the connection. Latch the cancel; the read body observes it, drains consumer-gone, and
-            // delivers the OCE at its terminal - tenure-safe. The write happens before any in-body
-            // registration arms, so this catch is the only place to capture a write-phase flow-cancel.
-            RequestCancel(_flowCancellationToken);
-            // The write faulted; no trailing write task to observe. The read drains to RFQ.
-            writeTask = default;
         }
         catch (Exception ex)
         {
@@ -565,7 +562,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                 // A command error lands in EITHER _pgError (read phase) OR CompleteError (completion phase),
                 // never both, so capturing in both places does not double-count a single command's error.
                 var capturedThisCommand = false;
-                if (IsConsumingAutonomously && _pgError is { } readError)
+                if (IsConsumingAutonomously && _pgError is { } readError && !IsOwnCancellation(readError))
                 {
                     (_drainErrors ??= new()).Add(new PostgresException(readError));
                     capturedThisCommand = true;
@@ -764,7 +761,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                     // by a live consumer; direct nonquery consumption has taken that ownership even if it
                     // raced a result publication.
                     if ((IsConsumingNonQuery || IsDraining && !_isResultReady)
-                        && !capturedThisCommand && completeError is { } err)
+                        && !capturedThisCommand && completeError is { } err && !IsOwnCancellation(err.Error))
                         (_drainErrors ??= new()).Add(new PostgresException(err.Error));
                 }
             }
@@ -816,29 +813,12 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
         }
         catch (OperationCanceledException ex) when (ex.CancellationToken == _callerCancellationToken || ex.CancellationToken == _flowCancellationToken)
         {
-
-            // All of what happens below is complicated by the fact PG cancellation is not deterministic.
-            // Ideally we want a mechanism to state "cancel if you are at this message and continue until you see this other one"
-            // Postgres unfortunately only supports a non-contextual cancel request, cancelling whatever is running, viewed from the Postgres side of things.
-            // This means that if commands execute fast, and the TCP window allowed the response to be flushed, we might just cancel whatever is coming after this flow.
-            if (_commandIndex is 0)
-            {
-                // Issue backend cancel(s), this is an ExecuteReaderAsync call.
-                // We have to issue as many cancels as there are syncs in this flow.
-            }
-            else
-            {
-                // This is a NextResultAsync call, we choose not to do anything here.
-                // If we do want to cancel something we have to take into account a cancellation actually cancels a *transaction* and not just a single command.
-            }
-
             HandleException(ex);
             throw;
         }
         catch (TimeoutException ex)
         {
-            // Issue backend cancel(s), this is a timeout on I/O, luckily this means we have a fairly high certainty we cancel our own commands.
-            // We have to issue as many cancels as there are syncs in this flow.
+            _cancellationRequester.Request();
             HandleException(ex);
             throw;
         }
@@ -956,8 +936,13 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
     {
         _cancelDeliverToken = token;
         Volatile.Write(ref _cancelRequested, true);
+        if (_cancellationRequester.IsInitialized)
+            _cancellationRequester.Request();
         _callerInteractionCore.RequestWake();
     }
+
+    bool IsOwnCancellation(PgError error)
+        => Volatile.Read(ref _cancelRequested) && error.SqlState == PgErrorCodes.QueryCanceled;
 
     // The terminal move-next completion (clean end, or user-cancel OCE), factored so it can run either
     // inline (when the body suspended at least once - off the dispatch frame) or be deferred to the
@@ -1202,6 +1187,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
         _callerCancellationTokenRegistration = default;
         _flowCancellationTokenRegistration.Dispose();
         _flowCancellationTokenRegistration = default;
+        _cancellationRequester = default;
         _cancelRequested = false;
         _cancelDeliverToken = default;
         _deliverCancelOce = false;
@@ -1356,12 +1342,29 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
             if (flow is null)
                 return new(false);
 
+            if (cancellationToken is { IsCancellationRequested: true } preCanceledToken)
+            {
+                flow._callerCancellationToken = preCanceledToken;
+                flow.RequestCancel(preCanceledToken);
+                flow._callerInteractionCore.OpenGate(runContinuationsAsynchronously: false);
+                return ValueTask.FromException<bool>(new OperationCanceledException(preCanceledToken));
+            }
+
             // The guard-decide-rearm is serialized against the body's terminal (see _rearmLock): the using
             // scope covers the _enumeratorCompleted read through the move-next Reset, and ends before the
             // gate dispatch below (which runs the body inline and would re-enter this non-reentrant lock).
             // try/finally release keeps it lock-safe on any throw.
             using (flow._rearmLock.EnterScope())
             {
+                // Publish the per-read token before the terminal repair below: a flow may already have
+                // completed before its first consumer call, and RepairLostTerminal needs this token to
+                // distinguish a pre-fired cancellation from a clean end.
+                if (cancellationToken is { } terminalToken && terminalToken.CanBeCanceled)
+                {
+                    flow._callerCancellationToken = terminalToken;
+                    flow._enumeratorMoveNextTaskSource.CanCompleteConcurrently = true;
+                }
+
                 // Terminal short-circuit. _enumeratorCompleted is version-less and survives a Reset, so a
                 // terminal landed on a PRIOR generation leaves it set while the consumer is parked on a
                 // fresh, pending generation with no completer (the lost-completion). Repair it for the close
@@ -1378,15 +1381,6 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                     if (flow._enumeratorCurrent is null)
                         ThrowHelper.ThrowInvalidOperation("No immediate sync/async mixing is allowed, the first MoveNext{Async} call has to match the async argument passed during initialize.");
                     flow.IsAsync = true;
-                }
-
-                // Override only with a cancelable per-read token: a no-token / None MoveNext keeps the
-                // token bound at submit (or GetAsyncEnumerator) for this read, never clobbering it with
-                // None. A cancelable token also arms the concurrent completer for this tenure.
-                if (cancellationToken is { } ct && ct.CanBeCanceled)
-                {
-                    flow._callerCancellationToken = ct;
-                    flow._enumeratorMoveNextTaskSource.CanCompleteConcurrently = true;
                 }
 
                 // Rearm only on a non-first call. The first-call source is fresh from OnReset and the body's

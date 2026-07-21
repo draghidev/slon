@@ -139,6 +139,8 @@ public class RecoveryTests
         /// cross post-snapshot (the drain-count reconciliation probe).
         public int HeldReadConsumeCount { get; init; } = 1;
 
+        public bool RequestCancellation { get; init; }
+
         /// SQL for the QueryNoFlush / ParseBindExecuteNoSync shapes (defaults to a trivial select).
         /// Lets a test run a side-effecting statement (e.g. BEGIN + CREATE TEMP TABLE) to observe
         /// whether recovery closed the transaction the failed flow left open.
@@ -193,6 +195,9 @@ public class RecoveryTests
 
             AfterWrites?.Invoke();
 
+            if (RequestCancellation)
+                context.CancellationRequester.Request();
+
             if (_phase is FaultPhase.PreReturn)
                 throw new InvalidOperationException("FaultingFlow pre-return synthetic failure.");
 
@@ -223,15 +228,15 @@ public class RecoveryTests
             static ValueTask FailedTask()
                 => new(Task.FromException(new InvalidOperationException("FaultingFlow synthetic failure.")));
 
-            // Acquire the decoder (the single-consumer read turn), signal it, then do a REAL parked
-            // read. This is the unfinished pipelineTask: when the recovery activates and robs the
+            // Acquire the decoder (the single-consumer read turn), signal it, wait on the test's
+            // release gate, then do a real read. This is the unfinished pipelineTask: when recovery activates and robs the
             // turn, this read's next decoder USE fails the per-use validity check and faults - and
             // that late fault on an already-recovering flow is the recovery-of-recovery trigger.
             static async ValueTask HoldReadTurn(Context context, TaskCompletionSource gate, TaskCompletionSource? acquired, int consumeCount)
             {
                 PgDecoder decoder = await context.GetDecoderAsync().ConfigureAwait(false);
                 acquired?.TrySetResult();
-                _ = gate; // vestigial; the read parks on the wire, not the gate
+                await gate.Task.ConfigureAwait(false);
                 for (var i = 0; i < consumeCount; i++)
                     await decoder.GetNextAsync().ConfigureAwait(false);
             }
@@ -253,6 +258,23 @@ public class RecoveryTests
         Assert.IsTrue(protocol.TryQueue(faulting));
 
         await RunAsync(protocol, "select 1");
+    }
+
+    [TestMethod]
+    public async Task RecoverySubstitution_RetiresUndeliveredCancellationIntent()
+    {
+        await using var protocol = await PgTestPool.NewIsolatedAsync(o => o.CancelSender = (_, _, _) =>
+            throw new AssertFailedException("an unactivated failed flow must not dispatch cancellation"));
+        var faulting = new FaultingFlow(async: true, FaultPhase.PipelineTask, WriteShape.None)
+        {
+            RequestCancellation = true,
+        };
+        Assert.IsTrue(protocol.TryQueue(faulting));
+
+        await RunAsync(protocol, "select 1");
+
+        Assert.IsFalse(protocol.HasPendingCancellation);
+        Assert.IsFalse(protocol.Completion.IsCompleted);
     }
 
     // Execute-item-task failure (PreReturn throw) after a Query was written but not flushed.
@@ -654,7 +676,7 @@ public class RecoveryTests
     // before the recovery takes the read turn. A timeout/desync here means that sequencing
     // regressed.
     [TestMethod]
-    public async Task TrailingTask_FailsWhileReadHeld_RecoveryDoesNotCollideOnReadTurn()
+    public async Task TrailingTask_Failure_WaitsForOutstandingReadBeforeRecovery()
     {
         var protocol = await ConnectAsync();
         try
@@ -671,19 +693,17 @@ public class RecoveryTests
             };
             Assert.IsTrue(protocol.TryQueue(faulting));
 
-            _ = Task.Run(async () =>
-            {
-                await acquired.Task.ConfigureAwait(false);   // the read is now holding the decoder
-                trailing.TrySetException(new InvalidOperationException("synthetic trailing fault while read held"));
-                await Task.Delay(50).ConfigureAwait(false);
-                releaseGate.TrySetResult();
-            });
-
-            // Assert the scenario was actually exercised (the read genuinely held the turn) before
-            // asserting the sibling drains cleanly - so a green run can't be a false positive from
-            // the read failing to acquire.
+            // The read genuinely owns the decoder before the trailing failure is published.
             await acquired.Task.WaitAsync(TimeSpan.FromSeconds(10));
-            await RunAsync(protocol, "select 1").WaitAsync(TimeSpan.FromSeconds(15));
+            trailing.TrySetException(new InvalidOperationException("synthetic trailing fault while read held"));
+
+            var sibling = RunAsync(protocol, "select 1");
+            await Task.Delay(50);
+            Assert.IsFalse(sibling.IsCompleted,
+                "recovery must not revoke a still-running pipeline phase's decoder ownership");
+
+            releaseGate.TrySetResult();
+            await sibling.WaitAsync(TimeSpan.FromSeconds(15));
         }
         finally
         {
@@ -786,6 +806,7 @@ public class RecoveryTests
         try
         {
             await acquired.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            releaseGate.TrySetResult();
 
             transport.ReleaseSegment(CommandComplete());
             await Task.Delay(50);

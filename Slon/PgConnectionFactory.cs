@@ -37,18 +37,30 @@ sealed class PgConnectionFactory : IPoolConnectionFactory<PgConnection>
     // policy, delivers the CancelRequest via the protocol-layer wire helper, disposes the
     // transport on every path. Passed to PgClientProtocolOptions.CancelSender so the protocol
     // layer can fire-and-forget without knowing about transports.
-    async ValueTask SendCancelAsync(int processId, int secretKey, CancellationToken cancellationToken)
+    async ValueTask<CancelRequestDelivery> SendCancelAsync(int processId, int secretKey, CancellationToken cancellationToken)
     {
-        var transport = await _transportConnectionFactory.ConnectAsync(cancellationToken).ConfigureAwait(false);
-        Exception? sendError = null;
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeout.CancelAfter(_clientOptions.ConnectionTimeout);
+        var token = timeout.Token;
+        TransportConnection transport;
         try
         {
-            await CancelRequest.SendAsync(transport, processId, secretKey, cancellationToken).ConfigureAwait(false);
+            transport = await _transportConnectionFactory.ConnectAsync(token).ConfigureAwait(false);
+        }
+        catch
+        {
+            return CancelRequestDelivery.NotSent;
+        }
+        Exception? sendError = null;
+        var delivery = CancelRequestDelivery.Sent;
+        try
+        {
+            await CancelRequest.SendAsync(transport, processId, secretKey, token).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
             sendError = ex;
-            throw;
+            delivery = CancelRequestDelivery.Unknown;
         }
         finally
         {
@@ -61,6 +73,7 @@ sealed class PgConnectionFactory : IPoolConnectionFactory<PgConnection>
             await transport.Writer.CompleteAsync(sendError).ConfigureAwait(false);
             await transport.Reader.CompleteAsync().ConfigureAwait(false);
         }
+        return delivery;
     }
 
     PgConnection Create(ConnectionPoolContext<PgConnection>? poolContext, TimeSpan timeout = default)

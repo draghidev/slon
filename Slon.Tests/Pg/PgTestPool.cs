@@ -72,6 +72,30 @@ static class PgTestPool
         return protocol;
     }
 
+    internal static Func<int, int, CancellationToken, ValueTask<CancelRequestDelivery>> CreateCancelSender(PgClientOptions options)
+        => async (processId, secretKey, cancellationToken) =>
+        {
+            var transport = await SocketStreamConnection.ConnectAsync(
+                options.EndPoint, cancellationToken: cancellationToken).ConfigureAwait(false);
+            Exception? error = null;
+            try
+            {
+                await CancelRequest.SendAsync(transport, processId, secretKey, cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                error = ex;
+                throw;
+            }
+            finally
+            {
+                transport.Abort();
+                await transport.Writer.CompleteAsync(error).ConfigureAwait(false);
+                await transport.Reader.CompleteAsync().ConfigureAwait(false);
+            }
+            return CancelRequestDelivery.Sent;
+        };
+
     // Sync flow exerciser shared across the Pg-layer tests. Driving CommandFlow directly so
     // the assertions attribute to the protocol, not to any ADO surface.
     internal static Task RunSync(PgClientProtocol protocol, string sql)

@@ -1,5 +1,6 @@
 using System.Reflection;
 using Slon.Pg.Protocol;
+using Slon.Pg.Protocol.Flows;
 
 namespace Slon.Tests.Pg;
 
@@ -13,7 +14,28 @@ static class ProtocolDiag
     const BindingFlags All = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
 
     internal static string Describe(PgClientFlow? f)
-        => f is null ? "null" : $"{{completed={f.IsCompleted},started={f.IsStarted},pending={f.IsPending}}}";
+    {
+        if (f is null)
+            return "null";
+        var common = $"type={f.GetType().Name},completed={f.IsCompleted},started={f.IsStarted},pending={f.IsPending}";
+        if (f is not CommandFlow)
+            return $"{{{common}}}";
+
+        var type = f.GetType();
+        object? F(string name) => type.GetField(name, All)!.GetValue(f);
+        var core = F("_callerInteractionCore")!;
+        var coreType = core.GetType();
+        object? C(string name) => coreType.GetField(name, All)!.GetValue(core);
+        var gate = C("_gate")!;
+        var gateType = gate.GetType();
+        var version = gateType.GetProperty("Version", All)!.GetValue(gate)!;
+        var status = gateType.GetMethod("GetStatus", All)!.Invoke(gate, [version]);
+        return $"{{{common},command={F("_commandIndex")},body={F("_bodyStarted")}," +
+               $"draining={F("_draining")},disposed={F("_consumerDisposed")}," +
+               $"terminal={F("_enumeratorCompleted")},cancel={F("_cancelRequested")}," +
+               $"gate={status},wake={C("_wakeRequested")},wakeContinuation={C("_wakeContinuation") is not null}," +
+               $"progress={C("_progressSignaled")}}}";
+    }
 
     internal static string Gauges(PgClientProtocol protocol)
         => $"backlog={protocol.Backlog} outstanding={protocol.Outstanding} " +

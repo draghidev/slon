@@ -232,6 +232,7 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
     protected virtual void OnExecutionCompleted(Exception? exception) {}
     protected virtual void OnDiscarded() {}
     protected virtual void OnReset() {}
+
     // The per-flow handoff rendezvous primitive for the (wait-list-free) sync source handoff: non-null only
     // for a flow that needs a caller takeover (a sync CommandFlow with a parked caller). The source signals
     // it when it dequeues-and-holds the flow for that caller (OnExecutorSuspended), and the caller parks on
@@ -295,6 +296,9 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
 
         public PgEncoder GetEncoder()
             => _executionControl.GetEncoder();
+
+        public PgClientProtocol.CancellationRequester CancellationRequester
+            => _executionControl.GetCancellationRequester();
 
         /// Returns an awaitable for the decoder. Activation is a cross-flow rendezvous completed by
         /// another flow's thread, so GetResult throws if not yet completed - async bodies await,
@@ -531,7 +535,7 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
                 case PgTypes.BackendType.ReadyForQuery:
                     flow._rfqCount -= 1;
                     if (flow._rfqCount is 0)
-                        control.OnFlowRfq(backendMessage);
+                        control.OnFlowRfq(flow, backendMessage);
                     handled = false;
                     return true;
                 case PgTypes.BackendType.NoticeResponse:
@@ -558,7 +562,7 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
                 case PgTypes.BackendType.ReadyForQuery:
                     flow._rfqCount -= 1;
                     if (flow._rfqCount is 0)
-                        control.OnFlowRfq(backendMessage);
+                        control.OnFlowRfq(flow, backendMessage);
                     goto default;
                 case PgTypes.BackendType.NoticeResponse:
                     // We sink all notices (this includes RAISE notices) and expect those to end up on the flow for user retrieval/logging.
@@ -707,6 +711,9 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
             try { flow._completionAction?.Invoke(flow, exception, flow._completionState); }
             catch (Exception ex) { /* TODO log */ control.FailProtocol(ex); }
         }
+
+        public PgClientProtocol.CancellationRequester GetCancellationRequester()
+            => new(control, flow);
 
         public ref readonly TState GetProtocolStatic<TState>()
             => ref ((IProtocolStatic<TState>)(object)control).Value;
