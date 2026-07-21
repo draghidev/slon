@@ -47,6 +47,10 @@ sealed class TrackedCommand
         }
     }
 
+    // Cleanup still needs the server-side name after logical invalidation has made CommandName
+    // unavailable to new executions.
+    internal EncodedString StoredCommandName => Volatile.Read(ref _state).Descriptor.CommandName;
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal bool TryGetPreparedDescriptor(out CommandDescriptor descriptor)
     {

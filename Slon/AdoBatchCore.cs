@@ -280,19 +280,7 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
                                 // Here we would make RowDescription portable (once we need it).
                                 if (metadata.IsPrepared)
                                 {
-                                    // CAS-fails only if another caller already completed (shouldn't
-                                    // happen under TryBeginPreparing ownership) or the TC got
-                                    // invalidated mid-flight. In the invalidated case the prepared
-                                    // name on the server is orphaned and should be added to the
-                                    // protocol's leaked-names salvage list (per-protocol, since
-                                    // server-side names are session-scoped) for later DEALLOCATE.
-                                    if (!t.Complete(metadata.ToPreparedDescriptor()))
-                                    {
-                                        // TODO if invalid, push t.CommandName into the protocol's
-                                        // salvage list. If !IsInvalid, throw (would mean someone
-                                        // bypassed TryBeginPreparing's exclusivity).
-                                    }
-                                    p.SetTracked(t);
+                                    p.CompletePreparing(t, metadata.ToPreparedDescriptor());
                                 }
                                 else
                                 {
@@ -363,6 +351,11 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
             {
                 OnCommandResultAction = onResultAction,
                 OnCommandResultActionState = onResultActionState,
+                OnCommandErrorAction = pgConnection is null
+                    ? null
+                    : static (descriptor, error, state) =>
+                        ((PgConnection)state!).ReconcilePreparedError(descriptor, error.SqlState),
+                OnCommandErrorActionState = pgConnection,
                 Commands = commandArray is null ? new(result.Command) : new(commandArray, commandCount, isPooled: true),
                 LeadingResultCount = commandOffset
             };
@@ -382,8 +375,10 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
         if (TryGetDataSource(out var dataSource, out var connection))
         {
             ThrowIfHasCloseConnection(behavior);
-            var tracker = dataSource.GetCommandTracker();
-            var options = CreateCommandFlowOptions([parameters], behavior, tracker: tracker);
+            _ = dataSource.GetCommandTracker(); // Ensures the data source and pool are initialized.
+            // Pool selection happens after flow construction. Until preparation can be resolved
+            // transactionally inside the selected-wire callback, this path must stay unprepared.
+            var options = CreateCommandFlowOptions([parameters], behavior);
             return dataSource.EnqueueCommands(options);
         }
 
@@ -420,8 +415,8 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
         static async ValueTask<CommandFlow> DataSourceCore(FieldRef<AdoBatchCore<TCommand>> fieldRef, SlonDataSource dataSource, DbParameterCollection? parameters, CommandBehavior behavior, CancellationToken cancellationToken)
         {
             fieldRef.Invoke().ThrowIfHasCloseConnection(behavior);
-            var tracker = await dataSource.GetCommandTrackerAsync(cancellationToken).ConfigureAwait(false);
-            var options = fieldRef.Invoke().CreateCommandFlowOptions([parameters], behavior, default, tracker);
+            await dataSource.GetCommandTrackerAsync(cancellationToken).ConfigureAwait(false);
+            var options = fieldRef.Invoke().CreateCommandFlowOptions([parameters], behavior);
             return await dataSource.EnqueueCommandsAsync(options, cancellationToken).ConfigureAwait(false);
         }
     }

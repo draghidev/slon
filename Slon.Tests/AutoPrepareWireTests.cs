@@ -1,3 +1,6 @@
+using Slon.Pg;
+using Slon.Pg.Protocol;
+
 namespace Slon.Tests;
 
 // Wire-level smoke tests for auto-prepare. Each test drives commands against real PostgreSQL,
@@ -193,7 +196,7 @@ public class AutoPrepareWireTests
     [TestMethod]
     public async Task Eviction_Drains_MaintenanceQueue_AndClearsPresence()
     {
-        await using var ds = CreateDataSource(maxAutoPreparations: 2, autoMinimumUses: 3);
+        await using var ds = CreateDataSource(maxAutoPreparations: 2, autoMinimumUses: 3, maxPoolSize: 1);
         await using var conn = await ds.OpenConnectionAsync(CancellationToken.None);
 
         const string sqlA = "select 300 as drain_a";
@@ -215,6 +218,7 @@ public class AutoPrepareWireTests
         var sqlAEntry = pg.TrackedEntries.FirstOrDefault(e => e.Command.CommandText == sqlA);
         Assert.IsNotNull(sqlAEntry.Command, "Expected sqlA still present (invalidated) before the drain.");
         Assert.IsTrue(sqlAEntry.Command.IsInvalid, "Expected sqlA to be the invalidated LRU victim.");
+        var sqlAName = sqlAEntry.Command.StoredCommandName;
         Assert.IsTrue(
             pg.PeekMaintenance().OfType<EvictDeallocate>().Any(e => e.Tracked.CommandText == sqlA),
             "Expected a queued EvictDeallocate for the evicted sqlA.");
@@ -234,6 +238,15 @@ public class AutoPrepareWireTests
         Assert.IsFalse(
             pg.TrackedEntries.Any(e => e.Command.CommandText == sqlA),
             "Expected the MaintenanceFlow to have drained the EvictDeallocate and removed sqlA from presence.");
+
+        await using var reacquired = await ds.OpenConnectionAsync(CancellationToken.None);
+        Assert.AreSame(pg, reacquired.UnderlyingPgConnection,
+            "The single-connection pool must reacquire the session whose maintenance was drained.");
+        await using var deallocate = new SlonCommand(reacquired, $"deallocate {sqlAName}");
+        var error = await Assert.ThrowsExactlyAsync<PostgresException>(async () =>
+            await deallocate.ExecuteNonQueryAsync(CancellationToken.None));
+        Assert.AreEqual(PgErrorCodes.InvalidSqlStatementName, error.SqlState,
+            "The maintenance Close must remove the named statement from PostgreSQL, not just client presence.");
     }
 
     [TestMethod]
@@ -248,6 +261,94 @@ public class AutoPrepareWireTests
         Assert.IsNotNull(tracker);
         Assert.IsTrue(tracker.RegisteredConnectionCount >= 1,
             $"Expected ≥1 registered connection; got {tracker.RegisteredConnectionCount}.");
+    }
+
+    [TestMethod]
+    public async Task MissingPreparedStatement_ClearsWirePresence()
+    {
+        await using var ds = CreateDataSource(autoMinimumUses: 2);
+        await using var conn = await ds.OpenConnectionAsync(CancellationToken.None);
+        const string sql = "select 401 as missing_prepared";
+
+        await RunN(conn, sql, 3);
+        var pg = conn.UnderlyingPgConnection!;
+        var tracked = pg.TrackedEntries.Single(e => e.Command.CommandText == sql);
+        Assert.AreEqual(TrackedStatus.Tracked, tracked.Status);
+
+        await using (var deallocate = new SlonCommand(conn, $"deallocate {tracked.Command.CommandName}"))
+            await deallocate.ExecuteNonQueryAsync(CancellationToken.None);
+
+        await using (var command = new SlonCommand(conn, sql))
+        {
+            var error = await Assert.ThrowsExactlyAsync<PostgresException>(async () =>
+                await command.ExecuteNonQueryAsync(CancellationToken.None));
+            Assert.AreEqual(PgErrorCodes.InvalidSqlStatementName, error.SqlState);
+        }
+
+        Assert.AreEqual(0, pg.TrackedCount);
+        await RunN(conn, sql, 1);
+        Assert.IsTrue(pg.TrackedEntries.Any(e => e.Command.CommandText == sql));
+    }
+
+    [TestMethod]
+    public async Task ChangedPreparedResultType_InvalidatesTrackedCommand()
+    {
+        await using var ds = CreateDataSource(autoMinimumUses: 2);
+        await using var conn = await ds.OpenConnectionAsync(CancellationToken.None);
+        const string table = "slon_changed_prepared_result";
+        const string sql = $"select value from {table}";
+
+        await Execute(conn, $"drop table if exists {table}");
+        await Execute(conn, $"create temporary table {table} (value integer)");
+        await Execute(conn, $"insert into {table} values (1)");
+
+        await RunN(conn, sql, 3);
+        var pg = conn.UnderlyingPgConnection!;
+        var tracked = pg.TrackedEntries.Single(e => e.Command.CommandText == sql).Command;
+
+        await using (var alter = new SlonCommand(conn,
+            $"alter table {table} alter column value type text using value::text"))
+            await alter.ExecuteNonQueryAsync(CancellationToken.None);
+
+        await using (var command = new SlonCommand(conn, sql))
+        {
+            var error = await Assert.ThrowsExactlyAsync<PostgresException>(async () =>
+                await command.ExecuteNonQueryAsync(CancellationToken.None));
+            Assert.AreEqual(PgErrorCodes.FeatureNotSupported, error.SqlState);
+        }
+
+        Assert.IsTrue(tracked.IsInvalid);
+        Assert.IsFalse(pg.TrackedEntries.Any(e => ReferenceEquals(e.Command, tracked)));
+        await RunN(conn, sql, 1);
+    }
+
+    [TestMethod]
+    public async Task InvalidatedPreparation_RemovesPresenceAndRetainsCleanupName()
+    {
+        await using var ds = CreateDataSource(autoMinimumUses: 2);
+        await using var conn = await ds.OpenConnectionAsync(CancellationToken.None);
+        const string sql = "select 402 as invalidated_preparation";
+
+        await RunN(conn, sql, 3);
+        var pg = conn.UnderlyingPgConnection!;
+        var tracked = pg.TrackedEntries.Single(e => e.Command.CommandText == sql).Command;
+        var name = tracked.StoredCommandName;
+
+        pg.RemoveTracked(tracked);
+        Assert.IsTrue(pg.TryBeginPreparing(tracked));
+        Assert.IsTrue(tracked.Invalidate());
+
+        pg.CompletePreparing(tracked,
+            CommandDescriptor.CreatePrepared(name, tracked.ParameterTypes, tracked.RowDescription));
+
+        Assert.IsFalse(pg.TrackedEntries.Any(e => ReferenceEquals(e.Command, tracked)));
+        Assert.IsTrue(pg.PeekMaintenance().OfType<CloseStatement>().Any(e => e.Name == name));
+    }
+
+    static async Task Execute(SlonConnection conn, string sql)
+    {
+        await using var command = new SlonCommand(conn, sql);
+        await command.ExecuteNonQueryAsync(CancellationToken.None);
     }
 
     static async Task RunN(SlonConnection conn, string sql, int n)

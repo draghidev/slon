@@ -463,9 +463,9 @@ public sealed partial class SlonConnection : IAdoConnection
         for (var i = 0; i < tracked.Length; i++)
         {
             var t = tracked[i];
+            names[i] = t.StoredCommandName;
             t.Invalidate();
             pgConnection.RemoveTracked(t);
-            names[i] = t.CommandName;
         }
 
         var tcs = awaitable ? new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously) : null;

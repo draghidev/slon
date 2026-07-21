@@ -144,6 +144,18 @@ sealed class TrackedCommands(int maxAuto, int autoMinimumUses, Action<TrackedCom
         return false;
     }
 
+    public bool InvalidateAuto(TrackedCommand tracked)
+    {
+        lock (_admissionLock)
+        {
+            if (tracked.Kind is not TrackedCommandKind.Auto || !tracked.Invalidate() || !Remove(tracked))
+                return false;
+
+            _autoCount--;
+            return true;
+        }
+    }
+
     public TrackedCommand GetOrAdd(TrackedCommand tracked)
         => TryAdd(tracked, out var existingTracked) ? tracked : existingTracked;
 

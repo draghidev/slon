@@ -13,6 +13,8 @@ readonly struct CommandFlowOptions
 {
     public Action<CommandResult, object?>? OnCommandResultAction { get; init; }
     public object? OnCommandResultActionState { get; init; }
+    public Action<CommandDescriptor, PgError, object?>? OnCommandErrorAction { get; init; }
+    public object? OnCommandErrorActionState { get; init; }
     public CommandList Commands { get; init; }
     public int LeadingResultCount { get; init; }
 }
@@ -730,6 +732,22 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                     var resultEnumerator = context.GetProtocolStatic<ReadState>().ResultMessageEnumerator;
                     resultEnumerator.Dispose();
                     completeError = resultEnumerator.CompleteError;
+                }
+
+                var commandError = _pgError ?? completeError?.Error;
+                if (commandError is { } observedError)
+                {
+                    try
+                    {
+                        _options.OnCommandErrorAction?.Invoke(
+                            _options.Commands.ItemRef(_commandIndex).Descriptor,
+                            observedError,
+                            _options.OnCommandErrorActionState);
+                    }
+                    catch
+                    {
+                        // Error observers are advisory and must not interrupt protocol progress.
+                    }
                 }
 
                 {

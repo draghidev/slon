@@ -37,6 +37,7 @@ abstract class MaintenanceWork
 sealed class EvictDeallocate(TrackedCommand tracked) : MaintenanceWork
 {
     public TrackedCommand Tracked { get; } = tracked;
+    public EncodedString Name { get; } = tracked.StoredCommandName;
 }
 
 // Server-side prepared statement that needs to be DEALLOCATEd by name only, no TrackedCommand
@@ -249,6 +250,27 @@ sealed class PgConnection : IPoolConnection<PgConnection>
     public void SetTracked(TrackedCommand tracked)
         => _tracked[tracked] = TrackedStatus.Tracked;
 
+    public void CompletePreparing(TrackedCommand tracked, in CommandDescriptor descriptor)
+    {
+        tracked.Complete(descriptor);
+
+        // Global invalidation may race this wire's Parse. Eviction skips Preparing entries, so
+        // the winner must close a statement that became invalid while its Parse was in flight.
+        if (tracked.IsInvalid)
+        {
+            RemoveTracked(tracked);
+            PushMaintenance(new CloseStatement(tracked.StoredCommandName));
+            return;
+        }
+
+        SetTracked(tracked);
+        if (tracked.IsInvalid)
+        {
+            RemoveTracked(tracked);
+            PushMaintenance(new CloseStatement(tracked.StoredCommandName));
+        }
+    }
+
     // Called on eviction (DEALLOCATE fanout) or to roll back an optimistic Preparing marker
     // when the Parse flow failed.
     public void RemoveTracked(TrackedCommand tracked)
@@ -258,6 +280,34 @@ sealed class PgConnection : IPoolConnection<PgConnection>
     // statement on this session. Drop all tracked entries so subsequent uses re-Parse.
     public void ClearTracked()
         => _tracked.Clear();
+
+    internal void ReconcilePreparedError(in CommandDescriptor descriptor, string sqlState)
+    {
+        if (!descriptor.IsPrepared)
+            return;
+
+        if (sqlState == PgErrorCodes.InvalidSqlStatementName)
+        {
+            ClearTracked();
+            return;
+        }
+
+        if (sqlState != PgErrorCodes.FeatureNotSupported)
+            return;
+
+        foreach (var tracked in _tracked.Keys)
+        {
+            if (tracked.CommandName != descriptor.CommandName)
+                continue;
+
+            if (tracked.Kind is TrackedCommandKind.Auto)
+            {
+                RemoveTracked(tracked);
+                _tracker?.InvalidateAuto(tracked);
+            }
+            return;
+        }
+    }
 
     // Test/diagnostic accessors. Exposed via InternalsVisibleTo so tests can verify
     // auto-prepare behavior without round-tripping through pg_prepared_statements.

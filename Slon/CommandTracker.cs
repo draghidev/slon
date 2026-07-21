@@ -57,6 +57,12 @@ sealed class CommandTracker : IDisposable, IAsyncDisposable
         }
     }
 
+    internal void InvalidateAuto(TrackedCommand tracked)
+    {
+        if (_tracked?.InvalidateAuto(tracked) == true)
+            OnEvict(tracked);
+    }
+
     public void Register(PgConnection connection)
     {
         lock (_registryLock)

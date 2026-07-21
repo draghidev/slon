@@ -72,7 +72,7 @@ sealed class MaintenanceFlow : PgClientFlow
             switch (node)
             {
                 case EvictDeallocate evict:
-                    encoder.WriteClose(evict.Tracked.CommandName);
+                    encoder.WriteClose(evict.Name);
                     break;
                 case CloseStatement close:
                     encoder.WriteClose(close.Name);
