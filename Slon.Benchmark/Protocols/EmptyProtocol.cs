@@ -201,7 +201,7 @@ sealed class EmptyProtocol<TMode> : IPoolConnection<EmptyProtocol<TMode>>
     readonly EmptyProtocolOptions _options;
     readonly Action? _poolConnectionIdleSignal;
     readonly CancellationTokenSource _abortCts;
-    QueuedPipeline<EmptyFlow<TMode>, Policy> _pipeline = null!;
+    UnboundedPipeline<EmptyFlow<TMode>, Policy> _pipeline = null!;
     readonly Lock _syncRoot = new();
     ProtocolStatus _status = ProtocolStatus.Created;
     int _drainingCount;
