@@ -24,7 +24,7 @@ public class FlowSourceDirectStressTests
     {
         var protocol = PgClientProtocol.Create(new PgClientProtocolOptions(PgTestPool.NewOptions()));
         var source = PgClientFlowSource.Create(protocol, protocol.FlowControl);
-        var enumerator = source.GetAsyncEnumerator();
+        var enumerator = source.CreateEnumerator();
         var first = CommandFlow.CreateUninitialized();
         var second = CommandFlow.CreateUninitialized();
         var callerThread = Environment.CurrentManagedThreadId;
@@ -80,7 +80,7 @@ public class FlowSourceDirectStressTests
         {
             const int N = 8;
             var source = PgClientFlowSource.Create(protocol, protocol.FlowControl);
-            var enumerator = source.GetAsyncEnumerator();
+            var enumerator = source.CreateEnumerator();
 
             var flows = new PgClientFlow[N];
             var index = new Dictionary<PgClientFlow, int>(ReferenceEqualityComparer.Instance);

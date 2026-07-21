@@ -91,7 +91,7 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
     // Arm the drain gate (see State.DrainSignal). Set before Complete is triggered.
     public void SetDrainSignal(TaskCompletionSource drainSignal) => _state.DrainSignal = drainSignal;
 
-    public Enumerator GetAsyncEnumerator(CancellationToken cancellationToken = default)
+    public Enumerator CreateEnumerator(CancellationToken cancellationToken = default)
     {
         return new(_state, cancellationToken);
     }

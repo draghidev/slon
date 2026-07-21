@@ -26,7 +26,7 @@ public class FlowSourceCompletionTests
         // else of the protocol is touched.
         var protocol = PgClientProtocol.Create(new PgClientProtocolOptions(PgTestPool.NewOptions()));
         var source = PgClientFlowSource.Create(protocol, protocol.FlowControl);
-        var enumerator = source.GetAsyncEnumerator();
+        var enumerator = source.CreateEnumerator();
 
         var flow = CommandFlow.CreateUninitialized();
         var consumed = 0;
@@ -89,7 +89,7 @@ public class FlowSourceCompletionTests
     {
         var protocol = PgClientProtocol.Create(new PgClientProtocolOptions(PgTestPool.NewOptions()));
         var source = PgClientFlowSource.Create(protocol, protocol.FlowControl);
-        var enumerator = source.GetAsyncEnumerator();
+        var enumerator = source.CreateEnumerator();
 
         // FIFO: an async flow queued AHEAD of the sync waiter. At completion the sync head can't be held
         // until the async ahead of it is disposed - the async head is left for DrainInert, which can't
