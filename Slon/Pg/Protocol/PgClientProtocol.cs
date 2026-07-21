@@ -382,6 +382,42 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         return true;
     }
 
+    internal bool TryQueue<TState, TFlow>(Func<TState, TFlow> materialize, TState state,
+        [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out TFlow? flow,
+        CancellationToken cancellationToken = default)
+        where TFlow : PgClientFlow
+    {
+        PgClientFlowSource.EnqueueResult enqueue = default;
+        bool handoff;
+        lock (_syncRoot)
+        {
+            if (_status is not ProtocolStatus.Ready)
+            {
+                flow = null;
+                return false;
+            }
+
+            flow = materialize(state);
+            if (cancellationToken.CanBeCanceled)
+                flow.BindCallerToken(cancellationToken);
+            handoff = flow.NeedsSyncHandoff;
+            if (!handoff)
+                enqueue = _source.Enqueue(flow, inlineEligible: _pipeline.Depth == 0 && _source.Backlog == 0);
+            else
+                _source.EnqueueSyncWaiter(flow);
+        }
+
+        if (!handoff)
+            enqueue.Execute(runContinuationsAsynchronously: false);
+        else
+            _source.WaitForExecutor(flow);
+        var control = flow.GetExecutionControl(FlowControl);
+        control.Bind(_options.FlowActivationTimeout);
+        if (_scoringEnabled && !control.IsPipelined)
+            Interlocked.Increment(ref _pipelineStalls);
+        return true;
+    }
+
     // Begin an exclusive-access scope: the user-driven sibling of the startup handshake. Builds (or
     // reuses) a nested pipeline (poolFacing:false, so no pool-unit signaling and no inner recovery)
     // and queues the cached ExclusiveAccessFlow on the outer pipeline. The returned flow is the scope

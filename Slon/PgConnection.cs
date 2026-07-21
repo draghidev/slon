@@ -332,7 +332,18 @@ sealed class PgConnection : IPoolConnection<PgConnection>
         }
     }
 
-    public bool TryQueue(PgClientFlow flow) => _protocol.TryQueue(flow);
+    public bool TryQueue(PgClientFlow flow, CancellationToken cancellationToken = default)
+        => _protocol.TryQueue(flow, cancellationToken: cancellationToken);
+
+    public bool TryQueue<TState, TFlow>(Func<PgConnection, TState, TFlow> materialize, TState state,
+        [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out TFlow? flow,
+        CancellationToken cancellationToken = default)
+        where TFlow : PgClientFlow
+        => _protocol.TryQueue(
+            static args => args.Materialize(args.Connection, args.State),
+            (Materialize: materialize, Connection: this, State: state),
+            out flow,
+            cancellationToken);
 
     public void PushMaintenance(MaintenanceWork work)
     {

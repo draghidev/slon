@@ -25,6 +25,31 @@ readonly struct EnqueueArgs<TCommand> where TCommand : IAdoCommand
     }
 }
 
+readonly struct MultiplexedEnqueueArgs<TCommand> where TCommand : IAdoCommand
+{
+    public readonly FieldRef<AdoBatchCore<TCommand>> FieldRef;
+    public readonly DbParameterCollection? Parameters;
+    public readonly CommandBehavior Behavior;
+    public readonly CommandTracker Tracker;
+
+    public MultiplexedEnqueueArgs(FieldRef<AdoBatchCore<TCommand>> fieldRef, DbParameterCollection? parameters, CommandBehavior behavior, CommandTracker tracker)
+    {
+        FieldRef = fieldRef;
+        Parameters = parameters;
+        Behavior = behavior;
+        Tracker = tracker;
+    }
+}
+
+sealed class PreparationClaims(PgConnection connection) : HashSet<TrackedCommand>
+{
+    public void Rollback()
+    {
+        foreach (var tracked in this)
+            connection.RemoveTracked(tracked);
+    }
+}
+
 // Shared between DbBatch and DbCommand
 struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
 {
@@ -201,7 +226,7 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
         // Tracks TrackedCommands that this batch's earlier commands have already issued Parse for
         // as the Winner. Subsequent same-TC commands in the same batch get the Present shape
         // (rely on the earlier in-batch Parse in the same Sync window).
-        HashSet<TrackedCommand>? intraBatchWinners = null;
+        PreparationClaims? preparationClaims = null;
         try
         {
             for (var i = 0; i < commands.Length; i++)
@@ -234,7 +259,7 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
                 if (pgConnection is not null && result.TrackerResult.Tracked is { } tracked)
                 {
                     // Same-SQL earlier in this batch already Winner'd → safe to ride its in-batch Parse.
-                    var isIntraBatchWinner = intraBatchWinners?.Contains(tracked) ?? false;
+                    var isIntraBatchWinner = preparationClaims?.Contains(tracked) ?? false;
                     var status = isIntraBatchWinner ? TrackedStatus.Tracked : pgConnection.GetTrackedStatus(tracked);
 
                     if (status is TrackedStatus.Tracked)
@@ -292,7 +317,7 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
                                 }
                             };
                             thisCompletionState = (pgConnection, tracked);
-                            (intraBatchWinners ??= new()).Add(tracked);
+                            (preparationClaims ??= new(pgConnection)).Add(tracked);
                         }
                         else
                         {
@@ -362,6 +387,7 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
         }
         catch
         {
+            preparationClaims?.Rollback();
             if (commandArray is not null)
                 ArrayPool<Command>.Shared.Return(commandArray, clearArray: true);
             if (pendingPrefix is not null)
@@ -375,11 +401,11 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
         if (TryGetDataSource(out var dataSource, out var connection))
         {
             ThrowIfHasCloseConnection(behavior);
-            _ = dataSource.GetCommandTracker(); // Ensures the data source and pool are initialized.
-            // Pool selection happens after flow construction. Until preparation can be resolved
-            // transactionally inside the selected-wire callback, this path must stay unprepared.
-            var options = CreateCommandFlowOptions([parameters], behavior);
-            return dataSource.EnqueueCommands(options);
+            var tracker = dataSource.GetCommandTracker();
+            return dataSource.EnqueueCommands(
+                static (pgConnection, args) => args.FieldRef.Invoke().CreateCommandFlowOptions(
+                    [args.Parameters], args.Behavior, tracker: args.Tracker, pgConnection: pgConnection),
+                new MultiplexedEnqueueArgs<TCommand>(_fieldRef, parameters, behavior, tracker));
         }
 
         return connection.Enqueue(
@@ -415,9 +441,12 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
         static async ValueTask<CommandFlow> DataSourceCore(FieldRef<AdoBatchCore<TCommand>> fieldRef, SlonDataSource dataSource, DbParameterCollection? parameters, CommandBehavior behavior, CancellationToken cancellationToken)
         {
             fieldRef.Invoke().ThrowIfHasCloseConnection(behavior);
-            await dataSource.GetCommandTrackerAsync(cancellationToken).ConfigureAwait(false);
-            var options = fieldRef.Invoke().CreateCommandFlowOptions([parameters], behavior);
-            return await dataSource.EnqueueCommandsAsync(options, cancellationToken).ConfigureAwait(false);
+            var tracker = await dataSource.GetCommandTrackerAsync(cancellationToken).ConfigureAwait(false);
+            return await dataSource.EnqueueCommandsAsync(
+                static (pgConnection, args) => args.FieldRef.Invoke().CreateCommandFlowOptions(
+                    [args.Parameters], args.Behavior, tracker: args.Tracker, pgConnection: pgConnection),
+                new MultiplexedEnqueueArgs<TCommand>(fieldRef, parameters, behavior, tracker),
+                cancellationToken).ConfigureAwait(false);
         }
     }
 

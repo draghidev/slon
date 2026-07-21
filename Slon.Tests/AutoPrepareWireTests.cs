@@ -177,6 +177,64 @@ public class AutoPrepareWireTests
         }
     }
 
+    [TestMethod]
+    public async Task MultiplexedCommands_PrepareOnSelectedWire()
+    {
+        await using var ds = CreateDataSource(autoMinimumUses: 2, maxPoolSize: 1);
+        const string sql = "select 201 as multiplexed_prepared";
+
+        for (var i = 0; i < 4; i++)
+        {
+            await using var command = new SlonCommand(ds, sql);
+            await command.ExecuteNonQueryAsync(CancellationToken.None);
+        }
+
+        await using var connection = await ds.OpenConnectionAsync(CancellationToken.None);
+        var entry = connection.UnderlyingPgConnection!.TrackedEntries.Single(
+            e => e.Command.CommandText == sql);
+        Assert.AreEqual(TrackedStatus.Tracked, entry.Status);
+    }
+
+    [TestMethod]
+    public async Task MultiplexedSyncCommands_PrepareOnSelectedWire()
+    {
+        await using var ds = CreateDataSource(autoMinimumUses: 2, maxPoolSize: 1);
+        const string sql = "select 203 as multiplexed_sync_prepared";
+
+        for (var i = 0; i < 4; i++)
+        {
+            using var command = new SlonCommand(ds, sql);
+            command.ExecuteNonQuery();
+        }
+
+        await using var connection = await ds.OpenConnectionAsync(CancellationToken.None);
+        Assert.AreEqual(TrackedStatus.Tracked,
+            connection.UnderlyingPgConnection!.TrackedEntries.Single(e => e.Command.CommandText == sql).Status);
+    }
+
+    [TestMethod]
+    public async Task MultiplexedBatch_RidesSelectedWirePreparation()
+    {
+        await using var ds = CreateDataSource(autoMinimumUses: 2, maxPoolSize: 1);
+        const string sql = "select 202 as multiplexed_batch_prepared";
+        await using var batch = ds.CreateBatch();
+        for (var i = 0; i < 8; i++)
+            batch.BatchCommands.Add(batch.CreateBatchCommand(sql));
+
+        await using var reader = await batch.ExecuteReaderAsync(CancellationToken.None);
+        var results = 0;
+        do
+        {
+            while (await reader.ReadAsync(CancellationToken.None)) { }
+            results++;
+        } while (await reader.NextResultAsync(CancellationToken.None));
+
+        Assert.AreEqual(8, results);
+        await using var connection = await ds.OpenConnectionAsync(CancellationToken.None);
+        Assert.AreEqual(TrackedStatus.Tracked,
+            connection.UnderlyingPgConnection!.TrackedEntries.Single(e => e.Command.CommandText == sql).Status);
+    }
+
     // Eviction queues an EvictDeallocate for the LRU victim; draining it must clear the victim from
     // the connection's presence map. Two things made the old version flake:
     //
