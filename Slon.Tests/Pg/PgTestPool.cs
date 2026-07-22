@@ -72,7 +72,7 @@ static class PgTestPool
         return protocol;
     }
 
-    internal static Func<int, int, CancellationToken, ValueTask<CancelRequestDelivery>> CreateCancelSender(PgClientOptions options)
+    internal static Func<int, int, CancellationToken, ValueTask<CancelRequestState>> CreateCancelSender(PgClientOptions options)
         => async (processId, secretKey, cancellationToken) =>
         {
             var transport = await SocketStreamConnection.ConnectAsync(
@@ -93,7 +93,7 @@ static class PgTestPool
                 await transport.Writer.CompleteAsync(error).ConfigureAwait(false);
                 await transport.Reader.CompleteAsync().ConfigureAwait(false);
             }
-            return CancelRequestDelivery.Sent;
+            return CancelRequestState.Sent;
         };
 
     // Sync flow exerciser shared across the Pg-layer tests. Driving CommandFlow directly so

@@ -58,7 +58,7 @@ sealed class PgClientProtocolOptions
 
     /// Sends a side-channel CancelRequest and classifies whether request bytes may have reached
     /// PostgreSQL. The attempt must have ended before it returns. Null disables server cancellation.
-    public Func<int, int, CancellationToken, ValueTask<CancelRequestDelivery>>? CancelSender { get; set; }
+    public Func<int, int, CancellationToken, ValueTask<CancelRequestState>>? CancelSender { get; set; }
 }
 
 sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable

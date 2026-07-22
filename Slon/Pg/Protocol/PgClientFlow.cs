@@ -7,6 +7,7 @@ namespace Slon.Pg.Protocol;
 abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgClientFlow>, IThreadPoolWorkItem
 {
     PgClientProtocol.Control? _pendingActivationControl;
+    PgClientProtocol.Control? _boundControl;
 
     /// Pairs this flow with its protocol control for a queued activation dispatch. The flow
     /// itself is the IThreadPoolWorkItem: an immutable (flow, control) pairing per queued
@@ -207,6 +208,7 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
         _activationTaskSource.Reset();
         _rfqCount = 0;
         _lastMessageInducesRfq = false;
+        _boundControl = null;
         // Clear the completion action: it is captured per-tenure (with its state), so a recycled flow must
         // not carry the prior tenure's action into the next - it would fire a stale callback (wrong
         // connection's depth-decrement / Break). Every setter re-arms per use (MaintenanceFlow.Bind,
@@ -221,6 +223,11 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
     // wait indefinitely for activation rather than busy-looping queue/timeout/re-arm, and stay off
     // the heartbeat's generation-agnostic timeout completer.
     protected virtual bool EnableActivationTimeout => false;
+
+    /// Requests PostgreSQL backend cancellation for this flow on its bound protocol control.
+    /// The protocol retains any request exposure that can outlive the flow.
+    protected void RequestBackendCancellation()
+        => _boundControl?.RequestServerCancellation(this);
 
     protected virtual void OnHeartbeat(TimeSpan interval) {}
     protected virtual void OnAbort(PgClientClosedException exception) {}
@@ -296,9 +303,6 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
 
         public PgEncoder GetEncoder()
             => _executionControl.GetEncoder();
-
-        public PgClientProtocol.CancellationRequester CancellationRequester
-            => _executionControl.GetCancellationRequester();
 
         /// Returns an awaitable for the decoder. Activation is a cross-flow rendezvous completed by
         /// another flow's thread, so GetResult throws if not yet completed - async bodies await,
@@ -590,6 +594,7 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
             }
 
             flow._isAsyncAtBind = state == 1;
+            flow._boundControl = control;
             // Only interactive flows arm the activation timeout. Infinite means the heartbeat's
             // timeout branch never fires for this flow (see OnHeartbeat).
             flow._remainingActivationTimeout = flow.EnableActivationTimeout ? activationTimeout : Timeout.InfiniteTimeSpan;
@@ -711,9 +716,6 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
             try { flow._completionAction?.Invoke(flow, exception, flow._completionState); }
             catch (Exception ex) { /* TODO log */ control.FailProtocol(ex); }
         }
-
-        public PgClientProtocol.CancellationRequester GetCancellationRequester()
-            => new(control, flow);
 
         public ref readonly TState GetProtocolStatic<TState>()
             => ref ((IProtocolStatic<TState>)(object)control).Value;

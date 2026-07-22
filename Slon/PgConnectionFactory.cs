@@ -37,7 +37,7 @@ sealed class PgConnectionFactory : IPoolConnectionFactory<PgConnection>
     // policy, delivers the CancelRequest via the protocol-layer wire helper, disposes the
     // transport on every path. Passed to PgClientProtocolOptions.CancelSender so the protocol
     // layer can fire-and-forget without knowing about transports.
-    async ValueTask<CancelRequestDelivery> SendCancelAsync(int processId, int secretKey, CancellationToken cancellationToken)
+    async ValueTask<CancelRequestState> SendCancelAsync(int processId, int secretKey, CancellationToken cancellationToken)
     {
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         timeout.CancelAfter(_clientOptions.ConnectionTimeout);
@@ -49,10 +49,10 @@ sealed class PgConnectionFactory : IPoolConnectionFactory<PgConnection>
         }
         catch
         {
-            return CancelRequestDelivery.NotSent;
+            return CancelRequestState.NotSent;
         }
         Exception? sendError = null;
-        var delivery = CancelRequestDelivery.Sent;
+        var delivery = CancelRequestState.Sent;
         try
         {
             await CancelRequest.SendAsync(transport, processId, secretKey, token).ConfigureAwait(false);
@@ -60,7 +60,7 @@ sealed class PgConnectionFactory : IPoolConnectionFactory<PgConnection>
         catch (Exception ex)
         {
             sendError = ex;
-            delivery = CancelRequestDelivery.Unknown;
+            delivery = CancelRequestState.Unknown;
         }
         finally
         {

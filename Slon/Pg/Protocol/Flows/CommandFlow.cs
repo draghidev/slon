@@ -30,7 +30,6 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
     CancellationToken _flowCancellationToken;
     CancellationTokenRegistration _callerCancellationTokenRegistration;
     CancellationTokenRegistration _flowCancellationTokenRegistration;
-    PgClientProtocol.CancellationRequester _cancellationRequester;
     // Callbacks only latch cancellation and wake the body. The body delivers cancellation at its
     // terminal, after releasing pipeline promise tenure.
     bool _cancelRequested;
@@ -196,11 +195,10 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
 
     FlowTasks ExecuteAutoCore(Context context)
     {
-        _cancellationRequester = context.CancellationRequester;
         if (_flowCancellationToken.IsCancellationRequested)
             RequestCancel(_flowCancellationToken);
         else if (Volatile.Read(ref _cancelRequested))
-            _cancellationRequester.Request();
+            RequestBackendCancellation();
         ValueTask writeTask;
         try
         {
@@ -699,7 +697,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
         }
         catch (TimeoutException ex)
         {
-            _cancellationRequester.Request();
+            RequestBackendCancellation();
             HandleException(ex);
             throw;
         }
@@ -817,8 +815,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
     {
         _cancelDeliverToken = token;
         Volatile.Write(ref _cancelRequested, true);
-        if (_cancellationRequester.IsInitialized)
-            _cancellationRequester.Request();
+        RequestBackendCancellation();
         _callerInteractionCore.RequestWake();
     }
 
@@ -1057,7 +1054,6 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
         _callerCancellationTokenRegistration = default;
         _flowCancellationTokenRegistration.Dispose();
         _flowCancellationTokenRegistration = default;
-        _cancellationRequester = default;
         _cancelRequested = false;
         _cancelDeliverToken = default;
         _deliverCancelOce = false;

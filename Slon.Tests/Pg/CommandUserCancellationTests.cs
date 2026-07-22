@@ -109,7 +109,7 @@ public class CommandUserCancellationTests
             {
                 await sender(processId, secretKey, token);
                 cancelDelivered.TrySetResult();
-                return CancelRequestDelivery.Sent;
+                return CancelRequestState.Sent;
             });
 
         using var cts = new CancellationTokenSource();
@@ -143,7 +143,7 @@ public class CommandUserCancellationTests
         {
             if (Interlocked.Increment(ref attempts) == 2)
                 attemptsExhausted.TrySetResult();
-            return new(CancelRequestDelivery.NotSent);
+            return new(CancelRequestState.NotSent);
         });
 
         using var cts = new CancellationTokenSource();
@@ -174,7 +174,7 @@ public class CommandUserCancellationTests
     {
         await using var blocker = await PgAdvisoryLock.AcquireAsync();
         var senderEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var delivery = new TaskCompletionSource<CancelRequestDelivery>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var delivery = new TaskCompletionSource<CancelRequestState>(TaskCreationOptions.RunContinuationsAsynchronously);
         await using var protocol = await PgTestPool.NewIsolatedAsync(o => o.CancelSender = async (_, _, _) =>
         {
             senderEntered.TrySetResult();
@@ -197,7 +197,7 @@ public class CommandUserCancellationTests
         await enumerator.DisposeAsync();
         Assert.IsTrue(protocol.HasPendingCancellation);
 
-        delivery.TrySetResult(CancelRequestDelivery.NotSent);
+        delivery.TrySetResult(CancelRequestState.NotSent);
         await WaitUntilAsync(() => !protocol.HasPendingCancellation);
         Assert.IsFalse(protocol.Completion.IsCompleted);
         await PgTestPool.RunAsync(protocol, "select 1");
@@ -258,7 +258,7 @@ public class CommandUserCancellationTests
             {
                 await sender(processId, secretKey, token);
                 cancelDelivered.TrySetResult();
-                return CancelRequestDelivery.Sent;
+                return CancelRequestState.Sent;
             });
 
         using var cts = new CancellationTokenSource();
