@@ -10,7 +10,7 @@ namespace Slon.Tests.Pg;
 
 // Pins cross-flow flush batching (write coalescing). Async pipelined writes defer their flush
 // (PgEncoder.CanDelayFlush) and should coalesce into one wire write until the byte threshold - a "conga
-// line" of P/B/D/E/S - flushed only when the executor genuinely parks (FlushGate.FlushBeforePark). The
+// line" of P/B/D/E/S—flushed only when the executor genuinely parks. The
 // in-memory transport counts physical flushes (each non-empty FlushAsync = one wire segment). Flows park
 // on their reads (no responses fed), so we measure writes only and tear the protocol down at the end.
 //

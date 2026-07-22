@@ -116,7 +116,8 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
 
     internal sealed class State
     {
-        public readonly FlushGate FlushGate;
+        readonly PgClientProtocol _protocol;
+        bool _flushArmed = true;
         // Primary storage: inline slot fast path + lazy one-way SPSC escalation (SlotEscalatingQueue).
         // The sequential common case - one in-flight flow, or a nested exclusive scope's serial
         // subflows - stays on the slot with no SPSC allocation; a pipelining connection escalates on
@@ -169,10 +170,32 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
 
         public State(PgClientProtocol protocol, PgClientProtocol.Control control, PipelineScheduler scheduler)
         {
-            FlushGate = new(protocol);
+            _protocol = protocol;
             _control = control;
             WakeEvent = new(runContinuationsAsynchronously: true, scheduler);
             WakeDriver = new(this, WakeEvent);
+        }
+
+        internal bool NeedsFlushArm
+            => _protocol.UnflushedBytes >= ProtocolDataWriter.UnflushedBytesFlushThreshold;
+
+        internal bool FlushArmed => Volatile.Read(ref _flushArmed);
+
+        internal void ConsumeFlushArm() => Volatile.Write(ref _flushArmed, false);
+
+        internal void RearmFlush() => Volatile.Write(ref _flushArmed, true);
+
+        // Flush before parking so in-flight writes reach the server. Socket writes normally complete
+        // inline; only backpressure returns a task for the source wait to join.
+        internal ValueTask? FlushBeforePark()
+        {
+            if (_protocol.UnflushedBytes is 0)
+                return null;
+            var task = _protocol.FlushAsync(CancellationToken.None);
+            if (!task.IsCompletedSuccessfully)
+                return task;
+            task.GetAwaiter().GetResult();
+            return null;
         }
 
         internal void SignalHeldSyncFlow()
@@ -399,9 +422,8 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
             // Arm gate: under the periodic-flush threshold each TryGetNext-consume requires a fresh
             // WaitForNextAsync round to fire the flush seam. WaitCore re-arms on Retry; we consume it
             // here on take so the next pull is gated again. Outside that, the fast path runs.
-            var gate = _state.FlushGate;
-            var needsArm = gate.NeedsArm;
-            if (needsArm && !gate.Armed)
+            var needsArm = _state.NeedsFlushArm;
+            if (needsArm && !_state.FlushArmed)
             {
                 item = null;
                 return false;
@@ -412,7 +434,7 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
             if (_state.TryDispatchAsyncOrHoldSync(out item))
             {
                 if (needsArm)
-                    gate.ConsumeArm();
+                    _state.ConsumeFlushArm();
                 if (_state.WakeDriver.IsInlineOneShot)
                     _state.InlineHandBack = true;
                 return true;
@@ -427,7 +449,7 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
         /// write backpressure - flush not completing inline - rides the Task shape.
         public WaitForNextAwaitable WaitForNextAsync()
         {
-            if (_state.FlushGate.FlushBeforePark() is { } flushTask)
+            if (_state.FlushBeforePark() is { } flushTask)
                 return WaitForNextAwaitable.FromTask(FlushThenWaitAsync(flushTask));
             return WaitCore();
         }
@@ -472,7 +494,7 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
             {
                 // An item is available - arm the next TryGetNext so it can consume one (only one
                 // while the flush-threshold gate holds, so a flush round lands between items).
-                _state.FlushGate.Rearm();
+                _state.RearmFlush();
                 return WaitForNextAwaitable.Retry;
             }
 
