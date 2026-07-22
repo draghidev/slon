@@ -12,9 +12,9 @@ namespace Slon.Pg.Protocol;
 readonly struct PgEncoder
 {
     readonly PgClientFlow.ExecutionControl _executionControl;
-    readonly PgProtocolDataWriter _writer;
+    readonly ProtocolDataWriter _writer;
 
-    internal PgEncoder(PgClientFlow.ExecutionControl executionControl, PgProtocolDataWriter writer)
+    internal PgEncoder(PgClientFlow.ExecutionControl executionControl, ProtocolDataWriter writer)
     {
         _executionControl = executionControl;
         _writer = writer;
@@ -28,18 +28,18 @@ readonly struct PgEncoder
     // call. Cached on the writer (per-connection) so each call reuses one instance, no
     // per-op allocation. Auto-reset on consumption keeps it ready for the next WouldBlock
     // cycle.
-    public WritableSignal WritableSignal => _writer.WritableSignal;
+    public WriteResumeSignal ResumeSignal => _writer.ResumeSignal;
 
     // Opens a scope that places the writer's cached signal in the transport's TLS slot for
     // the scope's lifetime, restoring on Dispose. Use this from a Resumable-driving caller
     // (flow body or sync wrapper) so the transport sees the signal underneath. Lets the
     // caller stay agnostic to the TLS plumbing.
-    public ResumableScope BeginResumableScope() => new(_writer.WritableSignal);
+    public ResumableScope BeginResumableScope() => new(_writer.ResumeSignal);
 
     // Forwards to the underlying writer so the sync encoder variants and higher-composition
     // sync drivers can park and signal without reaching into the transport directly.
     void WaitWritable() => _writer.WaitWritable();
-    void SignalWritable(Exception? exception = null) => _writer.SignalWritable(exception);
+    void ResumeWrite(Exception? exception = null) => _writer.ResumeWrite(exception);
     Exception TranslateAbort(Exception ex) => _writer.TranslateAbort(ex);
 
     // Dispatches a pending Resumable's driver loop to a LongRunning thread. Caller is
@@ -67,10 +67,10 @@ readonly struct PgEncoder
                     // write coroutine and leak the exception onto this side task. Route it through the
                     // signal's fault path so the coroutine unwinds and the abort-translated exception
                     // reaches the flow's execute path.
-                    e.SignalWritable(e.TranslateAbort(ex));
+                    e.ResumeWrite(e.TranslateAbort(ex));
                     break;
                 }
-                e.SignalWritable();
+                e.ResumeWrite();
             }
             t.GetAwaiter().GetResult();
         }, (encoder, resumable), CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default));
@@ -333,8 +333,7 @@ readonly struct PgEncoder
     static int GetStringWithNullTerminatorByteCount(string value, Encoding encoding)
         => encoding.GetByteCount(value) + sizeof(byte);
 
-    internal void CopyStartupBuffer<TBuffer>(TBuffer buffer) where TBuffer : ICopyableBuffer<byte>
-        => _writer.CopyFrom(buffer);
+    internal void CopyStartupBuffer(ReadOnlySpan<byte> buffer) => _writer.WriteRaw(buffer);
 
     internal void WriteStartupMD5Password(string username, string plainPassword, ReadOnlySpan<byte> salt, Encoding encoding)
     {
@@ -407,7 +406,7 @@ readonly struct PgEncoder
         => _executionControl.IsPipelined
             && _executionControl.HasQueuedFlow
             && !_executionControl.IsInlineDrive
-            && _writer.UnflushedBytes < PgProtocolDataWriter.UnflushedBytesFlushThreshold;
+            && _writer.UnflushedBytes < ProtocolDataWriter.UnflushedBytesFlushThreshold;
 
     // Sync flushes always run: a sync flow owns the executor for its duration, so a deferred flush
     // would never be picked up (the source never unwinds to the cross-item pre-flush) and the pipeline

@@ -70,8 +70,8 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
     readonly PgClientProtocolOptions _options;
     readonly ScopeResetOptions _scopeReset;
     TransportConnection _connection = null!;
-    IOutputWriter<byte> _pipeWriter = null!;
-    PgProtocolDataWriter _protocolDataWriter = null!;
+    IOutputWriter _pipeWriter = null!;
+    ProtocolDataWriter _protocolDataWriter = null!;
     PipeSegmentEnumerator<BackendMessageBatch.Segmenter, BackendMessageBatch> _pipeSegmentEnumerator = null!;
     PgDecoder _pgDecoder = null!;
 
@@ -179,7 +179,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
     void Initialize(TransportConnection connection, Action? onIdle)
     {
         _connection = connection;
-        _pipeWriter = connection.Writer as IOutputWriter<byte> ?? new PipeStreamingWriter(connection.Writer);
+        _pipeWriter = connection.Writer as IOutputWriter ?? new PipeOutputWriter(connection.Writer);
         _protocolDataWriter = new(_pipeWriter, PgClientOptions.PreStartupEncoding, connection.WaitWritable, AbortToken, FlowControl);
         _pipeSegmentEnumerator = new(connection.Reader,
             new(_options.DataRowStreamingThreshold), ownsReader: true);
@@ -381,7 +381,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
     // An ADO connection IS an exclusive scope (the protocol underneath is pooled and outlives the
     // connection), so connection-dispose is scope teardown, not protocol teardown. The scope CloseSignal
     // can be tripped independently (AbortActiveScope), and the per-scope decoder/writer shells over the
-    // shared Read/WriteChannel carry the scope's token, so a scope-only abort breaks a subflow parked on
+    // shared read/write pipes carry the scope's token, so a scope-only abort breaks a subflow parked on
     // a wire read/write while the pooled protocol survives. The shells are created once here alongside the
     // flyweight and reused across scopes.
     internal ExclusiveAccessFlow BeginExclusiveScope(bool async)
@@ -1098,14 +1098,14 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         CloseSignal? _scopeClose;
         public void BindScopeClose(CloseSignal scopeClose) => _scopeClose = scopeClose;
 
-        // Per-Control decoder/writer shells over the protocol's shared Read/WriteChannel. The inner
+        // Per-Control decoder/writer shells over the protocol's shared read/write pipes. The inner
         // (exclusive-scope) Control binds scope shells carrying the scope token; the outer Control
         // leaves these null and resolves to the protocol's base shells (themselves bound to this
         // Control). The single-pump invariant keeps only one shell per direction active at a time, so
-        // both share the one physical channel safely.
+        // both share the one physical pipe safely.
         PgDecoder? _decoder;
-        PgProtocolDataWriter? _writer;
-        public void BindShells(PgDecoder decoder, PgProtocolDataWriter writer)
+        ProtocolDataWriter? _writer;
+        public void BindShells(PgDecoder decoder, ProtocolDataWriter writer)
         {
             _decoder = decoder;
             _writer = writer;
@@ -1122,7 +1122,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         public PgClientFlow? ExecutorFlow => _slots.ExecutingItem;
         public PgClientFlow? ActivatedFlow => _slots.ActivatedItem;
 
-        public PgProtocolDataWriter Writer => _writer ?? protocol._protocolDataWriter;
+        public ProtocolDataWriter Writer => _writer ?? protocol._protocolDataWriter;
 
         // Backend identity from BackendKeyData (pulled from StartupFlow after startup completes).
         // Process id is the diagnostic-safe value (logs, "which backend"); secret key is restricted

@@ -11,15 +11,14 @@ using Slon.Transport;
 namespace Slon.Pg.Protocol;
 
 // Shared per-protocol write-side wire state. One instance per protocol, behind any number of
-// PgProtocolDataWriter shells (the base protocol shell plus a per-exclusive-scope shell). The
-// single-pump invariant means only one shell ever drives this channel at a time, so the message-
+// ProtocolDataWriter shells (the base protocol shell plus a per-exclusive-scope shell). The
+// single-pump invariant means only one shell ever drives this pipe at a time, so the message-
 // length tracking and BufferingWriter are safe to share. Token-bearing concerns (CTS, abort
-// translation, the abort-catch flush wrappers) live in the shell, not here; the channel exposes
+// translation and abort-aware flush wrappers) live in the shell, not here; the pipe exposes
 // only token-free flush primitives.
-sealed class WriteChannel
+sealed class ProtocolWritePipe(IOutputWriter writer, Encoding clientEncoding, Action waitWritable)
 {
-    readonly IOutputWriter<byte> _writer;
-    BufferingWriter _bufferingWriter;
+    BufferingWriter _bufferingWriter = new(writer);
 
     // Current message state (npgsql NpgsqlWriteBuffer.StartMessage / AdvanceMessageBytesFlushed
     // pattern, GHSA-x9vc-6hfv-hg8c). Validation is structural: per-write Write* methods are
@@ -30,21 +29,11 @@ sealed class WriteChannel
     int? _messageLength;
     int _messageBytesFlushed;
 
-    readonly Action _waitWritable;
-
     // Per-connection cached signal. The flow parks this in
     // TransportConnection.SyncNonBlockingSignal around each Resumable call, the transport
     // returns it on WouldBlock as the pending source, the flow's driver fires it via
     // Signal. Reused across operations thanks to auto-reset on consumption.
-    public WritableSignal WritableSignal { get; } = new();
-
-    public WriteChannel(IOutputWriter<byte> writer, Encoding clientEncoding, Action waitWritable)
-    {
-        _writer = writer;
-        _bufferingWriter = new(writer);
-        _waitWritable = waitWritable;
-        ClientEncoding = clientEncoding;
-    }
+    public WriteResumeSignal ResumeSignal { get; } = new();
 
     // Maps a thrown exception to a SocketError, or null when the exception isn't recognizable
     // as a transport-level socket error. Handles the .NET socket-stack path. NetworkStream and
@@ -62,17 +51,11 @@ sealed class WriteChannel
     // fires the cached writable signal, releasing any coroutine awaiter that captured it on
     // WouldBlock. WaitWritable forwards to the transport's wait callback (typically
     // Socket.Poll on a SelectMode.SelectWrite), parking the calling thread until writable.
-    public void SignalWritable(Exception? exception = null) => WritableSignal.Signal(exception);
-    public void WaitWritable() => _waitWritable();
-
-    internal void CopyFrom<TBuffer>(TBuffer buffer) where TBuffer : ICopyableBuffer<byte>
-    {
-        buffer.CopyTo(_writer);
-        _bufferingWriter.RefreshUnflushedBytes();
-    }
+    public void ResumeWrite(Exception? exception = null) => ResumeSignal.Signal(exception);
+    public void WaitWritable() => waitWritable();
 
     internal Func<PgTypeId, Oid> OidLookup { get; } = static pgTypeId => PgTypeCatalog.Default.GetOid(pgTypeId);
-    internal Encoding ClientEncoding { get; set; }
+    internal Encoding ClientEncoding { get; set; } = clientEncoding;
 
     public long UnflushedBytes => _bufferingWriter.UnflushedBytes;
 
@@ -225,7 +208,7 @@ sealed class WriteChannel
         }
         return Awaited(this, task, before);
 
-        static async ValueTask Awaited(WriteChannel self, ValueTask task, int before)
+        static async ValueTask Awaited(ProtocolWritePipe self, ValueTask task, int before)
         {
             try
             {
@@ -240,15 +223,15 @@ sealed class WriteChannel
     }
 
     // Wrapper to shield callers from slow writers (e.g. PipeWriter).
-    struct BufferingWriter : IOutputWriter<byte>
+    struct BufferingWriter : IOutputWriter
     {
-        readonly IOutputWriter<byte> _writer;
+        readonly IOutputWriter _writer;
         Memory<byte> _memory;
         ArraySegment<byte> _memoryArray;
         int _remaining;
         long _unflushedBytes;
 
-        public BufferingWriter(IOutputWriter<byte> writer)
+        public BufferingWriter(IOutputWriter writer)
         {
             _writer = writer;
             _unflushedBytes = writer.UnflushedBytes;

@@ -277,12 +277,12 @@ public class PipeSegmentEnumeratorEofTests
         var segments = new PipeSegmentEnumerator<BackendMessageBatch.Segmenter, BackendMessageBatch>(
             pipe.Reader, new BackendMessageBatch.Segmenter(8));
         var decoder = new PgDecoder(segments, CancellationToken.None, Timeout.InfiniteTimeSpan);
-        decoder.Channel.BindDecoder(decoder);
+        decoder.Pipe.BindDecoder(decoder);
 
         await pipe.Writer.WriteAsync(wire.AsMemory(0, 8));
-        Assert.IsTrue(decoder.Channel.TryMoveNextBatch(out _));
-        Assert.IsTrue(decoder.Channel.TryMoveNext());
-        var body = decoder.Channel.Current.OpenBodyReader();
+        Assert.IsTrue(decoder.Pipe.TryMoveNextBatch(out _));
+        Assert.IsTrue(decoder.Pipe.TryMoveNext());
+        var body = decoder.Pipe.Current.OpenBodyReader();
         Assert.AreEqual(3, body.Buffer.Length);
 
         await pipe.Writer.WriteAsync(wire.AsMemory(8, 5));

@@ -44,7 +44,7 @@ sealed class StartupFlow : PgClientFlow
 
     protected override async ValueTask<FlowTasks> ExecuteAuto(Context context)
     {
-        var spanWriter = new SpanWriter<MemoryBufferWriter, byte>(new MemoryBufferWriter());
+        var spanWriter = new SpanWriter<ArrayBufferWriter<byte>, byte>(new ArrayBufferWriter<byte>(4096));
         var encoder = context.GetEncoder();
         const int protocolVersion3 = 3 << 16; // 196608
         var startSegment = spanWriter;
@@ -63,7 +63,7 @@ sealed class StartupFlow : PgClientFlow
         // Write the length into the empty space left previously.
         startSegment.WriteUInt32BigEndian((uint)spanWriter.Committed);
 
-        encoder.CopyStartupBuffer(spanWriter.InnerWriter);
+        encoder.CopyStartupBuffer(spanWriter.InnerWriter.WrittenSpan);
         await encoder.FlushAuto().ConfigureAwait(false);
 
         var decoder = await context.GetDecoderAuto().ConfigureAwait(false);

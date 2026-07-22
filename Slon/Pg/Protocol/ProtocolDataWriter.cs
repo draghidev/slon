@@ -6,44 +6,44 @@ using Slon.Transport;
 
 namespace Slon.Pg.Protocol;
 
-// Thin, poolable write-side shell over a shared WriteChannel. Carries the token-bearing concerns:
+// Thin, poolable write-side shell over a shared ProtocolWritePipe. Carries the token-bearing concerns:
 // the scope/protocol abort token, its linked CTS (+ recycle), TranslateAbort, and the abort-catch
 // wrappers around Flush/FlushAsync. The physical wire state (BufferingWriter, message-length
-// tracking, Write*) lives in the channel; the shell delegates. Each exclusive scope gets its own
-// shell with the SCOPE token over the one shared channel; the single-pump invariant keeps only one
+// tracking and writes) lives in the pipe; the shell delegates. Each exclusive scope gets its own
+// shell with the scope token over the shared pipe; the single-pump invariant keeps only one
 // shell active at a time.
-sealed class PgProtocolDataWriter
+sealed class ProtocolDataWriter
 {
-    readonly WriteChannel _channel;
+    readonly ProtocolWritePipe _pipe;
     readonly CancellationToken _abortToken;
     readonly PgClientProtocol.Control _control;
     CancellationTokenSource _cts;
 
-    PgProtocolDataWriter(WriteChannel channel, CancellationToken abortToken, PgClientProtocol.Control control)
+    ProtocolDataWriter(ProtocolWritePipe pipe, CancellationToken abortToken, PgClientProtocol.Control control)
     {
-        _channel = channel;
+        _pipe = pipe;
         _abortToken = abortToken;
         _control = control;
         _cts = CancellationTokenSource.CreateLinkedTokenSource(abortToken);
     }
 
-    public PgProtocolDataWriter(IOutputWriter<byte> writer, Encoding clientEncoding, Action waitWritable, CancellationToken abortToken, PgClientProtocol.Control control)
-        : this(new WriteChannel(writer, clientEncoding, waitWritable), abortToken, control)
+    public ProtocolDataWriter(IOutputWriter writer, Encoding clientEncoding, Action waitWritable, CancellationToken abortToken, PgClientProtocol.Control control)
+        : this(new ProtocolWritePipe(writer, clientEncoding, waitWritable), abortToken, control)
     {
     }
 
-    // Builds a scope-bound shell over an existing channel, carrying the scope's abort token.
-    public static PgProtocolDataWriter CreateScopeShell(PgProtocolDataWriter baseShell, CancellationToken abortToken, PgClientProtocol.Control control)
-        => new(baseShell._channel, abortToken, control);
+    // Builds a scope-bound shell over the shared pipe with the scope's abort token.
+    public static ProtocolDataWriter CreateScopeShell(ProtocolDataWriter baseShell, CancellationToken abortToken, PgClientProtocol.Control control)
+        => new(baseShell._pipe, abortToken, control);
 
-    public WriteChannel Channel => _channel;
+    public ProtocolWritePipe Pipe => _pipe;
 
-    public WritableSignal WritableSignal => _channel.WritableSignal;
+    public WriteResumeSignal ResumeSignal => _pipe.ResumeSignal;
 
-    public SocketError? GetSocketError(Exception ex) => _channel.GetSocketError(ex);
+    public SocketError? GetSocketError(Exception ex) => _pipe.GetSocketError(ex);
 
-    public void SignalWritable(Exception? exception = null) => _channel.SignalWritable(exception);
-    public void WaitWritable() => _channel.WaitWritable();
+    public void ResumeWrite(Exception? exception = null) => _pipe.ResumeWrite(exception);
+    public void WaitWritable() => _pipe.WaitWritable();
 
     // Abort-to-typed-exception translation shared by the sync flush catch and the resumable driver:
     // the canonical closed exception once the abort token has fired, else the original. Mirrors the
@@ -52,45 +52,42 @@ sealed class PgProtocolDataWriter
     public Exception TranslateAbort(Exception ex)
         => _abortToken.IsCancellationRequested && _control.ClosedException is { } closed ? closed : ex;
 
-    internal void CopyFrom<TBuffer>(TBuffer buffer) where TBuffer : ICopyableBuffer<byte>
-        => _channel.CopyFrom(buffer);
-
-    internal Func<PgTypeId, Oid> OidLookup => _channel.OidLookup;
+    internal Func<PgTypeId, Oid> OidLookup => _pipe.OidLookup;
     internal Encoding ClientEncoding
     {
-        get => _channel.ClientEncoding;
-        set => _channel.ClientEncoding = value;
+        get => _pipe.ClientEncoding;
+        set => _pipe.ClientEncoding = value;
     }
 
-    public long UnflushedBytes => _channel.UnflushedBytes;
+    public long UnflushedBytes => _pipe.UnflushedBytes;
 
-    internal const long UnflushedBytesFlushThreshold = WriteChannel.UnflushedBytesFlushThreshold;
+    internal const long UnflushedBytesFlushThreshold = ProtocolWritePipe.UnflushedBytesFlushThreshold;
 
-    internal void StartMessage(byte type, int bodyLength) => _channel.StartMessage(type, bodyLength);
-    internal void StartMessage(int totalLength) => _channel.StartMessage(totalLength);
+    internal void StartMessage(byte type, int bodyLength) => _pipe.StartMessage(type, bodyLength);
+    internal void StartMessage(int totalLength) => _pipe.StartMessage(totalLength);
 
-    internal int CompleteCurrentMessageWithPadding() => _channel.CompleteCurrentMessageWithPadding();
+    internal int CompleteCurrentMessageWithPadding() => _pipe.CompleteCurrentMessageWithPadding();
 
     // TODO make a cut-off from where we start streaming the string.
     public ValueTask WriteStringWithNullTerminatorAsync(string value, Encoding encoding, int? encodedLength = null, CancellationToken cancellationToken = default)
     {
-        _channel.WriteStringWithNullTerminator(value, encoding, encodedLength);
+        _pipe.WriteStringWithNullTerminator(value, encoding, encodedLength);
         return new();
     }
 
     public void WriteStringWithNullTerminator(string value, Encoding encoding, int? encodedLength = null)
-        => _channel.WriteStringWithNullTerminator(value, encoding, encodedLength);
-    public void WriteRaw(ReadOnlySpan<byte> value) => _channel.WriteRaw(value);
-    public void WriteUShort(ushort value) => _channel.WriteUShort(value);
-    public void WriteByte(byte value) => _channel.WriteByte(value);
-    public void WriteUInt(uint value) => _channel.WriteUInt(value);
-    public void WriteInt(int value) => _channel.WriteInt(value);
+        => _pipe.WriteStringWithNullTerminator(value, encoding, encodedLength);
+    public void WriteRaw(ReadOnlySpan<byte> value) => _pipe.WriteRaw(value);
+    public void WriteUShort(ushort value) => _pipe.WriteUShort(value);
+    public void WriteByte(byte value) => _pipe.WriteByte(value);
+    public void WriteUInt(uint value) => _pipe.WriteUInt(value);
+    public void WriteInt(int value) => _pipe.WriteInt(value);
 
     public void Flush(TimeSpan timeout = default)
     {
         try
         {
-            _channel.Flush(timeout);
+            _pipe.Flush(timeout);
         }
         catch (Exception ex) when (_abortToken.IsCancellationRequested)
         {
@@ -107,7 +104,7 @@ sealed class PgProtocolDataWriter
     /// coordination-boundary check in connection-preserving flows.
     public ValueTask FlushAsync(CancellationToken cancellationToken)
     {
-        var task = _channel.FlushAsync(_cts.Token);
+        var task = _pipe.FlushAsync(_cts.Token);
         if (task.IsCompletedSuccessfully)
             return task;
         return Core(task, cancellationToken);

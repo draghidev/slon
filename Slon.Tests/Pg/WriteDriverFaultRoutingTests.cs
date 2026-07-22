@@ -9,9 +9,9 @@ using Slon.Pg.Protocol;
 namespace Slon.Tests.Pg;
 
 // RunResumableTask drives the sync write coroutine on a LongRunning thread via WaitWritable. The
-// WritableSignal the body parks on had no fault field, so a WaitWritable throw (deadline / abort)
+// WriteResumeSignal the body parks on had no fault field, so a WaitWritable throw (deadline / abort)
 // stranded the coroutine and leaked onto the side task instead of reaching the flow. The fix routes
-// the throw through WritableSignal.Signal(exception) (after TranslateAbort) so the coroutine
+// the throw through WriteResumeSignal.Signal(exception) (after TranslateAbort) so the coroutine
 // unwinds with the translated exception.
 //
 // Isolated on purpose. A full sync CommandFlow always has a following read whose OWN abort
@@ -34,12 +34,12 @@ public class WriteDriverFaultRoutingTests
         // WaitWritable stands in for the parked sync write's deadline/abort fault. A pre-cancelled
         // abort token drives TranslateAbort to the closed exception (decoupled from the disposed CTS).
         Action waitWritable = () => throw new TimeoutException("simulated write-deadline expiry");
-        var writer = new PgProtocolDataWriter(
-            new MemoryBufferWriter(), Encoding.UTF8, waitWritable, new CancellationToken(canceled: true), control);
+        var writer = new ProtocolDataWriter(
+            new BufferOutputWriter(), Encoding.UTF8, waitWritable, new CancellationToken(canceled: true), control);
         var encoder = new PgEncoder(default, writer);
 
         // The "write coroutine": parks on the signal exactly as FlushResumable does on WouldBlock.
-        async ValueTask Park() => await writer.WritableSignal.Pending();
+        async ValueTask Park() => await writer.ResumeSignal.Pending();
         var body = Park();
         Assert.IsFalse(body.IsCompleted, "the coroutine should be parked on the signal");
 

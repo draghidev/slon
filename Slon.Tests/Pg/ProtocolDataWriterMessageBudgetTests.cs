@@ -12,17 +12,17 @@ namespace Slon.Tests.Pg;
 // converter). The cap is the CVE-2024-32655 defense. These tests pin it at the writer, the single
 // chokepoint through which bytes leave for the wire. PgEncoder.StartMessage just forwards here.
 //
-// MemoryBufferWriter only commits bytes on Advance, which BufferingWriter defers to Flush, so a
+// BufferOutputWriter only commits bytes on Advance, which BufferingWriter defers to Flush, so a
 // throwing Flush leaves zero committed bytes - that is the "nothing over-length on the wire" assert.
 [TestClass]
-public class PgProtocolWriterMessageBudgetTests
+public class ProtocolDataWriterMessageBudgetTests
 {
-    static (PgProtocolDataWriter Writer, MemoryBufferWriter Sink) NewWriter()
+    static (ProtocolDataWriter Writer, BufferOutputWriter Sink) NewWriter()
     {
-        var sink = new MemoryBufferWriter();
+        var sink = new BufferOutputWriter();
         // control is only reached on the abort-cancelled async/sync flush path, none of which these
         // sync budget tests exercise (the throw precedes the flush; success cases leave abort unset).
-        var writer = new PgProtocolDataWriter(sink, Encoding.UTF8, static () => { }, default, null!);
+        var writer = new ProtocolDataWriter(sink, Encoding.UTF8, static () => { }, default, null!);
         return (writer, sink);
     }
 

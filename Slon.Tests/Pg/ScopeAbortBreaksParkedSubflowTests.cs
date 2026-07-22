@@ -9,7 +9,7 @@ namespace Slon.Tests.Pg;
 
 // A scope-only abort (the ADO connection-dispose lever) must break a subflow parked on a wire read
 // while the pooled protocol SURVIVES (its own token never trips). The scope-bound decoder/writer shells
-// over the shared Read/WriteChannel carry the scope's token, so AbortActiveScope reaches a parked
+// over the shared read/write pipes carry the scope's token, so AbortActiveScope reaches a parked
 // subflow; the protocol's own base shells keep the protocol token, so the pool unit is unaffected.
 [TestClass]
 [DoNotParallelize]
@@ -88,8 +88,8 @@ public class ScopeAbortBreaksParkedSubflowTests
 
         using var scopeAbort = new CancellationTokenSource();
         var sink = new ParkOnFlushSink();
-        var baseShell = new PgProtocolDataWriter(sink, Encoding.UTF8, static () => { }, default, control);
-        var scopeShell = PgProtocolDataWriter.CreateScopeShell(baseShell, scopeAbort.Token, control);
+        var baseShell = new ProtocolDataWriter(sink, Encoding.UTF8, static () => { }, default, control);
+        var scopeShell = ProtocolDataWriter.CreateScopeShell(baseShell, scopeAbort.Token, control);
 
         var flushTask = scopeShell.FlushAsync(CancellationToken.None);
         Assert.IsFalse(flushTask.IsCompleted, "the flush should be parked on the sink");
@@ -100,7 +100,7 @@ public class ScopeAbortBreaksParkedSubflowTests
     }
 
     // Sink whose async flush parks on the token the writer passes (its CTS, linked to the scope token).
-    sealed class ParkOnFlushSink : IOutputWriter<byte>
+    sealed class ParkOnFlushSink : IOutputWriter
     {
         byte[] _buffer = new byte[4096];
         public long UnflushedBytes => 0;

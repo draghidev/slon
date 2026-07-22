@@ -1,16 +1,17 @@
 using System.Diagnostics;
 using System.IO.Pipelines;
 using System.Runtime.CompilerServices;
+using Slon.Buffers;
 using Slon.Runtime.CompilerServices;
 
 namespace Slon.Pipelines;
 
-abstract class StreamPipeWriter : PipeWriter
+abstract class StreamPipeWriter : PipeWriter, IOutputWriter
 {
     readonly ValueTaskSourcePromise<FlushResult> _flushAsyncCorePromise = new();
     bool _isFlushActive;
 
-    // Null when CancelPendingFlush is not supported (conduit mode): the caller's token then threads
+    // Null when CancelPendingFlush is not supported: the caller's token then threads
     // straight to the underlying stream op, so we allocate neither this source nor a per-flush
     // registration. Only worth backing when the bottom is a non-token-cancelable channel (a pipe).
     protected AutoResetCancellationTokenSource? PendingFlushTokenSource { get; }
@@ -131,6 +132,15 @@ abstract class StreamPipeWriter : PipeWriter
         return FlushCore(writeToStream: true, ReadOnlySpan<byte>.Empty, timeout: timeout);
     }
 
+    void IOutputWriter.Flush(TimeSpan timeout)
+    {
+        var result = Flush(timeout);
+        if (result.IsCompleted)
+            throw new InvalidOperationException("Other pipe end was already completed.");
+        if (result.IsCanceled)
+            throw new OperationCanceledException();
+    }
+
     /// <inheritdoc />
     public override ValueTask<FlushResult> FlushAsync(CancellationToken cancellationToken = default)
     {
@@ -139,6 +149,28 @@ abstract class StreamPipeWriter : PipeWriter
             return new(new FlushResult(isCanceled: canceled, isCompleted: false));
 
         return FlushAsyncCore(writeToStream: true, data: ReadOnlyMemory<byte>.Empty, cancellationToken);
+    }
+
+    ValueTask IOutputWriter.FlushAsync(CancellationToken cancellationToken)
+    {
+        var flushTask = FlushAsync(cancellationToken);
+        if (!flushTask.IsCompletedSuccessfully)
+            return Core(flushTask);
+
+        EnsureFlushed(flushTask.Result);
+        return default;
+
+        [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
+        static async ValueTask Core(ValueTask<FlushResult> flushTask)
+            => EnsureFlushed(await flushTask.ConfigureAwait(false));
+
+        static void EnsureFlushed(FlushResult result)
+        {
+            if (result.IsCompleted)
+                throw new InvalidOperationException("Other pipe end was already completed.");
+            if (result.IsCanceled)
+                throw new OperationCanceledException();
+        }
     }
 
     /// <inheritdoc />
@@ -275,7 +307,7 @@ abstract class StreamPipeWriter : PipeWriter
                 ThrowAlreadyFlushing();
             }
 
-            // Conduit mode (no source): the caller's token threads straight to the stream op, no
+            // With no cancellation source, the caller's token threads straight to the stream op, no
             // registration. Otherwise hook the caller's token onto the source so CancelPendingFlush
             // and the caller's token both cancel.
             CancellationTokenRegistration reg = default;

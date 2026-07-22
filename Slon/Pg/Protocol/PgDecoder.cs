@@ -8,15 +8,15 @@ using Slon.Pipelines;
 
 namespace Slon.Pg.Protocol;
 
-// Thin, poolable read-side shell over a shared ReadChannel. Carries the token-bearing concerns:
+// Thin, poolable read-side shell over a shared ProtocolReadPipe. Carries the token-bearing concerns:
 // the scope/protocol abort token, its linked CTS (+ recycle), TranslateReadCancellation, the
 // read-timeout countdown + OnHeartbeat, CurrentExecutionControl, and the read/handler loops that
-// drive the channel against this shell's CTS. The physical wire state lives in the channel; each
-// exclusive scope gets its own shell with the SCOPE token over the one shared channel, and the
+// drive the pipe against this shell's CTS. The physical wire state lives in the pipe; each
+// exclusive scope gets its own shell with the scope token over the shared pipe, and the
 // single-pump invariant keeps only one shell active at a time.
 sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMessage>
 {
-    readonly ReadChannel _channel;
+    readonly ProtocolReadPipe _pipe;
     readonly CancellationToken _abortToken;
     readonly TimeSpan _defaultReadTimeout;
     readonly Action<TimeSpan> _onHeartbeatAction;
@@ -78,9 +78,9 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
         }
     }
 
-    PgDecoder(ReadChannel channel, CancellationToken abortToken, TimeSpan defaultReadTimeout)
+    PgDecoder(ProtocolReadPipe pipe, CancellationToken abortToken, TimeSpan defaultReadTimeout)
     {
-        _channel = channel;
+        _pipe = pipe;
         _abortToken = abortToken;
         _defaultReadTimeout = defaultReadTimeout;
         _cancellationTokenSource = CancellationTokenSource.CreateLinkedTokenSource(abortToken);
@@ -89,15 +89,15 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
     }
 
     internal PgDecoder(PipeSegmentEnumerator<BackendMessageBatch.Segmenter, BackendMessageBatch> messageBatchEnumerator, CancellationToken abortToken, TimeSpan defaultReadTimeout)
-        : this(new ReadChannel(messageBatchEnumerator), abortToken, defaultReadTimeout)
+        : this(new ProtocolReadPipe(messageBatchEnumerator), abortToken, defaultReadTimeout)
     {
     }
 
-    internal ReadChannel Channel => _channel;
+    internal ProtocolReadPipe Pipe => _pipe;
 
-    // Builds a scope-bound shell over an existing channel, carrying the scope's abort token.
+    // Builds a scope-bound shell over the shared pipe with the scope's abort token.
     internal static PgDecoder CreateScopeShell(PgDecoder baseShell, CancellationToken abortToken, TimeSpan defaultReadTimeout)
-        => new(baseShell._channel, abortToken, defaultReadTimeout);
+        => new(baseShell._pipe, abortToken, defaultReadTimeout);
 
     internal void Initialize(PgClientProtocol.Control control)
     {
@@ -112,19 +112,19 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
         ReadTimeout = _defaultReadTimeout;
         if (!ReferenceEquals(_control, control))
             _control = control;
-        _channel.BindDecoder(this);
+        _pipe.BindDecoder(this);
         // TODO we want a heartbeat setup directly through the protocol on construction.
         CurrentExecutionControl.RegisterDecoderOnHeartbeat(_onHeartbeatAction);
     }
 
     internal bool TryContinueCurrentMessage(SequencePosition consumed, long consumedLength, out CurrentSegmentBuffer result)
-        => _channel.TryContinueCurrentMessage(consumed, consumedLength, out result);
+        => _pipe.TryContinueCurrentMessage(consumed, consumedLength, out result);
 
     internal ValueTask<CurrentSegmentBuffer> ContinueCurrentMessageAsync(
         SequencePosition consumed, long consumedLength, CancellationToken cancellationToken)
     {
         EnsureUsableCts();
-        if (_channel.TryContinueCurrentMessage(consumed, consumedLength, out var result))
+        if (_pipe.TryContinueCurrentMessage(consumed, consumedLength, out var result))
             return new(result);
 
         return Core(cancellationToken);
@@ -140,7 +140,7 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
             {
                 SetRemainingTimeout(ReadTimeout);
                 timeoutSet = true;
-                return await _channel.ContinueCurrentMessageAsync(
+                return await _pipe.ContinueCurrentMessageAsync(
                     consumed, consumedLength, _cancellationTokenSource.Token).ConfigureAwait(false);
             }
             catch (Exception ex) when (_cancellationTokenSource.IsCancellationRequested)
@@ -165,7 +165,7 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
         {
             SetRemainingTimeout(ReadTimeout);
             timeoutSet = true;
-            return _channel.ContinueCurrentMessage(consumed, consumedLength, GetRemainingTimeout());
+            return _pipe.ContinueCurrentMessage(consumed, consumedLength, GetRemainingTimeout());
         }
         catch (Exception) when (_abortToken.IsCancellationRequested && _control.ClosedException is { } closed)
         {
@@ -179,12 +179,12 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
     }
 
     internal bool TryExtendCurrentMessage(out CurrentSegmentBuffer result)
-        => _channel.TryExtendCurrentMessage(out result);
+        => _pipe.TryExtendCurrentMessage(out result);
 
     internal ValueTask<CurrentSegmentBuffer> ExtendCurrentMessageAsync(CancellationToken cancellationToken)
     {
         EnsureUsableCts();
-        if (_channel.TryExtendCurrentMessage(out var result))
+        if (_pipe.TryExtendCurrentMessage(out var result))
             return new(result);
 
         return Core(cancellationToken);
@@ -200,7 +200,7 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
             {
                 SetRemainingTimeout(ReadTimeout);
                 timeoutSet = true;
-                return await _channel.ExtendCurrentMessageAsync(
+                return await _pipe.ExtendCurrentMessageAsync(
                     _cancellationTokenSource.Token).ConfigureAwait(false);
             }
             catch (Exception ex) when (_cancellationTokenSource.IsCancellationRequested)
@@ -224,7 +224,7 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
         {
             SetRemainingTimeout(ReadTimeout);
             timeoutSet = true;
-            return _channel.ExtendCurrentMessage(GetRemainingTimeout());
+            return _pipe.ExtendCurrentMessage(GetRemainingTimeout());
         }
         catch (Exception) when (_abortToken.IsCancellationRequested && _control.ClosedException is { } closed)
         {
@@ -342,17 +342,17 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
         EnsureUsableCts();
         while (true)
         {
-            var channel = _channel;
-            while (channel.TryMoveNext())
+            var pipe = _pipe;
+            while (pipe.TryMoveNext())
             {
-                var handleTask = CurrentExecutionControl.HandleMessageAuto(channel.Current);
+                var handleTask = CurrentExecutionControl.HandleMessageAuto(pipe.Current);
                 if (!handleTask.IsCompletedSuccessfully)
                     return MoveNextAsyncCore(null, null, handleTask, cancellationToken);
                 if (!handleTask.Result)
                     return new(true);
             }
 
-            if (channel.TryMoveNextBatch(out var completed))
+            if (pipe.TryMoveNextBatch(out var completed))
                 continue;
             if (completed)
                 return new(false);
@@ -361,7 +361,7 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
             var frontierFlow = EnterCancellationReadFrontier();
             try
             {
-                if (channel.TryBeginDirectRead(readToken, out var directReadTask))
+                if (pipe.TryBeginDirectRead(readToken, out var directReadTask))
                 {
                     try
                     {
@@ -369,7 +369,7 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
                         {
                             if (!directReadTask.IsCompletedSuccessfully)
                                 return MoveNextAsyncCore(null, directReadTask, null, cancellationToken, frontierFlow);
-                            if (channel.CompleteDirectRead(directReadTask.Result, readToken, out directReadTask, out var readFinished, out var directReadCompleted))
+                            if (pipe.CompleteDirectRead(directReadTask.Result, readToken, out directReadTask, out var readFinished, out var directReadCompleted))
                                 break;
                             if (!readFinished)
                                 continue;
@@ -385,7 +385,7 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
                     }
                     catch (Exception ex)
                     {
-                        channel.AbortDirectRead();
+                        pipe.AbortDirectRead();
                         LeaveCancellationReadFrontier(frontierFlow);
                         if (_cancellationTokenSource.IsCancellationRequested)
                             throw TranslateReadCancellation(ex, cancellationToken);
@@ -393,11 +393,11 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
                     }
                 }
 
-                var readTask = channel.ReadAsync(readToken);
+                var readTask = pipe.ReadAsync(readToken);
                 if (!readTask.IsCompletedSuccessfully)
                     return MoveNextAsyncCore(readTask, null, null, cancellationToken, frontierFlow);
                 LeaveCancellationReadFrontier(frontierFlow);
-                if (channel.TryMoveNextBatch(readTask.Result, _cancellationTokenSource.Token, out var readCompleted))
+                if (pipe.TryMoveNextBatch(readTask.Result, _cancellationTokenSource.Token, out var readCompleted))
                     continue;
                 if (readCompleted)
                     return new(false);
@@ -414,7 +414,6 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
             }
             nextRead:;
         }
-
 
 
         [MethodImpl(MethodImplOptions.NoInlining)]
@@ -447,7 +446,7 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
                             LeaveCancellationReadFrontier(frontierFlow!);
                             frontierFlow = null;
                             readTask = null;
-                            if (_channel.TryMoveNextBatch(result, _cancellationTokenSource.Token, out var readCompleted))
+                            if (_pipe.TryMoveNextBatch(result, _cancellationTokenSource.Token, out var readCompleted))
                                 continue;
                             if (readCompleted)
                                 return false;
@@ -468,7 +467,7 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
                                 timeoutSet = true;
                             }
                             var length = await pendingDirectRead.ConfigureAwait(false);
-                            if (_channel.CompleteDirectRead(length, _cancellationTokenSource.Token, out var nextDirectRead, out var readFinished, out var readCompleted))
+                            if (_pipe.CompleteDirectRead(length, _cancellationTokenSource.Token, out var nextDirectRead, out var readFinished, out var readCompleted))
                             {
                                 LeaveCancellationReadFrontier(frontierFlow!);
                                 frontierFlow = null;
@@ -488,7 +487,7 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
                         }
                         catch (Exception ex)
                         {
-                            _channel.AbortDirectRead();
+                            _pipe.AbortDirectRead();
                             if (frontierFlow is not null)
                             {
                                 LeaveCancellationReadFrontier(frontierFlow);
@@ -500,9 +499,9 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
                         }
                     }
 
-                    while (_channel.TryMoveNext())
+                    while (_pipe.TryMoveNext())
                     {
-                        var handleTask = CurrentExecutionControl.HandleMessageAuto(_channel.Current);
+                        var handleTask = CurrentExecutionControl.HandleMessageAuto(_pipe.Current);
                         if (!handleTask.IsCompletedSuccessfully)
                         {
                             messageHandledTask = handleTask;
@@ -514,7 +513,7 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
                     if (messageHandledTask.HasValue)
                         continue;
 
-                    if (_channel.TryMoveNextBatch(out var completed))
+                    if (_pipe.TryMoveNextBatch(out var completed))
                         continue;
                     if (completed)
                         return false;
@@ -523,10 +522,10 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
                     {
                         var token = _cancellationTokenSource.Token;
                         frontierFlow = EnterCancellationReadFrontier();
-                        if (_channel.TryBeginDirectRead(token, out var nextDirectRead))
+                        if (_pipe.TryBeginDirectRead(token, out var nextDirectRead))
                             directReadTask = nextDirectRead;
                         else
-                            readTask = _channel.ReadAsync(token);
+                            readTask = _pipe.ReadAsync(token);
                     }
                     catch (Exception ex) when (_cancellationTokenSource.IsCancellationRequested)
                     { throw TranslateReadCancellation(ex, cancellationToken); }
@@ -547,9 +546,8 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
     public BackendMessage Current
     {
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        get => EnrichError(_channel.Current);
+        get => EnrichError(_pipe.Current);
     }
-
 
     BackendMessage EnrichError(BackendMessage message)
     {
@@ -572,7 +570,7 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
         // only when the handler needs I/O, where we bail and the caller falls back to MoveNextAsync.
         while (true)
         {
-            while (_channel.TryPeekNext(out var header))
+            while (_pipe.TryPeekNext(out var header))
             {
                 var handled = false;
                 if (header.Type
@@ -580,11 +578,11 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
                     or PgTypes.BackendType.NoticeResponse
                     or PgTypes.BackendType.NotificationResponse
                     or PgTypes.BackendType.ParameterStatus
-                    && !CurrentExecutionControl.TryHandleMessage(_channel.Peeked, out handled))
+                    && !CurrentExecutionControl.TryHandleMessage(_pipe.Peeked, out handled))
                 {
                     goto unavailable;
                 }
-                _channel.TryMoveNext();
+                _pipe.TryMoveNext();
                 if (handled)
                     continue;
                 message = Current;
@@ -594,7 +592,7 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
             // The current batch is exhausted. Descend through any bytes the PipeReader already owns
             // before reporting unavailable; only a genuinely pending physical read should make the
             // async caller install its continuation tree.
-            if (!_channel.TryMoveNextBatch(out _))
+            if (!_pipe.TryMoveNextBatch(out _))
                 break;
         }
 
@@ -604,7 +602,7 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
     }
 
     // Auto-switch read, mirroring the encoder's FlushAuto: a sync flow takes the BLOCKING read path
-    // (GetNext -> MoveNext -> channel.MoveNext, a real blocking syscall - the BCL does the waiting), an
+    // (GetNext -> MoveNext -> pipe.MoveNext, a real blocking syscall—the BCL does the waiting), an
     // async flow takes GetNextAsync. Using GetNextAsync unconditionally for a sync flow leaves the read on
     // the non-blocking/emulated path, so the body completes on a TP thread instead of inline.
     public ValueTask<BackendMessage> GetNextAuto()
@@ -640,8 +638,8 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
         {
             while (true)
             {
-                var channel = _channel;
-                if (!channel.TryMoveNext())
+                var pipe = _pipe;
+                if (!pipe.TryMoveNext())
                 {
                     if (!timeoutSet)
                     {
@@ -653,7 +651,7 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
                     var frontierFlow = EnterCancellationReadFrontier();
                     try
                     {
-                        success = channel.MoveNext(GetRemainingTimeout());
+                        success = pipe.MoveNext(GetRemainingTimeout());
                     }
                     catch (Exception) when (_abortToken.IsCancellationRequested && _control.ClosedException is { } closed)
                     {
@@ -667,18 +665,17 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
                     {
                         LeaveCancellationReadFrontier(frontierFlow);
                     }
-                    channel.CommitBatch();
+                    pipe.CommitBatch();
                     if (!success)
                         return false;
 
-                    if (!channel.TryMoveNext())
+                    if (!pipe.TryMoveNext())
                         ThrowHelper.ThrowInvalidOperation("No message in a new batch");
                 }
 
-
                 // HandleMessageAuto is always sync-completing (every branch returns a
                 // synchronously-constructed ValueTask). Reading .Result inline is safe.
-                if (CurrentExecutionControl.HandleMessageAuto(channel.Current).Result)
+                if (CurrentExecutionControl.HandleMessageAuto(pipe.Current).Result)
                     continue;
 
                 return true;
@@ -698,8 +695,8 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
         return Current;
     }
 
-    void IDisposable.Dispose() => _channel.Dispose();
-    ValueTask IAsyncDisposable.DisposeAsync() => _channel.DisposeAsync();
+    void IDisposable.Dispose() => _pipe.Dispose();
+    ValueTask IAsyncDisposable.DisposeAsync() => _pipe.DisposeAsync();
 
     object? IEnumerator.Current => Current;
     void IEnumerator.Reset() => throw new NotSupportedException();
