@@ -1062,8 +1062,8 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         // Cancellation needs a proof-quality idle level; the slot reads are deliberately stale-tolerant.
         bool _isIdle = true;
         public bool IsIdle => Volatile.Read(ref _isIdle);
-        public void RequestServerCancellation(PgClientFlow instigator)
-            => protocol.RequestServerCancellation(instigator, this);
+        public void RequestServerCancellation(PgClientFlow instigator, PgClientFlow.BackendCancellationExtent extent, int window)
+            => protocol.RequestServerCancellation(instigator, this, extent, window);
         public void OnFlowSubstituted(PgClientFlow from, PgClientFlow to)
             => protocol.OnFlowSubstituted(this, from, to);
         internal string? ScopeResetCommand => protocol.ScopeResetCommand;
@@ -1229,10 +1229,12 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
 
         // Connection-wide transaction-state bookkeeping. Routes to the single protocol field (NOT a
         // per-Control copy) so inner-scope and outer flows keep one consistent view of the one wire.
-        public void OnFlowRfq(PgClientFlow flow, BackendMessage message)
+        public void OnFlowRfq(PgClientFlow flow, BackendMessage message, int completedWindow, int remainingRfqCount)
         {
             protocol._transactionStatus = ReadyForQueryMessage.Create(message).TransactionStatus;
-            protocol.OnFlowRfq(this, flow);
+            protocol.OnCancellationWindowCompleted(this, flow, completedWindow);
+            if (remainingRfqCount is 0)
+                protocol.OnFlowRfq(this, flow);
         }
 
         // Wire-handoff guard, called from Policy.CompleteItem when a flow retires. The OUTER multiplexed

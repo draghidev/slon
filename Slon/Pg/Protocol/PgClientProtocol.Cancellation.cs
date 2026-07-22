@@ -27,12 +27,15 @@ sealed partial class PgClientProtocol
 
     // Flow-owned request state. It ends when delivery becomes possible; any remaining connection-wide
     // reach is represented by a CancellationExposure instead.
-    sealed class CancellationIntent(PgClientFlow instigator, Control control)
+    sealed class CancellationIntent(PgClientFlow instigator, Control control, PgClientFlow.BackendCancellationExtent extent, int window)
     {
         internal readonly PgClientFlow Instigator = instigator;
         internal readonly Control Control = control;
         internal CancellationIntent? Next;
+        internal PgClientFlow.BackendCancellationExtent Extent = extent;
+        internal int Window = window;
         internal bool Dispatching;
+        internal bool AwaitingBoundary;
         internal bool InstigatorCompleted;
         internal byte Attempts;
     }
@@ -47,7 +50,8 @@ sealed partial class PgClientProtocol
         internal PgClientFlow? BoundaryFlow;
     }
 
-    internal void RequestServerCancellation(PgClientFlow instigator, Control control)
+    internal void RequestServerCancellation(PgClientFlow instigator, Control control,
+        PgClientFlow.BackendCancellationExtent extent, int window)
     {
         if (_options.CancelSender is null || _backendProcessId is 0)
             return;
@@ -61,10 +65,14 @@ sealed partial class PgClientProtocol
             for (var existing = _cancellationHead; existing is not null; existing = existing.Next)
             {
                 if (ReferenceEquals(existing.Instigator, instigator) && ReferenceEquals(existing.Control, control))
+                {
+                    if (extent > existing.Extent)
+                        existing.Extent = extent;
                     return;
+                }
             }
 
-            intent = new(instigator, control);
+            intent = new(instigator, control, extent, window);
             if (_cancellationTail is null)
                 _cancellationHead = intent;
             else
@@ -80,7 +88,7 @@ sealed partial class PgClientProtocol
     bool TryBeginCancellationDispatchLocked(CancellationIntent intent)
     {
         if (_status is not ProtocolStatus.Ready || _cancellationDispatching || intent.Dispatching
-            || intent.InstigatorCompleted || intent.Attempts >= 2
+            || intent.AwaitingBoundary || intent.InstigatorCompleted || intent.Attempts >= 2
             || !ReferenceEquals(intent.Control.ActivatedFlow, intent.Instigator))
             return false;
         _cancellationDispatching = true;
@@ -138,7 +146,10 @@ sealed partial class PgClientProtocol
             {
                 if (!intent.Control.IsIdle)
                     AddCancellationExposureLocked(new(intent.Instigator, intent.Control));
-                RemoveCancellationIntentLocked(intent);
+                if (intent.InstigatorCompleted || intent.Extent is PgClientFlow.BackendCancellationExtent.CurrentWindow)
+                    RemoveCancellationIntentLocked(intent);
+                else
+                    intent.AwaitingBoundary = true;
             }
         }
         TryDispatchNextCancellation();
@@ -193,6 +204,25 @@ sealed partial class PgClientProtocol
                     anyUnassigned = true;
             }
             Volatile.Write(ref _hasUnassignedCancellationBoundary, anyUnassigned);
+        }
+    }
+
+    void OnCancellationWindowCompleted(Control control, PgClientFlow flow, int completedWindow)
+    {
+        if (!Volatile.Read(ref _hasCancellationIntents))
+            return;
+        lock (_syncRoot)
+        {
+            for (var intent = _cancellationHead; intent is not null; intent = intent.Next)
+            {
+                if (!intent.AwaitingBoundary || !ReferenceEquals(intent.Control, control)
+                    || !ReferenceEquals(intent.Instigator, flow) || completedWindow < intent.Window)
+                    continue;
+                // Redrive is deliberately deferred until an attempt latch proves the previous
+                // request exposure cannot roll into this flow's next Sync window.
+                RemoveCancellationIntentLocked(intent);
+                break;
+            }
         }
     }
 

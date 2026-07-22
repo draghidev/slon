@@ -196,7 +196,7 @@ public class RecoveryTests
             AfterWrites?.Invoke();
 
             if (RequestCancellation)
-                RequestBackendCancellation();
+                RequestBackendCancellation(BackendCancellationExtent.RemainingFlow);
 
             if (_phase is FaultPhase.PreReturn)
                 throw new InvalidOperationException("FaultingFlow pre-return synthetic failure.");

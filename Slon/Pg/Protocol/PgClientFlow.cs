@@ -6,6 +6,13 @@ namespace Slon.Pg.Protocol;
 
 abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgClientFlow>, IThreadPoolWorkItem
 {
+    protected internal enum BackendCancellationExtent : byte
+    {
+        CurrentWindow,
+        RemainingFlow,
+        WholeFlow
+    }
+
     PgClientProtocol.Control? _pendingActivationControl;
     PgClientProtocol.Control? _boundControl;
 
@@ -33,6 +40,7 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
     readonly bool _supportsPipelining;
     Action<TimeSpan>? _decoderOnHeartbeatAction; // TODO should we have this here?
     int _rfqCount;
+    int _cancellationWindow;
     bool _lastMessageInducesRfq;
     // We store the IsAsync value at bind time so the protocol can keep track of pipeline stalls correctly.
     bool _isAsyncAtBind;
@@ -207,6 +215,7 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
         _completionCore.Reset();
         _activationTaskSource.Reset();
         _rfqCount = 0;
+        _cancellationWindow = 0;
         _lastMessageInducesRfq = false;
         _boundControl = null;
         // Clear the completion action: it is captured per-tenure (with its state), so a recycled flow must
@@ -226,8 +235,8 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
 
     /// Requests PostgreSQL backend cancellation for this flow on its bound protocol control.
     /// The protocol retains any request exposure that can outlive the flow.
-    protected void RequestBackendCancellation()
-        => _boundControl?.RequestServerCancellation(this);
+    protected void RequestBackendCancellation(BackendCancellationExtent extent = BackendCancellationExtent.CurrentWindow)
+        => _boundControl?.RequestServerCancellation(this, extent, Volatile.Read(ref _cancellationWindow));
 
     protected virtual void OnHeartbeat(TimeSpan interval) {}
     protected virtual void OnAbort(PgClientClosedException exception) {}
@@ -538,8 +547,7 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
             {
                 case PgTypes.BackendType.ReadyForQuery:
                     flow._rfqCount -= 1;
-                    if (flow._rfqCount is 0)
-                        control.OnFlowRfq(flow, backendMessage);
+                    control.OnFlowRfq(flow, backendMessage, flow._cancellationWindow++, flow._rfqCount);
                     handled = false;
                     return true;
                 case PgTypes.BackendType.NoticeResponse:
@@ -565,8 +573,7 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
             {
                 case PgTypes.BackendType.ReadyForQuery:
                     flow._rfqCount -= 1;
-                    if (flow._rfqCount is 0)
-                        control.OnFlowRfq(flow, backendMessage);
+                    control.OnFlowRfq(flow, backendMessage, flow._cancellationWindow++, flow._rfqCount);
                     goto default;
                 case PgTypes.BackendType.NoticeResponse:
                     // We sink all notices (this includes RAISE notices) and expect those to end up on the flow for user retrieval/logging.

@@ -198,7 +198,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
         if (_flowCancellationToken.IsCancellationRequested)
             RequestCancel(_flowCancellationToken);
         else if (Volatile.Read(ref _cancelRequested))
-            RequestBackendCancellation();
+            RequestBackendCancellation(BackendCancellationExtent.RemainingFlow);
         ValueTask writeTask;
         try
         {
@@ -697,7 +697,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
         }
         catch (TimeoutException ex)
         {
-            RequestBackendCancellation();
+            RequestBackendCancellation(BackendCancellationExtent.RemainingFlow);
             HandleException(ex);
             throw;
         }
@@ -815,7 +815,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
     {
         _cancelDeliverToken = token;
         Volatile.Write(ref _cancelRequested, true);
-        RequestBackendCancellation();
+        RequestBackendCancellation(BackendCancellationExtent.RemainingFlow);
         _callerInteractionCore.RequestWake();
     }
 
