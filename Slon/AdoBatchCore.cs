@@ -61,6 +61,8 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
     TimeSpan _timeout;
     bool _enableErrorBarriers;
     CommandFlow? _activeFlow;
+    Action<CommandResult, object?>? _onCommandResultAction;
+    object? _onCommandResultActionState;
     AdoCommandList<TCommand> _commands;
 
     public AdoBatchCore(SlonConnection connection, FieldRef<AdoBatchCore<TCommand>> fieldRef)
@@ -220,11 +222,11 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
         var commandCount = commands.Length + commandOffset;
         var commandArray = commandCount > 1 ? ArrayPool<Command>.Shared.Rent(commandCount) : null;
         if (pendingPrefix is not null)
-            commandArray![0] = Command.Create(pendingPrefix);
+            commandArray![0] = Command.Create(pendingPrefix) with { SuppressEnumeration = true };
         (Command Command, TrackerResult TrackerResult) result = default;
         Action<CommandResult, object?>? onResultAction = null;
         object? onResultActionState = null;
-        (Action<CommandResult, object?>, object?)?[]? completionArray = null;
+        (Action<CommandResult, object?>, object?)?[]? resultActions = null;
         // Tracks TrackedCommands that this batch's earlier commands have already issued Parse for
         // as the Winner. Subsequent same-TC commands in the same batch get the Present shape
         // (rely on the earlier in-batch Parse in the same Sync window).
@@ -253,10 +255,10 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
                 if (result.TrackerResult.Tracked is not null && !ReferenceEquals(adoCommand.Tracked, result.TrackerResult.Tracked))
                     adoCommand.Tracked = result.TrackerResult.Tracked;
 
-                // Per-command completion (presence-aware on the connection-bound path with a protocol
+                // Per-command result observation (presence-aware on the connection-bound path with a protocol
                 // in scope, falls through to the legacy TrackerResult-driven completion otherwise).
-                Action<CommandResult, object?>? thisCompletion;
-                object? thisCompletionState;
+                Action<CommandResult, object?>? thisResultAction;
+                object? thisResultActionState;
 
                 if (pgConnection is not null && result.TrackerResult.Tracked is { } tracked)
                 {
@@ -278,8 +280,8 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
                                     tracked.CommandName, descriptor.ParameterTypes, rowDescription: null)
                             }, result.TrackerResult);
                         }
-                        thisCompletion = null;
-                        thisCompletionState = null;
+                        thisResultAction = static (result, state) => AttachPreparedTerminalObserver(result, (PgConnection)state!);
+                        thisResultActionState = pgConnection;
                     }
                     else if (status is TrackedStatus.Preparing)
                     {
@@ -288,8 +290,8 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
                         var commandText = adoCommand.CommandText;
                         var paramTypes = result.Command.Descriptor.ParameterTypes;
                         result = (result.Command with { Descriptor = CommandDescriptor.Create(commandText, paramTypes, default) }, result.TrackerResult);
-                        thisCompletion = null;
-                        thisCompletionState = null;
+                        thisResultAction = null;
+                        thisResultActionState = null;
                     }
                     else // None
                     {
@@ -300,7 +302,7 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
                             var commandText = adoCommand.CommandText;
                             var paramTypes = result.Command.Descriptor.ParameterTypes;
                             result = (result.Command with { Descriptor = CommandDescriptor.Create(commandText, paramTypes, tracked.CommandName) }, result.TrackerResult);
-                            thisCompletion = static (cmdResult, state) =>
+                            thisResultAction = static (cmdResult, state) =>
                             {
                                 var (p, t) = ((PgConnection, TrackedCommand))state!;
                                 var metadata = cmdResult.GetMetadata();
@@ -317,8 +319,11 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
                                     // they aren't blocked.
                                     p.RemoveTracked(t);
                                 }
+
+                                if (metadata.IsPrepared)
+                                    AttachPreparedTerminalObserver(cmdResult, p);
                             };
-                            thisCompletionState = (pgConnection, tracked);
+                            thisResultActionState = (pgConnection, tracked);
                             (preparationClaims ??= new(pgConnection)).Add(tracked);
                         }
                         else
@@ -327,8 +332,8 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
                             var commandText = adoCommand.CommandText;
                             var paramTypes = result.Command.Descriptor.ParameterTypes;
                             result = (result.Command with { Descriptor = CommandDescriptor.Create(commandText, paramTypes, default) }, result.TrackerResult);
-                            thisCompletion = null;
-                            thisCompletionState = null;
+                            thisResultAction = null;
+                            thisResultActionState = null;
                         }
                     }
                 }
@@ -337,55 +342,49 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
                     // Data-source path placeholder, or no admission: no per-command completion.
                     // (The data-source orchestrator, when implemented, will use the same delegate-
                     // baked path as the connection-bound case here.)
-                    thisCompletion = null;
-                    thisCompletionState = null;
+                    thisResultAction = null;
+                    thisResultActionState = null;
                 }
 
                 if (commandArray is null)
                 {
-                    if (thisCompletion is not null)
+                    if (thisResultAction is not null)
                     {
-                        onResultAction = thisCompletion;
-                        onResultActionState = thisCompletionState;
+                        onResultAction = thisResultAction;
+                        onResultActionState = thisResultActionState;
                     }
                 }
                 else
                 {
-                    if (thisCompletion is not null)
+                    if (thisResultAction is not null)
                     {
-                        if (completionArray is null)
+                        if (resultActions is null)
                         {
-                            completionArray = new (Action<CommandResult, object?>, object?)?[commandCount];
+                            resultActions = new (Action<CommandResult, object?>, object?)?[commandCount];
                             if (onResultAction is not null)
-                                completionArray[commandOffset] = (onResultAction, onResultActionState);
+                                resultActions[commandOffset] = (onResultAction, onResultActionState);
 
                             onResultAction = static (result, state) =>
                             {
-                                var completions = ((Action<CommandResult, object?> Action, object? State)?[])state!;
-                                if (completions[result.GetMetadata().CommandIndex] is { } completion)
-                                    completion.Action(result, completion.State);
+                                var actions = ((Action<CommandResult, object?> Action, object? State)?[])state!;
+                                if (actions[result.GetMetadata().CommandIndex] is { } action)
+                                    action.Action(result, action.State);
                             };
-                            onResultActionState = completionArray;
+                            onResultActionState = resultActions;
                         }
-                        completionArray[i + commandOffset] = (thisCompletion, thisCompletionState);
+                        resultActions[i + commandOffset] = (thisResultAction, thisResultActionState);
                     }
 
                     commandArray[i + commandOffset] = result.Command;
                 }
             }
 
+            _onCommandResultAction = onResultAction;
+            _onCommandResultActionState = onResultActionState;
             return new()
             {
-                CancellationTarget = (ICommandFlowCancellationTarget)_fieldRef.Instance,
-                OnCommandResultAction = onResultAction,
-                OnCommandResultActionState = onResultActionState,
-                OnCommandErrorAction = pgConnection is null
-                    ? null
-                    : static (descriptor, error, state) =>
-                        ((PgConnection)state!).ReconcilePreparedError(descriptor, error.SqlState),
-                OnCommandErrorActionState = pgConnection,
-                Commands = commandArray is null ? new(result.Command) : new(commandArray, commandCount, isPooled: true),
-                LeadingResultCount = commandOffset
+                Observer = (ICommandFlowObserver)_fieldRef.Instance,
+                Commands = commandArray is null ? new(result.Command) : new(commandArray, commandCount, isPooled: true)
             };
         }
         catch
@@ -398,6 +397,17 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
             throw;
         }
     }
+
+    static void AttachPreparedTerminalObserver(CommandResult result, PgConnection connection)
+        => result.OnCompleted(static (completed, state) =>
+        {
+            if (completed.Error is not { } error)
+                return;
+
+            var metadata = completed.GetMetadata();
+            if (metadata.IsPrepared)
+                ((PgConnection)state!).ReconcilePreparedError(metadata.ToPreparedDescriptor(), error.SqlState);
+        }, connection);
 
     CommandFlow Enqueue(DbParameterCollection? parameters, CommandBehavior behavior)
     {
@@ -468,13 +478,6 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
         {
             var flow = Enqueue(parameters, CommandBehavior.SchemaOnly);
             enumerator = flow.GetEnumerator();
-            for (var i = 0; i < flow.LeadingResultCount; i++)
-            {
-                if (!enumerator.MoveNext())
-                    ThrowHelper.ThrowUnexpected("The flow returned fewer infrastructure results than expected.");
-                foreach (var _ in enumerator.Current) { }
-                enumerator.Current.GetCommandComplete();
-            }
             var span = _commands.AsSpan();
             for (var i = 0; i < span.Length; i++)
             {
@@ -532,21 +535,6 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
         {
             var flow = await thisRef.EnqueueAsync(parameters, CommandBehavior.SchemaOnly, cancellationToken).ConfigureAwait(false);
             enumerator = flow.GetAsyncEnumerator(cancellationToken);
-            for (var i = 0; i < flow.LeadingResultCount; i++)
-            {
-                if (!await enumerator.MoveNextAsync(cancellationToken).ConfigureAwait(false))
-                    ThrowHelper.ThrowUnexpected("The flow returned fewer infrastructure results than expected.");
-                var rows = enumerator.Current.GetAsyncEnumerator(cancellationToken);
-                try
-                {
-                    while (await rows.MoveNextAsync().ConfigureAwait(false)) { }
-                }
-                finally
-                {
-                    await rows.DisposeAsync().ConfigureAwait(false);
-                }
-                enumerator.Current.GetCommandComplete();
-            }
             for (var i = 0; i < fieldRef.Invoke()._commands.AsSpan().Length; i++)
             {
                 try
@@ -759,8 +747,20 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
         return cancellationToken.CanBeCanceled ? task.WaitAsync(cancellationToken) : task;
     }
 
-    internal void SetActiveFlow(CommandFlow flow) => Volatile.Write(ref _activeFlow, flow);
+    internal void OnFlowStarted(CommandFlow flow) => Volatile.Write(ref _activeFlow, flow);
 
-    internal void ClearActiveFlow(CommandFlow flow)
-        => Interlocked.CompareExchange(ref _activeFlow, null, flow);
+    internal void OnCommandResult(CommandFlow flow, CommandResult result)
+    {
+        if (ReferenceEquals(Volatile.Read(ref _activeFlow), flow))
+            _onCommandResultAction?.Invoke(result, _onCommandResultActionState);
+    }
+
+    internal void OnFlowEnded(CommandFlow flow)
+    {
+        if (!ReferenceEquals(Interlocked.CompareExchange(ref _activeFlow, null, flow), flow))
+            return;
+
+        _onCommandResultAction = null;
+        _onCommandResultActionState = null;
+    }
 }

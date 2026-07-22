@@ -25,6 +25,8 @@ abstract class CommandResult : IDisposable, IAsyncDisposable, IEnumerable<Row>, 
     long _recordsAffected;
     CommandCompleteMessage? _commandCompleteMessage;
     PgError? _errorMessage;
+    Action<CommandResult, object?>? _completionAction;
+    object? _completionActionState;
 
     // The requested row description is what was returned for this exact command (i.e. commands that requested a describe).
     protected void Initialize(int index, CommandDescriptor descriptor, RowDescription? requestedRowDescription, bool requestedExecution, bool simpleProtocol)
@@ -53,6 +55,8 @@ abstract class CommandResult : IDisposable, IAsyncDisposable, IEnumerable<Row>, 
         _recordsAffected = default;
         _commandCompleteMessage = null;
         _errorMessage = null;
+        _completionAction = null;
+        _completionActionState = null;
     }
 
     /// Returns all metadata known about the command after execution has taken place.
@@ -128,6 +132,16 @@ abstract class CommandResult : IDisposable, IAsyncDisposable, IEnumerable<Row>, 
     // through" state, not a "wait for it to flip" signal.
     public bool IsComplete => _commandCompleteMessage is not null || _errorMessage is not null;
 
+    internal PgError? Error => _errorMessage;
+
+    internal void OnCompleted(Action<CommandResult, object?> action, object? state)
+    {
+        Debug.Assert(!IsComplete);
+        Debug.Assert(_completionAction is null);
+        _completionAction = action;
+        _completionActionState = state;
+    }
+
     // RecordsAffected is only known once the command has run to its CommandComplete / ErrorResponse.
     // Reading it on a not-yet-drained result is a consumer bug - surface it loudly instead of silently
     // handing back 0 (which is what hid the un-drained ExecuteNonQuery path). Gate with IsComplete.
@@ -179,6 +193,21 @@ abstract class CommandResult : IDisposable, IAsyncDisposable, IEnumerable<Row>, 
                 // TODO fill out expected types.
                 _errorMessage = ErrorOrNoticeMessage.Create(message, []);
                 break;
+        }
+
+        if (_completionAction is { } action)
+        {
+            var state = _completionActionState;
+            _completionAction = null;
+            _completionActionState = null;
+            try
+            {
+                action(this, state);
+            }
+            catch
+            {
+                // Result observers are advisory and must not interrupt protocol progress.
+            }
         }
     }
 

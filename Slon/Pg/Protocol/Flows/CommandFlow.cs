@@ -9,21 +9,17 @@ using FlowCallerInteractionCoreResult = System.ValueTuple;
 
 namespace Slon.Pg.Protocol.Flows;
 
-interface ICommandFlowCancellationTarget
+interface ICommandFlowObserver
 {
-    void SetActiveFlow(CommandFlow flow);
-    void ClearActiveFlow(CommandFlow flow);
+    void OnFlowStarted(CommandFlow flow);
+    void OnCommandResult(CommandFlow flow, CommandResult result);
+    void OnFlowEnded(CommandFlow flow);
 }
 
 readonly struct CommandFlowOptions
 {
-    public ICommandFlowCancellationTarget? CancellationTarget { get; init; }
-    public Action<CommandResult, object?>? OnCommandResultAction { get; init; }
-    public object? OnCommandResultActionState { get; init; }
-    public Action<CommandDescriptor, PgError, object?>? OnCommandErrorAction { get; init; }
-    public object? OnCommandErrorActionState { get; init; }
+    public ICommandFlowObserver? Observer { get; init; }
     public CommandList Commands { get; init; }
-    public int LeadingResultCount { get; init; }
 }
 
 sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSource<FlowCallerInteractionCoreResult>, IValueTaskSource
@@ -146,7 +142,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
     {
         IsAsync = async;
         _options = options;
-        options.CancellationTarget?.SetActiveFlow(this);
+        options.Observer?.OnFlowStarted(this);
         // Arm before publication: teardown may complete the source concurrently even before enumeration.
         _enumeratorMoveNextTaskSource.CanCompleteConcurrently = true;
         return this;
@@ -160,8 +156,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
             : _flowCancellationToken;
 
     public int CommandCount => _options.Commands.Count;
-    internal int LeadingResultCount => _options.LeadingResultCount;
-    internal int VisibleCommandCount => CommandCount - LeadingResultCount;
+    internal int VisibleCommandCount => _options.Commands.VisibleCount;
     public bool IsResultReady => _isResultReady;
 
     public Enumerator GetEnumerator()
@@ -415,13 +410,16 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
             // User cancellation must not cancel activation or wire I/O. The flow observes it after
             // activation, drains itself to RFQ, then delivers OCE without invoking pipeline recovery.
             _decoder = await context.GetDecoderAuto().ConfigureAwait(false);
+            var publishedResult = false;
             while (++_commandIndex < CommandCount)
             {
                 _isResultReady = false;
                 bool hasPreparedDescription;
+                bool suppressEnumeration;
                 {
                     ref readonly var command = ref _options.Commands.ItemRef(_commandIndex);
                     _decoder.ReadTimeout = command.Timeout;
+                    suppressEnumeration = command.SuppressEnumeration;
                     hasPreparedDescription = command.Descriptor is { IsPrepared: true, PreparedRowDescription: not null }
                         && !command.DescribeOnly;
                 }
@@ -525,16 +523,13 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                     }
                     result.Initialize(_commandIndex, descriptor, _requestedRowDescription, !resultCommand.DescribeOnly, resultCommand.IsSimple());
                 }
-                if (IsConsumingNonQuery)
+                try
                 {
-                    try
-                    {
-                        _options.OnCommandResultAction?.Invoke(result, _options.OnCommandResultActionState);
-                    }
-                    catch
-                    {
-                        // Result observers are advisory and must not interrupt protocol progress.
-                    }
+                    _options.Observer?.OnCommandResult(this, result);
+                }
+                catch
+                {
+                    // Result observers are advisory and must not interrupt protocol progress.
                 }
 
                 // Disposal drains without another result handoff. Graceful close instead faults the
@@ -547,11 +542,12 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                     DeliverClose(context.ClosedException!);
                     MarkConsumerGoneByBody();
                 }
-                if (!IsDraining && !IsConsumingNonQuery)
+                var consumeInternally = IsConsumingNonQuery || suppressEnumeration;
+                if (!IsDraining && !consumeInternally)
                 {
                     // Eager async execution must wait for the consumer to arm generation zero before
                     // publishing its first result. Synchronous execution already runs on that caller.
-                    if (_commandIndex is 0 && IsAsync)
+                    if (!publishedResult && IsAsync)
                     {
                         await _callerInteractionCore.GetGateTask(this).ConfigureAwait(false);
                         HandleStoppingGate(context);
@@ -560,6 +556,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                     if (!IsDraining && !IsConsumingNonQuery)
                     {
                         _isResultReady = true;
+                        publishedResult = true;
                         // Result continuations run asynchronously so the body can reach the next gate
                         // before user code asks for the next result. Buffered batches then advance inline
                         // from MoveNextAsync instead of suspending one Task state machine per result.
@@ -602,7 +599,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                 // This also causes us to pick up any I/O exception thrown during user code that was stored on the resultmessage enumerator.
                 // In drain mode this dispose IS the drain: it reads remaining DataRows + CommandComplete for the current command.
                 (PgError Error, TransactionStatus TransactionStatus)? completeError;
-                if (IsConsumingNonQuery)
+                if (consumeInternally)
                 {
                     while (_decoder.Current.Header.Type is PgTypes.BackendType.DataRow)
                     {
@@ -628,20 +625,12 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                     completeError = resultEnumerator.CompleteError;
                 }
 
-                var commandError = _pgError ?? completeError?.Error;
-                if (commandError is { } observedError)
+                if (suppressEnumeration && result.Error is { } suppressedError && !IsOwnCancellation(suppressedError))
                 {
-                    try
-                    {
-                        _options.OnCommandErrorAction?.Invoke(
-                            _options.Commands.ItemRef(_commandIndex).Descriptor,
-                            observedError,
-                            _options.OnCommandErrorActionState);
-                    }
-                    catch
-                    {
-                        // Error observers are advisory and must not interrupt protocol progress.
-                    }
+                    (_drainErrors ??= new()).Add(new PostgresException(suppressedError));
+                    capturedThisCommand = true;
+                    if (!IsDraining)
+                        MarkConsumerGoneByBody();
                 }
 
                 {
@@ -657,7 +646,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                     // CompleteError - dedupe so one fault is one entry). A drain skips errors already owned
                     // by a live consumer; direct nonquery consumption has taken that ownership even if it
                     // raced a result publication.
-                    if ((IsConsumingNonQuery || IsDraining && !_isResultReady)
+                    if ((consumeInternally || IsDraining && !_isResultReady)
                         && !capturedThisCommand && completeError is { } err && !IsOwnCancellation(err.Error))
                         (_drainErrors ??= new()).Add(new PostgresException(err.Error));
                 }
@@ -739,14 +728,6 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                 if (!ReferenceEquals(_enumeratorCurrent, next))
                     _enumeratorCurrent = next;
 
-                try
-                {
-                    _options.OnCommandResultAction?.Invoke(next!, _options.OnCommandResultActionState);
-                }
-                catch
-                {
-                    // TODO log.
-                }
             }
 
             // Under close, the consumer owns delivery to whatever generation it armed (it self-delivers
@@ -1087,13 +1068,13 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
     protected override void OnExecutionCompleted(Exception? exception)
     {
         Volatile.Read(ref _cancelDelivery)?.TrySetResult();
-        _options.CancellationTarget?.ClearActiveFlow(this);
+        _options.Observer?.OnFlowEnded(this);
         _options.Commands.Return();
     }
 
     protected override void OnDiscarded()
     {
-        _options.CancellationTarget?.ClearActiveFlow(this);
+        _options.Observer?.OnFlowEnded(this);
         _options.Commands.Return();
     }
 

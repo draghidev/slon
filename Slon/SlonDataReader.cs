@@ -54,38 +54,6 @@ public sealed partial class SlonDataReader
                 : CommandResult.RowBuffering.Buffered;
         }
 
-        public void SkipLeadingResults(int count)
-        {
-            while (count-- > 0)
-            {
-                if (!_enumerator.MoveNext())
-                    ThrowHelper.ThrowUnexpected("The flow returned fewer infrastructure results than expected.");
-                var result = _enumerator.Current;
-                foreach (var _ in result) { }
-                result.GetCommandComplete();
-            }
-        }
-
-        public async ValueTask SkipLeadingResultsAsync(int count, CancellationToken cancellationToken)
-        {
-            while (count-- > 0)
-            {
-                if (!await _enumerator.MoveNextAsync(cancellationToken).ConfigureAwait(false))
-                    ThrowHelper.ThrowUnexpected("The flow returned fewer infrastructure results than expected.");
-                var result = _enumerator.Current;
-                var rows = result.GetAsyncEnumerator(cancellationToken);
-                try
-                {
-                    while (await rows.MoveNextAsync().ConfigureAwait(false)) { }
-                }
-                finally
-                {
-                    await rows.DisposeAsync().ConfigureAwait(false);
-                }
-                result.GetCommandComplete();
-            }
-        }
-
         public long? _recordsAffected;
 
         bool EnumerateCommands => false; // _behavior.HasFlag((CommandBehavior)64);
@@ -223,7 +191,6 @@ public sealed partial class SlonDataReader
         try
         {
             var core = new Core(enumerator, behavior, flow.VisibleCommandCount, asyncExecute: false);
-            core.SkipLeadingResults(flow.LeadingResultCount);
             core.NextResult();
             // TODO now that we don't need a DataReader while we wait for the first result we can pool the reader on the connection.
             return new SlonDataReader { State = ReaderState.Active, _core = core };
@@ -244,7 +211,6 @@ public sealed partial class SlonDataReader
         try
         {
             var core = new Core(enumerator, behavior, flow.VisibleCommandCount, asyncExecute: true);
-            await core.SkipLeadingResultsAsync(flow.LeadingResultCount, cancellationToken).ConfigureAwait(false);
 
             // This is an inline copy of NextResultAsync (minus the 'Current' check) to avoid an extra state machine.
             var next = false;

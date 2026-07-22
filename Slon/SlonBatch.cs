@@ -1,12 +1,13 @@
 using System.Data;
 using System.Data.Common;
+using Slon.Pg;
 using Slon.Pg.Protocol.Flows;
 
 namespace Slon;
 
 // TODO introduce execute overloads that take an array of parameter collections, requiring one for each batch command.
 /// <inheritdoc cref="System.Data.Common.DbBatch" />
-public sealed class SlonBatch : DbBatch, ICommandFlowCancellationTarget
+public sealed class SlonBatch : DbBatch, ICommandFlowObserver
 {
     AdoBatchCore<SlonBatchCommand> _batchCore;
     SlonBatchCommands? _batchCommands;
@@ -195,11 +196,14 @@ public sealed class SlonBatch : DbBatch, ICommandFlowCancellationTarget
     public Task CancelAsync(CancellationToken cancellationToken = default)
         => _batchCore.CancelAsync(cancellationToken);
 
-    void ICommandFlowCancellationTarget.SetActiveFlow(CommandFlow flow)
-        => _batchCore.SetActiveFlow(flow);
+    void ICommandFlowObserver.OnFlowStarted(CommandFlow flow)
+        => _batchCore.OnFlowStarted(flow);
 
-    void ICommandFlowCancellationTarget.ClearActiveFlow(CommandFlow flow)
-        => _batchCore.ClearActiveFlow(flow);
+    void ICommandFlowObserver.OnCommandResult(CommandFlow flow, CommandResult result)
+        => _batchCore.OnCommandResult(flow, result);
+
+    void ICommandFlowObserver.OnFlowEnded(CommandFlow flow)
+        => _batchCore.OnFlowEnded(flow);
 
     /// <summary>
     /// Setting this property is ignored by Slon. PostgreSQL only supports a single transaction at a given time on

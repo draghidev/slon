@@ -9,6 +9,8 @@ readonly struct Command()
 {
     // Whether the command only describes itself, without execution, also redescribes prepared commands.
     public bool DescribeOnly { get; init; } = false;
+    // Process the complete response, but omit it from the flow enumerator.
+    public bool SuppressEnumeration { get; init; } = false;
     public bool WithSync { get; init; } = false;
     public bool PreferSimple { get; init; } = false;
     public CommandDescriptor Descriptor { get; init; } = default;
@@ -57,6 +59,20 @@ readonly struct CommandList
     }
 
     public int Count => _commands is null ? 1 : _count;
+
+    public int VisibleCount
+    {
+        get
+        {
+            var count = 0;
+            foreach (ref readonly var command in AsSpan())
+            {
+                if (!command.SuppressEnumeration)
+                    count++;
+            }
+            return count;
+        }
+    }
 
     public Command this[int i] => ItemRef(i);
 
