@@ -173,7 +173,12 @@ sealed class ExclusiveAccessFlow : PgClientFlow
                 $"The exclusive scope completed leaving the connection in transaction status '{_protocol.TransactionStatus}'. " +
                 "The transaction must be committed or rolled back before completing the scope.");
         if (_protocol.ScopeResetCommand is { } resetCommand)
+        {
+            // An inner flow's CancelRequest is connection-wide. Do not extend its exposed prefix
+            // with the outer scope reset while delivery is unresolved.
+            await context.WaitForCancellationAttempt().ConfigureAwait(false);
             await ResetSession(context, resetCommand).ConfigureAwait(false);
+        }
         return ValueTask.CompletedTask;
     }
 

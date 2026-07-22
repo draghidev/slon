@@ -20,10 +20,29 @@ sealed partial class PgClientProtocol
     bool _hasCancellationIntents;
     bool _hasCancellationExposures;
     bool _hasUnassignedCancellationBoundary;
+    // Wire-wide admission latch. It confines growth of the exposed prefix while delivery is
+    // unresolved; bytes already written remain part of the cancellation exposure.
+    TaskCompletionSource? _cancellationAttempt;
 
     internal bool HasPendingCancellation
         => Volatile.Read(ref _hasCancellationIntents) || Volatile.Read(ref _hasCancellationExposures);
     internal bool HasUnassignedCancellationBoundary => Volatile.Read(ref _hasUnassignedCancellationBoundary);
+
+    ValueTask WaitForCancellationAttempt()
+    {
+        lock (_syncRoot)
+            return _cancellationAttempt is { } attempt ? new(attempt.Task) : default;
+    }
+
+    void ArmCancellationAttemptLocked()
+        => _cancellationAttempt ??= new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    void ReleaseCancellationAttemptLocked()
+    {
+        var attempt = _cancellationAttempt;
+        _cancellationAttempt = null;
+        attempt?.SetResult();
+    }
 
     // Flow-owned request state. It ends when delivery becomes possible; any remaining connection-wide
     // reach is represented by a CancellationExposure instead.
@@ -94,6 +113,7 @@ sealed partial class PgClientProtocol
         _cancellationDispatching = true;
         intent.Dispatching = true;
         intent.Attempts++;
+        ArmCancellationAttemptLocked();
         return true;
     }
 
@@ -135,6 +155,9 @@ sealed partial class PgClientProtocol
 
         lock (_syncRoot)
         {
+            // Release admission before processing the result. The request attempt is over; all
+            // remaining state describes its possible reach and must not hold later writes.
+            ReleaseCancellationAttemptLocked();
             intent.Dispatching = false;
             _cancellationDispatching = false;
             if (state is CancelRequestState.NotSent)

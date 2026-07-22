@@ -921,6 +921,8 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
             static async ValueTask<PipelineItemResult> ExecuteCore(
                 Control control, PgClientFlow item, CancellationToken cancellationToken)
             {
+                await control.WaitForCancellationAttempt().ConfigureAwait(false);
+
                 // No cross-item pre-flush: buffered bytes are flushed by the writing flow's own
                 // end-of-write flush once accumulation crosses the writer's threshold (which reads the
                 // shared, cumulative UnflushedBytes), and any sub-threshold remainder is drained by the
@@ -934,6 +936,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
             static async ValueTask<PipelineItemResult> ExecutePipelineTaskRecovery(
                 Control control, PgClientFlow item, CancellationToken cancellationToken)
             {
+                await control.WaitForCancellationAttempt().ConfigureAwait(false);
                 var tasks = await control.Execute(item).ConfigureAwait(false);
                 return new PipelineItemResult(tasks.TrailingExecutionTask, tasks.PipelineTask);
             }
@@ -1062,6 +1065,8 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         // Cancellation needs a proof-quality idle level; the slot reads are deliberately stale-tolerant.
         bool _isIdle = true;
         public bool IsIdle => Volatile.Read(ref _isIdle);
+        public ValueTask WaitForCancellationAttempt()
+            => protocol.WaitForCancellationAttempt();
         public void RequestServerCancellation(PgClientFlow instigator, PgClientFlow.BackendCancellationExtent extent, int window)
             => protocol.RequestServerCancellation(instigator, this, extent, window);
         public void OnFlowSubstituted(PgClientFlow from, PgClientFlow to)

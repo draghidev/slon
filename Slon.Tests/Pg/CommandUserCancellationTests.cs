@@ -11,6 +11,23 @@ namespace Slon.Tests.Pg;
 [TestClass]
 public class CommandUserCancellationTests
 {
+    sealed class AdmissionProbeFlow : PgClientFlow
+    {
+        readonly Action _onExecute;
+
+        public AdmissionProbeFlow(Action onExecute) : base(supportsPipelining: true)
+        {
+            _onExecute = onExecute;
+            IsAsync = true;
+        }
+
+        protected override ValueTask<FlowTasks> ExecuteAuto(Context context)
+        {
+            _onExecute();
+            return new(new FlowTasks());
+        }
+    }
+
     // Token is already cancelled before MoveNextAsync is called: the first MoveNextAsync surfaces OCE.
     [TestMethod]
     public async Task UserCt_PreFired_FirstMoveNextSurfacesOce()
@@ -200,6 +217,48 @@ public class CommandUserCancellationTests
         delivery.TrySetResult(CancelRequestState.NotSent);
         await WaitUntilAsync(() => !protocol.HasPendingCancellation);
         Assert.IsFalse(protocol.Completion.IsCompleted);
+        await PgTestPool.RunAsync(protocol, "select 1");
+    }
+
+    [TestMethod]
+    [DoNotParallelize]
+    public async Task ServerCancel_AttemptHoldsLaterFlowExecutionUntilDeliverySettles()
+    {
+        await using var blocker = await PgAdvisoryLock.AcquireAsync();
+        var senderEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var delivery = new TaskCompletionSource<CancelRequestState>(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var protocol = await PgTestPool.NewIsolatedAsync(o => o.CancelSender = async (_, _, _) =>
+        {
+            senderEntered.TrySetResult();
+            return await delivery.Task;
+        });
+
+        using var cts = new CancellationTokenSource();
+        var canceledFlow = new CommandFlow(async: true, blocker.WaitCommand);
+        Assert.IsTrue(protocol.TryQueue(canceledFlow, cancellationToken: cts.Token));
+        var canceled = canceledFlow.GetAsyncEnumerator(cts.Token);
+        var canceledMove = canceled.MoveNextAsync(cts.Token).AsTask();
+
+        await blocker.WaitUntilContendedAsync(protocol.FlowControl.BackendProcessId);
+        cts.Cancel();
+        await senderEntered.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+        var successorExecuted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var successor = new AdmissionProbeFlow(successorExecuted.SetResult);
+        Assert.IsTrue(protocol.TryQueue(successor));
+        await WaitUntilAsync(() => ReferenceEquals(protocol.FlowControl.ExecutorFlow, successor));
+        Assert.IsFalse(successorExecuted.Task.IsCompleted,
+            "A later flow executed while cancellation delivery was still unknown.");
+
+        delivery.SetResult(CancelRequestState.Sent);
+        await successorExecuted.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        await blocker.ReleaseAsync();
+
+        await Assert.ThrowsExactlyAsync<OperationCanceledException>(
+            async () => await canceledMove.WaitAsync(TimeSpan.FromSeconds(10)));
+        await canceled.DisposeAsync();
+        await successor.WaitForComplete().AsTask().WaitAsync(TimeSpan.FromSeconds(10));
+        await WaitUntilAsync(() => !protocol.HasPendingCancellation);
         await PgTestPool.RunAsync(protocol, "select 1");
     }
 

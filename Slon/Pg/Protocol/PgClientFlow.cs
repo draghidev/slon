@@ -313,6 +313,9 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
         public PgEncoder GetEncoder()
             => _executionControl.GetEncoder();
 
+        internal ValueTask WaitForCancellationAttempt()
+            => _executionControl.WaitForCancellationAttempt();
+
         /// Returns an awaitable for the decoder. Activation is a cross-flow rendezvous completed by
         /// another flow's thread, so GetResult throws if not yet completed - async bodies await,
         /// sync bodies use GetDecoderAuto, and direct dispatchers use IsCompleted + (Unsafe)OnCompleted.
@@ -610,6 +613,7 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
         // Tokens are routed from Control (protocol-owned). No per-flow storage.
         public CancellationToken AbortToken => control.AbortToken;
         public CancellationToken StoppingToken => control.StoppingToken;
+        internal ValueTask WaitForCancellationAttempt() => control.WaitForCancellationAttempt();
         public bool IsProtocolClosed => control.ClosedException is not null;
         public PgClientClosedException? ClosedException => control.ClosedException;
 
