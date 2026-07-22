@@ -1073,6 +1073,17 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         public void RequestServerCancellation(PgClientFlow instigator, PgClientFlow.BackendCancellationExtent extent,
             int window, PgClientFlow.BackendCancellationTiming timing)
             => protocol.RequestServerCancellation(instigator, this, extent, window, timing);
+        public bool IsAtCancellationReadFrontier(PgClientFlow flow, int window)
+            => Decoder.IsAtCancellationReadFrontier(flow, window);
+        public void EnterCancellationReadFrontier(PgClientFlow flow, int window)
+        {
+            Decoder.SetCancellationReadFrontier(flow, window);
+            if (protocol.HasCancellationIntents)
+                protocol.OnCancellationReadFrontier(this, flow, window);
+        }
+        public void LeaveCancellationReadFrontier() => Decoder.ClearCancellationReadFrontier();
+        public bool HasPriorCancellationExposure(PgClientFlow flow, int window)
+            => protocol.HasPriorCancellationExposure(this, flow, window);
         public void OnFlowSubstituted(PgClientFlow from, PgClientFlow to)
             => protocol.OnFlowSubstituted(this, from, to);
         internal string? ScopeResetCommand => protocol.ScopeResetCommand;

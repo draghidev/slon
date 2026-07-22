@@ -26,6 +26,9 @@ sealed class PostgresException : Exception
     public string? ColumnName => OriginalPgError.ColumnName;
     public string? ConstraintName => OriginalPgError.ConstraintName;
     public bool IsTransient => OriginalPgError.IsTransientError;
+    /// True when this operation was cancelled by a CancelRequest issued for an earlier
+    /// pipelined operation on the same PostgreSQL connection.
+    public bool IsCollateralCancellation => OriginalPgError.IsCollateralCancellation;
 
     // Eager: built at throw time while the buffer is valid, so Message renders anywhere the exception
     // travels. Replaces the base "Exception of type ... was thrown".
@@ -36,9 +39,13 @@ sealed class PostgresException : Exception
         var text = error.MessageText is { Length: > 0 } m
             ? m
             : "An error response was received from the PostgreSQL backend.";
-        return error.SqlState is { Length: > 0 } code
+        var message = error.SqlState is { Length: > 0 } code
             ? $"{severity}: {text} (SQLSTATE {code})"
             : $"{severity}: {text}";
+        return error.IsCollateralCancellation
+            ? message + " This operation was canceled by a PostgreSQL CancelRequest intended for an earlier pipelined operation. " +
+                "PostgreSQL applies the request to whichever operation is running when it is processed, so clients cannot eliminate this race."
+            : message;
     }
 
     [DoesNotReturn]

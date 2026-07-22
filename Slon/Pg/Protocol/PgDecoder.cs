@@ -28,6 +28,8 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
     const long ClaimedTimeoutTicks = long.MinValue;
     const long ExpiringTimeoutTicks = long.MinValue + 1;
     long _remainingTimeoutTicks;
+    int _cancellationReadFrontierWindow = -1;
+    PgClientFlow? _cancellationReadFrontierFlow;
 
     PgClientFlow.ExecutionControl CurrentExecutionControl
     {
@@ -179,6 +181,40 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
         return new TimeoutException("Read timed out.", cause);
     }
 
+    PgClientFlow EnterCancellationReadFrontier()
+    {
+        var execution = CurrentExecutionControl;
+        var flow = execution.Flow;
+        var window = flow.CancellationWindow;
+        _control.EnterCancellationReadFrontier(flow, window);
+        return flow;
+    }
+
+    void LeaveCancellationReadFrontier(PgClientFlow flow)
+        => _control.LeaveCancellationReadFrontier();
+
+    internal void SetCancellationReadFrontier(PgClientFlow flow, int window)
+    {
+        _cancellationReadFrontierFlow = flow;
+        // Full-fence publication before the caller probes for cancellation intents. The intent side
+        // atomically publishes its level before probing this frontier, closing the two-sided skip race.
+        Interlocked.Exchange(ref _cancellationReadFrontierWindow, window);
+    }
+
+    internal void ClearCancellationReadFrontier()
+    {
+        Volatile.Write(ref _cancellationReadFrontierWindow, -1);
+        _cancellationReadFrontierFlow = null;
+    }
+
+    internal bool IsAtCancellationReadFrontier(PgClientFlow flow, int window)
+    {
+        var observedWindow = Volatile.Read(ref _cancellationReadFrontierWindow);
+        return observedWindow == window
+            && ReferenceEquals(_cancellationReadFrontierFlow, flow)
+            && Volatile.Read(ref _cancellationReadFrontierWindow) == observedWindow;
+    }
+
     /// Flow-owned escape hatch from a parked read. Without it the only break-out is protocol
     /// abort. An uncaught firing triggers the protocol's recovery path, so prefer a
     /// coordination-boundary check in connection-preserving flows.
@@ -203,6 +239,7 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
                 return new(false);
 
             var readToken = _cancellationTokenSource.Token;
+            var frontierFlow = EnterCancellationReadFrontier();
             try
             {
                 if (channel.TryBeginDirectRead(readToken, out var directReadTask))
@@ -212,20 +249,25 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
                         while (true)
                         {
                             if (!directReadTask.IsCompletedSuccessfully)
-                                return MoveNextAsyncCore(null, directReadTask, null, cancellationToken);
+                                return MoveNextAsyncCore(null, directReadTask, null, cancellationToken, frontierFlow);
                             if (channel.CompleteDirectRead(directReadTask.Result, readToken, out directReadTask, out var readFinished, out var directReadCompleted))
                                 break;
                             if (!readFinished)
                                 continue;
                             if (directReadCompleted)
+                            {
+                                LeaveCancellationReadFrontier(frontierFlow);
                                 return new(false);
+                            }
                             goto nextRead;
                         }
+                        LeaveCancellationReadFrontier(frontierFlow);
                         continue;
                     }
                     catch (Exception ex)
                     {
                         channel.AbortDirectRead();
+                        LeaveCancellationReadFrontier(frontierFlow);
                         if (_cancellationTokenSource.IsCancellationRequested)
                             throw TranslateReadCancellation(ex, cancellationToken);
                         throw;
@@ -234,7 +276,8 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
 
                 var readTask = channel.ReadAsync(readToken);
                 if (!readTask.IsCompletedSuccessfully)
-                    return MoveNextAsyncCore(readTask, null, null, cancellationToken);
+                    return MoveNextAsyncCore(readTask, null, null, cancellationToken, frontierFlow);
+                LeaveCancellationReadFrontier(frontierFlow);
                 if (channel.TryMoveNextBatch(readTask.Result, _cancellationTokenSource.Token, out var readCompleted))
                     continue;
                 if (readCompleted)
@@ -242,14 +285,20 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
             }
             catch (Exception ex) when (_cancellationTokenSource.IsCancellationRequested)
             {
+                LeaveCancellationReadFrontier(frontierFlow);
                 throw TranslateReadCancellation(ex, cancellationToken);
+            }
+            catch
+            {
+                LeaveCancellationReadFrontier(frontierFlow);
+                throw;
             }
             nextRead:;
         }
 
         [MethodImpl(MethodImplOptions.NoInlining)]
         [AsyncMethodBuilder(typeof(NonContextRestoringPoolingValueTaskMethodBuilder<>))]
-        async ValueTask<bool> MoveNextAsyncCore(ValueTask<ReadResult>? readTask, ValueTask<int>? directReadTask, ValueTask<bool>? messageHandledTask, CancellationToken cancellationToken)
+        async ValueTask<bool> MoveNextAsyncCore(ValueTask<ReadResult>? readTask, ValueTask<int>? directReadTask, ValueTask<bool>? messageHandledTask, CancellationToken cancellationToken, PgClientFlow? frontierFlow = null)
         {
             var timeoutSet = false;
             var registration = cancellationToken.UnsafeRegister(static (state, _) => ((CancellationTokenSource)state!).Cancel(), _cancellationTokenSource);
@@ -274,6 +323,8 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
                                 timeoutSet = true;
                             }
                             var result = await pendingRead.ConfigureAwait(false);
+                            LeaveCancellationReadFrontier(frontierFlow!);
+                            frontierFlow = null;
                             readTask = null;
                             if (_channel.TryMoveNextBatch(result, _cancellationTokenSource.Token, out var readCompleted))
                                 continue;
@@ -298,6 +349,8 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
                             var length = await pendingDirectRead.ConfigureAwait(false);
                             if (_channel.CompleteDirectRead(length, _cancellationTokenSource.Token, out var nextDirectRead, out var readFinished, out var readCompleted))
                             {
+                                LeaveCancellationReadFrontier(frontierFlow!);
+                                frontierFlow = null;
                                 directReadTask = null;
                                 continue;
                             }
@@ -307,12 +360,19 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
                                 continue;
                             }
                             directReadTask = null;
+                            LeaveCancellationReadFrontier(frontierFlow!);
+                            frontierFlow = null;
                             if (readCompleted)
                                 return false;
                         }
                         catch (Exception ex)
                         {
                             _channel.AbortDirectRead();
+                            if (frontierFlow is not null)
+                            {
+                                LeaveCancellationReadFrontier(frontierFlow);
+                                frontierFlow = null;
+                            }
                             if (_cancellationTokenSource.IsCancellationRequested)
                                 throw TranslateReadCancellation(ex, cancellationToken);
                             throw;
@@ -341,6 +401,7 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
                     try
                     {
                         var token = _cancellationTokenSource.Token;
+                        frontierFlow = EnterCancellationReadFrontier();
                         if (_channel.TryBeginDirectRead(token, out var nextDirectRead))
                             directReadTask = nextDirectRead;
                         else
@@ -352,6 +413,8 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
             }
             finally
             {
+                if (frontierFlow is not null)
+                    LeaveCancellationReadFrontier(frontierFlow);
                 registration.Dispose();
                 if (timeoutSet)
                     SetRemainingTimeout(Timeout.InfiniteTimeSpan);
@@ -363,7 +426,19 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
     public BackendMessage Current
     {
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        get => _channel.Current;
+        get => EnrichError(_channel.Current);
+    }
+
+    BackendMessage EnrichError(BackendMessage message)
+    {
+        if (message.Header.Type is not PgTypes.BackendType.ErrorResponse)
+            return message;
+
+        var execution = CurrentExecutionControl;
+        var flow = execution.Flow;
+        if (_control.HasPriorCancellationExposure(flow, flow.CancellationWindow))
+            message.MarkPriorCancellationExposure();
+        return message;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -390,7 +465,7 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
                 _channel.TryMoveNext();
                 if (handled)
                     continue;
-                message = _channel.Current;
+                message = Current;
                 return true;
             }
 
@@ -508,6 +583,7 @@ sealed class BackendMessageContext
     BackendMessageBatch _remainingBatch;
     BackendMessage _current;
     short _version;
+    bool _hasPriorCancellationExposure;
 
     // Peek slot: TryPeekNext advances the real batch cursor into here, so the header parse
     // happens at peek time and a follow-up TryMoveNext can publish without re-parsing. _hasPeeked
@@ -530,8 +606,23 @@ sealed class BackendMessageContext
         return _current;
     }
 
+    public void MarkPriorCancellationExposure(short token)
+    {
+        if (_version != token)
+            ThrowHelper.ThrowInvalidOperation("Backend message has been invalidated by moving to the next message.");
+        _hasPriorCancellationExposure = true;
+    }
+
+    public bool HasPriorCancellationExposure(short token)
+    {
+        if (_version != token)
+            ThrowHelper.ThrowInvalidOperation("Backend message has been invalidated by moving to the next message.");
+        return _hasPriorCancellationExposure;
+    }
+
     public bool TryMoveNext()
     {
+        _hasPriorCancellationExposure = false;
         if (_hasPeeked)
         {
             _hasPeeked = false;
@@ -584,6 +675,7 @@ readonly struct ErrorOrNoticeMessage
     // before the next read advances the buffer. Preserve() copies it for errors that escape that window.
     readonly ReadOnlySequence<byte> _body;
     public bool IsNotice { get; }
+    public bool HasPriorCancellationExposure { get; }
     /// <summary>
     /// Specifies whether the exception is considered transient, that is, whether retrying the operation could
     /// succeed (e.g. a network error). Check <see cref="SqlState"/>.
@@ -663,11 +755,13 @@ readonly struct ErrorOrNoticeMessage
 
     public ReadOnlySpan<PgTypes.BackendType> Expected => _expected;
 
-    ErrorOrNoticeMessage(ReadOnlySequence<byte> body, PgTypes.BackendType[] expected, bool isNotice, bool unhandled)
+    ErrorOrNoticeMessage(ReadOnlySequence<byte> body, PgTypes.BackendType[] expected, bool isNotice, bool unhandled,
+        bool hasPriorCancellationExposure = false)
     {
         _body = body;
         _expected = expected;
         IsNotice = isNotice;
+        HasPriorCancellationExposure = hasPriorCancellationExposure;
         Unhandled = unhandled;
         SqlState = GetAscii((byte)'C');
     }
@@ -678,7 +772,7 @@ readonly struct ErrorOrNoticeMessage
     /// human-readable fields decode as UTF8 (TODO: thread ClientEncoding for non-UTF8 connections);
     /// the protocol-defined fields (C/S/V/P/p/L/R) are always ASCII.
     public ErrorOrNoticeMessage Preserve()
-        => new(new ReadOnlySequence<byte>(_body.ToArray()), _expected, IsNotice, Unhandled);
+        => new(new ReadOnlySequence<byte>(_body.ToArray()), _expected, IsNotice, Unhandled, HasPriorCancellationExposure);
 
     // Scan the field block for fieldType, returning its value bytes. One pass per access; the body is
     // small and the common path reads only a couple of fields.
@@ -710,7 +804,8 @@ readonly struct ErrorOrNoticeMessage
         message.EnsureExpected(PgTypes.BackendType.ErrorResponse, PgTypes.BackendType.NoticeResponse);
         message.EnsureBuffered();
 
-        return new(message.GetSequence(), expected.ToArray(), message.Header.Type is PgTypes.BackendType.NoticeResponse, unhandled);
+        return new(message.GetSequence(), expected.ToArray(), message.Header.Type is PgTypes.BackendType.NoticeResponse,
+            unhandled, message.HasPriorCancellationExposure);
     }
 
     // Test seam: build directly from a raw error/notice field block, bypassing the BackendMessage
@@ -752,6 +847,8 @@ sealed class PgError
     public string? Line => _message.Line;
     public string? Routine => _message.Routine;
     public bool IsTransientError => _message.IsTransientError;
+    public bool IsCollateralCancellation
+        => _message.HasPriorCancellationExposure && SqlState == PgErrorCodes.QueryCanceled;
 
     /// Copies the underlying field bytes so the error can outlive the transient message buffer.
     /// See <see cref="ErrorOrNoticeMessage.Preserve"/>.

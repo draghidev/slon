@@ -303,6 +303,12 @@ readonly struct BackendMessage
         return ErrorOrNoticeMessage.Create(this, expected, unhandled);
     }
 
+    internal void MarkPriorCancellationExposure()
+        => _context.MarkPriorCancellationExposure(_token);
+
+    internal bool HasPriorCancellationExposure
+        => _context.HasPriorCancellationExposure(_token);
+
     // We have no buffer for header only messages.
     public bool Buffered => _buffered;
 }

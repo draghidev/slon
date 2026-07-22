@@ -26,6 +26,7 @@ sealed partial class PgClientProtocol
 
     internal bool HasPendingCancellation
         => Volatile.Read(ref _hasCancellationIntents) || Volatile.Read(ref _hasCancellationExposures);
+    internal bool HasCancellationIntents => Volatile.Read(ref _hasCancellationIntents);
     internal bool HasUnassignedCancellationBoundary => Volatile.Read(ref _hasUnassignedCancellationBoundary);
 
     ValueTask WaitForCancellationAttempt()
@@ -55,6 +56,9 @@ sealed partial class PgClientProtocol
         internal int Window = window;
         internal bool Dispatching;
         internal bool AwaitingBoundary;
+        // Caller cancellation waits until buffered input has been consumed. Timeouts bypass this
+        // condition because their read cancellation has already established the failure boundary.
+        internal bool RequiresCancellationReadFrontier;
         internal bool InstigatorCompleted;
         internal byte Attempts;
         internal long RemainingDelayTicks;
@@ -90,7 +94,10 @@ sealed partial class PgClientProtocol
                     if (extent > existing.Extent)
                         existing.Extent = extent;
                     if (timing is PgClientFlow.BackendCancellationTiming.Immediate)
+                    {
                         existing.RemainingDelayTicks = 0;
+                        existing.RequiresCancellationReadFrontier = false;
+                    }
                     dispatch = TryBeginCancellationDispatchLocked(existing);
                     intent = existing;
                     break;
@@ -102,12 +109,15 @@ sealed partial class PgClientProtocol
                 intent = new(instigator, control, extent, window);
                 intent.RemainingDelayTicks = timing is PgClientFlow.BackendCancellationTiming.Immediate
                     ? 0 : GetCancelRequestDelayTicks();
+                intent.RequiresCancellationReadFrontier = timing is PgClientFlow.BackendCancellationTiming.AfterGrace;
                 if (_cancellationTail is null)
                     _cancellationHead = intent;
                 else
                     _cancellationTail.Next = intent;
                 _cancellationTail = intent;
-                Volatile.Write(ref _hasCancellationIntents, true);
+                // Full-fence publication before TryBegin probes the read frontier. The reader
+                // atomically publishes its frontier before probing this level.
+                Interlocked.Exchange(ref _hasCancellationIntents, true);
                 dispatch = TryBeginCancellationDispatchLocked(intent);
             }
         }
@@ -120,6 +130,7 @@ sealed partial class PgClientProtocol
         if (_status is not ProtocolStatus.Ready || _cancellationDispatching || intent.Dispatching
             || intent.AwaitingBoundary || intent.InstigatorCompleted || intent.Attempts >= 2
             || intent.RemainingDelayTicks > 0
+            || intent.RequiresCancellationReadFrontier && !IsAtCancellationReadFrontierLocked(intent)
             || !ReferenceEquals(intent.Control.ActivatedFlow, intent.Instigator))
             return false;
         _cancellationDispatching = true;
@@ -127,6 +138,48 @@ sealed partial class PgClientProtocol
         intent.Attempts++;
         ArmCancellationAttemptLocked();
         return true;
+    }
+
+    bool IsAtCancellationReadFrontierLocked(CancellationIntent intent)
+        => intent.Control.IsAtCancellationReadFrontier(intent.Instigator, intent.Window);
+
+    internal void OnCancellationReadFrontier(Control control, PgClientFlow flow, int window)
+    {
+        CancellationIntent? dispatchIntent = null;
+        lock (_syncRoot)
+        {
+            if (!_cancellationDispatching)
+            {
+                for (var intent = _cancellationHead; intent is not null; intent = intent.Next)
+                {
+                    if (TryBeginCancellationDispatchLocked(intent))
+                    {
+                        dispatchIntent = intent;
+                        break;
+                    }
+                }
+            }
+        }
+        if (dispatchIntent is not null)
+            _ = DispatchCancellationAsync(dispatchIntent);
+    }
+
+    internal bool HasPriorCancellationExposure(Control control, PgClientFlow flow, int window)
+    {
+        if (!Volatile.Read(ref _hasCancellationExposures))
+            return false;
+        lock (_syncRoot)
+        {
+            for (var exposure = _exposureHead; exposure is not null; exposure = exposure.Next)
+            {
+                if (ReferenceEquals(exposure.Control, control)
+                    && ReferenceEquals(exposure.BoundaryFlow, flow)
+                    && exposure.BoundaryWindow == window
+                    && !ReferenceEquals(exposure.Instigator, flow))
+                    return true;
+            }
+        }
+        return false;
     }
 
     long GetCancelRequestDelayTicks()
@@ -332,6 +385,7 @@ sealed partial class PgClientProtocol
                     intent.Window = completedWindow + 1;
                     intent.Attempts = 0;
                     intent.RemainingDelayTicks = GetCancelRequestDelayTicks();
+                    intent.RequiresCancellationReadFrontier = true;
                     if (TryBeginCancellationDispatchLocked(intent))
                         dispatchIntent = intent;
                 }

@@ -472,6 +472,8 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
     internal ExecutionControl GetExecutionControl(PgClientProtocol.Control control) => new(this, control);
     internal readonly struct ExecutionControl(PgClientFlow flow, PgClientProtocol.Control control)
     {
+        internal PgClientFlow Flow => flow;
+
         // Any sync flow causes pipeline stalls (blocks execution loop until decoder is available) so effectively can't pipeline.
         public bool IsPipelined => flow is { _supportsPipelining: true, _isAsyncAtBind: true };
         public bool IsAsync => flow.IsAsync;
