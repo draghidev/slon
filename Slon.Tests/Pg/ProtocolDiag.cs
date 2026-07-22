@@ -39,7 +39,7 @@ static class ProtocolDiag
 
     internal static string Gauges(PgClientProtocol protocol)
         => $"backlog={protocol.Backlog} outstanding={protocol.Outstanding} " +
-           $"executor={Describe(protocol.FlowControl.ExecutorFlow)} activated={Describe(protocol.FlowControl.ActivatedFlow)}";
+           $"executor={Describe(protocol.FlowControl.ExecutingFlow)} activated={Describe(protocol.FlowControl.ActivatedFlow)}";
 
     // Reflection readout of the source's pump state, test-only.
     internal static string SourceState(PgClientProtocol protocol)

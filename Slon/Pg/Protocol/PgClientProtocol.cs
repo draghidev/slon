@@ -254,7 +254,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         _source = PgClientFlowSource.Create(this, FlowControl, _options.ExecutionScheduler);
         _pipeline = Pipeline.Create<PgClientFlow, Policy, PgClientFlowSource, PgClientFlowSource.Enumerator>(new Policy(this, FlowControl), _source);
         FlowControl.BindSource(_source);
-        FlowControl.BindPipeline(new PipelineFlowSlots<Policy, PgClientFlowSource, PgClientFlowSource.Enumerator>(_pipeline));
+        FlowControl.BindPipeline(_pipeline);
         // Seed the wire's transaction status to Idle before the startup flow is queued. A fresh
         // connection holds no transaction, and StartupFlow's terminating RFQ doesn't route through
         // OnFlowRfq (it never arms _rfqCount - see CopyStartupBuffer), so without this seed the
@@ -1052,17 +1052,49 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
 
     }
 
+    // Erases the pipeline's policy and source types so controls at any nesting depth can read its
+    // execution slots through one closed internal shape.
+    abstract class FlowSlots
+    {
+        FlowSlots() { }
+
+        public abstract PgClientFlow? Executing { get; }
+        public abstract PgClientFlow? Activated { get; }
+
+        public static FlowSlots Create<TPolicy, TSource, TEnumerator>(
+            Pipeline<PgClientFlow, TPolicy, TSource, TEnumerator> pipeline)
+            where TPolicy : IPipelinePolicy<PgClientFlow>
+            where TSource : IPipelineSource<PgClientFlow, TEnumerator>
+            where TEnumerator : struct, IPipelineEnumerator<PgClientFlow>
+            => new PipelineSlots<TPolicy, TSource, TEnumerator>(pipeline);
+
+        sealed class PipelineSlots<TPolicy, TSource, TEnumerator>(
+            Pipeline<PgClientFlow, TPolicy, TSource, TEnumerator> pipeline) : FlowSlots
+            where TPolicy : IPipelinePolicy<PgClientFlow>
+            where TSource : IPipelineSource<PgClientFlow, TEnumerator>
+            where TEnumerator : struct, IPipelineEnumerator<PgClientFlow>
+        {
+            public override PgClientFlow? Executing => pipeline.ExecutingItem;
+            public override PgClientFlow? Activated => pipeline.ActivatedItem;
+        }
+    }
+
     internal sealed class Control(PgClientProtocol protocol, bool poolFacing) : IProtocolStatic<CommandFlow.ReadState>
     {
         // The pipeline whose slots this Control reads, bound right after that pipeline is created. The
         // outer (pool-facing) Control reads the protocol's own pipeline; an exclusive flow's inner
         // Control reads its inner pipeline - both through the same IPipelineSlots handle, so any
-        // nesting depth composes. ExecutorFlow / ActivatedFlow are the single source of truth (the
-        // single-pump invariant + in-order Activate-before-Complete): ExecutorFlow is the write-phase
-        // identity (ThrowIfCannotWrite); ActivatedFlow is the read-channel current-reader handle
+        // nesting depth composes. ExecutingFlow / ActivatedFlow are the single source of truth (the
+        // single-pump invariant + in-order Activate-before-Complete): ExecutingFlow is the write-phase
+        // identity (ThrowIfCannotWrite); ActivatedFlow is the read pipe's current-reader handle
         // (PgDecoder routes messages to it).
-        IFlowSlots _slots = null!;
-        public void BindPipeline(IFlowSlots slots) => _slots = slots;
+        FlowSlots _slots = null!;
+        public void BindPipeline<TPolicy, TSource, TEnumerator>(
+            Pipeline<PgClientFlow, TPolicy, TSource, TEnumerator> pipeline)
+            where TPolicy : IPipelinePolicy<PgClientFlow>
+            where TSource : IPipelineSource<PgClientFlow, TEnumerator>
+            where TEnumerator : struct, IPipelineEnumerator<PgClientFlow>
+            => _slots = FlowSlots.Create(pipeline);
 
         PgClientFlowSource _source;
         public void BindSource(PgClientFlowSource source) => _source = source;
@@ -1119,8 +1151,8 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         // recovery, yes wire recovery, mediated by the root.)
         public bool RecoversWireFailures => poolFacing;
 
-        public PgClientFlow? ExecutorFlow => _slots.ExecutingItem;
-        public PgClientFlow? ActivatedFlow => _slots.ActivatedItem;
+        public PgClientFlow? ExecutingFlow => _slots.Executing;
+        public PgClientFlow? ActivatedFlow => _slots.Activated;
 
         public ProtocolDataWriter Writer => _writer ?? protocol._protocolDataWriter;
 

@@ -496,7 +496,7 @@ public class CommandUserCancellationTests
         var successorExecuted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var successor = new AdmissionProbeFlow(successorExecuted.SetResult);
         Assert.IsTrue(protocol.TryQueue(successor));
-        await WaitUntilAsync(() => ReferenceEquals(protocol.FlowControl.ExecutorFlow, successor));
+        await WaitUntilAsync(() => ReferenceEquals(protocol.FlowControl.ExecutingFlow, successor));
         Assert.IsFalse(successorExecuted.Task.IsCompleted,
             "A later flow executed while cancellation delivery was still unknown.");
 

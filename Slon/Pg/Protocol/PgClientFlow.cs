@@ -746,7 +746,7 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
 
         public void ThrowIfCannotWrite()
         {
-            var executing = control.ExecutorFlow;
+            var executing = control.ExecutingFlow;
             if (ReferenceEquals(flow, executing))
                 return;
             // Substitution-substrate gate: the failed flow's trailing task continues writing

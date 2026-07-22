@@ -209,7 +209,7 @@ public class SyncFlowHandoffTests
                 // the caller's handoff wake never fired (the rendezvous seam).
                 var diag = string.Join("\n", leases.Take(leased).Select((l, i) =>
                     $"protocol {i}: progress={Volatile.Read(ref progress[i])}/20 backlog={l.Protocol.Backlog} outstanding={l.Protocol.Outstanding} " +
-                    $"executor={Describe(l.Protocol.FlowControl.ExecutorFlow)} activated={Describe(l.Protocol.FlowControl.ActivatedFlow)}" +
+                    $"executor={Describe(l.Protocol.FlowControl.ExecutingFlow)} activated={Describe(l.Protocol.FlowControl.ActivatedFlow)}" +
                     (l.Protocol.Backlog > 0 ? $"\n  source: {SourceState(l.Protocol)}" : "")));
                 Assert.Fail($"thread timed out\n{diag}");
             }
@@ -446,7 +446,7 @@ public class SyncFlowHandoffTests
             catch (TimeoutException)
             {
                 Assert.Fail($"block {b}: drive tasks timed out\nbacklog={protocol.Backlog} outstanding={protocol.Outstanding} " +
-                    $"executor={Describe(protocol.FlowControl.ExecutorFlow)} activated={Describe(protocol.FlowControl.ActivatedFlow)}\n" +
+                    $"executor={Describe(protocol.FlowControl.ExecutingFlow)} activated={Describe(protocol.FlowControl.ActivatedFlow)}\n" +
                     $"source: {SourceState(protocol)}");
                 return;
             }
