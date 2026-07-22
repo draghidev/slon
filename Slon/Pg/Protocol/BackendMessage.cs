@@ -31,7 +31,7 @@ readonly struct BackendMessage
     }
 
     public BackendMessage(BackendHeader header, ReadOnlySequence<byte> buffer, BackendMessageContext context, short token)
-        : this(header, buffer, context, token, buffer.Length >= header.Length) {}
+        : this(header, buffer, context, token, buffer.Length >= header.MessageLength) {}
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static bool TryCreateFromBatch(ref BackendMessageBatch batch, BackendMessageContext context, short token, out BackendMessage message)
@@ -43,7 +43,7 @@ readonly struct BackendMessage
         }
 
         Unsafe.SkipInit(out message);
-        Initialize(ref message, header, buffer, context, token, bufferLength >= header.Length);
+        Initialize(ref message, header, buffer, context, token, bufferLength >= header.MessageLength);
         return true;
     }
 
@@ -101,10 +101,16 @@ readonly struct BackendMessage
     }
 
     public ReadOnlySequence<byte> GetSequence(SequencePosition start)
-        => _buffer.Slice(start);
+    {
+        EnsureBodyWindowAvailable();
+        return _buffer.Slice(start);
+    }
 
     public ReadOnlySequence<byte> GetSequence(long offset)
-        => _buffer.Slice(BackendHeader.ByteCount + offset);
+    {
+        EnsureBodyWindowAvailable();
+        return _buffer.Slice(BackendHeader.ByteCount + offset);
+    }
 
     public ReadOnlySequence<byte> GetSequence()
         => GetSequence(0);
@@ -112,6 +118,7 @@ readonly struct BackendMessage
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public bool TryGetFirstSpan(int offset, out ReadOnlySpan<byte> span)
     {
+        EnsureBodyWindowAvailable();
         offset += BackendHeader.ByteCount;
         ref var buffer = ref Unsafe.AsRef(in _buffer);
         var startObject = StartObject(ref buffer);
@@ -150,6 +157,13 @@ readonly struct BackendMessage
 
     public SequenceReader<byte> BodyReader => new(GetSequence());
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    void EnsureBodyWindowAvailable()
+    {
+        if (!_buffered)
+            _context.EnsureBodyWindowAvailable(_token);
+    }
+
     public (PgError? Error, BackendType Type) EnsureExpectedOrError(params ReadOnlySpan<BackendType> expected)
         => EnsureExpectedOrError(unhandledError: true, expected);
 
@@ -174,6 +188,18 @@ readonly struct BackendMessage
     }
 
     public Accessor GetAccessor() => new(_context, _token);
+
+    internal BackendMessageBodyReader OpenBodyReader()
+        => new(_context, _token, GetSequence(), Buffered);
+
+    internal void BufferBody()
+    {
+        if (!Buffered)
+            _context.BufferCurrentMessage(_token);
+    }
+
+    internal ValueTask BufferBodyAsync(CancellationToken cancellationToken)
+        => Buffered ? default : _context.BufferCurrentMessageAsync(_token, cancellationToken);
 
     public readonly struct Accessor
     {

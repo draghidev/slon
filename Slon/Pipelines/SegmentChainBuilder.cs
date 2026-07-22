@@ -124,36 +124,59 @@ sealed class SegmentChainBuilder : IDisposable
             return 0;
         }
 
+        var consumedIndex = consumed.GetInteger();
+        var examinedIndex = examined.GetInteger();
         BufferSegment consumedSegment;
         BufferSegment examinedSegment;
         if (ReferenceEquals(consumedObject, examinedObject))
         {
-            // This may be a segment bashed to an array for perf reasons, do a check and take the segment instance.
-            if (consumedObject is not BufferSegment segment)
+            if (consumedObject is BufferSegment segment && !ReferenceEquals(segment, _consolidated))
             {
-                if (ReferenceEquals(_head.Array, consumedObject))
-                {
-                    examinedSegment = consumedSegment = _head;
-                }
-                else
-                {
-                    // Trigger an invalid cast exception.
-                    _ = (BufferSegment)consumedObject;
-                    return 0;
-                }
+                examinedSegment = consumedSegment = segment;
+            }
+            else if (ReferenceEquals(_head.Array, consumedObject))
+            {
+                examinedSegment = consumedSegment = _head;
             }
             else
             {
-                examinedSegment = consumedSegment = segment;
+                consumedSegment = ResolvePosition(consumedObject, ref consumedIndex);
+                examinedSegment = ResolvePosition(examinedObject, ref examinedIndex);
             }
         }
         else
         {
-            consumedSegment = (BufferSegment)consumedObject;
-            examinedSegment = (BufferSegment)examinedObject;
+            // A single-segment sequence exposes its backing array directly. Growing the chain changes
+            // later positions to BufferSegment positions, but the original array remains a valid head
+            // position until that head is consumed or consolidated.
+            consumedSegment = ResolvePosition(consumedObject, ref consumedIndex);
+            examinedSegment = ResolvePosition(examinedObject, ref examinedIndex);
         }
 
-        return Core(consumedSegment, consumed.GetInteger(), examinedSegment, examined.GetInteger());
+        return Core(consumedSegment, consumedIndex, examinedSegment, examinedIndex);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        BufferSegment ResolvePosition(object positionObject, ref int index)
+        {
+            if (positionObject is BufferSegment segment && !ReferenceEquals(segment, _consolidated))
+                return segment;
+            if (ReferenceEquals(_head.Array, positionObject))
+                return _head;
+
+            var consolidated = _consolidated;
+            if (consolidated is not null &&
+                (ReferenceEquals(consolidated, positionObject) || ReferenceEquals(consolidated.Array, positionObject)))
+            {
+                if ((uint)(index - _consolidatedIndex) > (uint)(consolidated.End - _consolidatedIndex))
+                    ThrowInvalidCursor();
+
+                index = _index + index - _consolidatedIndex;
+                return _head;
+            }
+
+            // Preserve the invalid-position exception produced before array unwrapping was supported.
+            return (BufferSegment)positionObject;
+        }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         long Core(BufferSegment consumedSegment, int consumedIndex, BufferSegment examinedSegment, int examinedIndex)

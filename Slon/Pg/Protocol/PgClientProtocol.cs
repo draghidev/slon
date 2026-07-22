@@ -38,6 +38,7 @@ sealed class PgClientProtocolOptions
         HeartbeatInterval = options.HeartbeatInterval;
         FlowActivationTimeout = options.ConnectionTimeout;
         ScopeReset = options.ScopeReset.Snapshot();
+        DataRowStreamingThreshold = options.DataRowStreamingThreshold;
     }
 
     public TimeProvider TimeProvider { get; set; } = TimeProvider.System;
@@ -57,6 +58,7 @@ sealed class PgClientProtocolOptions
     // Allocation-free grace before starting a backend CancelRequest. Heartbeat supplies the clock.
     public TimeSpan CancelRequestDelay { get; set; }
     public ScopeResetOptions ScopeReset { get; set; } = new();
+    public int DataRowStreamingThreshold { get; set; } = BackendMessageBatch.Segmenter.DefaultDataRowStreamingThreshold;
 
     /// Sends a side-channel CancelRequest and classifies whether request bytes may have reached
     /// PostgreSQL. The attempt must have ended before it returns. Null disables server cancellation.
@@ -179,7 +181,8 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         _connection = connection;
         _pipeWriter = connection.Writer as IOutputWriter<byte> ?? new PipeStreamingWriter(connection.Writer);
         _protocolDataWriter = new(_pipeWriter, PgClientOptions.PreStartupEncoding, connection.WaitWritable, AbortToken, FlowControl);
-        _pipeSegmentEnumerator = new(connection.Reader, new(), ownsReader: true);
+        _pipeSegmentEnumerator = new(connection.Reader,
+            new(_options.DataRowStreamingThreshold), ownsReader: true);
         _pgDecoder = new(_pipeSegmentEnumerator, AbortToken, _options.ReadTimeout);
 
         // Scoring is a pool concern: only maintain its inputs when an orchestrator drives us.

@@ -22,6 +22,12 @@ interface IPipeSegmenter<TSegment>
     OperationStatus CreateSegment(in ReadOnlySequence<byte> buffer, out long segmentLength, out TSegment segment);
 }
 
+readonly struct CurrentSegmentBuffer(ReadOnlySequence<byte> buffer, bool isComplete)
+{
+    public ReadOnlySequence<byte> Buffer { get; } = buffer;
+    public bool IsComplete { get; } = isComplete;
+}
+
 sealed class PipeSegmentEnumerator<TSegmenter, TSegment>(PipeReader reader, TSegmenter segmenter, bool ownsReader = false)
     : IEnumerator<TSegment>, IAsyncEnumerator<TSegment>
     where TSegmenter: IPipeSegmenter<TSegment>
@@ -31,8 +37,10 @@ sealed class PipeSegmentEnumerator<TSegmenter, TSegment>(PipeReader reader, TSeg
     TSegment _current = default!;
 
     SequencePosition _examinedPosition;
+    SequencePosition _currentSegmentStart;
     SequencePosition? _consumePosition;
     long _currentLength = -1;
+    byte _currentSegmentReadPending;
 
     public PipeReader PipeReader => reader;
 
@@ -79,6 +87,7 @@ sealed class PipeSegmentEnumerator<TSegmenter, TSegment>(PipeReader reader, TSeg
     bool EndOfData()
     {
         _currentLength = -1;
+        _currentSegmentReadPending = 0;
         return false;
     }
 
@@ -91,12 +100,122 @@ sealed class PipeSegmentEnumerator<TSegmenter, TSegment>(PipeReader reader, TSeg
     public bool TryMoveNext(out bool completed)
         => TryMoveNext(default, hasRead: false, out completed);
 
+    // Releases a consumed prefix of a partially buffered segment and polls for its next bytes. The
+    // returned buffer never crosses the segment boundary; normal MoveNext resumes at that boundary.
+    public bool TryContinueCurrentSegment(SequencePosition consumed, long consumedLength, out CurrentSegmentBuffer result)
+    {
+        PrepareCurrentSegmentRead(consumed, consumedLength, mode: 1);
+        if (!reader.TryRead(out var readResult))
+        {
+            result = default;
+            return false;
+        }
+
+        result = CompleteCurrentSegmentRead(readResult);
+        return true;
+    }
+
+    public bool TryExtendCurrentSegment(out CurrentSegmentBuffer result)
+    {
+        PrepareCurrentSegmentRead(_currentSegmentStart, consumedLength: 0, mode: 2);
+        if (!reader.TryRead(out var readResult))
+        {
+            result = default;
+            return false;
+        }
+
+        result = CompleteCurrentSegmentRead(readResult);
+        return true;
+    }
+
+    public ValueTask<CurrentSegmentBuffer> ContinueCurrentSegmentAsync(
+        SequencePosition consumed, long consumedLength, CancellationToken cancellationToken = default)
+    {
+        PrepareCurrentSegmentRead(consumed, consumedLength, mode: 1);
+        var task = reader.ReadAsync(cancellationToken);
+        return task.IsCompletedSuccessfully
+            ? new(CompleteCurrentSegmentRead(task.Result, cancellationToken))
+            : Core(task, cancellationToken);
+
+        [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
+        async ValueTask<CurrentSegmentBuffer> Core(ValueTask<ReadResult> task, CancellationToken cancellationToken)
+            => CompleteCurrentSegmentRead(await task.ConfigureAwait(false), cancellationToken);
+    }
+
+    public ValueTask<CurrentSegmentBuffer> ExtendCurrentSegmentAsync(CancellationToken cancellationToken = default)
+    {
+        PrepareCurrentSegmentRead(_currentSegmentStart, consumedLength: 0, mode: 2);
+        var task = reader.ReadAtLeastAsync((int)Math.Min(_currentLength, int.MaxValue), cancellationToken);
+        return task.IsCompletedSuccessfully
+            ? new(CompleteCurrentSegmentRead(task.Result, cancellationToken))
+            : Core(task, cancellationToken);
+
+        [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
+        async ValueTask<CurrentSegmentBuffer> Core(ValueTask<ReadResult> task, CancellationToken cancellationToken)
+            => CompleteCurrentSegmentRead(await task.ConfigureAwait(false), cancellationToken);
+    }
+
+    public CurrentSegmentBuffer ContinueCurrentSegment(
+        SequencePosition consumed, long consumedLength, TimeSpan timeout = default)
+    {
+        if (reader is not StreamPipeReader syncReader)
+            throw new NotSupportedException("Underlying pipe reader does not support synchronous reads.");
+
+        PrepareCurrentSegmentRead(consumed, consumedLength, mode: 1);
+        return CompleteCurrentSegmentRead(syncReader.Read(timeout));
+    }
+
+    public CurrentSegmentBuffer ExtendCurrentSegment(TimeSpan timeout = default)
+    {
+        if (reader is not StreamPipeReader syncReader)
+            throw new NotSupportedException("Underlying pipe reader does not support synchronous reads.");
+
+        PrepareCurrentSegmentRead(_currentSegmentStart, consumedLength: 0, mode: 2);
+        return CompleteCurrentSegmentRead(syncReader.ReadAtLeast((int)Math.Min(_currentLength, int.MaxValue), timeout));
+    }
+
+    void PrepareCurrentSegmentRead(SequencePosition consumed, long consumedLength, byte mode)
+    {
+        if (_currentSegmentReadPending != 0)
+        {
+            if (_currentSegmentReadPending != mode)
+                ThrowHelper.ThrowInvalidOperation("The pending segment read uses a different continuation mode.");
+            return;
+        }
+        if (_currentLength <= 0 || _consumePosition is not null)
+            ThrowHelper.ThrowInvalidOperation("The current segment is not awaiting more data.");
+        if (mode == 1 && (consumedLength <= 0 || consumedLength >= _currentLength))
+            throw new ArgumentOutOfRangeException(nameof(consumedLength));
+
+        reader.AdvanceTo(consumed, _examinedPosition);
+        _currentLength -= consumedLength;
+        _currentSegmentReadPending = mode;
+    }
+
+    CurrentSegmentBuffer CompleteCurrentSegmentRead(ReadResult result,
+        CancellationToken cancellationToken = default)
+    {
+        _currentSegmentReadPending = 0;
+        if (result.IsCanceled)
+            ThrowHelper.ThrowOperationCanceled(cancellationToken);
+        if (result.IsCompleted && result.Buffer.Length < _currentLength)
+            throw new EndOfStreamException("The pipe completed within a framed segment.");
+
+        var isComplete = result.Buffer.Length >= _currentLength;
+        var buffer = isComplete ? result.Buffer.Slice(0, _currentLength) : result.Buffer;
+        _currentSegmentStart = result.Buffer.Start;
+        _consumePosition = isComplete ? buffer.End : null;
+        _examinedPosition = buffer.End;
+        return new(buffer, isComplete);
+    }
+
     bool TryMoveNext(ReadResult suppliedRead, bool hasRead, out bool completed)
     {
         completed = false;
 
         if (_currentLength is not -1)
         {
+            _currentSegmentReadPending = 0;
             if (_consumePosition is null)
             {
                 if (!TryTakeRead(out var consumeResult))
@@ -114,11 +233,13 @@ sealed class PipeSegmentEnumerator<TSegmenter, TSegment>(PipeReader reader, TSeg
                     return false;
                 }
                 reader.AdvanceTo(consumeResult.Buffer.GetPosition(_currentLength));
+                _consumePosition = null;
                 _currentLength = -1;
             }
             else
             {
                 reader.AdvanceTo(_consumePosition.GetValueOrDefault(), _examinedPosition);
+                _consumePosition = null;
                 _currentLength = -1;
             }
         }
@@ -140,6 +261,7 @@ sealed class PipeSegmentEnumerator<TSegmenter, TSegment>(PipeReader reader, TSeg
             case OperationStatus.Done:
                 ArgumentOutOfRangeException.ThrowIfNegativeOrZero(_currentLength, "segmentLength");
                 _consumePosition = _currentLength <= result.Buffer.Length ? result.Buffer.GetPosition(_currentLength) : null;
+                _currentSegmentStart = result.Buffer.Start;
                 _examinedPosition = _consumePosition ?? result.Buffer.End;
                 return true;
             case OperationStatus.NeedMoreData:
@@ -178,6 +300,7 @@ sealed class PipeSegmentEnumerator<TSegmenter, TSegment>(PipeReader reader, TSeg
         // Advance past current segment.
         if (_currentLength is not -1)
         {
+            _currentSegmentReadPending = 0;
             // Not everything was buffered when the segment was returned (e.g. with length prefixed segments).
             if (_consumePosition is null)
             {
@@ -193,10 +316,12 @@ sealed class PipeSegmentEnumerator<TSegmenter, TSegment>(PipeReader reader, TSeg
                 if (result.Buffer.Length > _currentLength)
                     return Core(new(result), cancellationToken, consume: true);
                 reader.AdvanceTo(result.Buffer.GetPosition(_currentLength));
+                _consumePosition = null;
             }
             else
             {
                 reader.AdvanceTo(_consumePosition.GetValueOrDefault(), _examinedPosition);
+                _consumePosition = null;
             }
         }
 
@@ -217,6 +342,7 @@ sealed class PipeSegmentEnumerator<TSegmenter, TSegment>(PipeReader reader, TSeg
             case OperationStatus.Done:
                 ArgumentOutOfRangeException.ThrowIfNegativeOrZero(_currentLength, "segmentLength");
                 _consumePosition = _currentLength <= result.Buffer.Length ? result.Buffer.GetPosition(_currentLength) : null;
+                _currentSegmentStart = result.Buffer.Start;
                 // Stop examined at the segment boundary so trailing buffered bytes (next segment's data) stay visible to the next ReadAsync.
                 _examinedPosition = _consumePosition ?? result.Buffer.End;
                 return new(true);
@@ -272,6 +398,7 @@ sealed class PipeSegmentEnumerator<TSegmenter, TSegment>(PipeReader reader, TSeg
                     case OperationStatus.Done:
                         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(_currentLength, "segmentLength");
                         _consumePosition = _currentLength <= result.Buffer.Length ? result.Buffer.GetPosition(_currentLength) : null;
+                        _currentSegmentStart = result.Buffer.Start;
                         // Stop examined at the segment boundary so trailing buffered bytes stay visible to the next ReadAsync.
                         _examinedPosition = _consumePosition ?? result.Buffer.End;
                         return true;
@@ -310,6 +437,7 @@ sealed class PipeSegmentEnumerator<TSegmenter, TSegment>(PipeReader reader, TSeg
         // Advance past current segment.
         if (_currentLength is not -1)
         {
+            _currentSegmentReadPending = 0;
             if (_consumePosition is null)
             {
                 result = syncReader.ReadAtLeast((int)long.Min(_currentLength, int.MaxValue), timeout);
@@ -324,10 +452,12 @@ sealed class PipeSegmentEnumerator<TSegmenter, TSegment>(PipeReader reader, TSeg
                     goto loop;
                 }
                 reader.AdvanceTo(result.Buffer.GetPosition(_currentLength));
+                _consumePosition = null;
             }
             else
             {
                 reader.AdvanceTo(_consumePosition.GetValueOrDefault(), _examinedPosition);
+                _consumePosition = null;
             }
         }
 
@@ -369,6 +499,7 @@ sealed class PipeSegmentEnumerator<TSegmenter, TSegment>(PipeReader reader, TSeg
                 case OperationStatus.Done:
                     ArgumentOutOfRangeException.ThrowIfNegativeOrZero(_currentLength, "segmentLength");
                     _consumePosition = _currentLength <= result.Buffer.Length ? result.Buffer.GetPosition(_currentLength) : null;
+                    _currentSegmentStart = result.Buffer.Start;
                     // Stop examined at the segment boundary so trailing buffered bytes stay visible to the next ReadAsync.
                     _examinedPosition = _consumePosition ?? result.Buffer.End;
                     return true;

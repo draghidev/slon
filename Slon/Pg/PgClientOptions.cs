@@ -23,6 +23,7 @@ sealed class PgClientOptions
 
     public int PoolSize { get; init; }
     internal ScopeResetOptions ScopeReset { get; init; } = new();
+    internal int DataRowStreamingThreshold { get; init; } = BackendMessageBatch.Segmenter.DefaultDataRowStreamingThreshold;
 
     // Hardcoded to UTF8 until a use for another encoding comes up.
     internal Encoding Encoding => Encoding.UTF8;

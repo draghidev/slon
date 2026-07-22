@@ -47,6 +47,10 @@ public record SlonDataSourceOptions
     public TimeSpan CommandTimeout { get; init; } = DefaultCommandTimeout;
     public int AutoPreparationMinimumUses { get; set; } = 5;
     public int MaxActiveAutoPreparations { get; set; }
+    /// <summary>
+    /// DataRows larger than this may cross the decoder boundary before their complete body has arrived.
+    /// </summary>
+    public int DataRowStreamingThreshold { get; init; } = BackendMessageBatch.Segmenter.DefaultDataRowStreamingThreshold;
     /// <summary>Configures which connection state is reset when an exclusive scope is released.</summary>
     public ScopeResetOptions ScopeReset { get; init; } = new();
 
@@ -64,6 +68,7 @@ public record SlonDataSourceOptions
         HeartbeatInterval = HeartbeatInterval,
         MaintenanceInterval = MaintenanceInterval,
         ScopeReset = ScopeReset.Snapshot(),
+        DataRowStreamingThreshold = DataRowStreamingThreshold,
     };
 
     internal bool Validate()

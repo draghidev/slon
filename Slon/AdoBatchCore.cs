@@ -5,6 +5,7 @@ using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
 using Slon.Pg;
+using Slon.Pg.Protocol;
 using Slon.Pg.Protocol.Flows;
 
 namespace Slon;

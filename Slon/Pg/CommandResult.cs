@@ -3,12 +3,17 @@ using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
 using Slon.Pg.Protocol;
-using Slon.Runtime.CompilerServices;
 
 namespace Slon.Pg;
 
 abstract class CommandResult : IDisposable, IAsyncDisposable, IEnumerable<Row>, IAsyncEnumerable<Row>
 {
+    public enum RowBuffering : byte
+    {
+        Buffered,
+        Streaming
+    }
+
     readonly Row _row = new();
     RowDescription? _rowDescription;
     int _index;
@@ -64,14 +69,17 @@ abstract class CommandResult : IDisposable, IAsyncDisposable, IEnumerable<Row>, 
         };
     }
 
-    public RowEnumerator GetEnumerator() => new(this);
+    public RowEnumerator GetEnumerator(RowBuffering buffering = RowBuffering.Buffered) => new(this, buffering);
     public RowEnumerator GetAsyncEnumerator(CancellationToken cancellationToken = default)
+        => GetAsyncEnumerator(RowBuffering.Buffered, cancellationToken);
+
+    public RowEnumerator GetAsyncEnumerator(RowBuffering buffering, CancellationToken cancellationToken = default)
     {
         // The IAsyncEnumerable/Enumerator api was designed with serious LINQ and generator method tunnel vision...
         // if (cancellationToken.CanBeCanceled)
         //     throw new NotSupportedException("Cancelable CancellationTokens are not supported by this implementation.");
 
-        return new(this);
+        return new(this, buffering);
     }
 
     public bool TryGetCommandComplete([NotNullWhen(true)]out CommandCompleteMessage? value)
@@ -184,9 +192,25 @@ abstract class CommandResult : IDisposable, IAsyncDisposable, IEnumerable<Row>, 
     protected abstract bool MoveNextMessage();
     protected abstract ValueTask<bool> MoveNextMessageAsync();
 
-    public struct RowEnumerator(CommandResult instance) : IEnumerator<Row>, IAsyncEnumerator<Row>
+    public struct RowEnumerator(CommandResult instance, RowBuffering buffering) : IEnumerator<Row>, IAsyncEnumerator<Row>
     {
         Row? _row;
+
+        BackendMessage PrepareRow(BackendMessage message)
+        {
+            if (buffering is RowBuffering.Buffered && !message.Buffered)
+            {
+                message.BufferBody();
+                message = instance.GetCurrentMessage();
+            }
+            return message;
+        }
+
+        bool PublishRow(BackendMessage message)
+        {
+            (_row ??= instance.GetRow()).InitializeRow(message);
+            return true;
+        }
 
         public bool MoveNext()
         {
@@ -206,10 +230,7 @@ abstract class CommandResult : IDisposable, IAsyncDisposable, IEnumerable<Row>, 
             // CommandComplete, EmptyQueryResponse (if the portal was created from an empty query string), ErrorResponse, or PortalSuspended"
             var current = instance.GetCurrentMessage();
             if (current.Header.Type is PgTypes.BackendType.DataRow)
-            {
-                (_row ??= instance.GetRow()).InitializeRow(current);
-                return true;
-            }
+                return PublishRow(PrepareRow(current));
 
             return HandleUncommon(current);
         }
@@ -250,8 +271,17 @@ abstract class CommandResult : IDisposable, IAsyncDisposable, IEnumerable<Row>, 
             var current = instance.GetCurrentMessage();
             if (current.Header.Type is PgTypes.BackendType.DataRow)
             {
-                (_row ??= instance.GetRow()).InitializeRow(current);
-                return new(true);
+                if (buffering is RowBuffering.Buffered && !current.Buffered)
+                {
+                    var bufferTask = current.BufferBodyAsync(default);
+                    if (!bufferTask.IsCompletedSuccessfully)
+                    {
+                        var row = _row ??= instance.GetRow();
+                        return BufferRowAsync(bufferTask, row);
+                    }
+                    current = instance.GetCurrentMessage();
+                }
+                return new(PublishRow(current));
             }
 
             return new(HandleUncommon(current));
@@ -292,11 +322,21 @@ abstract class CommandResult : IDisposable, IAsyncDisposable, IEnumerable<Row>, 
             var current = instance.GetCurrentMessage();
             if (current.Header.Type is PgTypes.BackendType.DataRow)
             {
-                (_row ??= instance.GetRow()).InitializeRow(current);
-                return true;
+                if (buffering is RowBuffering.Buffered && !current.Buffered)
+                    await current.BufferBodyAsync(default).ConfigureAwait(false);
+                return PublishRow(instance.GetCurrentMessage());
             }
 
             return HandleUncommon(current);
+        }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
+        async ValueTask<bool> BufferRowAsync(ValueTask task, Row row)
+        {
+            await task.ConfigureAwait(false);
+            row.InitializeRow(instance.GetCurrentMessage());
+            return true;
         }
 
         public Row Current => _row!;

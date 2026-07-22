@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Collections;
 using System.Diagnostics;
 using System.IO.Pipelines;
@@ -111,8 +112,129 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
         ReadTimeout = _defaultReadTimeout;
         if (!ReferenceEquals(_control, control))
             _control = control;
+        _channel.BindDecoder(this);
         // TODO we want a heartbeat setup directly through the protocol on construction.
         CurrentExecutionControl.RegisterDecoderOnHeartbeat(_onHeartbeatAction);
+    }
+
+    internal bool TryContinueCurrentMessage(SequencePosition consumed, long consumedLength, out CurrentSegmentBuffer result)
+        => _channel.TryContinueCurrentMessage(consumed, consumedLength, out result);
+
+    internal ValueTask<CurrentSegmentBuffer> ContinueCurrentMessageAsync(
+        SequencePosition consumed, long consumedLength, CancellationToken cancellationToken)
+    {
+        EnsureUsableCts();
+        if (_channel.TryContinueCurrentMessage(consumed, consumedLength, out var result))
+            return new(result);
+
+        return Core(cancellationToken);
+
+        [AsyncMethodBuilder(typeof(NonContextRestoringPoolingValueTaskMethodBuilder<>))]
+        async ValueTask<CurrentSegmentBuffer> Core(CancellationToken cancellationToken)
+        {
+            var timeoutSet = false;
+            var frontierFlow = EnterCancellationReadFrontier();
+            var registration = cancellationToken.UnsafeRegister(
+                static (state, _) => ((CancellationTokenSource)state!).Cancel(), _cancellationTokenSource);
+            try
+            {
+                SetRemainingTimeout(ReadTimeout);
+                timeoutSet = true;
+                return await _channel.ContinueCurrentMessageAsync(
+                    consumed, consumedLength, _cancellationTokenSource.Token).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (_cancellationTokenSource.IsCancellationRequested)
+            {
+                throw TranslateReadCancellation(ex, cancellationToken);
+            }
+            finally
+            {
+                LeaveCancellationReadFrontier(frontierFlow);
+                registration.Dispose();
+                if (timeoutSet)
+                    SetRemainingTimeout(Timeout.InfiniteTimeSpan);
+            }
+        }
+    }
+
+    internal CurrentSegmentBuffer ContinueCurrentMessage(
+        SequencePosition consumed, long consumedLength)
+    {
+        var timeoutSet = false;
+        try
+        {
+            SetRemainingTimeout(ReadTimeout);
+            timeoutSet = true;
+            return _channel.ContinueCurrentMessage(consumed, consumedLength, GetRemainingTimeout());
+        }
+        catch (Exception) when (_abortToken.IsCancellationRequested && _control.ClosedException is { } closed)
+        {
+            throw closed;
+        }
+        finally
+        {
+            if (timeoutSet)
+                SetRemainingTimeout(Timeout.InfiniteTimeSpan);
+        }
+    }
+
+    internal bool TryExtendCurrentMessage(out CurrentSegmentBuffer result)
+        => _channel.TryExtendCurrentMessage(out result);
+
+    internal ValueTask<CurrentSegmentBuffer> ExtendCurrentMessageAsync(CancellationToken cancellationToken)
+    {
+        EnsureUsableCts();
+        if (_channel.TryExtendCurrentMessage(out var result))
+            return new(result);
+
+        return Core(cancellationToken);
+
+        [AsyncMethodBuilder(typeof(NonContextRestoringPoolingValueTaskMethodBuilder<>))]
+        async ValueTask<CurrentSegmentBuffer> Core(CancellationToken cancellationToken)
+        {
+            var timeoutSet = false;
+            var frontierFlow = EnterCancellationReadFrontier();
+            var registration = cancellationToken.UnsafeRegister(
+                static (state, _) => ((CancellationTokenSource)state!).Cancel(), _cancellationTokenSource);
+            try
+            {
+                SetRemainingTimeout(ReadTimeout);
+                timeoutSet = true;
+                return await _channel.ExtendCurrentMessageAsync(
+                    _cancellationTokenSource.Token).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (_cancellationTokenSource.IsCancellationRequested)
+            {
+                throw TranslateReadCancellation(ex, cancellationToken);
+            }
+            finally
+            {
+                LeaveCancellationReadFrontier(frontierFlow);
+                registration.Dispose();
+                if (timeoutSet)
+                    SetRemainingTimeout(Timeout.InfiniteTimeSpan);
+            }
+        }
+    }
+
+    internal CurrentSegmentBuffer ExtendCurrentMessage()
+    {
+        var timeoutSet = false;
+        try
+        {
+            SetRemainingTimeout(ReadTimeout);
+            timeoutSet = true;
+            return _channel.ExtendCurrentMessage(GetRemainingTimeout());
+        }
+        catch (Exception) when (_abortToken.IsCancellationRequested && _control.ClosedException is { } closed)
+        {
+            throw closed;
+        }
+        finally
+        {
+            if (timeoutSet)
+                SetRemainingTimeout(Timeout.InfiniteTimeSpan);
+        }
     }
 
     void OnHeartbeat(TimeSpan elapsed)
@@ -293,6 +415,8 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
             nextRead:;
         }
 
+
+
         [MethodImpl(MethodImplOptions.NoInlining)]
         [AsyncMethodBuilder(typeof(NonContextRestoringPoolingValueTaskMethodBuilder<>))]
         async ValueTask<bool> MoveNextAsyncCore(ValueTask<ReadResult>? readTask, ValueTask<int>? directReadTask, ValueTask<bool>? messageHandledTask, CancellationToken cancellationToken, PgClientFlow? frontierFlow = null)
@@ -426,6 +550,7 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
         get => EnrichError(_channel.Current);
     }
 
+
     BackendMessage EnrichError(BackendMessage message)
     {
         if (message.Header.Type is not PgTypes.BackendType.ErrorResponse)
@@ -549,6 +674,7 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
                     if (!channel.TryMoveNext())
                         ThrowHelper.ThrowInvalidOperation("No message in a new batch");
                 }
+
 
                 // HandleMessageAuto is always sync-completing (every branch returns a
                 // synchronously-constructed ValueTask). Reading .Result inline is safe.

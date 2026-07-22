@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.IO.Pipelines;
 using Slon.Pipelines;
 
@@ -25,6 +26,8 @@ sealed class ReadChannel
     public bool TryMoveNext() => _messageContext.TryMoveNext();
     public bool TryPeekNext(out BackendHeader header) => _messageContext.TryPeekNext(out header);
     public BackendMessage Peeked => _messageContext.Peeked;
+
+    public void BindDecoder(PgDecoder decoder) => _messageContext.BindDecoder(decoder);
 
     public bool TryMoveNextBatch(out bool completed)
     {
@@ -57,6 +60,26 @@ sealed class ReadChannel
         CommitBatch();
         return true;
     }
+
+    public bool TryContinueCurrentMessage(SequencePosition consumed, long consumedLength, out CurrentSegmentBuffer result)
+        => _messageBatchEnumerator.TryContinueCurrentSegment(consumed, consumedLength, out result);
+
+    public ValueTask<CurrentSegmentBuffer> ContinueCurrentMessageAsync(
+        SequencePosition consumed, long consumedLength, CancellationToken cancellationToken)
+        => _messageBatchEnumerator.ContinueCurrentSegmentAsync(consumed, consumedLength, cancellationToken);
+
+    public CurrentSegmentBuffer ContinueCurrentMessage(
+        SequencePosition consumed, long consumedLength, TimeSpan timeout)
+        => _messageBatchEnumerator.ContinueCurrentSegment(consumed, consumedLength, timeout);
+
+    public bool TryExtendCurrentMessage(out CurrentSegmentBuffer result)
+        => _messageBatchEnumerator.TryExtendCurrentSegment(out result);
+
+    public ValueTask<CurrentSegmentBuffer> ExtendCurrentMessageAsync(CancellationToken cancellationToken)
+        => _messageBatchEnumerator.ExtendCurrentSegmentAsync(cancellationToken);
+
+    public CurrentSegmentBuffer ExtendCurrentMessage(TimeSpan timeout)
+        => _messageBatchEnumerator.ExtendCurrentSegment(timeout);
 
     public ValueTask<bool> MoveNextAsync(CancellationToken cancellationToken) => _messageBatchEnumerator.MoveNextAsync(cancellationToken);
     public bool MoveNext(TimeSpan timeout) => _messageBatchEnumerator.MoveNext(timeout);

@@ -68,4 +68,65 @@ public class SegmentChainBuilderTests
         Assert.IsNull(builder.HeadInfo.Head);
         Assert.AreEqual(0, builder.BufferedBytes);
     }
+
+    [TestMethod]
+    public void AdvanceTo_AcceptsCurrentHeadArrayAfterChainGrowth()
+    {
+        using var builder = new SegmentChainBuilder(MemoryPool<byte>.Shared, minimumBufferSize: 16);
+
+        builder.Reserve(16, enforceHint: true).Span.Fill(1);
+        builder.Grow(16);
+        var singleSegment = builder.GetReadOnlySequence();
+        var consumed = singleSegment.GetPosition(4);
+
+        builder.Reserve(16, enforceHint: true).Span[0] = 2;
+        builder.Grow(1);
+        var chained = builder.GetReadOnlySequence();
+
+        var examined = builder.AdvanceTo(consumed, chained.End);
+
+        Assert.AreEqual(17, examined);
+        Assert.AreEqual(13, builder.BufferedBytes);
+        Assert.AreEqual(13, builder.GetReadOnlySequence().Length);
+    }
+
+    [TestMethod]
+    public void AdvanceTo_RejectsArrayPositionAfterItsHeadWasConsumed()
+    {
+        using var builder = new SegmentChainBuilder(MemoryPool<byte>.Shared, minimumBufferSize: 16);
+
+        builder.Reserve(16, enforceHint: true).Span.Fill(1);
+        builder.Grow(16);
+        var original = builder.GetReadOnlySequence();
+
+        builder.Reserve(16, enforceHint: true).Span[0] = 2;
+        builder.Grow(1);
+        var chained = builder.GetReadOnlySequence();
+        builder.AdvanceTo(chained.GetPosition(16));
+
+        Assert.ThrowsExactly<InvalidCastException>(() => builder.AdvanceTo(original.Start));
+    }
+
+    [TestMethod]
+    public void AdvanceTo_TranslatesArrayPositionAfterHeadConsolidation()
+    {
+        using var builder = new SegmentChainBuilder(MemoryPool<byte>.Shared, minimumBufferSize: 16);
+
+        builder.Reserve(16, enforceHint: true).Span.Fill(1);
+        builder.Grow(16);
+        var initial = builder.GetReadOnlySequence();
+        builder.AdvanceTo(initial.GetPosition(4));
+
+        var beforeConsolidation = builder.GetReadOnlySequence();
+        var consumed = beforeConsolidation.GetPosition(4);
+        builder.Reserve(16, enforceHint: true).Span[0] = 2;
+        builder.Grow(1);
+        var consolidated = builder.GetReadOnlySequence();
+
+        var examined = builder.AdvanceTo(consumed, consolidated.End);
+
+        Assert.AreEqual(13, examined);
+        Assert.AreEqual(9, builder.BufferedBytes);
+        Assert.AreEqual(9, builder.GetReadOnlySequence().Length);
+    }
 }

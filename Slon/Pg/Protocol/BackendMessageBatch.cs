@@ -10,6 +10,12 @@ namespace Slon.Pg.Protocol;
 struct BackendMessageBatch(ReadOnlySequence<byte> buffer)
 {
     FastReadOnlySequence<byte> _buffer = new(buffer);
+    long _consumedLength;
+
+    BackendMessageBatch(ReadOnlySequence<byte> buffer, long consumedLength) : this(buffer)
+        => _consumedLength = consumedLength;
+
+    public readonly long ConsumedLength => _consumedLength;
 
     public bool TryReadNextInPlace(out BackendHeader header, out ReadOnlySequence<byte> buffer, out uint bufferLength)
     {
@@ -24,6 +30,7 @@ struct BackendMessageBatch(ReadOnlySequence<byte> buffer)
         }
 
         var fastSeq = _buffer.SplitInPlace(Math.Min(_buffer.Length, protoHeader.MessageLength));
+        _consumedLength += fastSeq.Length;
         buffer = fastSeq.Sequence;
         Debug.Assert(fastSeq.Length <= uint.MaxValue);
         bufferLength = unchecked((uint)fastSeq.Length);
@@ -35,15 +42,26 @@ struct BackendMessageBatch(ReadOnlySequence<byte> buffer)
     {
         var thisCopy = this;
         var success = thisCopy.TryReadNextInPlace(out header, out buffer, out bufferLength);
-        remaining = success ? new(thisCopy._buffer.Sequence) : default;
+        remaining = success ? new(thisCopy._buffer.Sequence, thisCopy._consumedLength) : default;
         return success;
     }
 
     // Segmenter parses messages and ensures relevant messages are fully buffered before being returned.
     internal struct Segmenter : IPipeSegmenter<BackendMessageBatch>
     {
+        public const int DefaultDataRowStreamingThreshold = 16 * 1024;
+
+        readonly int _dataRowStreamingThreshold;
         int _minimumSize;
         public int MinimumSize => _minimumSize;
+
+        public Segmenter() : this(DefaultDataRowStreamingThreshold) {}
+
+        public Segmenter(int dataRowStreamingThreshold)
+        {
+            ArgumentOutOfRangeException.ThrowIfNegative(dataRowStreamingThreshold);
+            _dataRowStreamingThreshold = dataRowStreamingThreshold;
+        }
 
         public OperationStatus CreateSegment(in ReadOnlySequence<byte> buffer, out long segmentLength, out BackendMessageBatch segment)
         {
@@ -58,12 +76,12 @@ struct BackendMessageBatch(ReadOnlySequence<byte> buffer)
             {
                 if (reader.Remaining < header.MessageLength)
                 {
-                    // If the very first message needs buffering we return we need more data, otherwise we just omit it from this batch.
-                    if (MustBuffer((BackendType)header.Tag))
+                    var required = RequiredBufferedLength((BackendType)header.Tag, header.MessageLength);
+                    if (reader.Remaining < required)
                     {
-                        // We set a hint, if we do exceed max value we'll still make progress through examine advancing.
-                        // In that case we will just be called until we have enough data (hopefully not one byte at a time).
-                        _minimumSize = header.MessageLength > int.MaxValue ? int.MaxValue : (int)header.MessageLength;
+                        // MinimumSize is relative to the entire unconsumed pipe buffer, including messages
+                        // already framed before this one.
+                        _minimumSize = int.CreateSaturating(segmentLength + required);
                         needMoreData = true;
                         break;
                     }
@@ -89,17 +107,15 @@ struct BackendMessageBatch(ReadOnlySequence<byte> buffer)
             return needMoreData ? OperationStatus.NeedMoreData : OperationStatus.Done;
         }
 
-        // TODO when this returns true also make sure it's under a reasonable length limit, stream otherwise (buffered rows can just request full buffering later on).
-        static bool MustBuffer(BackendType backendType) => backendType switch
+        uint RequiredBufferedLength(BackendType backendType, uint messageLength) => backendType switch
         {
+            BackendType.DataRow => Math.Min(messageLength, (uint)_dataRowStreamingThreshold),
             // BackendType.RowDescription or
-            // BackendType.DataRow or
             // BackendType.CopyData or
             // BackendType.FunctionCallResponse or
             // BackendType.NotificationResponse or
             // BackendType.ParameterDescription => false,
-            // TODO make message body streaming work (most of it is in place, it's just work)
-            _ => true,
+            _ => messageLength,
         };
     }
 

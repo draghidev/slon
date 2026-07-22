@@ -5,6 +5,7 @@ using System.Runtime.CompilerServices;
 using System.Text;
 using Slon.Buffers;
 using Slon.Pg.Protocol;
+using Slon.Runtime.CompilerServices;
 
 namespace Slon.Pg;
 
@@ -12,6 +13,7 @@ sealed class Row
 {
     BackendMessage.Accessor _messageAccessor;
     RowDescription _rowDescription = null!;
+    BackendMessageBodyReader? _bodyReader;
 
     int _column = -1;
     int _columnOffset;
@@ -38,6 +40,7 @@ sealed class Row
 
     public T GetValue<T>(int ordinal)
     {
+        EnsureBuffered();
         if (TryGetFieldSpan(ordinal, out var field))
             return Decode<T>(field);
 
@@ -155,9 +158,25 @@ sealed class Row
     }
 
     public ValueTask<T> GetValueAsync<T>(int ordinal, CancellationToken cancellationToken = default)
-        => new(GetValue<T>(ordinal));
+    {
+        if (_bodyReader is null)
+            return new(GetValue<T>(ordinal));
+        return Core(ordinal, cancellationToken);
 
-    public Reader GetReader() => new(this);
+        [AsyncMethodBuilder(typeof(NonContextRestoringPoolingValueTaskMethodBuilder<>))]
+        async ValueTask<T> Core(int ordinal, CancellationToken cancellationToken)
+        {
+            await _bodyReader.BufferAllAsync(cancellationToken).ConfigureAwait(false);
+            _bodyReader = null;
+            return GetValue<T>(ordinal);
+        }
+    }
+
+    public Reader GetReader()
+    {
+        EnsureBuffered();
+        return new(this);
+    }
 
     public ref struct Reader
     {
@@ -206,10 +225,18 @@ sealed class Row
 
     internal void InitializeRow(in BackendMessage row)
     {
-        Debug.Assert(row.Buffered, "Column streaming is not implemented yet");
+        _bodyReader = row.Buffered ? null : row.OpenBodyReader();
         _column = 0;
         _columnOffset = sizeof(short);
         BackendMessage.Accessor.WriteGranularly(ref _messageAccessor, row.GetAccessor());
+    }
+
+    void EnsureBuffered()
+    {
+        if (_bodyReader is null)
+            return;
+        _bodyReader.BufferAll();
+        _bodyReader = null;
     }
 
     // Returns false when the seek was exhausted, true if positioned correctly, and throws if the seek is invalid.

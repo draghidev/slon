@@ -30,6 +30,7 @@ public sealed partial class SlonDataReader
         readonly bool _singleRowBehavior;
         readonly bool _remainingReflectsActual;
         readonly bool _asyncExecute;
+        readonly CommandResult.RowBuffering _rowBuffering;
 
         // We use this to prevent users doing any concurrent Dispose calls, at which point we throw.
         bool _closing;
@@ -48,6 +49,9 @@ public sealed partial class SlonDataReader
             var remaining = _remainingResults = singleRow || behavior.HasFlag(CommandBehavior.SingleResult) ? 1 : commandCount;
             _remainingReflectsActual = commandCount == remaining;
             _asyncExecute = asyncExecute;
+            _rowBuffering = behavior.HasFlag(CommandBehavior.SequentialAccess)
+                ? CommandResult.RowBuffering.Streaming
+                : CommandResult.RowBuffering.Buffered;
         }
 
         public void SkipLeadingResults(int count)
@@ -110,7 +114,7 @@ public sealed partial class SlonDataReader
                 return EnumerateCommands;
             }
 
-            _rowEnumerator = current.GetEnumerator();
+            _rowEnumerator = current.GetEnumerator(_rowBuffering);
             return true;
         }
 
