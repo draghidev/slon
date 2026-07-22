@@ -19,6 +19,59 @@ namespace Slon.Tests.Pg;
 [TestClass]
 public class SyncFlowHandoffTests
 {
+    sealed class WakeHolder
+    {
+        internal FlowCallerInteractionCore<ValueTuple> Core;
+    }
+
+    static ref FlowCallerInteractionCore<ValueTuple> GetWakeCore(WakeHolder holder) => ref holder.Core;
+
+    [TestMethod]
+    public async Task DedicatedWakeResumesOutsideTheThreadPool()
+    {
+        var holder = new WakeHolder();
+        holder.Core.Initialize();
+        var resumedOnThreadPool = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var suspended = Suspend(holder, resumedOnThreadPool);
+
+        holder.Core.RequestWake(useDedicatedDriver: true);
+
+        Assert.IsFalse(await resumedOnThreadPool.Task.WaitAsync(TimeSpan.FromSeconds(10)));
+        await suspended.WaitAsync(TimeSpan.FromSeconds(10));
+        holder.Core.Reset();
+
+        static async Task Suspend(WakeHolder holder, TaskCompletionSource<bool> resumedOnThreadPool)
+        {
+            FieldRef<FlowCallerInteractionCore<ValueTuple>> fieldRef;
+            unsafe
+            {
+                fieldRef = FieldRef<FlowCallerInteractionCore<ValueTuple>>.Create(&GetWakeCore, holder);
+            }
+            await holder.Core.SetContinuationAndUnblockWaiter(fieldRef);
+            resumedOnThreadPool.SetResult(Thread.CurrentThread.IsThreadPoolThread);
+        }
+    }
+
+    [TestMethod]
+    public void CloseBeforeSyncWait_IsRemembered()
+    {
+        var holder = new WakeHolder();
+        holder.Core.Initialize();
+
+        // Abort can precede creation of the synchronous disposer's event. The close must remain
+        // observable as progress rather than disappear through a null event reference.
+        holder.Core.CancelPendingWait(new InvalidOperationException("close"));
+        Action? continuation = null;
+        var waiter = new Thread(() => continuation = holder.Core.WaitForContinuation())
+        {
+            IsBackground = true
+        };
+
+        waiter.Start();
+        Assert.IsTrue(waiter.Join(TimeSpan.FromSeconds(1)), "the close wake was lost before wait registration");
+        Assert.IsNull(continuation);
+    }
+
     // Sanity check that nothing in the sync path secretly trampolines onto a TP thread and
     // returns on a different one. If this ever fires, something in the sync flow path is
     // doing implicit thread handoff against the contract. Drives the raw protocol so the

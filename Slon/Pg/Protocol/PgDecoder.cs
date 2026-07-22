@@ -525,6 +525,7 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
                     }
 
                     bool success;
+                    var frontierFlow = EnterCancellationReadFrontier();
                     try
                     {
                         success = channel.MoveNext(GetRemainingTimeout());
@@ -536,6 +537,10 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
                         // TimeoutException rather than an OCE. Translate any of them to the typed closed
                         // exception, mirroring the async path's TranslateReadCancellation.
                         throw closed;
+                    }
+                    finally
+                    {
+                        LeaveCancellationReadFrontier(frontierFlow);
                     }
                     channel.CommitBatch();
                     if (!success)

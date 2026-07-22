@@ -61,6 +61,21 @@ sealed class PgAdvisoryLock : IAsyncDisposable
                     select 1 from pg_stat_activity
                     where pid = {{backendProcessId}} and wait_event = 'advisory')
                 loop
+                    perform pg_stat_clear_snapshot();
+                    perform pg_sleep(0.001);
+                end loop;
+            end $$
+            """);
+
+    public Task WaitUntilContendedAsync()
+        => PgTestPool.RunAsync(_owner, $$"""
+            do $$
+            begin
+                while not exists (
+                    select 1 from pg_stat_activity
+                    where query like '%pg_advisory_xact_lock({{Key}})%' and wait_event = 'advisory')
+                loop
+                    perform pg_stat_clear_snapshot();
                     perform pg_sleep(0.001);
                 end loop;
             end $$

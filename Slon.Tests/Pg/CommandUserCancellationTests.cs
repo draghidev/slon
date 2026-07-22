@@ -151,6 +151,61 @@ public class CommandUserCancellationTests
 
     [TestMethod]
     [DoNotParallelize]
+    public async Task ServerCancel_CancelAsyncWaitsForDeliveryAttempt()
+    {
+        await using var blocker = await PgAdvisoryLock.AcquireAsync();
+        var senderEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var delivery = new TaskCompletionSource<CancelRequestState>(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var protocol = await PgTestPool.NewIsolatedAsync(o => o.CancelSender = (_, _, _) =>
+        {
+            senderEntered.TrySetResult();
+            return new(delivery.Task);
+        });
+
+        var flow = new CommandFlow(async: true, blocker.WaitCommand);
+        Assert.IsTrue(protocol.TryQueue(flow));
+        var enumerator = flow.GetAsyncEnumerator();
+        var moveNext = enumerator.MoveNextAsync().AsTask();
+
+        await blocker.WaitUntilContendedAsync(protocol.FlowControl.BackendProcessId);
+        var cancellation = flow.CancelAsync();
+        await senderEntered.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.IsFalse(cancellation.IsCompleted);
+
+        delivery.SetResult(CancelRequestState.Sent);
+        await cancellation.WaitAsync(TimeSpan.FromSeconds(10));
+        await blocker.ReleaseAsync();
+        await Assert.ThrowsExactlyAsync<OperationCanceledException>(
+            async () => await moveNext.WaitAsync(TimeSpan.FromSeconds(10)));
+        await enumerator.DisposeAsync();
+        await WaitUntilAsync(() => !protocol.HasPendingCancellation);
+    }
+
+    [TestMethod]
+    [DoNotParallelize]
+    public async Task ServerCancel_AbandonedSyncFlowGraduatesAndDrains()
+    {
+        await using var blocker = await PgAdvisoryLock.AcquireAsync();
+        await using var protocol = await PgTestPool.NewIsolatedAsync(o =>
+            o.CancelSender = (_, _, _) => new(CancelRequestState.Sent));
+        var flow = new CommandFlow(async: false,
+            Command.Create("select 1") with { WithSync = true },
+            blocker.WaitCommand);
+        Assert.IsTrue(protocol.TryQueue(flow));
+        var enumerator = flow.GetEnumerator();
+
+        Assert.IsTrue(await Task.Run(enumerator.MoveNext).WaitAsync(TimeSpan.FromSeconds(10)));
+        await blocker.WaitUntilContendedAsync(protocol.FlowControl.BackendProcessId);
+
+        await flow.CancelAsync().WaitAsync(TimeSpan.FromSeconds(10));
+        await blocker.ReleaseAsync();
+        await flow.WaitForComplete().AsTask().WaitAsync(TimeSpan.FromSeconds(10));
+        await WaitUntilAsync(() => !protocol.HasPendingCancellation);
+        await PgTestPool.RunAsync(protocol, "select 1");
+    }
+
+    [TestMethod]
+    [DoNotParallelize]
     public async Task ServerCancel_NotSent_DoesNotCondemnProtocol()
     {
         await using var blocker = await PgAdvisoryLock.AcquireAsync();
@@ -631,17 +686,17 @@ public class CommandUserCancellationTests
             return new(CancelRequestState.Sent);
         });
 
-        using var cts = new CancellationTokenSource();
         var flow = new CommandFlow(async: true,
             firstBlocker.WaitCommand with { WithSync = true },
             secondBlocker.WaitCommand);
-        Assert.IsTrue(protocol.TryQueue(flow, cancellationToken: cts.Token));
-        var enumerator = flow.GetAsyncEnumerator(cts.Token);
-        var moveNext = enumerator.MoveNextAsync(cts.Token).AsTask();
+        Assert.IsTrue(protocol.TryQueue(flow));
+        var enumerator = flow.GetAsyncEnumerator();
+        var moveNext = enumerator.MoveNextAsync().AsTask();
 
         await firstBlocker.WaitUntilContendedAsync(protocol.FlowControl.BackendProcessId);
-        cts.Cancel();
+        var cancellation = flow.CancelAsync();
         await WaitUntilAsync(() => Volatile.Read(ref attempts) == 1);
+        await cancellation.WaitAsync(TimeSpan.FromSeconds(10));
         await firstBlocker.ReleaseAsync();
 
         await secondBlocker.WaitUntilContendedAsync(protocol.FlowControl.BackendProcessId);
@@ -653,6 +708,60 @@ public class CommandUserCancellationTests
         await enumerator.DisposeAsync();
         await WaitUntilAsync(() => !protocol.HasPendingCancellation);
         await PgTestPool.RunAsync(protocol, "select 1");
+    }
+
+    [TestMethod]
+    [DoNotParallelize]
+    public async Task ServerCancel_PerReadTokenTargetsOnlyCurrentWindow()
+    {
+        await using var firstBlocker = await PgAdvisoryLock.AcquireAsync();
+        await using var secondBlocker = await PgAdvisoryLock.AcquireAsync();
+        var attempts = 0;
+        await using var protocol = await PgTestPool.NewIsolatedAsync(o => o.CancelSender = (_, _, _) =>
+        {
+            Interlocked.Increment(ref attempts);
+            return new(CancelRequestState.Sent);
+        });
+
+        using var cts = new CancellationTokenSource();
+        var flow = new CommandFlow(async: true,
+            Command.Create("select 1") with { WithSync = true },
+            firstBlocker.WaitCommand with { WithSync = true },
+            secondBlocker.WaitCommand);
+        Assert.IsTrue(protocol.TryQueue(flow));
+        var enumerator = flow.GetAsyncEnumerator();
+        Assert.IsTrue(await enumerator.MoveNextAsync());
+        var moveNext = enumerator.MoveNextAsync(cts.Token).AsTask();
+
+        await firstBlocker.WaitUntilContendedAsync(protocol.FlowControl.BackendProcessId);
+        cts.Cancel();
+        await WaitUntilAsync(() => Volatile.Read(ref attempts) == 1);
+        await firstBlocker.ReleaseAsync();
+        await secondBlocker.WaitUntilContendedAsync(protocol.FlowControl.BackendProcessId);
+        await secondBlocker.ReleaseAsync();
+
+        await Assert.ThrowsExactlyAsync<OperationCanceledException>(
+            async () => await moveNext.WaitAsync(TimeSpan.FromSeconds(10)));
+        await enumerator.DisposeAsync();
+        Assert.AreEqual(1, Volatile.Read(ref attempts));
+        await PgTestPool.RunAsync(protocol, "select 1");
+    }
+
+    [TestMethod]
+    [DoNotParallelize]
+    public async Task AdoCancel_TargetsItsActiveCommandFlow()
+    {
+        await using var blocker = await PgAdvisoryLock.AcquireAsync();
+        await using var command = AdoTestPool.CreateCommand($"select pg_advisory_xact_lock({blocker.Key})");
+        var execution = command.ExecuteScalarAsync();
+
+        await blocker.WaitUntilContendedAsync();
+        command.Cancel();
+
+        await Assert.ThrowsExactlyAsync<OperationCanceledException>(
+            async () => await execution.WaitAsync(TimeSpan.FromSeconds(10)));
+        await blocker.ReleaseAsync();
+        await AdoTestPool.ExecuteNonQueryAsync("select 1");
     }
 
     [TestMethod]

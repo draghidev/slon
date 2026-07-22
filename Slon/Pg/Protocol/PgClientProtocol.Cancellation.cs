@@ -45,23 +45,22 @@ sealed partial class PgClientProtocol
         attempt?.SetResult();
     }
 
-    // Flow-owned request state. It ends when delivery becomes possible; any remaining connection-wide
-    // reach is represented by a CancellationExposure instead.
-    sealed class CancellationIntent(PgClientFlow instigator, Control control, PgClientFlow.BackendCancellationExtent extent, int window)
+    // One flow-window request. Once delivery may have occurred, any remaining wire-wide reach is
+    // represented by a CancellationExposure instead.
+    sealed class CancellationIntent(PgClientFlow instigator, Control control, int window)
     {
         internal readonly PgClientFlow Instigator = instigator;
         internal readonly Control Control = control;
         internal CancellationIntent? Next;
-        internal PgClientFlow.BackendCancellationExtent Extent = extent;
         internal int Window = window;
         internal bool Dispatching;
-        internal bool AwaitingBoundary;
         // Caller cancellation waits until buffered input has been consumed. Timeouts bypass this
         // condition because their read cancellation has already established the failure boundary.
         internal bool RequiresCancellationReadFrontier;
         internal bool InstigatorCompleted;
         internal byte Attempts;
         internal long RemainingDelayTicks;
+        internal TaskCompletionSource? Delivery;
     }
 
     // Connection-owned residue from a Sent/Unknown request. It may outlive its instigating flow and is
@@ -76,23 +75,40 @@ sealed partial class PgClientProtocol
     }
 
     internal void RequestServerCancellation(PgClientFlow instigator, Control control,
-        PgClientFlow.BackendCancellationExtent extent, int window, PgClientFlow.BackendCancellationTiming timing)
+        int window, PgClientFlow.BackendCancellationTiming timing, TaskCompletionSource? delivery = null)
     {
         if (_options.CancelSender is null || _backendProcessId is 0)
+        {
+            delivery?.TrySetResult();
             return;
+        }
 
         CancellationIntent? intent = null;
         var dispatch = false;
         lock (_syncRoot)
         {
-            if (_status is not ProtocolStatus.Ready)
+            if (_status is not ProtocolStatus.Ready || instigator.IsCompleted)
+            {
+                delivery?.TrySetResult();
                 return;
+            }
+            for (var exposure = _exposureHead; exposure is not null; exposure = exposure.Next)
+            {
+                if (ReferenceEquals(exposure.Instigator, instigator)
+                    && ReferenceEquals(exposure.Control, control)
+                    && ReferenceEquals(exposure.BoundaryFlow, instigator)
+                    && exposure.BoundaryWindow == window)
+                {
+                    delivery?.TrySetResult();
+                    return;
+                }
+            }
             for (var existing = _cancellationHead; existing is not null; existing = existing.Next)
             {
-                if (ReferenceEquals(existing.Instigator, instigator) && ReferenceEquals(existing.Control, control))
+                if (ReferenceEquals(existing.Instigator, instigator) && ReferenceEquals(existing.Control, control)
+                    && existing.Window == window)
                 {
-                    if (extent > existing.Extent)
-                        existing.Extent = extent;
+                    existing.Delivery ??= delivery;
                     if (timing is PgClientFlow.BackendCancellationTiming.Immediate)
                     {
                         existing.RemainingDelayTicks = 0;
@@ -106,7 +122,8 @@ sealed partial class PgClientProtocol
 
             if (intent is null)
             {
-                intent = new(instigator, control, extent, window);
+                intent = new(instigator, control, window);
+                intent.Delivery = delivery;
                 intent.RemainingDelayTicks = timing is PgClientFlow.BackendCancellationTiming.Immediate
                     ? 0 : GetCancelRequestDelayTicks();
                 intent.RequiresCancellationReadFrontier = timing is PgClientFlow.BackendCancellationTiming.AfterGrace;
@@ -128,7 +145,7 @@ sealed partial class PgClientProtocol
     bool TryBeginCancellationDispatchLocked(CancellationIntent intent)
     {
         if (_status is not ProtocolStatus.Ready || _cancellationDispatching || intent.Dispatching
-            || intent.AwaitingBoundary || intent.InstigatorCompleted || intent.Attempts >= 2
+            || intent.InstigatorCompleted || intent.Attempts >= 2
             || intent.RemainingDelayTicks > 0
             || intent.RequiresCancellationReadFrontier && !IsAtCancellationReadFrontierLocked(intent)
             || !ReferenceEquals(intent.Control.ActivatedFlow, intent.Instigator))
@@ -257,22 +274,17 @@ sealed partial class PgClientProtocol
             _cancellationDispatching = false;
             if (state is CancelRequestState.NotSent)
             {
-                if (intent.InstigatorCompleted)
+                if (intent.InstigatorCompleted || intent.Window < intent.Instigator.CancellationWindow)
                     RemoveCancellationIntentLocked(intent);
+                else if (intent.Attempts >= 2)
+                    intent.Delivery?.TrySetResult();
             }
             else
             {
                 if (!intent.Control.IsIdle)
                     AddCancellationExposureLocked(new(intent.Instigator, intent.Control));
-                if (intent.InstigatorCompleted || intent.Extent is PgClientFlow.BackendCancellationExtent.CurrentWindow)
-                    RemoveCancellationIntentLocked(intent);
-                else
-                {
-                    // The attempt has ended. An RFQ for this or a later window is therefore an
-                    // ACK-relative frontier: the request cannot reach beyond it.
-                    intent.Window = intent.Instigator.CancellationWindow;
-                    intent.AwaitingBoundary = true;
-                }
+                RemoveCancellationIntentLocked(intent);
+                intent.Delivery?.TrySetResult();
             }
         }
         TryDispatchNextCancellation();
@@ -344,11 +356,10 @@ sealed partial class PgClientProtocol
         Volatile.Write(ref _hasUnassignedCancellationBoundary, anyUnassigned);
     }
 
-    void OnCancellationWindowCompleted(Control control, PgClientFlow flow, int completedWindow, int remainingRfqCount)
+    void OnCancellationWindowCompleted(Control control, PgClientFlow flow, int completedWindow)
     {
         if (!HasPendingCancellation)
             return;
-        CancellationIntent? dispatchIntent = null;
         lock (_syncRoot)
         {
             var exposure = _exposureHead;
@@ -367,33 +378,11 @@ sealed partial class PgClientProtocol
                 if (!ReferenceEquals(intent.Control, control) || !ReferenceEquals(intent.Instigator, flow)
                     || completedWindow < intent.Window)
                     continue;
-                if (!intent.AwaitingBoundary)
-                {
-                    if (intent.Dispatching)
-                        break;
-                    if (remainingRfqCount is 0 || intent.Extent is PgClientFlow.BackendCancellationExtent.CurrentWindow)
-                        RemoveCancellationIntentLocked(intent);
-                    else
-                        intent.Window = completedWindow + 1;
-                    break;
-                }
-                if (remainingRfqCount is 0)
+                if (!intent.Dispatching)
                     RemoveCancellationIntentLocked(intent);
-                else
-                {
-                    intent.AwaitingBoundary = false;
-                    intent.Window = completedWindow + 1;
-                    intent.Attempts = 0;
-                    intent.RemainingDelayTicks = GetCancelRequestDelayTicks();
-                    intent.RequiresCancellationReadFrontier = true;
-                    if (TryBeginCancellationDispatchLocked(intent))
-                        dispatchIntent = intent;
-                }
                 break;
             }
         }
-        if (dispatchIntent is not null)
-            _ = DispatchCancellationAsync(dispatchIntent);
     }
 
     void OnFlowCompleted(Control control, PgClientFlow flow, int remainingDepth)

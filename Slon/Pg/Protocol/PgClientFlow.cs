@@ -6,13 +6,6 @@ namespace Slon.Pg.Protocol;
 
 abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgClientFlow>, IThreadPoolWorkItem
 {
-    protected internal enum BackendCancellationExtent : byte
-    {
-        CurrentWindow,
-        RemainingFlow,
-        WholeFlow
-    }
-
     protected internal enum BackendCancellationTiming : byte
     {
         AfterGrace,
@@ -137,12 +130,6 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
     // flows - where it is the genuine question being asked.
     internal bool NeedsSyncHandoff => !IsAsyncForEnqueue && GetHandoffMres() is not null;
 
-    // Probably should use a cts here.
-    public void Cancel()
-    {
-        throw new NotImplementedException();
-    }
-
     protected PgClientFlow(bool supportsPipelining)
     {
         _supportsPipelining = supportsPipelining;
@@ -242,10 +229,14 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
 
     /// Requests PostgreSQL backend cancellation for this flow on its bound protocol control.
     /// The protocol retains any request exposure that can outlive the flow.
-    protected void RequestBackendCancellation(
-        BackendCancellationExtent extent = BackendCancellationExtent.CurrentWindow,
-        BackendCancellationTiming timing = BackendCancellationTiming.AfterGrace)
-        => _boundControl?.RequestServerCancellation(this, extent, Volatile.Read(ref _cancellationWindow), timing);
+    protected void RequestBackendCancellation(BackendCancellationTiming timing = BackendCancellationTiming.AfterGrace,
+        TaskCompletionSource? delivery = null)
+    {
+        var control = _boundControl;
+        if (control is null)
+            return;
+        control.RequestServerCancellation(this, Volatile.Read(ref _cancellationWindow), timing, delivery);
+    }
 
     protected virtual void OnHeartbeat(TimeSpan interval) {}
     protected virtual void OnAbort(PgClientClosedException exception) {}
@@ -255,6 +246,7 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
     /// AbortToken. Idempotent across heartbeat ticks (subclasses use TrySet).
     protected virtual void OnStopping(PgClientClosedException exception) {}
     protected virtual void OnExecutionCompleted(Exception? exception) {}
+    protected virtual void OnCancellationWindowCompleted(int completedWindow, int remainingWindowCount) {}
     protected virtual void OnDiscarded() {}
     protected virtual void OnReset() {}
 
@@ -561,7 +553,9 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
             {
                 case PgTypes.BackendType.ReadyForQuery:
                     flow._rfqCount -= 1;
-                    control.OnFlowRfq(flow, backendMessage, flow._cancellationWindow++, flow._rfqCount);
+                    var completedWindow = flow._cancellationWindow++;
+                    control.OnFlowRfq(flow, backendMessage, completedWindow);
+                    flow.OnCancellationWindowCompleted(completedWindow, flow._rfqCount);
                     handled = false;
                     return true;
                 case PgTypes.BackendType.NoticeResponse:
@@ -587,7 +581,9 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
             {
                 case PgTypes.BackendType.ReadyForQuery:
                     flow._rfqCount -= 1;
-                    control.OnFlowRfq(flow, backendMessage, flow._cancellationWindow++, flow._rfqCount);
+                    var completedWindow = flow._cancellationWindow++;
+                    control.OnFlowRfq(flow, backendMessage, completedWindow);
+                    flow.OnCancellationWindowCompleted(completedWindow, flow._rfqCount);
                     goto default;
                 case PgTypes.BackendType.NoticeResponse:
                     // We sink all notices (this includes RAISE notices) and expect those to end up on the flow for user retrieval/logging.

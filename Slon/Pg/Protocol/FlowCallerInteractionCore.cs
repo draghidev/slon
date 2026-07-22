@@ -23,6 +23,9 @@ struct FlowCallerInteractionCore<TResult>
     bool _progressSignaled;
     // One-shot flag set by RequestWake; consumed by the OnCompleted post-store re-check.
     bool _wakeRequested;
+    // Cancellation may have to take ownership from a sync caller that will not return. Once set,
+    // a claimed handoff runs on a dedicated driver instead of occupying a pool worker.
+    bool _dedicatedWakeRequested;
     // The sticky close-latch: the canonical close exception for this flow's tenure, set out-of-band by
     // the protocol abort/stopping (CancelPendingWait) AND by the body's terminal close paths. The
     // consumer reads it on every Reset rearm to self-deliver the close to its just-armed generation,
@@ -72,7 +75,9 @@ struct FlowCallerInteractionCore<TResult>
         // reads the latch set.
         var latched = SetCloseLatch(exception);
         _gate.TrySetException(latched, runContinuationsAsynchronously: true);
-        _mres?.Set();
+        // The synchronous disposer may not have created its event yet. Publish a sticky progress
+        // level so WaitForContinuation observes the close even when this Set would have been a no-op.
+        SignalProgress();
     }
 
     // Public: a sync flow exposes this as its handoff rendezvous primitive (GetHandoffMres) for the
@@ -147,16 +152,39 @@ struct FlowCallerInteractionCore<TResult>
     // External wake request from consumer-side state changes (Enumerator.Dispose /
     // DisposeAsync). Spec: WakeProtocol.tla. Fires both wake mechanisms:
     //   - SignalProgress wakes a sync caller blocked in WaitForContinuation.
-    //   - Interlocked.Exchange on _wakeContinuation queues the body's resume action to TP if
-    //     present, covering async DisposeAsync on a sync-suspended body where the gate
-    //     can't reach the wait.
-    public void RequestWake()
+    //   - Interlocked.Exchange on _wakeContinuation claims the body's resume action if present,
+    //     covering consumer abandonment while a sync body is suspended. Ordinary wakes use the
+    //     thread pool; cancellation may graduate the flow to a dedicated driver.
+    public void RequestWake(bool useDedicatedDriver = false)
     {
+        if (useDedicatedDriver)
+            Volatile.Write(ref _dedicatedWakeRequested, true);
         Interlocked.Exchange(ref _wakeRequested, true);
         SignalProgress();
         var stored = Interlocked.Exchange(ref _wakeContinuation, null);
         if (stored is not null)
-            ThreadPool.UnsafeQueueUserWorkItem(static s => ((Action)s!)(), (object)stored);
+            Dispatch(stored, Volatile.Read(ref _dedicatedWakeRequested));
+    }
+
+    static void Dispatch(Action continuation, bool useDedicatedDriver)
+    {
+        if (!useDedicatedDriver)
+        {
+            ThreadPool.UnsafeQueueUserWorkItem(static s => ((Action)s!)(), (object)continuation);
+            return;
+        }
+
+        if (ExecutionContext.IsFlowSuppressed())
+            StartDedicated(continuation);
+        else
+        {
+            using (ExecutionContext.SuppressFlow())
+                StartDedicated(continuation);
+        }
+
+        static void StartDedicated(Action continuation)
+            => _ = Task.Factory.StartNew(static state => ((Action)state!)(), continuation,
+                CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
     }
 
     // Wake any WaitForContinuation that's parked without registering a continuation. Used by
@@ -180,6 +208,7 @@ struct FlowCallerInteractionCore<TResult>
         _wakeContinuation = null;
         _progressSignaled = false;
         _wakeRequested = false;
+        _dedicatedWakeRequested = false;
         _closeException = null;
         _gate.Reset();
     }
@@ -220,7 +249,7 @@ struct FlowCallerInteractionCore<TResult>
                 {
                     var stored = Interlocked.Exchange(ref field._wakeContinuation, null);
                     if (stored is not null)
-                        ThreadPool.UnsafeQueueUserWorkItem(static s => ((Action)s!)(), (object)stored);
+                        Dispatch(stored, Volatile.Read(ref field._dedicatedWakeRequested));
                 }
             }
 

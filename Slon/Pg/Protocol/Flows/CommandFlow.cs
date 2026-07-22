@@ -9,8 +9,15 @@ using FlowCallerInteractionCoreResult = System.ValueTuple;
 
 namespace Slon.Pg.Protocol.Flows;
 
+interface ICommandFlowCancellationTarget
+{
+    void SetActiveFlow(CommandFlow flow);
+    void ClearActiveFlow(CommandFlow flow);
+}
+
 readonly struct CommandFlowOptions
 {
+    public ICommandFlowCancellationTarget? CancellationTarget { get; init; }
     public Action<CommandResult, object?>? OnCommandResultAction { get; init; }
     public object? OnCommandResultActionState { get; init; }
     public Action<CommandDescriptor, PgError, object?>? OnCommandErrorAction { get; init; }
@@ -21,6 +28,13 @@ readonly struct CommandFlowOptions
 
 sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSource<FlowCallerInteractionCoreResult>, IValueTaskSource
 {
+    enum CancellationScope : byte
+    {
+        None,
+        CurrentWindow = 1,
+        RemainingFlow = 2
+    }
+
     // Flow state
     CommandFlowOptions _options;
     FlowCallerInteractionCore<FlowCallerInteractionCoreResult> _callerInteractionCore;
@@ -33,8 +47,10 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
     // Callbacks only latch cancellation and wake the body. The body delivers cancellation at its
     // terminal, after releasing pipeline promise tenure.
     bool _cancelRequested;
+    int _cancellationScope;
     // The token to carry on the terminal OCE, captured when the body observes the cancel.
     CancellationToken _cancelDeliverToken;
+    TaskCompletionSource? _cancelDelivery;
     // Set by the body's cancel drain transition; the terminal SetResult delivers OCE (not a clean end).
     bool _deliverCancelOce;
     // Errors encountered while draining are surfaced by a waiting DisposeAsync. Live consumers observe
@@ -130,6 +146,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
     {
         IsAsync = async;
         _options = options;
+        options.CancellationTarget?.SetActiveFlow(this);
         // Arm before publication: teardown may complete the source concurrently even before enumeration.
         _enumeratorMoveNextTaskSource.CanCompleteConcurrently = true;
         return this;
@@ -196,9 +213,9 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
     FlowTasks ExecuteAutoCore(Context context)
     {
         if (_flowCancellationToken.IsCancellationRequested)
-            RequestCancel(_flowCancellationToken);
+            RequestCancel(_flowCancellationToken, CancellationScope.RemainingFlow);
         else if (Volatile.Read(ref _cancelRequested))
-            RequestBackendCancellation(BackendCancellationExtent.RemainingFlow);
+            RequestBackendCancellation(delivery: Volatile.Read(ref _cancelDelivery));
         ValueTask writeTask;
         try
         {
@@ -416,13 +433,13 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                 {
                     Debug.Assert(IsAsync);
                     _callerCancellationTokenRegistration = _callerCancellationToken.UnsafeRegister(static (state, token)
-                        => ((CommandFlow)state!).RequestCancel(token), this);
+                        => ((CommandFlow)state!).RequestCancel(token, CancellationScope.CurrentWindow), this);
                 }
                 if (_flowCancellationToken.CanBeCanceled && !IsDraining)
                 {
                     Debug.Assert(IsAsync);
                     _flowCancellationTokenRegistration = _flowCancellationToken.UnsafeRegister(static (state, token)
-                        => ((CommandFlow)state!).RequestCancel(token), this);
+                        => ((CommandFlow)state!).RequestCancel(token, CancellationScope.RemainingFlow), this);
                 }
                 // After close, a fresh command must not consume bytes left by its predecessor. A draining
                 // flow may continue reading its own response to restore RFQ.
@@ -483,12 +500,13 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                     await _flowCancellationTokenRegistration.DisposeAsync().ConfigureAwait(false);
                 // Cancellation switches to autonomous drain; terminal delivery follows RFQ and tenure release.
                 if ((Volatile.Read(ref _cancelRequested) || EffectiveCancellationToken.IsCancellationRequested)
-                    && !IsDraining && !_enumeratorCompleted)
+                    && !_enumeratorCompleted)
                 {
                     _cancelDeliverToken = EffectiveCancellationToken.IsCancellationRequested ? EffectiveCancellationToken : _cancelDeliverToken;
                     _deliverCancelOce = true;
                     _enumeratorCompleted = true;
-                    MarkConsumerGoneByBody();
+                    if (!IsDraining)
+                        MarkConsumerGoneByBody();
                 }
 
                 CommandResult<ResultMessageEnumerator> result;
@@ -697,7 +715,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
         }
         catch (TimeoutException ex)
         {
-            RequestBackendCancellation(BackendCancellationExtent.RemainingFlow, BackendCancellationTiming.Immediate);
+            RequestBackendCancellation(BackendCancellationTiming.Immediate);
             HandleException(ex);
             throw;
         }
@@ -811,12 +829,48 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
     // it from a context that may hold (or race) the shared pipeline promise, driving ExecuteSource into a
     // TryStart over a tenured promise. Instead we latch intent + the token to carry, and RequestWake so a
     // parked body advances to its terminal, where it delivers the OCE tenure-safely (after its return).
-    void RequestCancel(CancellationToken token)
+    internal Task CancelAsync()
+    {
+        var delivery = Volatile.Read(ref _cancelDelivery);
+        if (delivery is null)
+        {
+            var created = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            delivery = Interlocked.CompareExchange(ref _cancelDelivery, created, null) ?? created;
+        }
+        if (IsCompleted)
+        {
+            delivery.TrySetResult();
+            return delivery.Task;
+        }
+        RequestCancel(default, CancellationScope.RemainingFlow);
+        if (IsCompleted)
+            delivery.TrySetResult();
+        return delivery.Task;
+    }
+
+    void RequestCancel(CancellationToken token, CancellationScope scope)
     {
         _cancelDeliverToken = token;
+        var observedScope = Volatile.Read(ref _cancellationScope);
+        while ((int)scope > observedScope)
+        {
+            var priorScope = Interlocked.CompareExchange(ref _cancellationScope, (int)scope, observedScope);
+            if (priorScope == observedScope)
+                break;
+            observedScope = priorScope;
+        }
         Volatile.Write(ref _cancelRequested, true);
-        RequestBackendCancellation(BackendCancellationExtent.RemainingFlow);
-        _callerInteractionCore.RequestWake();
+        Interlocked.Exchange(ref _draining, true);
+        RequestBackendCancellation(delivery: Volatile.Read(ref _cancelDelivery));
+        _callerInteractionCore.OpenGate(runContinuationsAsynchronously: true);
+        _callerInteractionCore.RequestWake(useDedicatedDriver: !IsAsync && Volatile.Read(ref _cancelDelivery) is not null);
+    }
+
+    protected override void OnCancellationWindowCompleted(int completedWindow, int remainingWindowCount)
+    {
+        if (remainingWindowCount != 0
+            && Volatile.Read(ref _cancellationScope) == (int)CancellationScope.RemainingFlow)
+            RequestBackendCancellation(delivery: Volatile.Read(ref _cancelDelivery));
     }
 
     bool IsOwnCancellation(PgError error)
@@ -1031,10 +1085,17 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
     }
 
     protected override void OnExecutionCompleted(Exception? exception)
-        => _options.Commands.Return();
+    {
+        Volatile.Read(ref _cancelDelivery)?.TrySetResult();
+        _options.CancellationTarget?.ClearActiveFlow(this);
+        _options.Commands.Return();
+    }
 
     protected override void OnDiscarded()
-        => _options.Commands.Return();
+    {
+        _options.CancellationTarget?.ClearActiveFlow(this);
+        _options.Commands.Return();
+    }
 
     protected override void OnReset()
     {
@@ -1055,7 +1116,9 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
         _flowCancellationTokenRegistration.Dispose();
         _flowCancellationTokenRegistration = default;
         _cancelRequested = false;
+        _cancellationScope = (int)CancellationScope.None;
         _cancelDeliverToken = default;
+        _cancelDelivery = null;
         _deliverCancelOce = false;
         _drainErrors = null;
         _consumeNonQuery = false;
@@ -1211,7 +1274,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
             if (cancellationToken is { IsCancellationRequested: true } preCanceledToken)
             {
                 flow._callerCancellationToken = preCanceledToken;
-                flow.RequestCancel(preCanceledToken);
+                flow.RequestCancel(preCanceledToken, CancellationScope.CurrentWindow);
                 flow._callerInteractionCore.OpenGate(runContinuationsAsynchronously: false);
                 return ValueTask.FromException<bool>(new OperationCanceledException(preCanceledToken));
             }

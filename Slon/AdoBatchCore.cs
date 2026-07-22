@@ -59,6 +59,7 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
     bool _explicitlyPrepared;
     TimeSpan _timeout;
     bool _enableErrorBarriers;
+    CommandFlow? _activeFlow;
     AdoCommandList<TCommand> _commands;
 
     public AdoBatchCore(SlonConnection connection, FieldRef<AdoBatchCore<TCommand>> fieldRef)
@@ -374,6 +375,7 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
 
             return new()
             {
+                CancellationTarget = (ICommandFlowCancellationTarget)_fieldRef.Instance,
                 OnCommandResultAction = onResultAction,
                 OnCommandResultActionState = onResultActionState,
                 OnCommandErrorAction = pgConnection is null
@@ -742,13 +744,22 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
         return ReleaseOwnedAsync(connection);
     }
 
-    // TODO what to do with concurrent callers, datasource commands etc.?
     public void Cancel()
     {
-        // We can't throw in connectionless scenarios as dapper etc expect this method to work.
-        if (TryGetDataSource(out _, out var connection))
-            return;
-
-        connection.PerformUserCancellation();
+        Volatile.Read(ref _activeFlow)?.CancelAsync().GetAwaiter().GetResult();
     }
+
+    public Task CancelAsync(CancellationToken cancellationToken = default)
+    {
+        var flow = Volatile.Read(ref _activeFlow);
+        if (flow is null)
+            return Task.CompletedTask;
+        var task = flow.CancelAsync();
+        return cancellationToken.CanBeCanceled ? task.WaitAsync(cancellationToken) : task;
+    }
+
+    internal void SetActiveFlow(CommandFlow flow) => Volatile.Write(ref _activeFlow, flow);
+
+    internal void ClearActiveFlow(CommandFlow flow)
+        => Interlocked.CompareExchange(ref _activeFlow, null, flow);
 }

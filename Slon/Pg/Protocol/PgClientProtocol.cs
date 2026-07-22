@@ -1070,9 +1070,9 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         public bool IsIdle => Volatile.Read(ref _isIdle);
         public ValueTask WaitForCancellationAttempt()
             => protocol.WaitForCancellationAttempt();
-        public void RequestServerCancellation(PgClientFlow instigator, PgClientFlow.BackendCancellationExtent extent,
-            int window, PgClientFlow.BackendCancellationTiming timing)
-            => protocol.RequestServerCancellation(instigator, this, extent, window, timing);
+        public void RequestServerCancellation(PgClientFlow instigator, int window,
+            PgClientFlow.BackendCancellationTiming timing, TaskCompletionSource? delivery = null)
+            => protocol.RequestServerCancellation(instigator, this, window, timing, delivery);
         public bool IsAtCancellationReadFrontier(PgClientFlow flow, int window)
             => Decoder.IsAtCancellationReadFrontier(flow, window);
         public void EnterCancellationReadFrontier(PgClientFlow flow, int window)
@@ -1249,10 +1249,10 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
 
         // Connection-wide transaction-state bookkeeping. Routes to the single protocol field (NOT a
         // per-Control copy) so inner-scope and outer flows keep one consistent view of the one wire.
-        public void OnFlowRfq(PgClientFlow flow, BackendMessage message, int completedWindow, int remainingRfqCount)
+        public void OnFlowRfq(PgClientFlow flow, BackendMessage message, int completedWindow)
         {
             protocol._transactionStatus = ReadyForQueryMessage.Create(message).TransactionStatus;
-            protocol.OnCancellationWindowCompleted(this, flow, completedWindow, remainingRfqCount);
+            protocol.OnCancellationWindowCompleted(this, flow, completedWindow);
         }
 
         // Wire-handoff guard, called from Policy.CompleteItem when a flow retires. The OUTER multiplexed

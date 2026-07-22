@@ -2,11 +2,12 @@ using System.Data;
 using System.Data.Common;
 using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
+using Slon.Pg.Protocol.Flows;
 
 namespace Slon;
 
 /// <inheritdoc cref="System.Data.Common.DbCommand" />
-public sealed class SlonCommand: DbCommand
+public sealed class SlonCommand: DbCommand, ICommandFlowCancellationTarget
 {
     AdoBatchCore<AdoCommand> _batchCore;
 
@@ -224,13 +225,17 @@ public sealed class SlonCommand: DbCommand
 
     /// <inheritdoc/>
     public override void Cancel()
-    {
-        // Callers may cancel before assigning a connection.
-        if (_batchCore.TryGetDataSource(out _, out var connection))
-            return;
+        => _batchCore.Cancel();
 
-        connection.PerformUserCancellation();
-    }
+    /// <summary>Requests cancellation and waits until delivery settles or execution ends.</summary>
+    public Task CancelAsync(CancellationToken cancellationToken = default)
+        => _batchCore.CancelAsync(cancellationToken);
+
+    void ICommandFlowCancellationTarget.SetActiveFlow(CommandFlow flow)
+        => _batchCore.SetActiveFlow(flow);
+
+    void ICommandFlowCancellationTarget.ClearActiveFlow(CommandFlow flow)
+        => _batchCore.ClearActiveFlow(flow);
 
     /// <summary>Executes the command against its connection object, returning the number of rows affected.</summary>
     /// <returns>The number of records affected.</returns>
