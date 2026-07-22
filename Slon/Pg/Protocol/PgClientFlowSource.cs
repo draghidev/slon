@@ -2,25 +2,11 @@ using System.Runtime.CompilerServices;
 using Draghi.Pipelining;
 using Draghi.Pipelining.Internal;
 
-// Composes Draghi.Pipelining.Internal SPSC primitives. The Experimental tag is deliberate. This
-// is the protocol's idle-flush + sync-flow handoff seam.
-#pragma warning disable DRAGHI001
-
 namespace Slon.Pg.Protocol;
 
-/// Pipeline source for PgClientFlow. SPSC primary queue on the thin TryGetNext/WaitForNextAsync pull
-/// seam (a WakeSignal wait, no value-task source), plus a sync-flow handoff slot that lets a sync
-/// producer's thread drive the executor for its own item without TP dispatch in the rendezvous.
-///
-/// Idle handoff: the sync producer publishes its flow into HandoffSlot and sets HandoffActive, which
-/// gates async producers' signals and completion wakes from racing the rendezvous. It then blocks in
-/// WakeSignal.WaitForSuspended until the executor's wait is armed, acks the slot, and claims the wait
-/// inline: the executor's continuation runs on the producer's thread, its TryGetNext retry takes the
-/// acked slot, and the flow is processed synchronously before EnqueueSyncWithHandoff returns. No TP
-/// work item at any point.
-///
-/// Async producers arriving during HandoffActive enqueue without signalling. After the handoff the
-/// sync caller wakes the executor on TP only if items or a deferred completion accrued, zero TP otherwise.
+/// Pipeline source for <see cref="PgClientFlow"/>. Async flows run from the executor; a sync head is
+/// held for its caller, which claims the executor wait and drives that flow inline. Both modes share
+/// one FIFO and the same source-wait protocol.
 readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowSource.Enumerator>
 {
     readonly State _state;
@@ -43,23 +29,14 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
             ThrowCompleted();
 
         inlineEligible &= _state.EnqueueItem(flow);
-        // Release store suffices: the flag's only cross-thread reader is the handoff close-out's
-        // compensation, and EnqueueResult.Execute's under-lock gate is the full fence that publishes
-        // it in time. A stale TRUE costs at most a spurious compensation wake (the wait re-check peeks
-        // the queue, not this flag).
-        Volatile.Write(ref _state.QueueNotEmpty, true);
-
         return new(_state, inlineEligible);
     }
 
     /// Synchronously enqueues a sync-mode flow and blocks until the executor processes it on the
     /// caller's thread, which drives the rendezvous and the body. No TP work item at any point.
-    /// Single producer per source (serialized by the protocol's submission lock). 1: open the handoff
-    /// window (HandoffActive) and publish the flow into the slot, gating async signals. 2: claim the
-    /// executor's parked wait under the wake lock, acking the slot only on a winning claim so a racing
-    /// async wake can't snipe it; re-wait and retry if the executor was busy. The claim dispatches the
-    /// executor's continuation inline here to pull the flow and process it. If async producers deferred
-    /// items during the window, wake the executor on TP afterward, else zero TP.
+    /// The flow keeps its FIFO position until the executor holds it for this caller. The caller then
+    /// claims the reserved wait and drives one turn inline; the wake driver serializes concurrent
+    /// notifications and transfers any trailing work to the scheduler.
     // Combined sync handoff for callers without an outer enqueue lock (the exclusive scope's inner
     // source, a single sync producer): append at the FIFO tail and run the blocking rendezvous.
     public void EnqueueSyncWithHandoff(PgClientFlow flow)
@@ -85,7 +62,6 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
     public void DrainInertItems(Action<PgClientFlow> onInert)
     {
         _state.DrainInert(onInert);
-        Volatile.Write(ref _state.QueueNotEmpty, false);
     }
 
     // Arm the drain gate (see State.DrainSignal). Set before Complete is triggered.
@@ -99,7 +75,7 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
     /// Backlog: flows enqueued but not yet dispatched. With Pipeline.Depth (in-flight = dispatched -
     /// completed), Depth + Backlog is the total outstanding. Lock-free read, may be stale.
     public int Backlog => _state.Backlog;
-    internal bool IsInlineDrive => _state.InlineOneShot;
+    internal bool IsInlineDrive => _state.WakeDriver.IsInlineOneShot;
     internal BacklogEnumerator GetBacklogEnumerator() => _state.GetBacklogEnumerator();
 
     internal void OnActivationHeartbeat(TimeSpan period) => _state.OnActivationHeartbeat(period);
@@ -147,12 +123,10 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
         // first overlap. Same SPSC contract as the bare queue it replaces (single producer = Enqueue,
         // single consumer = the executor's pull), so it is a drop-in. Non-readonly: mutated by ref this.
         SlotEscalatingQueue<PgClientFlow> _storage;
-        // The wait-protocol WakeSignal with suspension observation enabled: the executor's waits
-        // arm against it (thin path, no value-task source), and EnqueueSyncWithHandoff
-        // rendezvouses on WaitForSuspended. Scheduler-routed async wakes come with it.
-        public readonly WakeSignal WakeSignal;
-        public bool QueueNotEmpty;
-        public PgClientFlow Current = null!;
+        // The source wait and its serialized driver. The driver also coordinates sync takeover at an
+        // idle boundary, keeping executor ownership out of the queue implementation below.
+        public readonly SourceWakeEvent WakeEvent;
+        public readonly PgFlowSourceDriver WakeDriver;
         // Drain gate. Fired once from WaitCore's completed-resolution when the executor's pull
         // resolves completed (WaitForNextAsync delivers false). Shutdown awaits it before draining
         // the residual so the drain is the sole consumer of the SPSC queue (a concurrent executor
@@ -171,27 +145,12 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
         public bool TakeoverActive;
         public bool IsCompleted;
 
-        // Set under the wake lock by OnExecutorSuspended when the executor parks AT a sync head: that
-        // park is reserved for the head sync caller's takeover, so TryClaim (async / Complete) must NOT
-        // steal it. Set to false on any non-sync-head park (idle / async head). A producer-readable
-        // substitute for the SPSC-illegal queue peek a producer can't do itself.
-        public bool ParkedAtSyncHead;
+        // Published at the event handoff boundary because producers cannot inspect the SPSC head.
+        // Ordinary notifications must not claim a wait reserved for the held sync flow's caller.
+        public bool SyncHeadReserved;
 
-        // Single-runner latch over the executor continuation. _driving is 1 while a Slon-driven pump turn
-        // runs its synchronous body (DispatchClaimed -> the turn's park-return). A drive that arrives
-        // during that window - including a re-entrant self-heal raised from inside the turn's OWN
-        // OnExecutorSuspended (which runs mid-MoveNext, before the continuation has unwound) - records
-        // _redrive instead of dispatching a second continuation onto another thread. The active runner
-        // serves _redrive on its way out (RunLoop). This is what keeps two pumps off Draghi's
-        // Count==0 inline-activation gate, i.e. off the "already executing" shared-promise collision: the
-        // handover is atomic, the continuation is only ever live on one thread. All three fields transition
-        // under the wake lock, paired with OnExecutorSuspended and the claim sites.
-        int _driving;
-        bool _redrive;
-        // An async enqueue that claims an idle source may drive its own first item inline. The budget
-        // ends after that item is dispatched: the next pull fake-misses, and RunLoop transfers any
-        // accrued redrive to the scheduler instead of draining later producers on this caller's thread.
-        public bool InlineOneShot;
+        // Set after an inline async turn consumes its one-item budget. The next pull parks so the wake
+        // driver can transfer any accumulated work to the scheduler.
         public bool InlineHandBack;
 
         // The Control every flow in this source is bound to. Used to mint a flow's ExecutionControl so the
@@ -212,53 +171,12 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
         {
             FlushGate = new(protocol);
             _control = control;
-            WakeSignal = new(runContinuationsAsynchronously: true, scheduler, enableWaitForSuspended: true);
-            WakeSignal.OnSuspended = OnExecutorSuspended;
+            WakeEvent = new(runContinuationsAsynchronously: true, scheduler);
+            WakeDriver = new(this, WakeEvent);
         }
 
-        // Invoked under the wake lock when the executor parks. If it dequeued a sync flow and is HOLDING
-        // it (HeldSyncFlow) for that flow's caller, signal THAT flow's own handoff MRES so its caller takes
-        // over and runs the held flow on its own thread. Idle / async-drained parks are not a sync rendezvous.
-        void OnExecutorSuspended()
-        {
-            var held = HeldSyncFlow;
-            // Reserve this park for the held sync caller (TryClaim reads this under the same lock) BEFORE
-            // signalling, so a producer's TryClaim can't steal the park between the signal and the gate.
-            // Plain store: every reader (Drive, RunLoop) and the claim-site clear are under this same wake
-            // lock, so its acquire/release barriers publish it - no volatile needed.
-            ParkedAtSyncHead = held is not null;
-            if (held is not null)
-            {
-                // Hand the held sync caller its takeover wake - but only if NO runner is live. A live runner
-                // (this park is its OWN suspend, mid-MoveNext) signals the caller from RunLoop AFTER it drops
-                // _driving, so the caller can't wake into a held latch, fail its _driving==0 claim, and
-                // strand. The b-path (executor resumed off a trailing await, outside RunLoop) has no later
-                // release point, so it signals here.
-                if (_driving == 0)
-                    held.GetExecutionControl(_control).GetHandoffMres()?.Set();   // the just-held caller, parked on its own flow's MRES
-                return;
-            }
-            // Parking idle / async-headed with work still queued: re-drive the pump on TP rather than
-            // idle-park on pending work. The close-out re-signal and a producer's kick are both lost when
-            // they land while the pump is OFF the wake-park - which happens when a sync flow takes the
-            // executor INLINE on its caller's thread and then faults: RecoverItem awaits the trailing,
-            // suspending the pump off-park, and resumes it on the trailing's TP thread, so the one-shot
-            // hand-back arms here with the next caller's flow already queued but unsignalled. Self-healing
-            // here keeps all of that contained in the source. Claim the park we just armed and dispatch
-            // its continuation on TP; an async dispatch only schedules, so it is safe under this wake lock.
-            if (HasItem())
-            {
-                // A Slon-driven turn is live (this park is its own suspend): record the re-drive and let
-                // that runner serve it after the continuation unwinds - dispatching a second continuation
-                // here would race the still-unwinding MoveNext (the double-pump). With no runner (the
-                // executor was resumed off a trailing/commit await, outside RunLoop), keep the original
-                // self-heal: claim and dispatch on TP.
-                if (_driving == 1)
-                    _redrive = true;
-                else if (WakeSignal.TryClaimLocked())
-                    WakeSignal.DispatchClaimed(runContinuationsAsynchronously: true);
-            }
-        }
+        internal void SignalHeldSyncFlow()
+            => HeldSyncFlow?.GetExecutionControl(_control).GetHandoffMres()?.Set();
 
         // Register Complete as the completion-token callback. Done here (not in Enumerator) so Complete
         // can stay private: its single-writer safety depends on the CTS firing it at most once, so the
@@ -280,116 +198,7 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
             // wakes when ITS OWN flow is drained inert (DrainInert -> ExecutionControl.Complete -> OnComplete
             // -> HandleException -> SignalProgress sets the flow's MRES), then re-reads IsCompleted and bails.
             // No direct wait-list head wake - there is no wait-list.
-            TryClaim(runContinuationsAsynchronously: true);
-        }
-
-        // Claim the executor's parked wait and dispatch its continuation. Gated on ParkedAtSyncHead so an
-        // async/Complete claim never STEALS a park the executor is holding at a sync head (reserved for
-        // that head sync caller's takeover): stealing it makes the sync caller's own claim lose, and the
-        // claim-loss Reset can eat the executor's re-park signal -> lost wake. The read and the claim are
-        // one wake-lock hold, paired with OnExecutorSuspended's under-lock write. A claim dropped to a
-        // sync-head park is intentional: the sync caller takes over, and its close-out re-signal re-drives
-        // the executor for any async deferred during the window. Other parks (idle / async head) are not
-        // reserved, so async drains freely - no FIFO misroute. EXCEPTION: once completing, the reservation
-        // is lifted - there are no more takeovers, so Complete must be able to claim a sync-head park to
-        // un-park an executor whose caller is bailing (else it strands and DrainSignal never fires). Only
-        // Complete reaches here post-completion (the async Execute path throws at Enqueue first).
-        public void TryClaim(bool runContinuationsAsynchronously)
-            => Drive(runContinuationsAsynchronously);
-
-        // === The single-runner invariant ===
-        // _driving==1 means exactly one thread is driving the executor continuation. It is taken (paired
-        // with a successful WakeSignal claim) and dropped only under the wake lock, so DispatchClaimed is
-        // never invoked on two threads at once - that is what keeps two pumps off Draghi's Count==0 inline-
-        // activation gate (the "already executing" shared-promise collision). A drive that finds a runner
-        // live records _redrive; the runner serves it before relinquishing. The MRES handoff to a sync
-        // caller's takeover is sequenced through the SAME latch: the runner signals the caller only AFTER it
-        // drops _driving, so the caller's claim (gated on _driving==0) always finds the latch free. Every
-        // transition - _driving, _redrive, the sync-head MRES signal - happens under the wake lock, so they
-        // totally order against each other and against TryClaimLocked.
-
-        // Single funnel for every drive that does not already hold the runner role: the producer enqueue,
-        // Complete, and the sync caller's kick / close-out. Either BECOMES the runner (claim + take _driving)
-        // or, with a runner live, records a re-drive it serves on its way out - never a second concurrent
-        // DispatchClaimed. Never steals a sync-head park reserved for that head's own takeover (the sync
-        // caller claims it via WaitForExecutor); Complete is the lone exception, lifted once IsCompleted (no
-        // more takeovers), so a bailing caller's park is un-parked and DrainSignal can fire.
-        void Drive(bool runAsync)
-        {
-            var wakeSignal = WakeSignal;
-            wakeSignal.AcquireWakeLock();
-            var became = false;
-            if (ParkedAtSyncHead && !Volatile.Read(ref IsCompleted))
-            {
-                // Reserved for a sync-head takeover: do not steal and do not re-drive - the caller owns it.
-            }
-            else if (_driving == 1)
-                _redrive = true;
-            else if (wakeSignal.TryClaimLocked())
-            {
-                _driving = 1;
-                _redrive = false;   // fresh runner counts only the re-drives raised during ITS run
-                InlineOneShot = !runAsync;
-                became = true;
-            }
-            wakeSignal.ReleaseWakeLock();
-            if (!became)
-                return;
-            if (runAsync)
-                wakeSignal.Scheduler.SubmitDetached(static s => ((State)s!).RunLoop(), this);
-            else
-                RunLoop();
-        }
-
-        // The single runner: drives one claimed turn at a time to its park, INLINE (the continuation
-        // re-enters the protocol on this thread, so DispatchClaimed must be off the wake lock). After each
-        // turn it either SERVES an accrued re-drive (a producer enqueue or a self-heal) by re-claiming the
-        // just-armed park and staying the runner, or RELINQUISHES (drops _driving). A turn that parks off a
-        // WakeSignal arm (a trailing/commit await on the recovery / write-back-pressure path) has nothing to
-        // re-claim, so it relinquishes and that resume's own park self-heals. On relinquishing at a sync-head
-        // park it hands the caller its takeover wake AFTER dropping _driving - signalling before the drop
-        // would let the caller wake into a held latch, fail its _driving==0 claim, reset its MRES, and
-        // strand with no re-signal (the executor is already parked and will not re-park).
-        void RunLoop()
-        {
-            var wakeSignal = WakeSignal;
-            while (true)
-            {
-                wakeSignal.DispatchClaimed(runContinuationsAsynchronously: false);
-                wakeSignal.AcquireWakeLock();
-                if (InlineOneShot)
-                {
-                    InlineOneShot = false;
-                    _driving = 0;
-                    var transfer = _redrive
-                        && !(ParkedAtSyncHead && !Volatile.Read(ref IsCompleted))
-                        && wakeSignal.TryClaimLocked();
-                    if (transfer)
-                    {
-                        _redrive = false;
-                        _driving = 1;
-                    }
-                    wakeSignal.ReleaseWakeLock();
-                    if (transfer)
-                        wakeSignal.Scheduler.SubmitDetached(static s => ((State)s!).RunLoop(), this);
-                    return;
-                }
-                if (_redrive
-                    && !(ParkedAtSyncHead && !Volatile.Read(ref IsCompleted))
-                    && wakeSignal.TryClaimLocked())
-                {
-                    _redrive = false;
-                    wakeSignal.ReleaseWakeLock();
-                    continue;
-                }
-                // Relinquish. Drop the latch, then hand a reserved sync-head park to its caller. HeldSyncFlow
-                // is non-null exactly when we parked at a sync head (OnExecutorSuspended sets them together).
-                _driving = 0;
-                var handBack = Volatile.Read(ref IsCompleted) ? null : HeldSyncFlow;
-                handBack?.GetExecutionControl(_control).GetHandoffMres()?.Set();
-                wakeSignal.ReleaseWakeLock();
-                return;
-            }
+            WakeDriver.Drive(runContinuationsAsynchronously: true);
         }
 
         // Phase 1 of the sync handoff, under the protocol's _syncRoot: enqueue the sync flow at its real
@@ -403,7 +212,6 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
             // mutable IsAsync: a flow on the sync path is a sync handoff regardless of its IsAsync state.
             flow.CaptureAsyncRoutingSnapshot(isAsync: false);
             _storage.Enqueue(flow);
-            Volatile.Write(ref QueueNotEmpty, true);
             return flow;
         }
 
@@ -411,7 +219,7 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
         // over so the body runs on the caller's thread. Parks on the flow's OWN handoff MRES.
         public void WaitForExecutor(PgClientFlow flow)
         {
-            var wakeSignal = WakeSignal;
+            var wakeDriver = WakeDriver;
             // Caller-handoff path only: the routing (TryQueueFlow / ExclusiveAccessFlow.Queue, gated on
             // NeedsSyncHandoff) sends autonomous sync flows (null MRES, no parked caller) down the async
             // dispatch path instead, so a flow that reaches here always carries its waiter MRES. Fail loud
@@ -419,63 +227,34 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
             var mres = flow.GetExecutionControl(_control).GetHandoffMres()
                 ?? throw new InvalidOperationException("WaitForExecutor reached with a null handoff MRES: an autonomous sync flow must route via async dispatch (NeedsSyncHandoff), not the caller-handoff park.");
             // Kick the executor so it pulls and drains earlier flows in FIFO order, dequeue-and-holding the
-            // first sync head and parking - OnExecutorSuspended then signals THAT held flow's MRES. A no-op
+            // first sync head and parking - OnHandoffReady then signals THAT held flow's MRES. A no-op
             // if the executor is already running (it reaches our flow on its own). Through the latch so the
             // kick can't spin up a second runner alongside one already live.
-            Drive(runAsync: true);
+            wakeDriver.Drive(runContinuationsAsynchronously: true);
 
             while (true)
             {
+                var handoff = wakeDriver.TryClaimHandoff(flow, mres, out var claim);
+                if (handoff is PgFlowSourceDriver.HandoffStatus.Claimed)
+                {
+                    claim.DispatchInline();
+                    break;
+                }
+                if (handoff is PgFlowSourceDriver.HandoffStatus.Completed)
+                    break;
+
+                // The held head may still sit behind async work. Re-drive after the locked recheck,
+                // then park; a signal between these operations remains set in the MRES.
+                wakeDriver.Drive(runContinuationsAsynchronously: true);
                 mres.Wait();
-                wakeSignal.AcquireWakeLock();
-                // Reset under the lock, right after Wait: a successful claim hands the body a CLEAN MRES (the
-                // body reuses it for its own WaitForContinuation rendezvous). Manual-reset + two signal
-                // sources (OnExecutorSuspended here, the inert-drain SignalProgress on completion), so the
-                // Reset must serialize with the Set under the wake lock.
-                mres.Reset();
-                // Become the single runner for our own takeover. _driving==0 gates against a runner already
-                // live (an async drive that beat us here): we lose this round, loop, and retry when it parks
-                // at our sync head and re-signals our MRES (OnExecutorSuspended's held branch).
-                if (ReferenceEquals(HeldSyncFlow, flow) && _driving == 0 && wakeSignal.TryClaimLocked())
-                {
-                    _driving = 1;
-                    _redrive = false;   // fresh runner: only re-drives raised during OUR run count
-                    TakeoverPending = true;   // our inline pull dequeues our own (now held) flow
-                    // Consume the sync-head reservation NOW, under the same wake lock that set it
-                    // (OnExecutorSuspended). ParkedAtSyncHead is a producer-readable "this park is reserved
-                    // for a parked sync caller" flag; once WE (that caller) claim it, it is no longer reserved
-                    // - we are the runner. Leaving it true lets it go STALE-TRUE for the whole takeover body:
-                    // a concurrent async Drive then reads it, treats a live-caller park as reserved, and drops
-                    // its wake without recording a re-drive (Drive's reserved branch is a no-op), so the async
-                    // item strands with the pipeline empty and its response buffered. Cleared here, that Drive
-                    // falls through to _redrive and the runner serves it. Set together with HeldSyncFlow at the
-                    // park; cleared together with the claim that consumes them. Plain store: under the wake lock,
-                    // same as its set (OnExecutorSuspended) and its reads (Drive, RunLoop).
-                    ParkedAtSyncHead = false;
-                    wakeSignal.ReleaseWakeLock();
-                    // Inline: the pump continuation runs on this thread, dequeues our flow, runs its body,
-                    // then one-shot fake-misses and re-parks (pump back to TP) so this returns.
-                    RunLoop();
-                    break;
-                }
-                // Completion bail: the source completed and we did not claim a park to take our flow over.
-                // It (and anything ahead of it) drains inert; its fault surfaces via the flow. Stop waiting
-                // - the executor resolves Completed and will not signal us again.
-                if (Volatile.Read(ref IsCompleted))
-                {
-                    wakeSignal.ReleaseWakeLock();
-                    break;
-                }
-                wakeSignal.ReleaseWakeLock();
             }
 
             // Close-out: kick the executor to advance to the next FIFO flow. It dequeues-and-holds the next
-            // sync head and OnExecutorSuspended signals THAT caller's MRES. On completion the executor
+            // sync head and OnHandoffReady signals THAT caller's MRES. On completion the executor
             // resolves Completed instead of advancing, but each parked caller wakes when ITS OWN flow drains
             // inert (its terminal SignalProgress sets its MRES), so no direct successor wake is needed here.
-            // Through the latch: if our takeover's RunLoop is still unwinding, this records a re-drive it
-            // serves rather than racing a second runner onto the wire.
-            Drive(runAsync: true);
+            // Advance to the next FIFO flow, coalescing with a driver that is still unwinding.
+            wakeDriver.Drive(runContinuationsAsynchronously: true);
         }
 
         // Async enqueue (the EnqueueResult / Execute path). Capture the routing async-mode (async here)
@@ -516,30 +295,22 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
         // takes it over. Reads IsAsyncAtBind (the STABLE routing snapshot captured at enqueue), not the
         // mutable IsAsync a body flips mid-execution.
         public PgClientFlow? HeldSyncFlow;
-        public bool TryDispatchAsyncOrHoldSync()
+        public bool TryDispatchAsyncOrHoldSync([System.Diagnostics.CodeAnalysis.MaybeNullWhen(false)] out PgClientFlow item)
         {
             if (HeldSyncFlow is not null)
+            {
+                item = null;
                 return false;   // a sync flow is held, waiting for its caller: do not dispatch behind it
-            if (!_storage.TryDequeue(out Current!))
+            }
+            if (!_storage.TryDequeue(out item!))
                 return false;   // empty
-            if (!_storage.TryPeek(out _))
-                Volatile.Write(ref QueueNotEmpty, false);
-            if (Current.IsAsyncAtBind)
+            if (item.IsAsyncAtBind)
                 return true;    // async: dispatch on the executor
-            HeldSyncFlow = Current;   // sync: hold for its caller's takeover, fake-miss
+            HeldSyncFlow = item;   // sync: hold for its caller's takeover, fake-miss
+            item = null;
             return false;
         }
 
-        public bool TryDequeue()
-        {
-            if (_storage.TryDequeue(out Current!))
-            {
-                if (!_storage.TryPeek(out _))
-                    Volatile.Write(ref QueueNotEmpty, false);
-                return true;
-            }
-            return false;
-        }
     }
 
     /// Result of <see cref="Enqueue"/>. Calling <see cref="Execute"/> wakes the executor (or
@@ -558,7 +329,7 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
         public void Execute(bool runContinuationsAsynchronously)
         {
             if (_state is null) return;
-            _state.TryClaim(runContinuationsAsynchronously || !_inlineEligible);
+            _state.WakeDriver.Drive(runContinuationsAsynchronously || !_inlineEligible);
         }
     }
 
@@ -586,7 +357,7 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
 
         /// Synchronous pull. A sync flow's caller takes it over inline (the two takeover flags); a sync
         /// flow it is NOT taking over is fake-missed so the executor parks for that caller; otherwise the
-        /// primary queue. Items route through State.Current.
+        /// primary queue.
         public bool TryGetNext([System.Diagnostics.CodeAnalysis.MaybeNullWhen(false)] out PgClientFlow item)
         {
             if (_state.InlineHandBack)
@@ -605,7 +376,6 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
                 // body; the next pull one-shot fake-misses (TakeoverActive) so the pump re-parks.
                 item = _state.HeldSyncFlow;
                 _state.HeldSyncFlow = null;
-                _state.Current = item!;
                 return item is not null;
             }
             if (_state.TakeoverActive)
@@ -639,16 +409,14 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
             // Dispatch an ASYNC head on the executor; a SYNC head is dequeued-and-held for its caller's
             // takeover (fake-miss here). One dequeue, check after - see TryDispatchAsyncOrHoldSync for why
             // a peek-then-dequeue would race a producer into a misroute.
-            if (_state.TryDispatchAsyncOrHoldSync())
+            if (_state.TryDispatchAsyncOrHoldSync(out item))
             {
                 if (needsArm)
                     gate.ConsumeArm();
-                item = _state.Current;
-                if (_state.InlineOneShot)
+                if (_state.WakeDriver.IsInlineOneShot)
                     _state.InlineHandBack = true;
                 return true;
             }
-            item = null;
             return false;
         }
 
@@ -666,8 +434,8 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
 
         WaitForNextAwaitable WaitCore()
         {
-            var wakeSignal = _state.WakeSignal;
-            wakeSignal.AcquireWakeLock();
+            var wakeSignal = _state.WakeEvent;
+            using var wait = wakeSignal.BeginWait();
 
             // One-shot takeover hand-back: the sync caller's pull just fake-missed (TakeoverActive).
             // Reset it; unless completing (checked below, BEFORE any arm), Arm so the pump parks here -
@@ -680,50 +448,35 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
             if (inlineHandBack)
                 _state.InlineHandBack = false;
 
-            // Completion BEATS the primary queue, including any queued sync flow: once completing, the
-            // whole queue drains inert and blocked sync callers bail (Complete wakes them; WaitForExecutor
-            // sees IsCompleted and returns). No takeover during shutdown - an async flow ahead of a sync
-            // waiter can't be skipped to reach it (it must drain inert / rebind, not run), so takeover
-            // can't be done consistently; draining everything inert is the uniform model (previously this
-            // was gated on a queued sync waiter to keep the executor alive for a takeover - that gate is
-            // gone). Fire DrainSignal so Shutdown drains the residual as the sole consumer.
-            //
-            // Every park in this method MUST pass this check under the arm's own wake-lock hold - that is
-            // the whole lost-wake proof: Complete's write-then-Drive either precedes this hold (this read
-            // sees true, no arm) or follows the registration's release (Drive claims the armed _pending).
-            // The takeover hand-back arm used to skip it, relying on the sync caller's close-out Drive -
-            // which only covers a hand-back parked synchronously inside that caller's takeover RunLoop. A
-            // turn that suspends off-signal between the body and this pull (item-result / commit / trailing
-            // await) arms LATER, on its TP resume with _driving==0, after both the close-out Drive and
-            // Complete's Drive have passed and found nothing armed: the arm was unchecked, the wake lost,
-            // and shutdown hung on DrainSignal (the pool-mix wedge).
+            // Completion beats queued work: shutdown drains the residual as the sole consumer. This
+            // check must remain inside every BeginWait boundary. Complete either precedes it and prevents
+            // the wait, or follows registration and claims that wait through the driver. The rule also
+            // covers pulls resumed from trailing work rather than from the source event.
             if (Volatile.Read(ref _state.IsCompleted) || _completionToken.IsCancellationRequested)
             {
-                wakeSignal.ReleaseWakeLock();
                 _state.DrainSignal?.TrySetResult();
-                return WaitForNextAwaitable.Completed();
+                return WaitForNextAwaitable.Completed;
             }
 
             // Not completing: park the hand-back. Skips the item-retry branch below on purpose - the
             // one-shot must park even with items queued (hand the pump back to TP rather than draining
             // a later flow on the sync caller's thread).
             if (takeoverHandBack || inlineHandBack)
-                return wakeSignal.Arm();
+                return wait.WaitAsync();
 
             // A dispatchable item is available - retry to consume it - UNLESS a sync flow is already held
             // for its caller's takeover, in which case we park here and let that caller take it (we must
-            // not dispatch behind it). HasItem is the authoritative not-empty peek (QueueNotEmpty can go
-            // stale-true). A sync head still in the queue gets dequeued-and-held on the retry's next pull.
+            // not dispatch behind it). A sync head still in the queue gets dequeued-and-held on the
+            // retry's next pull.
             if (_state.HeldSyncFlow is null && _state.HasItem())
             {
                 // An item is available - arm the next TryGetNext so it can consume one (only one
                 // while the flush-threshold gate holds, so a flush round lands between items).
                 _state.FlushGate.Rearm();
-                wakeSignal.ReleaseWakeLock();
-                return WaitForNextAwaitable.Retry();
+                return WaitForNextAwaitable.Retry;
             }
 
-            return wakeSignal.Arm();
+            return wait.WaitAsync();
         }
 
         // Only reached on real write backpressure (the flush didn't complete inline), so a pooled

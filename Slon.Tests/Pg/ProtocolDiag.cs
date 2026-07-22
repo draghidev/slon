@@ -48,19 +48,21 @@ static class ProtocolDiag
         var state = source.GetType().GetField("_state", All)!.GetValue(source)!;
         var st = state.GetType();
         object? S(string name) => st.GetField(name, All)!.GetValue(state);
-        var wake = S("WakeSignal")!;
+        var wake = S("WakeEvent")!;
         var wt = wake.GetType();
         object? W(string name) => wt.GetField(name, All)!.GetValue(wake);
+        var driver = S("WakeDriver")!;
+        var dt = driver.GetType();
+        object? D(string name) => dt.GetField(name, All)!.GetValue(driver);
         var pipeline = typeof(PgClientProtocol).GetField("_pipeline", All)!.GetValue(protocol)!;
         var pumpTask = (Task)pipeline.GetType().GetField("_executionTask", All)!.GetValue(pipeline)!;
         var pump = pumpTask.Status + (pumpTask.Exception is { } ex
             ? $" ex={ex.InnerException?.GetType().Name}: {ex.InnerException?.Message}\n  pump fault stack: {ex.InnerException?.StackTrace}"
             : "");
         return $"pumpTask={pump} armed={W("_pending")} registered={W("_waitContinuation") is not null} " +
-            $"driving={S("_driving")} redrive={S("_redrive")} " +
-            $"parkedSyncHead={S("ParkedAtSyncHead")} held={S("HeldSyncFlow") is not null} " +
-            $"takeoverPending={S("TakeoverPending")} takeoverActive={S("TakeoverActive")} " +
-            $"queueNotEmpty={S("QueueNotEmpty")}";
+            $"driving={D("_active")} redrive={D("_redrive")} " +
+            $"parkedSyncHead={S("SyncHeadReserved")} held={S("HeldSyncFlow") is not null} " +
+            $"takeoverPending={S("TakeoverPending")} takeoverActive={S("TakeoverActive")}";
     }
 
     internal static void JoinAllOrDump(Thread[] threads, PgClientProtocol protocol, string what)

@@ -86,7 +86,7 @@ public class SyncFlowHandoffTests
     }
 
     // Per-iteration thread-id check across many handoff cycles. Repeats the rendezvous tightly
-    // so any per-call leak in HandoffSlot / HandoffActive / QueueNotEmpty / SyncHead / SyncTail
+    // so any per-call leak in the handoff state
     // / the parked-MRES would either deadlock or break the caller-thread guarantee within a few
     // hundred runs.
     [TestMethod]

@@ -384,7 +384,7 @@ public class ProtocolCompletionTests
     // Dispose, so its hand-back arm is ordered strictly before the caller's close-out re-signal
     // and is always claimed. A FAULTED body instead rides RecoverItem's trailing await - the pump
     // resumes on a TP thread with no close-out behind it, and the one-shot hand-back park
-    // (WaitCore's TakeoverActive branch) armed WITHOUT re-checking IsCompleted: WakeSignal left
+    // (WaitCore's TakeoverActive branch) armed WITHOUT re-checking IsCompleted: SourceWakeEvent left
     // _pending stuck true with the continuation stored, DrainSignal never fired, and shutdown hung
     // forever at its WhenAny. Recipe: CompleteAsync mid-body plants IsCompleted while the executor
     // is off-signal (its Drive is a guaranteed no-op - nothing armed), then DisposeAsync's abort
