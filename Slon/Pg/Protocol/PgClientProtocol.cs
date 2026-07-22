@@ -54,6 +54,8 @@ sealed class PgClientProtocolOptions
     public TimeSpan FlowActivationTimeout { get; set; }
     public TimeSpan HeartbeatInterval { get; set; } = TimeSpan.FromSeconds(1);
     public TimeSpan ReadTimeout { get; set; } = Timeout.InfiniteTimeSpan;
+    // Allocation-free grace before starting a backend CancelRequest. Heartbeat supplies the clock.
+    public TimeSpan CancelRequestDelay { get; set; }
     public ScopeResetOptions ScopeReset { get; set; } = new();
 
     /// Sends a side-channel CancelRequest and classifies whether request bytes may have reached
@@ -793,6 +795,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
                 // TODO log it
             }
         }
+        OnCancellationHeartbeat(period);
         return new();
     }
 
@@ -1067,8 +1070,9 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         public bool IsIdle => Volatile.Read(ref _isIdle);
         public ValueTask WaitForCancellationAttempt()
             => protocol.WaitForCancellationAttempt();
-        public void RequestServerCancellation(PgClientFlow instigator, PgClientFlow.BackendCancellationExtent extent, int window)
-            => protocol.RequestServerCancellation(instigator, this, extent, window);
+        public void RequestServerCancellation(PgClientFlow instigator, PgClientFlow.BackendCancellationExtent extent,
+            int window, PgClientFlow.BackendCancellationTiming timing)
+            => protocol.RequestServerCancellation(instigator, this, extent, window, timing);
         public void OnFlowSubstituted(PgClientFlow from, PgClientFlow to)
             => protocol.OnFlowSubstituted(this, from, to);
         internal string? ScopeResetCommand => protocol.ScopeResetCommand;

@@ -697,7 +697,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
         }
         catch (TimeoutException ex)
         {
-            RequestBackendCancellation(BackendCancellationExtent.RemainingFlow);
+            RequestBackendCancellation(BackendCancellationExtent.RemainingFlow, BackendCancellationTiming.Immediate);
             HandleException(ex);
             throw;
         }

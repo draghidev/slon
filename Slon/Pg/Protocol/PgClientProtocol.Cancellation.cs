@@ -57,6 +57,7 @@ sealed partial class PgClientProtocol
         internal bool AwaitingBoundary;
         internal bool InstigatorCompleted;
         internal byte Attempts;
+        internal long RemainingDelayTicks;
     }
 
     // Connection-owned residue from a Sent/Unknown request. It may outlive its instigating flow and is
@@ -71,13 +72,13 @@ sealed partial class PgClientProtocol
     }
 
     internal void RequestServerCancellation(PgClientFlow instigator, Control control,
-        PgClientFlow.BackendCancellationExtent extent, int window)
+        PgClientFlow.BackendCancellationExtent extent, int window, PgClientFlow.BackendCancellationTiming timing)
     {
         if (_options.CancelSender is null || _backendProcessId is 0)
             return;
 
-        CancellationIntent intent;
-        bool dispatch;
+        CancellationIntent? intent = null;
+        var dispatch = false;
         lock (_syncRoot)
         {
             if (_status is not ProtocolStatus.Ready)
@@ -88,27 +89,37 @@ sealed partial class PgClientProtocol
                 {
                     if (extent > existing.Extent)
                         existing.Extent = extent;
-                    return;
+                    if (timing is PgClientFlow.BackendCancellationTiming.Immediate)
+                        existing.RemainingDelayTicks = 0;
+                    dispatch = TryBeginCancellationDispatchLocked(existing);
+                    intent = existing;
+                    break;
                 }
             }
 
-            intent = new(instigator, control, extent, window);
-            if (_cancellationTail is null)
-                _cancellationHead = intent;
-            else
-                _cancellationTail.Next = intent;
-            _cancellationTail = intent;
-            Volatile.Write(ref _hasCancellationIntents, true);
-            dispatch = TryBeginCancellationDispatchLocked(intent);
+            if (intent is null)
+            {
+                intent = new(instigator, control, extent, window);
+                intent.RemainingDelayTicks = timing is PgClientFlow.BackendCancellationTiming.Immediate
+                    ? 0 : GetCancelRequestDelayTicks();
+                if (_cancellationTail is null)
+                    _cancellationHead = intent;
+                else
+                    _cancellationTail.Next = intent;
+                _cancellationTail = intent;
+                Volatile.Write(ref _hasCancellationIntents, true);
+                dispatch = TryBeginCancellationDispatchLocked(intent);
+            }
         }
         if (dispatch)
-            _ = DispatchCancellationAsync(intent);
+            _ = DispatchCancellationAsync(intent!);
     }
 
     bool TryBeginCancellationDispatchLocked(CancellationIntent intent)
     {
         if (_status is not ProtocolStatus.Ready || _cancellationDispatching || intent.Dispatching
             || intent.AwaitingBoundary || intent.InstigatorCompleted || intent.Attempts >= 2
+            || intent.RemainingDelayTicks > 0
             || !ReferenceEquals(intent.Control.ActivatedFlow, intent.Instigator))
             return false;
         _cancellationDispatching = true;
@@ -116,6 +127,35 @@ sealed partial class PgClientProtocol
         intent.Attempts++;
         ArmCancellationAttemptLocked();
         return true;
+    }
+
+    long GetCancelRequestDelayTicks()
+        => _options.CancelRequestDelay == Timeout.InfiniteTimeSpan
+            ? long.MaxValue
+            : Math.Max(0, _options.CancelRequestDelay.Ticks);
+
+    void OnCancellationHeartbeat(TimeSpan elapsed)
+    {
+        if (!Volatile.Read(ref _hasCancellationIntents))
+            return;
+        CancellationIntent? dispatchIntent = null;
+        lock (_syncRoot)
+        {
+            if (_cancellationDispatching)
+                return;
+            for (var intent = _cancellationHead; intent is not null; intent = intent.Next)
+            {
+                if (intent.RemainingDelayTicks is > 0 and < long.MaxValue)
+                    intent.RemainingDelayTicks = Math.Max(0, intent.RemainingDelayTicks - elapsed.Ticks);
+                if (TryBeginCancellationDispatchLocked(intent))
+                {
+                    dispatchIntent = intent;
+                    break;
+                }
+            }
+        }
+        if (dispatchIntent is not null)
+            _ = DispatchCancellationAsync(dispatchIntent);
     }
 
     void OnFlowActivated(Control control, PgClientFlow flow)
@@ -271,9 +311,19 @@ sealed partial class PgClientProtocol
 
             for (var intent = _cancellationHead; intent is not null; intent = intent.Next)
             {
-                if (!intent.AwaitingBoundary || !ReferenceEquals(intent.Control, control)
-                    || !ReferenceEquals(intent.Instigator, flow) || completedWindow < intent.Window)
+                if (!ReferenceEquals(intent.Control, control) || !ReferenceEquals(intent.Instigator, flow)
+                    || completedWindow < intent.Window)
                     continue;
+                if (!intent.AwaitingBoundary)
+                {
+                    if (intent.Dispatching)
+                        break;
+                    if (remainingRfqCount is 0 || intent.Extent is PgClientFlow.BackendCancellationExtent.CurrentWindow)
+                        RemoveCancellationIntentLocked(intent);
+                    else
+                        intent.Window = completedWindow + 1;
+                    break;
+                }
                 if (remainingRfqCount is 0)
                     RemoveCancellationIntentLocked(intent);
                 else
@@ -281,6 +331,7 @@ sealed partial class PgClientProtocol
                     intent.AwaitingBoundary = false;
                     intent.Window = completedWindow + 1;
                     intent.Attempts = 0;
+                    intent.RemainingDelayTicks = GetCancelRequestDelayTicks();
                     if (TryBeginCancellationDispatchLocked(intent))
                         dispatchIntent = intent;
                 }

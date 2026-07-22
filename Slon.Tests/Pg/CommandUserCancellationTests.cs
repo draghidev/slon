@@ -187,6 +187,121 @@ public class CommandUserCancellationTests
 
     [TestMethod]
     [DoNotParallelize]
+    public async Task ServerCancel_GraceExpiresOnHeartbeatWithoutPerIntentTimer()
+    {
+        await using var blocker = await PgAdvisoryLock.AcquireAsync();
+        var attempted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var attempts = 0;
+        await using var protocol = await PgTestPool.NewIsolatedAsync(o =>
+        {
+            o.HeartbeatInterval = TimeSpan.FromHours(1);
+            o.CancelRequestDelay = TimeSpan.FromSeconds(100);
+            o.CancelSender = (_, _, _) =>
+            {
+                Interlocked.Increment(ref attempts);
+                attempted.TrySetResult();
+                return new(CancelRequestState.Sent);
+            };
+        });
+
+        using var cts = new CancellationTokenSource();
+        var flow = new CommandFlow(async: true, blocker.WaitCommand);
+        Assert.IsTrue(protocol.TryQueue(flow, cancellationToken: cts.Token));
+        var enumerator = flow.GetAsyncEnumerator(cts.Token);
+        var moveNext = enumerator.MoveNextAsync(cts.Token).AsTask();
+
+        await blocker.WaitUntilContendedAsync(protocol.FlowControl.BackendProcessId);
+        cts.Cancel();
+        Assert.IsTrue(protocol.HasPendingCancellation);
+        Assert.AreEqual(0, Volatile.Read(ref attempts));
+
+        await protocol.Heartbeat(TimeSpan.FromSeconds(40));
+        Assert.AreEqual(0, Volatile.Read(ref attempts));
+        await protocol.Heartbeat(TimeSpan.FromSeconds(60));
+        await attempted.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.AreEqual(1, Volatile.Read(ref attempts));
+
+        await blocker.ReleaseAsync();
+        await Assert.ThrowsExactlyAsync<OperationCanceledException>(
+            async () => await moveNext.WaitAsync(TimeSpan.FromSeconds(10)));
+        await enumerator.DisposeAsync();
+        await WaitUntilAsync(() => !protocol.HasPendingCancellation);
+        await PgTestPool.RunAsync(protocol, "select 1");
+    }
+
+    [TestMethod]
+    [DoNotParallelize]
+    public async Task ServerCancel_FlowFinishesDuringGrace_SuppressesSideChannelAttempt()
+    {
+        await using var blocker = await PgAdvisoryLock.AcquireAsync();
+        var attempts = 0;
+        await using var protocol = await PgTestPool.NewIsolatedAsync(o =>
+        {
+            o.HeartbeatInterval = TimeSpan.FromHours(1);
+            o.CancelRequestDelay = TimeSpan.FromSeconds(100);
+            o.CancelSender = (_, _, _) =>
+            {
+                Interlocked.Increment(ref attempts);
+                return new(CancelRequestState.Sent);
+            };
+        });
+
+        using var cts = new CancellationTokenSource();
+        var flow = new CommandFlow(async: true, blocker.WaitCommand);
+        Assert.IsTrue(protocol.TryQueue(flow, cancellationToken: cts.Token));
+        var enumerator = flow.GetAsyncEnumerator(cts.Token);
+        var moveNext = enumerator.MoveNextAsync(cts.Token).AsTask();
+
+        await blocker.WaitUntilContendedAsync(protocol.FlowControl.BackendProcessId);
+        cts.Cancel();
+        await blocker.ReleaseAsync();
+        await Assert.ThrowsExactlyAsync<OperationCanceledException>(
+            async () => await moveNext.WaitAsync(TimeSpan.FromSeconds(10)));
+        await enumerator.DisposeAsync();
+        await WaitUntilAsync(() => !protocol.HasPendingCancellation);
+
+        await protocol.Heartbeat(TimeSpan.FromSeconds(100));
+        Assert.AreEqual(0, Volatile.Read(ref attempts));
+        await PgTestPool.RunAsync(protocol, "select 1");
+    }
+
+    [TestMethod]
+    [DoNotParallelize]
+    public async Task ServerCancel_ReadTimeoutBypassesCallerCancellationGrace()
+    {
+        await using var blocker = await PgAdvisoryLock.AcquireAsync();
+        var attempted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var protocol = await PgTestPool.NewIsolatedAsync(o =>
+        {
+            o.HeartbeatInterval = TimeSpan.FromHours(1);
+            o.CancelRequestDelay = TimeSpan.FromHours(1);
+            o.CancelSender = (_, _, _) =>
+            {
+                attempted.TrySetResult();
+                return new(CancelRequestState.Sent);
+            };
+        });
+
+        var flow = new CommandFlow(async: true,
+            blocker.WaitCommand with { Timeout = TimeSpan.FromSeconds(100) });
+        Assert.IsTrue(protocol.TryQueue(flow));
+        var enumerator = flow.GetAsyncEnumerator();
+        var moveNext = enumerator.MoveNextAsync().AsTask();
+
+        await blocker.WaitUntilContendedAsync(protocol.FlowControl.BackendProcessId);
+        await protocol.Heartbeat(TimeSpan.FromSeconds(100));
+        await attempted.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        await blocker.ReleaseAsync();
+
+        await Assert.ThrowsExactlyAsync<TimeoutException>(
+            async () => await moveNext.WaitAsync(TimeSpan.FromSeconds(10)));
+        await Assert.ThrowsExactlyAsync<TimeoutException>(async () => await enumerator.DisposeAsync());
+        await WaitUntilAsync(() => !protocol.HasPendingCancellation);
+        await PgTestPool.RunAsync(protocol, "select 1");
+    }
+
+    [TestMethod]
+    [DoNotParallelize]
     public async Task ServerCancel_NotSentAfterInstigatorCompletes_RetiresIntent()
     {
         await using var blocker = await PgAdvisoryLock.AcquireAsync();

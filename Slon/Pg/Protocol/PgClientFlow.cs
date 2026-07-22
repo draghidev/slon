@@ -13,6 +13,12 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
         WholeFlow
     }
 
+    protected internal enum BackendCancellationTiming : byte
+    {
+        AfterGrace,
+        Immediate
+    }
+
     PgClientProtocol.Control? _pendingActivationControl;
     PgClientProtocol.Control? _boundControl;
 
@@ -236,8 +242,10 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
 
     /// Requests PostgreSQL backend cancellation for this flow on its bound protocol control.
     /// The protocol retains any request exposure that can outlive the flow.
-    protected void RequestBackendCancellation(BackendCancellationExtent extent = BackendCancellationExtent.CurrentWindow)
-        => _boundControl?.RequestServerCancellation(this, extent, Volatile.Read(ref _cancellationWindow));
+    protected void RequestBackendCancellation(
+        BackendCancellationExtent extent = BackendCancellationExtent.CurrentWindow,
+        BackendCancellationTiming timing = BackendCancellationTiming.AfterGrace)
+        => _boundControl?.RequestServerCancellation(this, extent, Volatile.Read(ref _cancellationWindow), timing);
 
     protected virtual void OnHeartbeat(TimeSpan interval) {}
     protected virtual void OnAbort(PgClientClosedException exception) {}
