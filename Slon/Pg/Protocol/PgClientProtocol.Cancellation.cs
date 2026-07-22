@@ -67,6 +67,7 @@ sealed partial class PgClientProtocol
         internal readonly Control Control = control;
         internal CancellationExposure? Next;
         internal PgClientFlow? BoundaryFlow;
+        internal int BoundaryWindow;
     }
 
     internal void RequestServerCancellation(PgClientFlow instigator, Control control,
@@ -119,11 +120,12 @@ sealed partial class PgClientProtocol
 
     void OnFlowActivated(Control control, PgClientFlow flow)
     {
-        if (!Volatile.Read(ref _hasCancellationIntents))
+        if (!HasPendingCancellation)
             return;
         CancellationIntent? dispatchIntent = null;
         lock (_syncRoot)
         {
+            AssignCancellationBoundaryLocked(control, flow);
             if (!_cancellationDispatching)
             {
                 for (var intent = _cancellationHead; intent is not null; intent = intent.Next)
@@ -172,7 +174,12 @@ sealed partial class PgClientProtocol
                 if (intent.InstigatorCompleted || intent.Extent is PgClientFlow.BackendCancellationExtent.CurrentWindow)
                     RemoveCancellationIntentLocked(intent);
                 else
+                {
+                    // The attempt has ended. An RFQ for this or a later window is therefore an
+                    // ACK-relative frontier: the request cannot reach beyond it.
+                    intent.Window = intent.Instigator.CancellationWindow;
                     intent.AwaitingBoundary = true;
+                }
             }
         }
         TryDispatchNextCancellation();
@@ -180,13 +187,19 @@ sealed partial class PgClientProtocol
 
     void AddCancellationExposureLocked(CancellationExposure exposure)
     {
+        if (exposure.Control.ActivatedFlow is { IsCompleted: false } boundary)
+        {
+            exposure.BoundaryFlow = boundary;
+            exposure.BoundaryWindow = boundary.CancellationWindow;
+        }
         if (_exposureTail is null)
             _exposureHead = exposure;
         else
             _exposureTail.Next = exposure;
         _exposureTail = exposure;
         Volatile.Write(ref _hasCancellationExposures, true);
-        Volatile.Write(ref _hasUnassignedCancellationBoundary, true);
+        if (exposure.BoundaryFlow is null)
+            Volatile.Write(ref _hasUnassignedCancellationBoundary, true);
     }
 
     void TryDispatchNextCancellation()
@@ -216,54 +229,66 @@ sealed partial class PgClientProtocol
             return;
         lock (_syncRoot)
         {
-            var anyUnassigned = false;
-            for (var exposure = _exposureHead; exposure is not null; exposure = exposure.Next)
-            {
-                if (exposure.BoundaryFlow is not null)
-                    continue;
-                if (ReferenceEquals(exposure.Control, control))
-                    exposure.BoundaryFlow = flow;
-                else
-                    anyUnassigned = true;
-            }
-            Volatile.Write(ref _hasUnassignedCancellationBoundary, anyUnassigned);
+            AssignCancellationBoundaryLocked(control, flow);
         }
     }
 
-    void OnCancellationWindowCompleted(Control control, PgClientFlow flow, int completedWindow)
+    void AssignCancellationBoundaryLocked(Control control, PgClientFlow flow)
     {
-        if (!Volatile.Read(ref _hasCancellationIntents))
-            return;
-        lock (_syncRoot)
+        var anyUnassigned = false;
+        for (var exposure = _exposureHead; exposure is not null; exposure = exposure.Next)
         {
-            for (var intent = _cancellationHead; intent is not null; intent = intent.Next)
+            if (exposure.BoundaryFlow is not null)
+                continue;
+            if (ReferenceEquals(exposure.Control, control))
             {
-                if (!intent.AwaitingBoundary || !ReferenceEquals(intent.Control, control)
-                    || !ReferenceEquals(intent.Instigator, flow) || completedWindow < intent.Window)
-                    continue;
-                // Redrive is deliberately deferred until an attempt latch proves the previous
-                // request exposure cannot roll into this flow's next Sync window.
-                RemoveCancellationIntentLocked(intent);
-                break;
+                exposure.BoundaryFlow = flow;
+                exposure.BoundaryWindow = flow.CancellationWindow;
             }
+            else
+                anyUnassigned = true;
         }
+        Volatile.Write(ref _hasUnassignedCancellationBoundary, anyUnassigned);
     }
 
-    void OnFlowRfq(Control control, PgClientFlow flow)
+    void OnCancellationWindowCompleted(Control control, PgClientFlow flow, int completedWindow, int remainingRfqCount)
     {
-        if (!Volatile.Read(ref _hasCancellationExposures))
+        if (!HasPendingCancellation)
             return;
+        CancellationIntent? dispatchIntent = null;
         lock (_syncRoot)
         {
             var exposure = _exposureHead;
             while (exposure is not null)
             {
                 var next = exposure.Next;
-                if (ReferenceEquals(exposure.Control, control) && ReferenceEquals(exposure.BoundaryFlow, flow))
+                if (ReferenceEquals(exposure.Control, control)
+                    && ReferenceEquals(exposure.BoundaryFlow, flow)
+                    && completedWindow >= exposure.BoundaryWindow)
                     RemoveCancellationExposureLocked(exposure);
                 exposure = next;
             }
+
+            for (var intent = _cancellationHead; intent is not null; intent = intent.Next)
+            {
+                if (!intent.AwaitingBoundary || !ReferenceEquals(intent.Control, control)
+                    || !ReferenceEquals(intent.Instigator, flow) || completedWindow < intent.Window)
+                    continue;
+                if (remainingRfqCount is 0)
+                    RemoveCancellationIntentLocked(intent);
+                else
+                {
+                    intent.AwaitingBoundary = false;
+                    intent.Window = completedWindow + 1;
+                    intent.Attempts = 0;
+                    if (TryBeginCancellationDispatchLocked(intent))
+                        dispatchIntent = intent;
+                }
+                break;
+            }
         }
+        if (dispatchIntent is not null)
+            _ = DispatchCancellationAsync(dispatchIntent);
     }
 
     void OnFlowCompleted(Control control, PgClientFlow flow, int remainingDepth)
@@ -296,6 +321,7 @@ sealed partial class PgClientProtocol
                     else if (ReferenceEquals(exposure.BoundaryFlow, flow))
                     {
                         exposure.BoundaryFlow = null;
+                        exposure.BoundaryWindow = 0;
                         Volatile.Write(ref _hasUnassignedCancellationBoundary, true);
                     }
                 }
@@ -326,7 +352,10 @@ sealed partial class PgClientProtocol
             for (var exposure = _exposureHead; exposure is not null; exposure = exposure.Next)
             {
                 if (ReferenceEquals(exposure.Control, control) && ReferenceEquals(exposure.BoundaryFlow, from))
+                {
                     exposure.BoundaryFlow = to;
+                    exposure.BoundaryWindow = to.CancellationWindow;
+                }
             }
         }
     }

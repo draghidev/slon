@@ -41,6 +41,7 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
     Action<TimeSpan>? _decoderOnHeartbeatAction; // TODO should we have this here?
     int _rfqCount;
     int _cancellationWindow;
+    internal int CancellationWindow => Volatile.Read(ref _cancellationWindow);
     bool _lastMessageInducesRfq;
     // We store the IsAsync value at bind time so the protocol can keep track of pipeline stalls correctly.
     bool _isAsyncAtBind;

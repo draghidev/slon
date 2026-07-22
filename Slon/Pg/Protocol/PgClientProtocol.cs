@@ -1237,9 +1237,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         public void OnFlowRfq(PgClientFlow flow, BackendMessage message, int completedWindow, int remainingRfqCount)
         {
             protocol._transactionStatus = ReadyForQueryMessage.Create(message).TransactionStatus;
-            protocol.OnCancellationWindowCompleted(this, flow, completedWindow);
-            if (remainingRfqCount is 0)
-                protocol.OnFlowRfq(this, flow);
+            protocol.OnCancellationWindowCompleted(this, flow, completedWindow, remainingRfqCount);
         }
 
         // Wire-handoff guard, called from Policy.CompleteItem when a flow retires. The OUTER multiplexed
