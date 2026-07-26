@@ -271,6 +271,7 @@ sealed class EmptyProtocol<TMode> : IPoolConnection<EmptyProtocol<TMode>>
     // The benchmark protocol has no startup flow (it constructs immediately Ready), so there is
     // no suppressed idle publication for the pool's post-lease Start to unblock.
     void IPoolConnection<EmptyProtocol<TMode>>.Start() { }
+    bool IPoolConnection<EmptyProtocol<TMode>>.TryBeginPruning() => false;
 
     int IPoolConnection<EmptyProtocol<TMode>>.CompareTo(EmptyProtocol<TMode>? other)
     {

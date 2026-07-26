@@ -184,6 +184,7 @@ static class PgTestPool
         public bool IsSchedulable => Protocol.IsSchedulable;
         public Task Completion => Protocol.Completion;
         public int CompareTo(PooledProtocol? other) => Protocol.CompareTo(other?.Protocol);
+        public bool TryBeginPruning() => Protocol.TryBeginPruning();
         public Task CompleteAsync(Exception? exception = null) => Protocol.CompleteAsync(exception);
 
         void ReleaseHeartbeatRegistration()

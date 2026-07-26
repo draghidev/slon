@@ -145,6 +145,7 @@ sealed class FakeConnection : IPoolConnection<FakeConnection>
         return l < r ? -1 : l == r ? 0 : 1;
     }
 
+    public bool TryBeginPruning() => false;
     public Task CompleteAsync(Exception? exception = null) => Task.CompletedTask;
 
     // The fake drives idle publication explicitly via MarkIdleAndSignal, so the startup

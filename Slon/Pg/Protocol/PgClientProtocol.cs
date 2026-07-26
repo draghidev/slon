@@ -137,6 +137,18 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
     internal bool IsDraining => Status is ProtocolStatus.Draining or ProtocolStatus.Completed;
     internal bool IsSchedulable => Status is ProtocolStatus.Ready;
 
+    internal bool TryBeginPruning()
+    {
+        lock (_syncRoot)
+        {
+            if (_status is not ProtocolStatus.Ready || Outstanding != 0)
+                return false;
+
+            _status = ProtocolStatus.Draining;
+            return true;
+        }
+    }
+
     // Published before close tokens fire.
     internal PgClientClosedException? CloseReason => _close.Reason;
     // Used by state queries, recovery, and pool steering.

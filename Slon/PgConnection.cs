@@ -165,6 +165,7 @@ sealed class PgConnection : IPoolConnection<PgConnection>
     public Task Completion => _protocol.Completion;
     public Exception? CompletionException => _protocol.CompletionException;
     public int CompareTo(PgConnection? other) => _protocol.CompareTo(other?._protocol);
+    public bool TryBeginPruning() => _protocol.TryBeginPruning();
 
     public Task CompleteAsync(Exception? exception = null) => _protocol.CompleteAsync(exception);
 

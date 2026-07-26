@@ -23,13 +23,18 @@ public class ConnectionPoolTests
         int _started;
         int _idle = 1;
         int _schedulable = 1;
+        readonly bool _allowPruning;
+        TaskCompletionSource? _pruningEntered;
+        TaskCompletionSource? _pruningRelease;
         readonly TaskCompletionSource _completion = new(TaskCreationOptions.RunContinuationsAsynchronously);
         int _heartbeatCount;
         IDisposable? _heartbeatRegistration;
 
-        public AdmissionConnection(ConnectionPoolContext<AdmissionConnection> context, bool registerHeartbeat = false)
+        public AdmissionConnection(ConnectionPoolContext<AdmissionConnection> context,
+            bool registerHeartbeat = false, bool allowPruning = true)
         {
             _poolContext = context;
+            _allowPruning = allowPruning;
             if (registerHeartbeat)
                 _heartbeatRegistration = context.OnHeartbeat(static (connection, _) =>
                 {
@@ -43,8 +48,15 @@ public class ConnectionPoolTests
         public bool IsSchedulable => Volatile.Read(ref _schedulable) != 0 && !Completion.IsCompleted;
         public Task Completion => _completion.Task;
         public int HeartbeatCount => Volatile.Read(ref _heartbeatCount);
+        public Task PruningEntered => _pruningEntered?.Task ?? Task.CompletedTask;
 
         public void Start() => Volatile.Write(ref _started, 1);
+        public void GatePruning()
+        {
+            _pruningEntered = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            _pruningRelease = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        }
+        public void ReleasePruning() => _pruningRelease?.TrySetResult();
 
         public void RunInitialWorkToIdle()
         {
@@ -60,6 +72,8 @@ public class ConnectionPoolTests
             Volatile.Write(ref _schedulable, 0);
         }
 
+        public void MarkBusy() => Volatile.Write(ref _idle, 0);
+
         public void CompleteRecovery()
         {
             Volatile.Write(ref _schedulable, 1);
@@ -74,6 +88,16 @@ public class ConnectionPoolTests
 
         public int CompareTo(AdmissionConnection? other) => 0;
 
+        public bool TryBeginPruning()
+        {
+            _pruningEntered?.TrySetResult();
+            _pruningRelease?.Task.GetAwaiter().GetResult();
+            if (!_allowPruning || Volatile.Read(ref _idle) == 0 ||
+                Interlocked.CompareExchange(ref _schedulable, 0, 1) != 1)
+                return false;
+            return true;
+        }
+
         public Task CompleteAsync(Exception? exception = null)
         {
             Interlocked.Exchange(ref _heartbeatRegistration, null)?.Dispose();
@@ -85,17 +109,27 @@ public class ConnectionPoolTests
     sealed class AdmissionConnectionFactory : IPoolConnectionFactory<AdmissionConnection>
     {
         readonly bool _registerHeartbeat;
+        readonly bool _allowPruning;
+        readonly System.Collections.Concurrent.ConcurrentQueue<AdmissionConnection> _created = new();
 
-        public AdmissionConnectionFactory(bool registerHeartbeat = false)
-            => _registerHeartbeat = registerHeartbeat;
+        public AdmissionConnectionFactory(bool registerHeartbeat = false, bool allowPruning = true)
+            => (_registerHeartbeat, _allowPruning) = (registerHeartbeat, allowPruning);
 
         public AdmissionConnection? LastCreated { get; private set; }
+        public AdmissionConnection[] Created => _created.ToArray();
 
         public AdmissionConnection Create(ConnectionPoolContext<AdmissionConnection> context, TimeSpan timeout = default)
-            => LastCreated = new(context, _registerHeartbeat);
+            => Add(new(context, _registerHeartbeat, _allowPruning));
 
         public ValueTask<AdmissionConnection> CreateAsync(ConnectionPoolContext<AdmissionConnection> context, CancellationToken cancellationToken = default)
-            => new(LastCreated = new AdmissionConnection(context, _registerHeartbeat));
+            => new(Add(new AdmissionConnection(context, _registerHeartbeat, _allowPruning)));
+
+        AdmissionConnection Add(AdmissionConnection connection)
+        {
+            LastCreated = connection;
+            _created.Enqueue(connection);
+            return connection;
+        }
     }
 
     sealed class GatedAdmissionConnectionFactory : IPoolConnectionFactory<AdmissionConnection>
@@ -312,6 +346,240 @@ public class ConnectionPoolTests
 
         Assert.AreEqual(retiredCount, retired.HeartbeatCount,
             "a connection removed from the pool registry must also leave heartbeat traversal");
+    }
+
+    [TestMethod]
+    public async Task IdlePruning_ClosesMedianIdlePopulationAboveMinimum()
+    {
+        var time = new FakeTimeProvider();
+        var factory = new AdmissionConnectionFactory(registerHeartbeat: true);
+        await using var pool = new ConnectionPool<AdmissionConnection>(factory, new()
+        {
+            MinConnections = 1,
+            MaxConnections = 3,
+            HeartbeatInterval = TimeSpan.FromSeconds(1),
+            ConnectionPruningInterval = TimeSpan.FromSeconds(1),
+            ConnectionIdleLifetime = TimeSpan.FromSeconds(3),
+            TimeProvider = time,
+        });
+        await pool.OpenAllConnectionsAsync(TimeSpan.FromSeconds(1));
+
+        var connections = factory.Created;
+        Assert.HasCount(3, connections);
+        for (var tick = 1; tick <= 2; tick++)
+        {
+            time.Advance(TimeSpan.FromSeconds(1));
+            var expected = tick;
+            await WaitUntilAsync(() => connections.All(c => c.HeartbeatCount >= expected), TimeSpan.FromSeconds(1),
+                "the pruning lifetime must be measured from complete heartbeat samples");
+            Assert.IsTrue(connections.All(c => !c.Completion.IsCompleted),
+                "no connection should be pruned before the full idle lifetime");
+        }
+
+        time.Advance(TimeSpan.FromSeconds(1));
+        await WaitUntilAsync(() => connections.Count(c => c.Completion.IsCompleted) == 2, TimeSpan.FromSeconds(1),
+            "the median idle population above the minimum should be pruned");
+        Assert.AreEqual(1, connections.Count(c => !c.Completion.IsCompleted));
+    }
+
+    [TestMethod]
+    public async Task InfiniteIdleLifetime_DisablesPruning()
+    {
+        var time = new FakeTimeProvider();
+        var factory = new AdmissionConnectionFactory(registerHeartbeat: true);
+        await using var pool = new ConnectionPool<AdmissionConnection>(factory, new()
+        {
+            MaxConnections = 2,
+            HeartbeatInterval = TimeSpan.FromSeconds(1),
+            ConnectionPruningInterval = TimeSpan.Zero,
+            ConnectionIdleLifetime = Timeout.InfiniteTimeSpan,
+            TimeProvider = time,
+        });
+        await pool.OpenAllConnectionsAsync(TimeSpan.FromSeconds(1));
+
+        time.Advance(TimeSpan.FromHours(1));
+
+        Assert.IsTrue(factory.Created.All(c => !c.Completion.IsCompleted));
+    }
+
+    [TestMethod]
+    public async Task FixedSizePool_DisablesPruning()
+    {
+        var time = new FakeTimeProvider();
+        var factory = new AdmissionConnectionFactory(registerHeartbeat: true);
+        await using var pool = new ConnectionPool<AdmissionConnection>(factory, new()
+        {
+            MinConnections = 2,
+            MaxConnections = 2,
+            HeartbeatInterval = TimeSpan.FromSeconds(1),
+            ConnectionPruningInterval = TimeSpan.Zero,
+            ConnectionIdleLifetime = TimeSpan.Zero,
+            TimeProvider = time,
+        });
+        await pool.OpenAllConnectionsAsync(TimeSpan.FromSeconds(1));
+
+        time.Advance(TimeSpan.FromHours(1));
+
+        Assert.IsTrue(factory.Created.All(c => !c.Completion.IsCompleted));
+    }
+
+    [TestMethod]
+    public void PruningIntervalBelowHeartbeat_Throws()
+    {
+        Assert.ThrowsExactly<ArgumentOutOfRangeException>(() =>
+            new ConnectionPool<AdmissionConnection>(new AdmissionConnectionFactory(), new()
+            {
+                MaxConnections = 1,
+                HeartbeatInterval = TimeSpan.FromSeconds(2),
+                ConnectionPruningInterval = TimeSpan.FromSeconds(1),
+            }));
+    }
+
+    [TestMethod]
+    public async Task IdlePruning_RefusedClaimsReturnTheirIdleTokens()
+    {
+        var time = new FakeTimeProvider();
+        var factory = new AdmissionConnectionFactory(registerHeartbeat: true, allowPruning: false);
+        await using var pool = new ConnectionPool<AdmissionConnection>(factory, new()
+        {
+            MaxConnections = 2,
+            HeartbeatInterval = TimeSpan.FromSeconds(1),
+            ConnectionPruningInterval = TimeSpan.FromSeconds(1),
+            ConnectionIdleLifetime = TimeSpan.FromSeconds(1),
+            TimeProvider = time,
+        });
+        await pool.OpenAllConnectionsAsync(TimeSpan.FromSeconds(1));
+
+        var connections = factory.Created;
+        time.Advance(TimeSpan.FromSeconds(1));
+        time.Advance(TimeSpan.FromSeconds(1));
+        await WaitUntilAsync(() => connections.All(c => c.HeartbeatCount > 0), TimeSpan.FromSeconds(1),
+            "the pruning tick should inspect both idle connections");
+
+        Assert.IsTrue(connections.All(c => !c.Completion.IsCompleted));
+        var first = await pool.GetAsync(TimeSpan.FromSeconds(1));
+        first.RunInitialWorkToIdle();
+        var second = await pool.GetAsync(TimeSpan.FromSeconds(1));
+        Assert.AreNotSame(first, second, "a refused prune must return every claimed idle token");
+    }
+
+    [TestMethod]
+    public async Task RefusedPruning_WakesWaiterThatRegisteredWhileTokenWasClaimed()
+    {
+        var time = new FakeTimeProvider();
+        var factory = new AdmissionConnectionFactory(allowPruning: false);
+        await using var pool = new ConnectionPool<AdmissionConnection>(factory, new()
+        {
+            MaxConnections = 1,
+            HeartbeatInterval = TimeSpan.FromSeconds(1),
+            ConnectionPruningInterval = TimeSpan.FromSeconds(1),
+            ConnectionIdleLifetime = TimeSpan.FromSeconds(1),
+            TimeProvider = time,
+        });
+        await pool.OpenAllConnectionsAsync(TimeSpan.FromSeconds(1));
+
+        var connection = factory.LastCreated!;
+        time.Advance(TimeSpan.FromSeconds(1));
+        connection.GatePruning();
+        var tick = Task.Run(() => time.Advance(TimeSpan.FromSeconds(1)));
+        await connection.PruningEntered.WaitAsync(TimeSpan.FromSeconds(1));
+
+        var waiting = pool.GetAsync(TimeSpan.FromSeconds(1)).AsTask();
+        await WaitUntilAsync(() => pool.WaiterCount == 1, TimeSpan.FromSeconds(1),
+            "the waiter must register while pruning owns the idle token");
+        connection.ReleasePruning();
+        await tick;
+
+        Assert.AreSame(connection, await waiting);
+    }
+
+    [TestMethod]
+    public async Task IdlePruning_CountsBusyConnectionsTowardMinimum()
+    {
+        var time = new FakeTimeProvider();
+        var factory = new AdmissionConnectionFactory(registerHeartbeat: true);
+        await using var pool = new ConnectionPool<AdmissionConnection>(factory, new()
+        {
+            MinConnections = 1,
+            MaxConnections = 3,
+            HeartbeatInterval = TimeSpan.FromSeconds(1),
+            ConnectionPruningInterval = TimeSpan.FromSeconds(1),
+            ConnectionIdleLifetime = TimeSpan.FromSeconds(1),
+            TimeProvider = time,
+        });
+        await pool.OpenAllConnectionsAsync(TimeSpan.FromSeconds(1));
+
+        var busy = await pool.GetAsync(TimeSpan.FromSeconds(1));
+        busy.MarkBusy();
+        var connections = factory.Created;
+        time.Advance(TimeSpan.FromSeconds(1));
+        time.Advance(TimeSpan.FromSeconds(1));
+        await WaitUntilAsync(() => connections.Count(c => c.Completion.IsCompleted) == 2, TimeSpan.FromSeconds(1),
+            "consistently idle capacity may be removed while a busy connection satisfies the minimum");
+
+        Assert.IsFalse(busy.Completion.IsCompleted);
+        Assert.AreEqual(1, connections.Count(c => !c.Completion.IsCompleted));
+    }
+
+    [TestMethod]
+    public async Task PrunedConnection_ReleasesCapacityForReplacement()
+    {
+        var time = new FakeTimeProvider();
+        var factory = new AdmissionConnectionFactory(registerHeartbeat: true);
+        await using var pool = new ConnectionPool<AdmissionConnection>(factory, new()
+        {
+            MaxConnections = 1,
+            HeartbeatInterval = TimeSpan.FromSeconds(1),
+            ConnectionPruningInterval = TimeSpan.FromSeconds(1),
+            ConnectionIdleLifetime = TimeSpan.FromSeconds(1),
+            TimeProvider = time,
+        });
+        await pool.OpenAllConnectionsAsync(TimeSpan.FromSeconds(1));
+
+        var pruned = factory.LastCreated!;
+        time.Advance(TimeSpan.FromSeconds(1));
+        time.Advance(TimeSpan.FromSeconds(1));
+        await pruned.Completion.WaitAsync(TimeSpan.FromSeconds(1));
+
+        var replacement = await pool.GetAsync(TimeSpan.FromSeconds(1));
+        Assert.AreNotSame(pruned, replacement);
+        Assert.IsFalse(replacement.Completion.IsCompleted);
+    }
+
+    [TestMethod]
+    public async Task IdlePruning_ObservesDemandBetweenHeartbeatSamples()
+    {
+        var time = new FakeTimeProvider();
+        var factory = new AdmissionConnectionFactory(registerHeartbeat: true);
+        await using var pool = new ConnectionPool<AdmissionConnection>(factory, new()
+        {
+            MaxConnections = 3,
+            HeartbeatInterval = TimeSpan.FromSeconds(1),
+            ConnectionPruningInterval = TimeSpan.FromSeconds(1),
+            ConnectionIdleLifetime = TimeSpan.FromSeconds(3),
+            TimeProvider = time,
+        });
+        await pool.OpenAllConnectionsAsync(TimeSpan.FromSeconds(1));
+
+        time.Advance(TimeSpan.FromSeconds(1));
+        var rented = new AdmissionConnection[3];
+        for (var i = 0; i < rented.Length; i++)
+        {
+            rented[i] = await pool.GetAsync(TimeSpan.FromSeconds(1));
+            rented[i].MarkBusy();
+        }
+        foreach (var connection in rented)
+            connection.RunInitialWorkToIdle();
+
+        time.Advance(TimeSpan.FromSeconds(1));
+        time.Advance(TimeSpan.FromSeconds(1));
+        Assert.IsTrue(factory.Created.All(c => !c.Completion.IsCompleted),
+            "demand entirely between heartbeat samples must lower the interval sample");
+
+        for (var i = 0; i < 3; i++)
+            time.Advance(TimeSpan.FromSeconds(1));
+        await WaitUntilAsync(() => factory.Created.All(c => c.Completion.IsCompleted), TimeSpan.FromSeconds(1),
+            "a later lifetime window with uninterrupted idle capacity should prune");
     }
 
     [TestMethod]

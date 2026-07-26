@@ -9,7 +9,15 @@ namespace Slon.Pools;
 
 public class ConnectionPoolOptions
 {
+    /// Minimum number of connections preserved by statistical idle pruning.
+    public int MinConnections { get; set; }
     public int MaxConnections { get; set; }
+    /// Duration over which minimum idle-capacity samples are collected before pruning.
+    /// Set to <see cref="Timeout.InfiniteTimeSpan"/> to allow growth without shrinking.
+    /// Pruning is also disabled when <see cref="MinConnections"/> equals <see cref="MaxConnections"/>.
+    public TimeSpan ConnectionIdleLifetime { get; set; } = TimeSpan.FromMinutes(5);
+    /// Interval over which the minimum idle capacity is sampled.
+    public TimeSpan ConnectionPruningInterval { get; set; } = TimeSpan.FromSeconds(10);
     public TimeProvider TimeProvider { get; set; } = TimeProvider.System;
     public TimeSpan HeartbeatInterval { get; set; } = TimeSpan.FromSeconds(1);
 }
@@ -50,17 +58,58 @@ public sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
     internal int WaiterCount => _waitQueue.Count;
 
     readonly Heartbeat _heartbeat;
+    readonly int _minConnections;
+    readonly TimeSpan _pruningInterval;
+    readonly int[]? _idleSamples;
+    TimeSpan _pruningElapsed;
+    int _idleSampleIndex;
+    int _pruningIdleCount;
+    int _pruningIdleMinimum;
 
     public ConnectionPool(IPoolConnectionFactory<T> factory, ConnectionPoolOptions options)
     {
         var maxConnections = options.MaxConnections;
         if (maxConnections <= 0)
             throw new ArgumentOutOfRangeException(nameof(maxConnections), "Cannot be zero or negative.");
+        if ((uint)options.MinConnections > (uint)maxConnections)
+            throw new ArgumentOutOfRangeException(nameof(options.MinConnections),
+                "Must be between zero and MaxConnections.");
+        var pruningEnabled = options.ConnectionIdleLifetime != Timeout.InfiniteTimeSpan &&
+            options.MinConnections < maxConnections;
+        if (options.ConnectionIdleLifetime < TimeSpan.Zero &&
+            options.ConnectionIdleLifetime != Timeout.InfiniteTimeSpan)
+            throw new ArgumentOutOfRangeException(nameof(options.ConnectionIdleLifetime),
+                "Must be non-negative or Timeout.InfiniteTimeSpan.");
+        if (pruningEnabled && options.ConnectionPruningInterval <= TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(nameof(options.ConnectionPruningInterval),
+                "Must be positive.");
+        if (pruningEnabled && options.ConnectionPruningInterval < options.HeartbeatInterval)
+            throw new ArgumentOutOfRangeException(nameof(options.ConnectionPruningInterval),
+                "Must be at least HeartbeatInterval when pruning is enabled.");
+        if (pruningEnabled && options.ConnectionIdleLifetime < options.ConnectionPruningInterval)
+            throw new ArgumentOutOfRangeException(nameof(options.ConnectionIdleLifetime),
+                "Must be at least ConnectionPruningInterval.");
 
         _connections = new object?[maxConnections];
 
         _factory = factory;
+        _minConnections = options.MinConnections;
+        _pruningInterval = options.ConnectionPruningInterval;
+        if (pruningEnabled)
+        {
+            var lifetimeTicks = options.ConnectionIdleLifetime.Ticks;
+            var intervalTicks = _pruningInterval.Ticks;
+            var sampleCount = lifetimeTicks / intervalTicks;
+            if (lifetimeTicks % intervalTicks != 0)
+                sampleCount++;
+            if (sampleCount > int.MaxValue)
+                throw new ArgumentOutOfRangeException(nameof(options.ConnectionIdleLifetime),
+                    "The lifetime requires too many pruning samples.");
+            _idleSamples = new int[(int)sampleCount];
+        }
         _heartbeat = new(options.HeartbeatInterval, options.TimeProvider);
+        if (_idleSamples is not null)
+            _heartbeat.Register(OnPoolHeartbeat);
         _context = new ConnectionPoolContext<T>(
             (connection, isIdle) =>
             {
@@ -71,6 +120,65 @@ public sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
             },
             (conn, action)  => _heartbeat.Register(interval => action(conn, interval))
         );
+    }
+
+    ValueTask OnPoolHeartbeat(TimeSpan interval)
+    {
+        _pruningElapsed += interval;
+        if (_pruningElapsed < _pruningInterval)
+            return ValueTask.CompletedTask;
+
+        _pruningElapsed -= _pruningInterval;
+        var samples = _idleSamples!;
+        var minimum = Interlocked.Exchange(ref _pruningIdleMinimum, int.MaxValue);
+        ObserveIdleMinimum(Volatile.Read(ref _pruningIdleCount));
+        samples[_idleSampleIndex++] = minimum;
+        if (_idleSampleIndex != samples.Length)
+            return ValueTask.CompletedTask;
+
+        _idleSampleIndex = 0;
+        Array.Sort(samples);
+        // The lower median is deliberately conservative for even-sized windows.
+        var idle = samples[(samples.Length - 1) / 2];
+        PruneIdleConnections(idle);
+        return ValueTask.CompletedTask;
+    }
+
+    void PruneIdleConnections(int count)
+    {
+        if (count <= 0 || _minConnections == _connections.Length)
+            return;
+
+        var live = 0;
+        for (var i = 0; i < _connections.Length; i++)
+        {
+            if (TryGetConnection(ref _connections[i], out var connection) &&
+                !connection.Completion.IsCompleted)
+                live++;
+        }
+        count = Math.Min(count, live - _minConnections);
+        if (count <= 0)
+            return;
+
+        // Refused claims return their token. Bound the walk so retained-session connections
+        // cannot make a pruning tick cycle forever.
+        var candidates = _idle.Count;
+        while (candidates-- > 0 && count > 0 && _idle.TryDequeue(out var connection))
+        {
+            if (connection.TryBeginPruning())
+            {
+                RecordIdleRemovalForPruning();
+                count--;
+                _ = connection.CompleteAsync();
+            }
+            else
+            {
+                if (ReturnIdleToken(connection))
+                    SignalAvailability();
+                else
+                    RecordIdleRemovalForPruning();
+            }
+        }
     }
 
     void ObserveCompletion(T connection)
@@ -87,11 +195,35 @@ public sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
 
     void PublishIdle(T connection)
     {
+        if (_idleSamples is not null)
+            Interlocked.Increment(ref _pruningIdleCount);
         _idle.Enqueue(connection);
         _waitQueue.Signal();
     }
 
     void SignalAvailability() => _waitQueue.Signal();
+
+    void RecordIdleRemovalForPruning()
+    {
+        if (_idleSamples is null)
+            return;
+
+        var count = Interlocked.Decrement(ref _pruningIdleCount);
+        Debug.Assert(count >= 0);
+        ObserveIdleMinimum(count);
+    }
+
+    void ObserveIdleMinimum(int count)
+    {
+        var minimum = Volatile.Read(ref _pruningIdleMinimum);
+        while (count < minimum)
+        {
+            var observed = Interlocked.CompareExchange(ref _pruningIdleMinimum, count, minimum);
+            if (observed == minimum)
+                return;
+            minimum = observed;
+        }
+    }
 
     bool DoSchedule<TState>(ConnectionCandidate<T> context, Func<ConnectionCandidate<T>, TState, bool>? schedule, TState state, bool newConnection = false)
     {
@@ -107,11 +239,15 @@ public sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
         return false;
     }
 
-    void ReturnIdleToken(T connection)
+    bool ReturnIdleToken(T connection)
     {
         // A dequeue owns the idle token until scheduling succeeds or the token is returned.
         if (connection.IsIdle && connection.IsSchedulable)
+        {
             _idle.Enqueue(connection);
+            return true;
+        }
+        return false;
     }
 
     async ValueTask<T> WaitForAvailabilityAsync<TState>(Func<ConnectionCandidate<T>, TState, bool>? schedule, TState state,
@@ -199,6 +335,7 @@ public sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
                 {
                     if (DoSchedule(new(idle, cancellationToken), schedule, state))
                     {
+                        RecordIdleRemovalForPruning();
                         future = null;
                         connection = idle;
                         return true;
@@ -206,12 +343,14 @@ public sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
                 }
                 catch
                 {
-                    ReturnIdleToken(idle);
+                    if (!ReturnIdleToken(idle))
+                        RecordIdleRemovalForPruning();
                     throw;
                 }
             }
 
-            ReturnIdleToken(idle);
+            if (!ReturnIdleToken(idle))
+                RecordIdleRemovalForPruning();
             // Do not consume our own re-publication in this synchronous drain.
             if (idle.IsIdle && idle.IsSchedulable)
                 break;
@@ -312,10 +451,10 @@ public sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
             }
             else
             {
-                // Placement failure does not revoke pool ownership. If the delegate made no
-                // progress, restore the idle token it consumed; otherwise the connection's own
-                // eventual busy-to-idle edge republishes it.
-                ReturnIdleToken(conn!);
+                // Placement failure does not revoke pool ownership. Publish a connection on
+                // which the delegate made no progress.
+                if (conn!.IsIdle && conn.IsSchedulable)
+                    PublishIdle(conn);
             }
             throw;
         }
@@ -382,7 +521,8 @@ public sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
             else
             {
                 // See the synchronous path: keep an admitted, still-idle connection reachable.
-                ReturnIdleToken(conn!);
+                if (conn!.IsIdle && conn.IsSchedulable)
+                    PublishIdle(conn);
             }
             if (wasTimeout)
                 throw new TimeoutException("The operation has timed out.", ex);

@@ -16,8 +16,13 @@ public interface IPoolConnection<TSelf>
     Task Completion { get; }
     int CompareTo(TSelf? other);
 
+    /// Atomically takes an idle connection out of scheduling rotation for pool pruning.
+    /// Implementations may refuse because the connection is no longer idle or owns retained
+    /// session state. A successful claim must prevent all later scheduling.
+    bool TryBeginPruning();
+
     /// Called by the pool exactly once after the fully-created connection has been installed in
     /// its pool slot, and before any initial work is scheduled. Implementations should use this
-    /// admission boundary to enable idle-channel publication.
+    /// admission boundary to enable idle publication.
     void Start();
 }
