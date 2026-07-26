@@ -279,7 +279,8 @@ public sealed class SlonDataSource: DbDataSource
                     args.Async, args.CreateOptions(connection, args.State)),
                 (CreateOptions: createOptions, State: state, Flow: flow, Async: async),
                 out _,
-                context.CancellationToken);
+                context.CancellationToken,
+                mustPipeline: !context.IsIdleCandidate);
         }
     }
 

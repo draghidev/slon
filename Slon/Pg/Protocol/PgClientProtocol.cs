@@ -356,14 +356,14 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
 
     internal bool TryQueue<TState, TFlow>(Func<TState, TFlow> materialize, TState state,
         [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out TFlow? flow,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default, bool mustPipeline = false)
         where TFlow : PgClientFlow
     {
         PgClientFlowSource.EnqueueResult enqueue = default;
         bool handoff;
         lock (_syncRoot)
         {
-            if (_status is not ProtocolStatus.Ready)
+            if (_status is not ProtocolStatus.Ready || (mustPipeline && _pipeline.Depth == 0))
             {
                 flow = null;
                 return false;
