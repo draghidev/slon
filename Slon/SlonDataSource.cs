@@ -28,6 +28,14 @@ public record SlonDataSourceOptions
     public TimeSpan CancellationTimeout { get; init; } = TimeSpan.FromSeconds(10);
     public int MinPoolSize { get; init; } = 1;
     public int MaxPoolSize { get; init; } = 10;
+    /// Duration over which the pool observes unused capacity before pruning it.
+    /// Set to <see cref="Timeout.InfiniteTimeSpan"/> to let the pool grow without shrinking.
+    /// Pruning is also disabled when <see cref="MinPoolSize"/> equals <see cref="MaxPoolSize"/>.
+    public TimeSpan ConnectionIdleLifetime { get; init; } = TimeSpan.FromMinutes(5);
+    /// Interval between idle-capacity observations.
+    public TimeSpan ConnectionPruningInterval { get; init; } = TimeSpan.FromSeconds(10);
+
+    /// Configures a fixed-size pool. Fixed-size pools are not pruned.
     public int PoolSize
     {
         init
@@ -209,7 +217,10 @@ public sealed class SlonDataSource: DbDataSource
                 if (_options.MaxPoolSize > 0)
                     _connectionPool = new ConnectionPool<PgConnection>(factory, new()
                     {
+                        MinConnections = _options.MinPoolSize,
                         MaxConnections = _options.MaxPoolSize,
+                        ConnectionIdleLifetime = _options.ConnectionIdleLifetime,
+                        ConnectionPruningInterval = _options.ConnectionPruningInterval,
                         HeartbeatInterval = _options.HeartbeatInterval,
                     });
                 _clientFactory = factory;
