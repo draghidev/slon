@@ -67,7 +67,7 @@ sealed class PgConnection : IPoolConnection<PgConnection>
     public string MintExplicitPrepareName() => $"_ep{Interlocked.Increment(ref _explicitPrepareCounter)}";
 
     // Startup suppresses idle publication until the create path has committed the initial lease.
-    Action? _underlyingPoolIdleSignal;
+    ConnectionPoolContext<PgConnection>? _poolContext;
     int _isStarted;
 
     PgConnection(PgClientProtocol protocol, CommandTracker? tracker, TimeSpan maintenanceInterval)
@@ -87,8 +87,10 @@ sealed class PgConnection : IPoolConnection<PgConnection>
     {
         var protocol = PgClientProtocol.Create(protocolOptions);
         var conn = new PgConnection(protocol, tracker, clientOptions.MaintenanceInterval);
-        conn._underlyingPoolIdleSignal = poolContext?.CreateConnectionIdleSignal(conn);
-        protocol.Start(clientOptions, transport, conn._underlyingPoolIdleSignal is null ? NoopOnIdle : conn.SignalIdleIfStarted, timeout);
+        conn._poolContext = poolContext;
+        protocol.Start(clientOptions, transport,
+            poolContext is null ? NoopAvailability : conn.SignalAvailabilityIfStarted,
+            timeout);
         conn.WireHeartbeat(clientOptions, poolContext);
         return conn;
     }
@@ -97,23 +99,25 @@ sealed class PgConnection : IPoolConnection<PgConnection>
     {
         var protocol = PgClientProtocol.Create(protocolOptions);
         var conn = new PgConnection(protocol, tracker, clientOptions.MaintenanceInterval);
-        conn._underlyingPoolIdleSignal = poolContext?.CreateConnectionIdleSignal(conn);
-        await protocol.StartAsync(clientOptions, transport, conn._underlyingPoolIdleSignal is null ? NoopOnIdle : conn.SignalIdleIfStarted, cancellationToken).ConfigureAwait(false);
+        conn._poolContext = poolContext;
+        await protocol.StartAsync(clientOptions, transport,
+            poolContext is null ? NoopAvailability : conn.SignalAvailabilityIfStarted,
+            cancellationToken).ConfigureAwait(false);
         conn.WireHeartbeat(clientOptions, poolContext);
         return conn;
     }
 
-    void SignalIdleIfStarted()
+    void SignalAvailabilityIfStarted(bool isIdle)
     {
         if (Volatile.Read(ref _isStarted) != 0)
-            _underlyingPoolIdleSignal!();
+            _poolContext!.SignalAvailability(this, isIdle);
     }
 
     // Enables depth-to-zero publication after installation and initial lease assignment.
     public void Start() => Volatile.Write(ref _isStarted, 1);
 
     // A non-null callback tells the protocol that this wrapper supplies heartbeat orchestration.
-    static readonly Action NoopOnIdle = static () => { };
+    static readonly Action<bool> NoopAvailability = static _ => { };
 
     void WireHeartbeat(PgClientOptions options, ConnectionPoolContext<PgConnection>? poolContext)
     {

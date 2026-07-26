@@ -59,7 +59,7 @@ static class PgTestPool
     }
 
     // Construct a fresh, non-pooled protocol the caller owns end to end. Use in tests that fault the wire,
-    // destroy the protocol, or need custom heartbeat/timeout settings. Standalone heartbeat (no onIdle),
+    // destroy the protocol, or need custom heartbeat/timeout settings. Standalone heartbeat (no pool callback),
     // so flow activation timeouts work without a pool driving the tick.
     internal static async Task<PgClientProtocol> NewIsolatedAsync(Action<PgClientProtocolOptions>? configureOptions = null)
     {
@@ -137,7 +137,7 @@ static class PgTestPool
     internal sealed class PooledProtocol : IPoolConnection<PooledProtocol>
     {
         int _started;
-        Action? _idleSignal;
+        ConnectionPoolContext<PooledProtocol>? _poolContext;
         IDisposable? _heartbeatRegistration;
         public PgClientProtocol Protocol { get; }
 
@@ -154,11 +154,11 @@ static class PgTestPool
             {
                 var protocol = PgClientProtocol.Create(new PgClientProtocolOptions(options));
                 var conn = new PooledProtocol(protocol);
-                conn._idleSignal = poolContext.CreateConnectionIdleSignal(conn);
+                conn._poolContext = poolContext;
                 // Register before startup so any startup-terminal path releases the registration
                 // through the protocol completion observer too.
                 conn._heartbeatRegistration = poolContext.OnHeartbeat(static (c, interval) => c.Protocol.Heartbeat(interval), conn);
-                await protocol.StartAsync(options, transport, conn.SignalIdleIfStarted, cancellationToken).ConfigureAwait(false);
+                await protocol.StartAsync(options, transport, conn.SignalAvailabilityIfStarted, cancellationToken).ConfigureAwait(false);
                 return conn;
             }
             catch (Exception ex)
@@ -172,10 +172,10 @@ static class PgTestPool
             }
         }
 
-        void SignalIdleIfStarted()
+        void SignalAvailabilityIfStarted(bool isIdle)
         {
             if (Volatile.Read(ref _started) == 1)
-                _idleSignal!();
+                _poolContext!.SignalAvailability(this, isIdle);
         }
 
         public void Start() => Volatile.Write(ref _started, 1);

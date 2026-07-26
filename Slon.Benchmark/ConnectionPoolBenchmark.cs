@@ -120,16 +120,16 @@ sealed class FakeConnection : IPoolConnection<FakeConnection>
 {
     static readonly Task NeverCompletes = new TaskCompletionSource().Task;
     int _depth;
-    Action? _idleSignal;
+    ConnectionPoolContext<FakeConnection>? _poolContext;
 
-    internal void SetIdleSignal(Action signal) => _idleSignal = signal;
+    internal void SetPoolContext(ConnectionPoolContext<FakeConnection> context) => _poolContext = context;
     internal void IncrementDepth() => Interlocked.Increment(ref _depth);
     internal void DecrementDepth() => Interlocked.Decrement(ref _depth);
     internal void MarkIdleAndSignal()
     {
         // Idle = depth 0. Simulate work-done by firing the pool's idle callback.
         Volatile.Write(ref _depth, 0);
-        _idleSignal?.Invoke();
+        _poolContext?.SignalAvailability(this, isIdle: true);
     }
 
     public bool IsIdle => Volatile.Read(ref _depth) is 0;
@@ -157,7 +157,7 @@ sealed class FakeFactory : IPoolConnectionFactory<FakeConnection>
     public FakeConnection Create(ConnectionPoolContext<FakeConnection> poolContext, TimeSpan timeout = default)
     {
         var conn = new FakeConnection();
-        conn.SetIdleSignal(poolContext.CreateConnectionIdleSignal(conn));
+        conn.SetPoolContext(poolContext);
         // Start idle so it lands in the pool's idle channel.
         conn.MarkIdleAndSignal();
         return conn;

@@ -261,7 +261,7 @@ public class PgClientRequestBenchmark : ClientBenchmark
                         continue;
                     }
                     conn = await pool.GetAsync(
-                        static (ctx, flow) => ctx.Connection.Protocol.TryQueue(flow, mustPipeline: !ctx.WasIdle),
+                        static (ctx, flow) => ctx.Connection.Protocol.TryQueue(flow, mustPipeline: !ctx.IsIdleCandidate),
                         flow, TimeSpan.FromSeconds(30), CancellationToken.None).ConfigureAwait(false);
                     count = 1;
                 }

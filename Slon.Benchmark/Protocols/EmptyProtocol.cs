@@ -199,7 +199,7 @@ sealed class EmptyProtocol<TMode> : IPoolConnection<EmptyProtocol<TMode>>
     where TMode : struct
 {
     readonly EmptyProtocolOptions _options;
-    readonly Action? _poolConnectionIdleSignal;
+    readonly ConnectionPoolContext<EmptyProtocol<TMode>>? _poolContext;
     readonly CancellationTokenSource _abortCts;
     UnboundedPipeline<EmptyFlow<TMode>, Policy> _pipeline = null!;
     readonly Lock _syncRoot = new();
@@ -215,7 +215,7 @@ sealed class EmptyProtocol<TMode> : IPoolConnection<EmptyProtocol<TMode>>
         // No startup flow for the benchmark protocol, immediately ready.
         lock (_syncRoot)
             _status = ProtocolStatus.Ready;
-        _poolConnectionIdleSignal = poolContext?.CreateConnectionIdleSignal(this);
+        _poolContext = poolContext;
     }
 
     Control FlowControl { get; }
@@ -363,7 +363,7 @@ sealed class EmptyProtocol<TMode> : IPoolConnection<EmptyProtocol<TMode>>
             if (typeof(TMode) == typeof(PooledUserCompleted))
             {
                 if (remainingDepth is 0)
-                    protocol._poolConnectionIdleSignal?.Invoke();
+                    protocol._poolContext?.SignalAvailability(protocol, isIdle: true);
             }
         }
     }

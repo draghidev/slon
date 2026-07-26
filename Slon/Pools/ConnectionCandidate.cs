@@ -1,6 +1,6 @@
 namespace Slon.Pools;
 
-public readonly struct ConnectionCandidate<T>(T connection, CancellationToken cancellationToken, bool wasIdle = true)
+public readonly struct ConnectionCandidate<T>(T connection, CancellationToken cancellationToken, bool isIdleCandidate = true)
 {
     public T Connection { get; } = connection;
 
@@ -8,13 +8,10 @@ public readonly struct ConnectionCandidate<T>(T connection, CancellationToken ca
     /// when their scheduling work needs to honor caller cancellation.
     public CancellationToken CancellationToken { get; } = cancellationToken;
 
-    /// This connection was idle when selected.
-    /// <returns>True when idle. False when busy, there may be delays before new work gets processed.</returns>
+    /// Whether the pool selected this connection through the idle or newly-opened path.
     /// <remarks>
-    /// Schedulers should not add work to connections that became idle when they weren't when this scheduling context was created.
-    /// <br/><br/>
-    /// Failure to do so can cause e.g. synchronous callers expecting an idle connection to block on async work due to the connection actually being busy.
-    /// Degradation in connection selection performance might also occur when connections marked as being idle are often not idle.
+    /// A non-idle candidate may only accept work if it remains busy. This prevents a
+    /// pipelining attempt from claiming a connection after its busy-to-idle transition.
     /// </remarks>
-    public bool WasIdle { get; } = wasIdle;
+    public bool IsIdleCandidate { get; } = isIdleCandidate;
 }

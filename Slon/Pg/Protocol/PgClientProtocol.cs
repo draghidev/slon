@@ -86,7 +86,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
     double _throughputPerTick;
     int _currentFlowStartTick;
     Heartbeat? _heartbeat;
-    Action? _poolConnectionIdleSignal;
+    Action<bool>? _poolConnectionAvailabilitySignal;
 
     // BackendKeyData used for diagnostics and side-channel cancellation.
     int _backendProcessId;
@@ -176,7 +176,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
     public static PgClientProtocol Create(PgClientProtocolOptions protocolOptions)
         => new(protocolOptions);
 
-    void Initialize(TransportConnection connection, Action? onIdle)
+    void Initialize(TransportConnection connection, Action<bool>? onAvailability)
     {
         _connection = connection;
         _pipeWriter = connection.Writer as IOutputWriter ?? new PipeOutputWriter(connection.Writer);
@@ -186,30 +186,31 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         _pgDecoder = new(_pipeSegmentEnumerator, AbortToken, _options.ReadTimeout);
 
         // Scoring is a pool concern: only maintain its inputs when an orchestrator drives us.
-        _scoringEnabled = onIdle is not null;
+        _scoringEnabled = onAvailability is not null;
 
-        // A non-null onIdle means an external orchestrator (pool, PgConnection) drives us,
+        // A non-null availability callback means an external orchestrator drives us,
         // including the heartbeat tick. When null, we run our own heartbeat so standalone
         // consumers get working flow activation timeouts.
-        if (onIdle is null)
+        if (onAvailability is null)
         {
             _heartbeat = new(_options.HeartbeatInterval, _options.TimeProvider);
             _heartbeat.Register(period => Heartbeat(period));
         }
         else
         {
-            _poolConnectionIdleSignal = onIdle;
+            _poolConnectionAvailabilitySignal = onAvailability;
         }
     }
 
-    public void Start(PgClientOptions options, TransportConnection connection, Action? onIdle = null, TimeSpan timeout = default)
+    public void Start(PgClientOptions options, TransportConnection connection,
+        Action<bool>? onAvailability = null, TimeSpan timeout = default)
     {
         try
         {
             if (connection.Reader is not StreamPipeReader || connection.Writer is not StreamPipeWriter)
                 ThrowHelper.ThrowInvalidOperation("Transport does not support synchronous I/O.");
 
-            Initialize(connection, onIdle);
+            Initialize(connection, onAvailability);
             var flow = new StartupFlow(async: false, options, timeout == default ? options.ConnectionTimeout : timeout);
             var task = StartAsync(flow, flow.WaitForComplete());
             Debug.Assert(task.IsCompleted);
@@ -222,11 +223,12 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         }
     }
 
-    public async ValueTask StartAsync(PgClientOptions options, TransportConnection connection, Action? onIdle = null, CancellationToken cancellationToken = default)
+    public async ValueTask StartAsync(PgClientOptions options, TransportConnection connection,
+        Action<bool>? onAvailability = null, CancellationToken cancellationToken = default)
     {
         try
         {
-            Initialize(connection, onIdle);
+            Initialize(connection, onAvailability);
             var flow = new StartupFlow(async: true, options, options.ConnectionTimeout);
             await StartAsync(flow, flow.WaitForComplete(cancellationToken), cancellationToken).ConfigureAwait(false);
         }
@@ -1361,20 +1363,20 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
             }
 
             // At pipeline park (remainingDepth == 0) release the rooted read-state buffers and signal
-            // the pool's idle hook. The framework manages the ActivatedItem slot (cleared right after
+            // the pool's idle publication. The framework manages the ActivatedItem slot (cleared right after
             // this), and the in-order Activate-before-Complete invariant means no successor Activate
             // races this completion.
             if (remainingDepth is 0)
             {
                 _commandFlowReadState = new();
-                // The pool idle hook runs in the advancer/retirement work-item context: a raw throw
+                // Pool availability signaling runs in the advancer/retirement work-item context: a raw throw
                 // would crash that thread unobserved. But don't just swallow either - if the hook that
                 // reclaims this connection is throwing, the integration is broken and the pipeline won't
                 // get cleaned up naturally, so tear down via FailProtocol (fire-and-forget self-evict;
                 // the pool picks it up through the status flag).
                 if (poolFacing)
                 {
-                    try { protocol._poolConnectionIdleSignal?.Invoke(); }
+                    try { protocol._poolConnectionAvailabilitySignal?.Invoke(true); }
                     catch (Exception ex) { /* TODO log */ protocol.FailProtocol(ex); }
                 }
             }

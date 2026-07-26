@@ -10,7 +10,7 @@ using Slon.Transport;
 
 namespace Slon.Tests;
 
-// Adds connection lifecycle management (lease/release via the idle channel, pool-driven
+// Adds connection lifecycle management (lease/release via the idle queue, pool-driven
 // heartbeat). If cross-connection blocking surfaces here, the lease path or the pool's
 // shared heartbeat thread is the coupling. Each test builds a fresh pool so lease/release
 // semantics are tested in isolation.
@@ -19,16 +19,17 @@ public class ConnectionPoolTests
 {
     sealed class AdmissionConnection : IPoolConnection<AdmissionConnection>
     {
-        readonly Action _signalIdle;
+        readonly ConnectionPoolContext<AdmissionConnection> _poolContext;
         int _started;
         int _idle = 1;
+        int _schedulable = 1;
         readonly TaskCompletionSource _completion = new(TaskCreationOptions.RunContinuationsAsynchronously);
         int _heartbeatCount;
         IDisposable? _heartbeatRegistration;
 
         public AdmissionConnection(ConnectionPoolContext<AdmissionConnection> context, bool registerHeartbeat = false)
         {
-            _signalIdle = context.CreateConnectionIdleSignal(this);
+            _poolContext = context;
             if (registerHeartbeat)
                 _heartbeatRegistration = context.OnHeartbeat(static (connection, _) =>
                 {
@@ -39,7 +40,7 @@ public class ConnectionPoolTests
 
         public bool Started => Volatile.Read(ref _started) != 0;
         public bool IsIdle => Volatile.Read(ref _idle) != 0;
-        public bool IsSchedulable => !Completion.IsCompleted;
+        public bool IsSchedulable => Volatile.Read(ref _schedulable) != 0 && !Completion.IsCompleted;
         public Task Completion => _completion.Task;
         public int HeartbeatCount => Volatile.Read(ref _heartbeatCount);
 
@@ -50,7 +51,19 @@ public class ConnectionPoolTests
             Assert.IsTrue(Started, "initial work must not begin before pool admission");
             Volatile.Write(ref _idle, 0);
             Volatile.Write(ref _idle, 1);
-            _signalIdle();
+            _poolContext.SignalAvailability(this, isIdle: true);
+        }
+
+        public void EnterRecovery()
+        {
+            Volatile.Write(ref _idle, 0);
+            Volatile.Write(ref _schedulable, 0);
+        }
+
+        public void CompleteRecovery()
+        {
+            Volatile.Write(ref _schedulable, 1);
+            _poolContext.SignalAvailability(this, isIdle: false);
         }
 
         public void MarkCompletedExternally()
@@ -103,6 +116,32 @@ public class ConnectionPoolTests
             _started.TrySetResult();
             await _release.Task.WaitAsync(cancellationToken);
             return Connection;
+        }
+    }
+
+    sealed class FailingThenSuccessfulFactory : IPoolConnectionFactory<AdmissionConnection>
+    {
+        readonly TaskCompletionSource _started = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        readonly TaskCompletionSource _release = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        int _attempt;
+
+        public Task Started => _started.Task;
+        public void Release() => _release.TrySetResult();
+
+        public AdmissionConnection Create(ConnectionPoolContext<AdmissionConnection> context, TimeSpan timeout = default)
+            => throw new NotSupportedException();
+
+        public async ValueTask<AdmissionConnection> CreateAsync(ConnectionPoolContext<AdmissionConnection> context,
+            CancellationToken cancellationToken = default)
+        {
+            if (Interlocked.Increment(ref _attempt) == 1)
+            {
+                _started.TrySetResult();
+                await _release.Task.WaitAsync(cancellationToken);
+                throw new InvalidOperationException("first open failed");
+            }
+
+            return new(context);
         }
     }
 
@@ -169,7 +208,7 @@ public class ConnectionPoolTests
         await WaitUntilAsync(() => pool.WaiterCount == 1, TimeSpan.FromSeconds(1),
             "a correctly depleted idle set must park the second lease");
         Assert.IsFalse(second.IsCompleted,
-            "a second channel entry would allow the same idle connection to be leased twice");
+            "a second idle entry would allow the same connection to be leased twice");
         cancellation.Cancel();
         await Assert.ThrowsExactlyAsync<TaskCanceledException>(() => second);
     }
@@ -273,6 +312,232 @@ public class ConnectionPoolTests
 
         Assert.AreEqual(retiredCount, retired.HeartbeatCount,
             "a connection removed from the pool registry must also leave heartbeat traversal");
+    }
+
+    [TestMethod]
+    public async Task TerminalCompletion_WakesWaiterForFreedCapacity()
+    {
+        var factory = new AdmissionConnectionFactory();
+        await using var pool = new ConnectionPool<AdmissionConnection>(factory, new()
+        {
+            MaxConnections = 1,
+        });
+
+        var retired = await pool.GetAsync(TimeSpan.FromSeconds(1));
+        var waiting = pool.GetAsync(TimeSpan.FromSeconds(1)).AsTask();
+        await Task.Yield();
+        Assert.IsFalse(waiting.IsCompleted,
+            "the sole idle token is held by the first lease, so the second acquisition must wait");
+
+        retired.MarkCompletedExternally();
+        var replacement = await waiting;
+
+        Assert.AreNotSame(retired, replacement);
+        Assert.IsFalse(replacement.Completion.IsCompleted);
+    }
+
+    [TestMethod]
+    public async Task FailedOpening_WakesWaiterForFreedCapacity()
+    {
+        var factory = new FailingThenSuccessfulFactory();
+        await using var pool = new ConnectionPool<AdmissionConnection>(factory, new()
+        {
+            MaxConnections = 1,
+        });
+
+        var failedOpen = pool.GetAsync(TimeSpan.FromSeconds(1)).AsTask();
+        await factory.Started;
+        var waiting = pool.GetAsync(TimeSpan.FromSeconds(1)).AsTask();
+        await Task.Yield();
+        Assert.IsFalse(waiting.IsCompleted);
+
+        factory.Release();
+        await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => failedOpen);
+
+        var connection = await waiting;
+        Assert.IsFalse(connection.Completion.IsCompleted);
+    }
+
+    [TestMethod]
+    public async Task RecoveryAvailability_PassesWaiterWhosePlacementRejectsBusyConnection()
+    {
+        await using var pool = new ConnectionPool<AdmissionConnection>(
+            new AdmissionConnectionFactory(), new() { MaxConnections = 1 });
+
+        var connection = await pool.GetAsync(TimeSpan.FromSeconds(1));
+        connection.EnterRecovery();
+
+        using var cancellation = new CancellationTokenSource();
+        var exclusive = pool.GetAsync(
+            static (candidate, _) => candidate.Connection.IsIdle,
+            state: 0,
+            timeout: Timeout.InfiniteTimeSpan,
+            cancellationToken: cancellation.Token).AsTask();
+        var multiplexed = pool.GetAsync(
+            static (_, _) => true,
+            state: 0,
+            timeout: TimeSpan.FromSeconds(1)).AsTask();
+
+        await WaitUntilAsync(() => pool.WaiterCount == 2, TimeSpan.FromSeconds(1),
+            "both placement attempts must be parked before recovery restores continuity");
+        connection.CompleteRecovery();
+
+        Assert.AreSame(connection, await multiplexed);
+        Assert.IsFalse(exclusive.IsCompleted,
+            "the exclusive waiter must remain parked while the recovered connection is busy");
+        cancellation.Cancel();
+        await Assert.ThrowsExactlyAsync<TaskCanceledException>(() => exclusive);
+    }
+
+    [TestMethod]
+    public async Task RecoveryAvailability_PassesToNextCompatibleWaiterAfterPolicyRejection()
+    {
+        await using var pool = new ConnectionPool<AdmissionConnection>(
+            new AdmissionConnectionFactory(), new() { MaxConnections = 1 });
+
+        var connection = await pool.GetAsync(TimeSpan.FromSeconds(1));
+        connection.EnterRecovery();
+
+        using var cancellation = new CancellationTokenSource();
+        var rejecting = pool.GetAsync(
+            static (_, _) => false,
+            state: 0,
+            timeout: Timeout.InfiniteTimeSpan,
+            cancellationToken: cancellation.Token).AsTask();
+        var accepting = pool.GetAsync(
+            static (_, _) => true,
+            state: 0,
+            timeout: TimeSpan.FromSeconds(1)).AsTask();
+
+        await WaitUntilAsync(() => pool.WaiterCount == 2, TimeSpan.FromSeconds(1),
+            "both waiters must be parked before recovery restores continuity");
+        connection.CompleteRecovery();
+
+        Assert.AreSame(connection, await accepting,
+            "policy rejection must pass the availability edge to the next waiter");
+        Assert.IsFalse(rejecting.IsCompleted,
+            "the rejecting waiter must remain parked after passing the availability edge");
+        cancellation.Cancel();
+        await Assert.ThrowsExactlyAsync<TaskCanceledException>(() => rejecting);
+    }
+
+    [TestMethod]
+    public async Task CancelledWaiter_DoesNotConsumeLaterAvailability()
+    {
+        await using var pool = new ConnectionPool<AdmissionConnection>(
+            new AdmissionConnectionFactory(), new() { MaxConnections = 1 });
+
+        var connection = await pool.GetAsync(TimeSpan.FromSeconds(1));
+        connection.EnterRecovery();
+
+        using var cancellation = new CancellationTokenSource();
+        var cancelled = pool.GetAsync(
+            static (_, _) => true,
+            state: 0,
+            timeout: Timeout.InfiniteTimeSpan,
+            cancellationToken: cancellation.Token).AsTask();
+        await WaitUntilAsync(() => pool.WaiterCount == 1, TimeSpan.FromSeconds(1),
+            "the cancellable waiter must be queued before cancellation");
+
+        cancellation.Cancel();
+        try
+        {
+            await cancelled;
+            Assert.Fail("the cancelled waiter should not complete successfully");
+        }
+        catch (OperationCanceledException ex)
+        {
+            Assert.AreEqual(cancellation.Token, ex.CancellationToken);
+        }
+        await WaitUntilAsync(() => pool.WaiterCount == 0, TimeSpan.FromSeconds(1),
+            "cancellation must physically unlink the waiter");
+
+        var accepting = pool.GetAsync(
+            static (_, _) => true,
+            state: 0,
+            timeout: TimeSpan.FromSeconds(1)).AsTask();
+        await WaitUntilAsync(() => pool.WaiterCount == 1, TimeSpan.FromSeconds(1),
+            "the replacement waiter must be queued before availability is restored");
+
+        connection.CompleteRecovery();
+        Assert.AreSame(connection, await accepting);
+    }
+
+    [TestMethod]
+    public async Task IdleAvailability_PreservesFifoAcrossPlacementPolicies()
+    {
+        await using var pool = new ConnectionPool<AdmissionConnection>(
+            new AdmissionConnectionFactory(), new() { MaxConnections = 1 });
+
+        var connection = await pool.GetAsync(TimeSpan.FromSeconds(1));
+        var exclusive = pool.GetAsync(
+            static (candidate, _) => candidate.IsIdleCandidate,
+            state: 0,
+            timeout: TimeSpan.FromSeconds(1)).AsTask();
+        var shared = pool.GetAsync(
+            static (_, _) => true,
+            state: 0,
+            timeout: TimeSpan.FromSeconds(1)).AsTask();
+
+        await WaitUntilAsync(() => pool.WaiterCount == 2, TimeSpan.FromSeconds(1),
+            "both placement policies must be queued before the idle edge");
+        connection.RunInitialWorkToIdle();
+
+        Assert.AreSame(connection, await exclusive,
+            "an idle edge must select the oldest waiter regardless of placement policy");
+        Assert.IsFalse(shared.IsCompleted);
+
+        connection.RunInitialWorkToIdle();
+        Assert.AreSame(connection, await shared);
+    }
+
+    [TestMethod]
+    public async Task DisposeAsync_FaultsQueuedWaitersWithDifferentPlacementPolicies()
+    {
+        var pool = new ConnectionPool<AdmissionConnection>(
+            new AdmissionConnectionFactory(), new() { MaxConnections = 1 });
+
+        await pool.GetAsync(TimeSpan.FromSeconds(1));
+        var exclusive = pool.GetAsync(
+            static (candidate, _) => candidate.IsIdleCandidate,
+            state: 0,
+            timeout: Timeout.InfiniteTimeSpan).AsTask();
+        var shared = pool.GetAsync(
+            static (_, _) => true,
+            state: 0,
+            timeout: Timeout.InfiniteTimeSpan).AsTask();
+
+        await WaitUntilAsync(() => pool.WaiterCount == 2, TimeSpan.FromSeconds(1),
+            "both waiters must be queued before disposal");
+        await pool.DisposeAsync();
+
+        await Assert.ThrowsExactlyAsync<ObjectDisposedException>(() => exclusive);
+        await Assert.ThrowsExactlyAsync<ObjectDisposedException>(() => shared);
+    }
+
+    [TestMethod]
+    public async Task AvailabilityRacingWaiterRegistration_IsNotLost()
+    {
+        for (var i = 0; i < 100; i++)
+        {
+            await using var pool = new ConnectionPool<AdmissionConnection>(
+                new AdmissionConnectionFactory(), new() { MaxConnections = 1 });
+
+            var connection = await pool.GetAsync(TimeSpan.FromSeconds(1));
+            connection.EnterRecovery();
+            var waiting = pool.GetAsync(
+                static (_, _) => true,
+                state: 0,
+                timeout: TimeSpan.FromSeconds(1)).AsTask();
+
+            // WaiterCount becomes visible immediately after registration, potentially before
+            // the mandatory state rescan which closes the registration/signal race.
+            await WaitUntilAsync(() => pool.WaiterCount == 1, TimeSpan.FromSeconds(1),
+                "the waiter must publish itself before availability changes");
+            connection.CompleteRecovery();
+
+            Assert.AreSame(connection, await waiting);
+        }
     }
 
     [TestMethod]

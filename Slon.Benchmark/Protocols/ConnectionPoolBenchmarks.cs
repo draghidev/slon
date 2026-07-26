@@ -41,7 +41,7 @@ public class ConnectionPoolBenchmarks
             var flow = _flows[i];
             flow.Reset();
             await _connectionPool.GetAsync(
-                static (ctx, flow) => ctx.Connection.TryQueue(flow, mustPipeline: !ctx.WasIdle), flow,
+                static (ctx, flow) => ctx.Connection.TryQueue(flow, mustPipeline: !ctx.IsIdleCandidate), flow,
                 TimeSpan.Zero, CancellationToken.None);
         }
 
