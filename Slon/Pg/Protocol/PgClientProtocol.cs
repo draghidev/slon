@@ -285,6 +285,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
 
     void SignalReady()
     {
+        var becameReady = false;
         lock (_syncRoot)
         {
             if (_drainingCount > 0)
@@ -292,8 +293,23 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
 
             if (_drainingCount is 0 && _status is not ProtocolStatus.Completed)
             {
+                becameReady = _status is not ProtocolStatus.Ready;
                 _status = ProtocolStatus.Ready;
             }
+        }
+
+        if (becameReady)
+            _poolConnectionAvailabilitySignal?.Invoke(false);
+    }
+
+    void SignalDraining()
+    {
+        lock (_syncRoot)
+        {
+            if (_status is ProtocolStatus.Completed)
+                return;
+            _drainingCount++;
+            _status = ProtocolStatus.Draining;
         }
     }
 
@@ -892,6 +908,12 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
                     || (shutdownClose is not null && (ReferenceEquals(exception, shutdownClose) || ReferenceEquals(failureException, shutdownClose)))
                     ? failureException
                     : new AggregateException(failureException, exception);
+
+                // Recovery retirement made the wire schedulable. Publish that state before completing
+                // the supplanted flow: its completion continuation may immediately submit new work.
+                if (resyncRecovery.BlocksAdmission)
+                    _control.RecoveryCompleted();
+
                 failedFlow.GetExecutionControl(_control).Complete(combined);
             }
         }
@@ -1046,8 +1068,11 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
             // (CompleteItem fires when the recovery completes). The failed item's lifetime extends as
             // far as the recovery, so its dispatch state, RFQ bookkeeping, and registrations release
             // before the instance can be reused.
-            recoveryItem = ResyncRecoveryFlow.Create(
+            var recovery = ResyncRecoveryFlow.Create(
                 _control, failedItem, context.Exception, outstandingPhase, outstandingIsRead, failedItemControl.RfqCount, canWriteSync, canWrite);
+            recoveryItem = recovery;
+            if (recovery.BlocksAdmission)
+                _control.RecoveryStarted();
             _control.OnFlowSubstituted(failedItem, recoveryItem);
             return true;
         }
@@ -1343,6 +1368,9 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
 
         // Self-evict route for the flow layer's completion-callback seam (see ExecutionControl.Complete).
         internal void FailProtocol(Exception? reason) => protocol.FailProtocol(reason);
+
+        internal void RecoveryStarted() => protocol.SignalDraining();
+        internal void RecoveryCompleted() => protocol.SignalReady();
 
         internal void OnCompleted(PgClientFlow flow, int remainingDepth)
         {

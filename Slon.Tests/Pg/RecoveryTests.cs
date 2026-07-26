@@ -129,6 +129,10 @@ public class RecoveryTests
         /// await it before its own DrainPhase read (the read-side mirror of ControllableTrailing).
         public TaskCompletionSource? ControllablePipelineRead { get; init; }
 
+        /// Keeps the pipeline task pending until the test completes or faults it. Unlike
+        /// ControllablePipelineRead this does not acquire the decoder.
+        public TaskCompletionSource? ControllablePipeline { get; init; }
+
         /// Completed by the pipeline read once it has actually acquired the decoder (the read turn).
         /// Lets a test fault the trailing only AFTER the read is genuinely holding the turn, so the
         /// recovery runs while the outstanding read is live (the definitive read-outstanding case).
@@ -202,7 +206,9 @@ public class RecoveryTests
                 throw new InvalidOperationException("FaultingFlow pre-return synthetic failure.");
 
             ValueTask pipelineTask;
-            if (ControllablePipelineRead is { } readGate)
+            if (ControllablePipeline is { } controllablePipeline)
+                pipelineTask = new ValueTask(controllablePipeline.Task);
+            else if (ControllablePipelineRead is { } readGate)
                 pipelineTask = HoldReadTurn(context, readGate, PipelineReadAcquired, HeldReadConsumeCount);
             else
                 pipelineTask = _phase is FaultPhase.PipelineTask ? FailedTask() : ValueTask.CompletedTask;
@@ -257,6 +263,36 @@ public class RecoveryTests
         var faulting = new FaultingFlow(async: true, FaultPhase.PipelineTask, WriteShape.None);
         Assert.IsTrue(protocol.TryQueue(faulting));
 
+        await RunAsync(protocol, "select 1");
+    }
+
+    [TestMethod]
+    public async Task InFlightReadOnlyRecovery_BlocksNewAdmissionUntilRecovered()
+    {
+        await using var protocol = await ConnectAsync();
+        var pipeline = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var faulting = new FaultingFlow(async: true, FaultPhase.PipelineTask, WriteShape.QueryNoFlush)
+        {
+            QueryText = "select pg_sleep(0.2)",
+            ControllablePipeline = pipeline,
+        };
+        Assert.IsTrue(protocol.TryQueue(faulting));
+
+        // Let the pending pipeline task enter the in-flight sequence, then fault it after the
+        // executor has released the write window. Recovery can only drain the flow's existing RFQ.
+        while (protocol.PipelineDepth == 0)
+            await Task.Yield();
+        pipeline.TrySetException(new InvalidOperationException("synthetic in-flight pipeline fault"));
+        while (protocol.IsSchedulable)
+            await Task.Yield();
+
+        var duringRecovery = new CommandFlow(async: true, Command.Create("select 1"));
+        Assert.IsFalse(protocol.TryQueue(duringRecovery),
+            "read-only recovery must not enlarge the set condemned if its inherited boundary is invalid");
+
+        await Assert.ThrowsExactlyAsync<InvalidOperationException>(
+            () => faulting.WaitForComplete().AsTask().WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.IsTrue(protocol.IsSchedulable);
         await RunAsync(protocol, "select 1");
     }
 

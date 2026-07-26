@@ -45,6 +45,10 @@ sealed class ResyncRecoveryFlow : PgClientFlow
     /// always-written ROLLBACK on just the write window being open.
     public bool CanWriteSync => _canWriteSync;
 
+    // A recovery without the write window can only drain boundaries left by the failed flow. Stop
+    // admitting new work until that premise has been validated by reaching those boundaries.
+    public bool BlocksAdmission => !_canWrite;
+
     /// True while the failed flow still has an in-flight read. The decoder permit resolves to
     /// FailedFlow while this holds so that read finishes on its own read-state, not the recovery's.
     /// The read-side inverse of ThrowIfCannotWrite. DrainPhase awaits it before taking the read turn.
