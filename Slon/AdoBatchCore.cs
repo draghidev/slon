@@ -598,17 +598,8 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
         ref var thisRef = ref fieldRef.Invoke();
         thisRef.ThrowIfDisposed();
         cancellationToken.ThrowIfCancellationRequested();
-        CommandFlow.Enumerator enumerator = default;
-        try
-        {
-            enumerator = (await thisRef.EnqueueAsync(parameters, CommandBehavior.Default, cancellationToken).ConfigureAwait(false)).GetAsyncEnumerator(cancellationToken);
-            var recordsAffected = await enumerator.ConsumeNonQueryAsync().ConfigureAwait(false);
-            return checked((int)recordsAffected);
-        }
-        finally
-        {
-            await enumerator.DisposeAsync().ConfigureAwait(false);
-        }
+        var flow = await thisRef.EnqueueAsync(parameters, CommandBehavior.Default, cancellationToken).ConfigureAwait(false);
+        return checked((int)await flow.ConsumeNonQueryAsync(cancellationToken).ConfigureAwait(false));
     }
 
     public ValueTask<int> ExecuteNonQueryAsync(DbParameterCollection? parameters, CancellationToken cancellationToken = default)

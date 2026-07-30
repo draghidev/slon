@@ -52,8 +52,11 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
     // Errors encountered while draining are surfaced by a waiting DisposeAsync. Live consumers observe
     // their errors directly, and the list remains unallocated on the successful path.
     List<PostgresException>? _drainErrors;
+    // Set only by ConsumeNonQueryAsync, after enqueue but before any consumer-side gate release.
+    // The body cannot reach first publication until such a release, and every release publishes
+    // this write, so plain accesses suffice and the body observes the mode at first wake.
     bool _consumeNonQuery;
-    bool IsConsumingNonQuery => Volatile.Read(ref _consumeNonQuery);
+    bool IsConsumingNonQuery => _consumeNonQuery;
     bool IsConsumingAutonomously => IsDraining || IsConsumingNonQuery;
     long _nonQueryRecordsAffected;
 
@@ -146,6 +149,33 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
         // Arm before publication: teardown may complete the source concurrently even before enumeration.
         _enumeratorMoveNextTaskSource.CanCompleteConcurrently = true;
         return this;
+    }
+
+    // Declares internal non-query consumption and runs it to completion. The single entry point
+    // makes the ownership rule structural: no enumerator is exposed on this path, so mixing
+    // enumeration with internal consumption is unrepresentable. The declaration precedes any
+    // consumer-side gate release, so the body observes it at first wake and never publishes.
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
+    internal async ValueTask<long> ConsumeNonQueryAsync(CancellationToken cancellationToken = default)
+    {
+        _consumeNonQuery = true;
+        var enumerator = GetAsyncEnumerator(cancellationToken);
+        try
+        {
+            // Release a body parked pre-publication and wake the flow.
+            _callerInteractionCore.OpenGate(runContinuationsAsynchronously: false);
+            _callerInteractionCore.RequestWake();
+            _ = await EnumeratorMoveNextTask.ConfigureAwait(false);
+            // Internal consumption owns error delivery. Errors collected during the internal
+            // drain have no other outlet: DisposeAsync deliberately skips a completed flow.
+            if (_drainErrors is { Count: > 0 } errors)
+                throw errors.Count == 1 ? errors[0] : new AggregateException(errors);
+            return _nonQueryRecordsAffected;
+        }
+        finally
+        {
+            await enumerator.DisposeAsync().ConfigureAwait(false);
+        }
     }
 
     // The token in force for the current read: the flow token once fired (whole-flow cancel), else the
@@ -599,7 +629,12 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                 // This also causes us to pick up any I/O exception thrown during user code that was stored on the resultmessage enumerator.
                 // In drain mode this dispose IS the drain: it reads remaining DataRows + CommandComplete for the current command.
                 (PgError Error, TransactionStatus TransactionStatus)? completeError;
-                if (consumeInternally)
+                // Current mode, not the iteration snapshot: a body that raced past the snapshot
+                // before the caller declared non-query consumption published a result no consumer
+                // will read. Its decoder state is identical to the internal path's entry (rows
+                // unread, the consume caller never touches Current), so it takes the internal
+                // path wholesale, error collection and accumulation included.
+                if (consumeInternally || IsConsumingNonQuery)
                 {
                     while (_decoder.Current.Header.Type is PgTypes.BackendType.DataRow)
                     {
@@ -644,9 +679,9 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                     // Capture a completion-phase error only if the read phase did not already capture this
                     // command's error (a single command's ErrorResponse can appear in both _pgError and
                     // CompleteError - dedupe so one fault is one entry). A drain skips errors already owned
-                    // by a live consumer; direct nonquery consumption has taken that ownership even if it
-                    // raced a result publication.
-                    if ((consumeInternally || IsDraining && !_isResultReady)
+                    // by a live consumer. Direct nonquery consumption routes through the internal path
+                    // above (current-mode check), so its errors are collected there.
+                    if ((consumeInternally || IsConsumingNonQuery || IsDraining && !_isResultReady)
                         && !capturedThisCommand && completeError is { } err && !IsOwnCancellation(err.Error))
                         (_drainErrors ??= new()).Add(new PostgresException(err.Error));
                 }
@@ -1303,26 +1338,6 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
             if (flow._callerInteractionCore.CloseException is { } closed)
                 flow.DeliverClose(closed);
             return flow.EnumeratorMoveNextTask;
-        }
-
-        internal ValueTask<long> ConsumeNonQueryAsync()
-        {
-            if (flow is null)
-                return new(0);
-
-            Volatile.Write(ref flow._consumeNonQuery, true);
-            // Cover both sides of the first-result race: release a body already parked on the gate;
-            // a body observing the mode first skips publication and the gate altogether.
-            flow._callerInteractionCore.OpenGate(runContinuationsAsynchronously: false);
-            flow._callerInteractionCore.RequestWake();
-            return AwaitCompletion(flow);
-
-            [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
-            static async ValueTask<long> AwaitCompletion(CommandFlow flow)
-            {
-                _ = await flow.EnumeratorMoveNextTask.ConfigureAwait(false);
-                return flow._nonQueryRecordsAffected;
-            }
         }
 
         public CommandResult Current => flow?._enumeratorCurrent ?? default!;
