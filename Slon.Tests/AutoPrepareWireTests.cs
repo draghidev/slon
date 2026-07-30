@@ -246,9 +246,9 @@ public class AutoPrepareWireTests
     //     after the EvictDeallocate ahead of it has drained. A Close against a nonexistent statement
     //     is a no-op per protocol (CloseComplete), so the probe touches no real server state.
     //
-    //  2. The LRU stamp is Environment.TickCount64 ("statistical only", ~15ms resolution), so sqlA
-    //     and sqlB used back-to-back could tie and either become the approximate-LRU victim. One 50ms
-    //     gap after sqlA puts it in an older tick than sqlB - the only thing that matters: sqlC
+    //  2. The LRU stamp is Environment.TickCount64 ("statistical only"), so sqlA and sqlB used
+    //     back-to-back could tie and either become the approximate-LRU victim. Waiting for the actual
+    //     tick transition after sqlA puts it in an older tick than sqlB - the only thing that matters: sqlC
     //     crossing the cap evicts the LRU of the existing pair {sqlA, sqlB}, so sqlC (the new
     //     entrant) is never a candidate and needs no gap of its own.
     [TestMethod]
@@ -261,11 +261,12 @@ public class AutoPrepareWireTests
         const string sqlB = "select 301 as drain_b";
         const string sqlC = "select 302 as drain_c";
 
-        // Separate sqlA's stamp from sqlB's so sqlA is unambiguously the older eviction candidate. The
-        // gap must exceed the TickCount64 resolution; 50ms is comfortably above it.
-        var stampGap = TimeSpan.FromMilliseconds(50);
+        // Separate sqlA's stamp from sqlB's so sqlA is unambiguously the older eviction candidate,
+        // without paying a fixed delay larger than the platform's TickCount64 resolution.
         await RunN(conn, sqlA, 4);
-        await Task.Delay(stampGap);
+        var stamp = Environment.TickCount64;
+        while (Environment.TickCount64 == stamp)
+            await Task.Delay(1);
         await RunN(conn, sqlB, 4);
         await RunN(conn, sqlC, 4);
 
@@ -300,11 +301,115 @@ public class AutoPrepareWireTests
         await using var reacquired = await ds.OpenConnectionAsync(CancellationToken.None);
         Assert.AreSame(pg, reacquired.UnderlyingPgConnection,
             "The single-connection pool must reacquire the session whose maintenance was drained.");
+        // Ground truth first: server-side presence discriminates a maintenance delivery hole (row
+        // still present, the Close never took effect) from a client-side error loss (row gone, so a
+        // non-throwing deallocate below means the 26000 was swallowed on the way up). Row existence
+        // only, no value decode.
+        await using var probe = new SlonCommand(reacquired,
+            $"select 1 from pg_prepared_statements where name = '{sqlAName}'");
+        await using (var probeReader = await probe.ExecuteReaderAsync(CancellationToken.None))
+        {
+            Assert.IsFalse(await probeReader.ReadAsync(CancellationToken.None),
+                $"pg_prepared_statements still holds {sqlAName} after the drained maintenance Close: the Close never took effect server-side.");
+        }
         await using var deallocate = new SlonCommand(reacquired, $"deallocate {sqlAName}");
         var error = await Assert.ThrowsExactlyAsync<PostgresException>(async () =>
             await deallocate.ExecuteNonQueryAsync(CancellationToken.None));
         Assert.AreEqual(PgErrorCodes.InvalidSqlStatementName, error.SqlState,
             "The maintenance Close must remove the named statement from PostgreSQL, not just client presence.");
+    }
+
+    [TestMethod]
+    public async Task EvictionMaintenanceBatch_ClosesEveryServerStatement()
+    {
+        const int evictions = 8;
+        await using var ds = CreateDataSource(maxAutoPreparations: 1, autoMinimumUses: 2, maxPoolSize: 1);
+        await using var conn = await ds.OpenConnectionAsync(CancellationToken.None);
+        var pg = conn.UnderlyingPgConnection!;
+        var evictedNames = new List<EncodedString>(evictions);
+
+        // The held scope keeps maintenance behind this lease, accumulating every Close into one
+        // extended-protocol window. Each new admission evicts the preceding prepared statement.
+        for (var i = 0; i <= evictions; i++)
+        {
+            var sql = $"select {i} as maintenance_batch_{i}";
+            await RunN(conn, sql, 3);
+            var tracked = pg.TrackedEntries.Single(e => e.Command.CommandText == sql).Command;
+            if (i < evictions)
+                evictedNames.Add(tracked.StoredCommandName);
+        }
+
+        var drained = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        pg.PushMaintenance(new CloseStatement("slon_maintenance_batch_probe") { Completion = drained });
+        await conn.CloseAsync();
+        await drained.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+        await using var reacquired = await ds.OpenConnectionAsync(CancellationToken.None);
+        Assert.AreSame(pg, reacquired.UnderlyingPgConnection);
+        foreach (var name in evictedNames)
+        {
+            await using var probe = new SlonCommand(reacquired,
+                $"select 1 from pg_prepared_statements where name = '{name}'");
+            await using var reader = await probe.ExecuteReaderAsync(CancellationToken.None);
+            Assert.IsFalse(await reader.ReadAsync(CancellationToken.None),
+                $"Maintenance reported completion while PostgreSQL still held evicted statement {name}.");
+        }
+    }
+
+    [TestMethod]
+    public async Task MissingStatementErrors_AreNeverSuppressedByExecuteNonQuery()
+    {
+        await using var ds = CreateDataSource(maxAutoPreparations: 1, autoMinimumUses: 2, maxPoolSize: 1);
+        await using var conn = await ds.OpenConnectionAsync(CancellationToken.None);
+
+        // Repeated error recovery is the contract under test; 32 consecutive windows retain
+        // meaningful in-process exposure while process-level stress supplies the larger multiplier.
+        for (var i = 0; i < 32; i++)
+        {
+            var name = $"slon_missing_{i}";
+            var error = await Deallocate(name);
+            if (error is null)
+            {
+                // Ground truth before the retry. A real statement list discriminates a genuine
+                // server-side statement from a shifted read window; the probe itself failing on a
+                // shifted window is equally a verdict.
+                string prepared;
+                try
+                {
+                    await using var probe = new SlonCommand(conn,
+                        "select coalesce(string_agg(name, ','), '<none>') from pg_prepared_statements");
+                    await using var probeReader = await probe.ExecuteReaderAsync(CancellationToken.None);
+                    prepared = await probeReader.ReadAsync(CancellationToken.None)
+                        ? probeReader.GetString(0)
+                        : "<no row>";
+                }
+                catch (Exception probeEx)
+                {
+                    prepared = $"<probe failed: {probeEx.GetType().Name}: {probeEx.Message}>";
+                }
+                var repeated = await Deallocate(name);
+                Assert.Fail($"Iteration {i} returned normally for a missing prepared statement; " +
+                    (repeated is null
+                        ? "the identical retry also returned normally, so error delivery was lost."
+                        : $"the identical retry produced {repeated.SqlState}, so the first command found a server-side statement.") +
+                    $" Server prepared statements at failure: [{prepared}]");
+            }
+            Assert.AreEqual(PgErrorCodes.InvalidSqlStatementName, error.SqlState, $"Iteration {i}");
+        }
+
+        async Task<PostgresException?> Deallocate(string name)
+        {
+            await using var command = new SlonCommand(conn, $"deallocate {name}");
+            try
+            {
+                await command.ExecuteNonQueryAsync(CancellationToken.None);
+                return null;
+            }
+            catch (PostgresException error)
+            {
+                return error;
+            }
+        }
     }
 
     [TestMethod]

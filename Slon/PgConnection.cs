@@ -214,13 +214,15 @@ sealed class PgConnection : IPoolConnection<PgConnection>
         // the winner must close a statement that became invalid while its Parse was in flight.
         if (tracked.IsInvalid)
         {
-            RemoveTracked(tracked);
-            PushMaintenance(new CloseStatement(tracked.StoredCommandName));
+            CloseInvalidated();
             return;
         }
 
         SetTracked(tracked);
         if (tracked.IsInvalid)
+            CloseInvalidated();
+
+        void CloseInvalidated()
         {
             RemoveTracked(tracked);
             PushMaintenance(new CloseStatement(tracked.StoredCommandName));
