@@ -223,7 +223,7 @@ sealed class ExclusiveAccessFlow : PgClientFlow
         _innerStopping = true;
         if (Volatile.Read(ref _acquired))
         {
-            DrainThenEndScope(_completeInner(null));
+            CompleteInnerThenEndScope(_completeInner(null));
         }
         else
         {
@@ -232,31 +232,27 @@ sealed class ExclusiveAccessFlow : PgClientFlow
         }
     }
 
-    // Abort completes inner items with the close reason and releases the body immediately.
+    // Abort completes inner items with the close reason. The outer flow may retire only after the
+    // inner pipeline stops; otherwise both source pumps can reach the shared writer concurrently.
     protected override void OnAbort(PgClientClosedException exception)
     {
         if (_innerAborting)
             return;
         _innerAborting = true;
         if (Volatile.Read(ref _acquired))
-            FireAndForget(_completeInner(exception));
+            CompleteInnerThenEndScope(_completeInner(exception));
         else
+        {
             _handoffReady.TrySetException(exception);
-        _scopeEnded.TrySetResult();
+            _scopeEnded.TrySetResult();
+        }
     }
 
-    // Observe fire-and-forget faults without throwing into the heartbeat thread.
-    async void DrainThenEndScope(ValueTask drain)
+    // Observe completion faults without throwing into the heartbeat thread.
+    async void CompleteInnerThenEndScope(ValueTask completion)
     {
-        try { await drain.ConfigureAwait(false); }
+        try { await completion.ConfigureAwait(false); }
         catch { /* TODO route to an unobserved-exception hook once one exists */ }
         finally { _scopeEnded.TrySetResult(); }
-    }
-
-    // Inner completion is idempotent, so this may race user completion.
-    static async void FireAndForget(ValueTask task)
-    {
-        try { await task.ConfigureAwait(false); }
-        catch { /* TODO route to an unobserved-exception hook once one exists */ }
     }
 }

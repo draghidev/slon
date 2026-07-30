@@ -1,6 +1,11 @@
+using System.Buffers.Binary;
+using System.IO.Pipelines;
 using Slon.Pg;
+using Slon.Tests;
 using Slon.Pg.Protocol;
 using Slon.Pg.Protocol.Flows;
+using Slon.Pipelines;
+using Slon.Transport;
 
 namespace Slon.Tests.Pg;
 
@@ -191,39 +196,49 @@ public class ExclusiveAccessFlowTests
         }
     }
 
-    // The cascade (verification step 4): a protocol shutdown while a scope is OPEN must drive the inner
-    // pipeline to teardown instead of stranding its idle inner executor. Open a scope, run a command to
-    // completion (so the inner executor is parked idle, the scope still held), then gracefully
-    // CompleteAsync the protocol WITHOUT calling CompleteScopeAsync. The protocol must reach Completed
-    // promptly - the inner executor was woken via ExclusiveAccessFlow.OnStopping -> _completeInner - NOT
-    // hang because the scope was never ended.
-    //
-    // Faults the protocol, so NewIsolatedAsync (not the shared pool). This exercises the protocol
-    // graceful stop reaching the idle inner executor; it does NOT assert that a scope abort interrupts a
-    // parked wire READ (that is ScopeAbortBreaksParkedSubflowTests), so the subflow is run to completion
-    // first rather than left parked on a server-side wait.
     [TestMethod]
-    public async Task ProtocolShutdown_WhileScopeOpen_CascadesToInnerTeardown()
+    public Task GracefulProtocolShutdown_WhileScopeOpen_CascadesToInnerTeardown()
+        => ProtocolShutdownWhileScopeOpenCascadesToInnerTeardown(null);
+
+    [TestMethod]
+    public Task ForcefulProtocolShutdown_WhileScopeOpen_CascadesToInnerTeardown()
+        => ProtocolShutdownWhileScopeOpenCascadesToInnerTeardown(new InvalidOperationException("test shutdown"));
+
+    static async Task ProtocolShutdownWhileScopeOpenCascadesToInnerTeardown(Exception? cause)
     {
-        // The cascade's OnStopping fires from the heartbeat tick, so CompleteAsync's latency is bounded
-        // by the heartbeat interval. Use a 50ms interval (as ProtocolCompletionTests does) so the test
-        // costs ~50ms instead of waiting out the 1s default.
         var protocol = await PgTestPool.NewIsolatedAsync(o => o.HeartbeatInterval = TimeSpan.FromMilliseconds(50));
         try
         {
             var scope = protocol.BeginExclusiveScope(async: true);
             await scope.HandoffReady;
 
-            // Run a command to completion so the inner executor is parked idle, but DO NOT end the scope.
             await DrainAsync(scope.Queue(new CommandFlow(async: true, Command.Create("select 1"))));
 
-            // Shut down the protocol with the scope still open. Without the cascade, the inner executor
-            // would never be woken and the protocol drain would hang.
-            var cause = new InvalidOperationException("test shutdown");
-            await protocol.CompleteAsync(cause).WaitAsync(TimeSpan.FromSeconds(10));
+            try
+            {
+                await protocol.CompleteAsync(cause).WaitAsync(TimeSpan.FromSeconds(10));
+            }
+            catch (TimeoutException)
+            {
+                // A hang here is a distinct face from the collision below - dump the slot/pump state
+                // so it self-classifies (the shutdown x recovery bailout face was pinned by exactly
+                // this readout in the racing-teardown family).
+                Assert.Fail("cascade CompleteAsync did not converge: " +
+                    $"[unflushed={protocol.UnflushedBytes} scope: pending={scope.IsPending} started={scope.IsStarted} completed={scope.IsCompleted}]\n" +
+                    $"{ProtocolDiag.Gauges(protocol)}\nsource: {ProtocolDiag.SourceState(protocol)}");
+            }
+            catch (InvalidOperationException ex) when (!ReferenceEquals(ex, cause))
+            {
+                // Pump collision capture: record the premise the deterministic-repro attempts keep
+                // missing (see the amplifier test below).
+                Assert.Fail("flush-promise collision: " +
+                    $"[unflushed={protocol.UnflushedBytes} scope: pending={scope.IsPending} started={scope.IsStarted} completed={scope.IsCompleted} " +
+                    $"protocol: draining={protocol.IsDraining} completed={protocol.IsCompleted}]\n" +
+                    $"{ProtocolDiag.Gauges(protocol)}\nsource: {ProtocolDiag.SourceState(protocol)}\n{ex}");
+            }
 
             Assert.IsTrue(protocol.IsCompleted, "Protocol must reach Completed; a hang means the inner executor was stranded.");
-            Assert.AreSame(cause, protocol.CompletionException, "shutdown reason preserved");
+            Assert.AreSame(cause, protocol.CompletionException, "Shutdown reason must be preserved.");
         }
         finally
         {
@@ -352,5 +367,155 @@ public class ExclusiveAccessFlowTests
         // regression.
         Assert.IsTrue(perCycle < 8192,
             $"Per-cycle steady-state allocation {perCycle:F0} bytes suggests the scope signal is no longer a reused flyweight.");
+    }
+
+    // Hold the inner teardown flush until the test releases it. If the outer flow retires first,
+    // its source pump collides with the held single-caller flush promise.
+    [TestMethod]
+    public async Task ForcefulShutdown_ScopeOpen_NoPumpCollision()
+    {
+        // No real server is involved (canned handshake), so options only need the reset pinned on:
+        // the scope reset write is the teardown's unflushed-bytes fuel.
+        var options = new PgClientOptions
+        {
+            EndPoint = TestEndPoint.Default,
+            Username = "postgres",
+            Password = "postgres123",
+            Database = "postgres",
+            ScopeReset = new ScopeResetOptions { ClearListeners = true },
+        };
+
+        var protocolOptions = new PgClientProtocolOptions(options)
+        {
+            CompletionTimeout = TimeSpan.FromMilliseconds(2),
+            HeartbeatInterval = TimeSpan.FromMilliseconds(5),
+        };
+        var transport = new GatedWriteTransport(StartupHandshake());
+        var protocol = PgClientProtocol.Create(protocolOptions);
+        await protocol.StartAsync(options, transport);
+
+        var scope = protocol.BeginExclusiveScope(async: true);
+        try
+        {
+            await scope.HandoffReady.WaitAsync(TimeSpan.FromSeconds(10));
+        }
+        catch (TimeoutException)
+        {
+            Assert.Fail($"scope handoff stranded pre-arm\n{ProtocolDiag.Gauges(protocol)}\nsource: {ProtocolDiag.SourceState(protocol)}");
+        }
+
+        transport.ArmWriteFaults();
+        var completion = protocol.CompleteAsync(new Exception("test shutdown"));
+        try
+        {
+            await transport.HeldWriteEntered.WaitAsync(TimeSpan.FromSeconds(10));
+            Assert.IsFalse(completion.IsCompleted, "Outer teardown advanced while the inner flush was held.");
+        }
+        catch (TimeoutException)
+        {
+            // The premise itself failed: teardown never reached the held write. Distinct from both the
+            // collision (IOE below) and a held-write hang; dump so it self-classifies.
+            Assert.Fail($"teardown never entered the held write (amplifier premise not reached)\n" +
+                $"{ProtocolDiag.Gauges(protocol)}\nsource: {ProtocolDiag.SourceState(protocol)}");
+        }
+        finally
+        {
+            transport.ReleaseHeldWrite();
+        }
+        try
+        {
+            await completion.WaitAsync(TimeSpan.FromSeconds(10));
+        }
+        catch (PgClientClosedException)
+        {
+        }
+        catch (TimeoutException)
+        {
+            Assert.Fail($"teardown did not converge after held-write release\n{ProtocolDiag.Gauges(protocol)}\nsource: {ProtocolDiag.SourceState(protocol)}");
+        }
+        catch (InvalidOperationException ex)
+        {
+            Assert.Fail($"Teardown pumps collided on the shared flush promise: {ex}\n{ProtocolDiag.Gauges(protocol)}\nsource: {ProtocolDiag.SourceState(protocol)}");
+        }
+        Assert.IsTrue(protocol.IsCompleted, "Protocol must reach Completed.");
+        await protocol.DisposeAsync();
+    }
+
+    static byte[] StartupHandshake()
+    {
+        var b = new byte[64];
+        int o = 0;
+        b[o++] = (byte)'R'; BinaryPrimitives.WriteInt32BigEndian(b.AsSpan(o), 8); o += 4; BinaryPrimitives.WriteInt32BigEndian(b.AsSpan(o), 0); o += 4;
+        b[o++] = (byte)'K'; BinaryPrimitives.WriteInt32BigEndian(b.AsSpan(o), 12); o += 4; BinaryPrimitives.WriteInt32BigEndian(b.AsSpan(o), 4321); o += 4; BinaryPrimitives.WriteInt32BigEndian(b.AsSpan(o), 8765); o += 4;
+        b[o++] = (byte)'Z'; BinaryPrimitives.WriteInt32BigEndian(b.AsSpan(o), 5); o += 4; b[o++] = (byte)'I';
+        return b.AsSpan(0, o).ToArray();
+    }
+
+    // After arming, the first write faults immediately and the second is held until released.
+    // A third flush attempted while it is held collides with the writer's single-caller promise.
+    sealed class GateStream : Stream
+    {
+        readonly TaskCompletionSource _heldWriteEntered = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        readonly TaskCompletionSource _releaseHeldWrite = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        bool _faultWrites;
+        int _faultedWrites;
+
+        public Task HeldWriteEntered => _heldWriteEntered.Task;
+
+        public void ArmWriteFaults() => Volatile.Write(ref _faultWrites, true);
+
+        public void ReleaseHeldWrite() => _releaseHeldWrite.TrySetResult();
+
+        public override bool CanRead => false;
+        public override bool CanSeek => false;
+        public override bool CanWrite => true;
+        public override long Length => 0;
+        public override long Position { get => 0; set { } }
+        public override void Flush() { }
+        public override Task FlushAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+        public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) { }
+
+        public override async ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            if (Volatile.Read(ref _faultWrites))
+            {
+                if (Interlocked.Increment(ref _faultedWrites) is 2)
+                {
+                    _heldWriteEntered.TrySetResult();
+                    await _releaseHeldWrite.Task.ConfigureAwait(false);
+                }
+                throw new IOException("simulated wire abort");
+            }
+        }
+
+        public override Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+            => WriteAsync(buffer.AsMemory(offset, count), cancellationToken).AsTask();
+    }
+
+    // Canned-handshake reader (left open so reads park like an idle socket) over a real
+    // DefaultStreamPipeWriter, so the write side exercises the production single-caller promise.
+    sealed class GatedWriteTransport : TransportConnection
+    {
+        readonly Pipe _toClient = new();
+        readonly GateStream _stream = new();
+
+        public GatedWriteTransport(byte[] canned)
+        {
+            _toClient.Writer.WriteAsync(canned).AsTask().GetAwaiter().GetResult();
+            Writer = new DefaultStreamPipeWriter(_stream, new StreamPipeWriterOptions(), supportCancelPending: false);
+        }
+
+        public override PipeReader Reader => _toClient.Reader;
+        public override PipeWriter Writer { get; }
+        public override void WaitWritable() { }
+
+        public Task HeldWriteEntered => _stream.HeldWriteEntered;
+
+        public void ArmWriteFaults() => _stream.ArmWriteFaults();
+
+        public void ReleaseHeldWrite() => _stream.ReleaseHeldWrite();
     }
 }
