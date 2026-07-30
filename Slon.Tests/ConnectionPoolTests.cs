@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using Microsoft.Extensions.Time.Testing;
@@ -24,6 +25,9 @@ public class ConnectionPoolTests
         int _idle = 1;
         int _schedulable = 1;
         readonly bool _allowPruning;
+        readonly bool _throwOnStart;
+        TaskCompletionSource? _admissionEntered;
+        ManualResetEventSlim? _admissionRelease;
         TaskCompletionSource? _pruningEntered;
         TaskCompletionSource? _pruningRelease;
         readonly TaskCompletionSource _completion = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -31,10 +35,11 @@ public class ConnectionPoolTests
         IDisposable? _heartbeatRegistration;
 
         public AdmissionConnection(ConnectionPoolContext<AdmissionConnection> context,
-            bool registerHeartbeat = false, bool allowPruning = true)
+            bool registerHeartbeat = false, bool allowPruning = true, bool throwOnStart = false)
         {
             _poolContext = context;
             _allowPruning = allowPruning;
+            _throwOnStart = throwOnStart;
             if (registerHeartbeat)
                 _heartbeatRegistration = context.OnHeartbeat(static (connection, _) =>
                 {
@@ -50,7 +55,21 @@ public class ConnectionPoolTests
         public int HeartbeatCount => Volatile.Read(ref _heartbeatCount);
         public Task PruningEntered => _pruningEntered?.Task ?? Task.CompletedTask;
 
-        public void Start() => Volatile.Write(ref _started, 1);
+        public void Start()
+        {
+            _admissionEntered?.TrySetResult();
+            _admissionRelease?.Wait();
+            if (_throwOnStart)
+                throw new InvalidOperationException("admission failed");
+            Volatile.Write(ref _started, 1);
+        }
+        public Task AdmissionEntered => _admissionEntered?.Task ?? Task.CompletedTask;
+        public void GateAdmission()
+        {
+            _admissionEntered = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            _admissionRelease = new();
+        }
+        public void ReleaseAdmission() => _admissionRelease?.Set();
         public void GatePruning()
         {
             _pruningEntered = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -106,11 +125,11 @@ public class ConnectionPoolTests
         }
     }
 
-    sealed class AdmissionConnectionFactory : IPoolConnectionFactory<AdmissionConnection>
+    sealed class AdmissionConnectionFactory : AdmissionFactoryBase
     {
         readonly bool _registerHeartbeat;
         readonly bool _allowPruning;
-        readonly System.Collections.Concurrent.ConcurrentQueue<AdmissionConnection> _created = new();
+        readonly ConcurrentQueue<AdmissionConnection> _created = new();
 
         public AdmissionConnectionFactory(bool registerHeartbeat = false, bool allowPruning = true)
             => (_registerHeartbeat, _allowPruning) = (registerHeartbeat, allowPruning);
@@ -118,18 +137,26 @@ public class ConnectionPoolTests
         public AdmissionConnection? LastCreated { get; private set; }
         public AdmissionConnection[] Created => _created.ToArray();
 
-        public AdmissionConnection Create(ConnectionPoolContext<AdmissionConnection> context, TimeSpan timeout = default)
-            => Add(new(context, _registerHeartbeat, _allowPruning));
-
-        public ValueTask<AdmissionConnection> CreateAsync(ConnectionPoolContext<AdmissionConnection> context, CancellationToken cancellationToken = default)
-            => new(Add(new AdmissionConnection(context, _registerHeartbeat, _allowPruning)));
-
-        AdmissionConnection Add(AdmissionConnection connection)
+        protected override AdmissionConnection Add(ConnectionPoolContext<AdmissionConnection> context)
         {
+            var connection = new AdmissionConnection(context, _registerHeartbeat, _allowPruning);
             LastCreated = connection;
             _created.Enqueue(connection);
             return connection;
         }
+    }
+
+    // Shared sync/async forwarding for factories whose creation is a synchronous Add.
+    abstract class AdmissionFactoryBase : IPoolConnectionFactory<AdmissionConnection>
+    {
+        public AdmissionConnection Create(ConnectionPoolContext<AdmissionConnection> context, TimeSpan timeout = default)
+            => Add(context);
+
+        public ValueTask<AdmissionConnection> CreateAsync(ConnectionPoolContext<AdmissionConnection> context,
+            CancellationToken cancellationToken = default)
+            => new(Add(context));
+
+        protected abstract AdmissionConnection Add(ConnectionPoolContext<AdmissionConnection> context);
     }
 
     sealed class GatedAdmissionConnectionFactory : IPoolConnectionFactory<AdmissionConnection>
@@ -150,6 +177,36 @@ public class ConnectionPoolTests
             _started.TrySetResult();
             await _release.Task.WaitAsync(cancellationToken);
             return Connection;
+        }
+    }
+
+    sealed class FailingAdmissionFactory : AdmissionFactoryBase
+    {
+        readonly ConcurrentQueue<AdmissionConnection> _created = new();
+        int _attempt;
+
+        public AdmissionConnection[] Created => _created.ToArray();
+
+        protected override AdmissionConnection Add(ConnectionPoolContext<AdmissionConnection> context)
+        {
+            var connection = new AdmissionConnection(context,
+                throwOnStart: Interlocked.Increment(ref _attempt) == 1);
+            _created.Enqueue(connection);
+            return connection;
+        }
+    }
+
+    sealed class GatedFailingAdmissionFactory : AdmissionFactoryBase
+    {
+        AdmissionConnection? _connection;
+        public AdmissionConnection? Connection => Volatile.Read(ref _connection);
+
+        protected override AdmissionConnection Add(ConnectionPoolContext<AdmissionConnection> context)
+        {
+            var connection = new AdmissionConnection(context, throwOnStart: true);
+            connection.GateAdmission();
+            Volatile.Write(ref _connection, connection);
+            return connection;
         }
     }
 
@@ -362,7 +419,7 @@ public class ConnectionPoolTests
             ConnectionIdleLifetime = TimeSpan.FromSeconds(3),
             TimeProvider = time,
         });
-        await pool.OpenAllConnectionsAsync(TimeSpan.FromSeconds(1));
+        await PopulateAsync(pool, 3);
 
         var connections = factory.Created;
         Assert.HasCount(3, connections);
@@ -395,7 +452,7 @@ public class ConnectionPoolTests
             ConnectionIdleLifetime = Timeout.InfiniteTimeSpan,
             TimeProvider = time,
         });
-        await pool.OpenAllConnectionsAsync(TimeSpan.FromSeconds(1));
+        await PopulateAsync(pool, 2);
 
         time.Advance(TimeSpan.FromHours(1));
 
@@ -416,7 +473,7 @@ public class ConnectionPoolTests
             ConnectionIdleLifetime = TimeSpan.Zero,
             TimeProvider = time,
         });
-        await pool.OpenAllConnectionsAsync(TimeSpan.FromSeconds(1));
+        await PopulateAsync(pool, 2);
 
         time.Advance(TimeSpan.FromHours(1));
 
@@ -448,7 +505,7 @@ public class ConnectionPoolTests
             ConnectionIdleLifetime = TimeSpan.FromSeconds(1),
             TimeProvider = time,
         });
-        await pool.OpenAllConnectionsAsync(TimeSpan.FromSeconds(1));
+        await PopulateAsync(pool, 2);
 
         var connections = factory.Created;
         time.Advance(TimeSpan.FromSeconds(1));
@@ -476,7 +533,7 @@ public class ConnectionPoolTests
             ConnectionIdleLifetime = TimeSpan.FromSeconds(1),
             TimeProvider = time,
         });
-        await pool.OpenAllConnectionsAsync(TimeSpan.FromSeconds(1));
+        await PopulateAsync(pool, 1);
 
         var connection = factory.LastCreated!;
         time.Advance(TimeSpan.FromSeconds(1));
@@ -507,7 +564,7 @@ public class ConnectionPoolTests
             ConnectionIdleLifetime = TimeSpan.FromSeconds(1),
             TimeProvider = time,
         });
-        await pool.OpenAllConnectionsAsync(TimeSpan.FromSeconds(1));
+        await PopulateAsync(pool, 3);
 
         var busy = await pool.GetAsync(TimeSpan.FromSeconds(1));
         busy.MarkBusy();
@@ -534,7 +591,7 @@ public class ConnectionPoolTests
             ConnectionIdleLifetime = TimeSpan.FromSeconds(1),
             TimeProvider = time,
         });
-        await pool.OpenAllConnectionsAsync(TimeSpan.FromSeconds(1));
+        await PopulateAsync(pool, 1);
 
         var pruned = factory.LastCreated!;
         time.Advance(TimeSpan.FromSeconds(1));
@@ -559,7 +616,7 @@ public class ConnectionPoolTests
             ConnectionIdleLifetime = TimeSpan.FromSeconds(3),
             TimeProvider = time,
         });
-        await pool.OpenAllConnectionsAsync(TimeSpan.FromSeconds(1));
+        await PopulateAsync(pool, 3);
 
         time.Advance(TimeSpan.FromSeconds(1));
         var rented = new AdmissionConnection[3];
@@ -605,6 +662,21 @@ public class ConnectionPoolTests
     }
 
     [TestMethod]
+    public async Task SaturationTimeout_HasSameSyncAndAsyncSurface()
+    {
+        await using var pool = new ConnectionPool<AdmissionConnection>(
+            new AdmissionConnectionFactory(), new() { MaxConnections = 1 });
+        await pool.GetAsync(TimeSpan.FromSeconds(1));
+
+        var sync = Assert.ThrowsExactly<TimeoutException>(
+            () => pool.Get(TimeSpan.FromMilliseconds(20)));
+        var async = await Assert.ThrowsExactlyAsync<TimeoutException>(
+            async () => await pool.GetAsync(TimeSpan.FromMilliseconds(20)));
+
+        Assert.AreEqual(async.Message, sync.Message);
+    }
+
+    [TestMethod]
     public async Task FailedOpening_WakesWaiterForFreedCapacity()
     {
         var factory = new FailingThenSuccessfulFactory();
@@ -624,6 +696,40 @@ public class ConnectionPoolTests
 
         var connection = await waiting;
         Assert.IsFalse(connection.Completion.IsCompleted);
+    }
+
+    [TestMethod]
+    public async Task AdmittedConnectionPublication_WakesWaiter()
+    {
+        await using var pool = new ConnectionPool<AdmissionConnection>(
+            new AdmissionConnectionFactory(), new() { MaxConnections = 1 });
+        var scheduling = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var release = new ManualResetEventSlim();
+
+        var opening = Task.Run(async () => await pool.GetAsync(
+            static (candidate, state) =>
+            {
+                candidate.Connection.MarkBusy();
+                state.Scheduling.TrySetResult();
+                state.Release.Wait();
+                return true;
+            },
+            (Scheduling: scheduling, Release: release),
+            TimeSpan.FromSeconds(10)));
+
+        await scheduling.Task;
+        var waiting = pool.GetAsync(
+            static (_, _) => true,
+            state: 0,
+            timeout: TimeSpan.FromSeconds(1)).AsTask();
+        await WaitUntilAsync(() => pool.WaiterCount == 1, TimeSpan.FromSeconds(1),
+            "the second renter must park while the admitted connection is unpublished");
+
+        release.Set();
+        var connection = await opening;
+
+        Assert.AreSame(connection, await waiting,
+            "publishing an admitted connection must expose its remaining scheduling capacity");
     }
 
     [TestMethod]
@@ -760,6 +866,51 @@ public class ConnectionPoolTests
     }
 
     [TestMethod]
+    public async Task Newcomer_DoesNotBargePastAwakenedWaiter()
+    {
+        await using var pool = new ConnectionPool<AdmissionConnection>(
+            new AdmissionConnectionFactory(), new() { MaxConnections = 1 });
+
+        var connection = await pool.GetAsync(TimeSpan.FromSeconds(1));
+        var queued = pool.GetAsync(TimeSpan.FromSeconds(1)).AsTask();
+        await WaitUntilAsync(() => pool.WaiterCount == 1, TimeSpan.FromSeconds(1),
+            "the older renter must be queued before the idle edge");
+
+        connection.RunInitialWorkToIdle();
+        var newcomer = pool.GetAsync(TimeSpan.FromSeconds(1)).AsTask();
+
+        Assert.AreSame(connection, await queued,
+            "the detached wake must retain priority over a racing newcomer");
+        Assert.IsFalse(newcomer.IsCompleted,
+            "the newcomer must wait for availability after the older renter");
+
+        connection.RunInitialWorkToIdle();
+        Assert.AreSame(connection, await newcomer);
+    }
+
+    [TestMethod]
+    public async Task ThrowingAwakenedWaiter_PassesAvailability()
+    {
+        await using var pool = new ConnectionPool<AdmissionConnection>(
+            new AdmissionConnectionFactory(), new() { MaxConnections = 1 });
+
+        var connection = await pool.GetAsync(TimeSpan.FromSeconds(1));
+        var throwing = pool.GetAsync(
+            static (_, _) => throw new InvalidOperationException("placement failed"),
+            state: 0,
+            timeout: TimeSpan.FromSeconds(1)).AsTask();
+        var follower = pool.GetAsync(TimeSpan.FromSeconds(1)).AsTask();
+        await WaitUntilAsync(() => pool.WaiterCount == 2, TimeSpan.FromSeconds(1),
+            "both renters must be queued before the idle edge");
+
+        connection.RunInitialWorkToIdle();
+
+        await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => throwing);
+        Assert.AreSame(connection, await follower,
+            "an awakened placement failure must pass the availability edge");
+    }
+
+    [TestMethod]
     public async Task DisposeAsync_FaultsQueuedWaitersWithDifferentPlacementPolicies()
     {
         var pool = new ConnectionPool<AdmissionConnection>(
@@ -830,6 +981,28 @@ public class ConnectionPoolTests
     }
 
     [TestMethod]
+    public async Task DisposeAsync_RacingFailedAdmission_AwaitsItsCleanup()
+    {
+        var factory = new GatedFailingAdmissionFactory();
+        var pool = new ConnectionPool<AdmissionConnection>(factory, new() { MaxConnections = 1 });
+        var opening = Task.Run(() => pool.Get(TimeSpan.FromSeconds(10)));
+        while (factory.Connection is null)
+            await Task.Yield();
+        await factory.Connection.AdmissionEntered;
+
+        var disposing = pool.DisposeAsync().AsTask();
+        Assert.IsFalse(disposing.IsCompleted,
+            "disposal must wait while the claimed slot is still admitting its connection");
+
+        factory.Connection.ReleaseAdmission();
+        await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => opening);
+        await disposing;
+
+        Assert.IsTrue(factory.Connection.Completion.IsCompleted,
+            "failed admission cleanup must finish before pool disposal returns");
+    }
+
+    [TestMethod]
     public async Task DisposeAsync_RacingInitialSchedule_AwaitsOpenerSettlement()
     {
         var pool = new ConnectionPool<AdmissionConnection>(
@@ -888,15 +1061,92 @@ public class ConnectionPoolTests
             // ObjectDisposedException instead of timing out.
             Assert.AreSame(factory.LastCreated, await pool.GetAsync(TimeSpan.FromSeconds(1)));
             await Assert.ThrowsExactlyAsync<TimeoutException>(async () =>
-                await pool.GetAsync(TimeSpan.FromMilliseconds(20)));
+                await pool.GetAsync(TimeSpan.FromMilliseconds(5)));
         }
+    }
+
+    [TestMethod]
+    public async Task AsyncAdmissionFailure_ClosesConnectionAndReleasesSlot()
+    {
+        var factory = new FailingAdmissionFactory();
+        await using var pool = new ConnectionPool<AdmissionConnection>(
+            factory,
+            new() { MaxConnections = 1 });
+
+        await Assert.ThrowsExactlyAsync<InvalidOperationException>(async () =>
+            await pool.GetAsync(TimeSpan.FromSeconds(1)));
+
+        var failed = factory.Created[0];
+        Assert.IsTrue(failed.Completion.IsCompleted,
+            "a connection that failed admission must be closed rather than published");
+
+        var replacement = await pool.GetAsync(TimeSpan.FromSeconds(1));
+        Assert.AreNotSame(failed, replacement);
+        Assert.IsTrue(replacement.Started);
+    }
+
+    [TestMethod]
+    public async Task SyncAdmissionFailure_ClosesConnectionAndReleasesSlot()
+    {
+        var factory = new FailingAdmissionFactory();
+        await using var pool = new ConnectionPool<AdmissionConnection>(
+            factory,
+            new() { MaxConnections = 1 });
+
+        Assert.ThrowsExactly<InvalidOperationException>(() =>
+            pool.Get(TimeSpan.FromSeconds(1)));
+
+        var failed = factory.Created[0];
+        Assert.IsTrue(failed.Completion.IsCompleted,
+            "a connection that failed admission must be closed rather than published");
+
+        var replacement = await pool.GetAsync(TimeSpan.FromSeconds(1));
+        Assert.AreNotSame(failed, replacement);
+        Assert.IsTrue(replacement.Started);
+    }
+
+    [TestMethod]
+    public async Task AsyncInitializerFailure_ClosesCreatedConnection()
+    {
+        var inner = new AdmissionConnectionFactory();
+        var factory = new InitializingConnectionFactory<AdmissionConnection>(
+            inner,
+            asyncInitializer: static (_, _) =>
+                ValueTask.FromException(new InvalidOperationException("initializer failed")));
+        await using var pool = new ConnectionPool<AdmissionConnection>(
+            factory,
+            new() { MaxConnections = 1 });
+
+        await Assert.ThrowsExactlyAsync<InvalidOperationException>(async () =>
+            await pool.GetAsync(TimeSpan.FromSeconds(1)));
+
+        Assert.IsTrue(inner.LastCreated!.Completion.IsCompleted,
+            "the initializing factory must close a connection it cannot return");
+    }
+
+    [TestMethod]
+    public async Task SyncInitializerFailure_ClosesCreatedConnection()
+    {
+        var inner = new AdmissionConnectionFactory();
+        var factory = new InitializingConnectionFactory<AdmissionConnection>(
+            inner,
+            initializer: static (_, _) => throw new InvalidOperationException("initializer failed"));
+        await using var pool = new ConnectionPool<AdmissionConnection>(
+            factory,
+            new() { MaxConnections = 1 });
+
+        Assert.ThrowsExactly<InvalidOperationException>(() =>
+            pool.Get(TimeSpan.FromSeconds(1)));
+
+        Assert.IsTrue(inner.LastCreated!.Completion.IsCompleted,
+            "the initializing factory must close a connection it cannot return");
     }
 
     [TestMethod]
     public async Task Sync_OnLeasedConnection_Completes()
     {
         await using var pool = NewPool();
-        var conn = await pool.GetConnectionAsync(0L, TimeSpan.FromSeconds(10));
+        var conn = await pool.GetAsync(TimeSpan.FromSeconds(10));
         await RunSyncOn(conn, "select 1");
     }
 
@@ -904,7 +1154,7 @@ public class ConnectionPoolTests
     public async Task Async_OnLeasedConnection_Completes()
     {
         await using var pool = NewPool();
-        var conn = await pool.GetConnectionAsync(0L, TimeSpan.FromSeconds(10));
+        var conn = await pool.GetAsync(TimeSpan.FromSeconds(10));
         await RunAsyncOn(conn, "select 1");
     }
 
@@ -912,7 +1162,7 @@ public class ConnectionPoolTests
     public async Task SyncWhileAsyncInFlight_SameLeasedConn_BothComplete()
     {
         await using var pool = NewPool();
-        var conn = await pool.GetConnectionAsync(0L, TimeSpan.FromSeconds(10));
+        var conn = await pool.GetAsync(TimeSpan.FromSeconds(10));
 
         await RunAsyncOn(conn, "select 1"); // warm
 
@@ -957,6 +1207,27 @@ public class ConnectionPoolTests
         Assert.IsTrue(condition(), because);
     }
 
+    static async Task PopulateAsync(ConnectionPool<AdmissionConnection> pool, int count)
+    {
+        var connections = new AdmissionConnection[count];
+        for (var i = 0; i < connections.Length; i++)
+        {
+            connections[i] = await pool.GetAsync(
+                static (candidate, _) =>
+                {
+                    if (!candidate.IsIdleCandidate)
+                        return false;
+                    candidate.Connection.MarkBusy();
+                    return true;
+                },
+                (object?)null,
+                TimeSpan.FromSeconds(1));
+        }
+
+        foreach (var connection in connections)
+            connection.RunInitialWorkToIdle();
+    }
+
     // Terminal abort is the wire-dead path: forceful DisposeAsync RSTs the socket, fires AbortToken, and
     // drives Shutdown to Completed. The terminal Completion task is what the pool
     // evicts on; here we verify end-to-end that an aborted connection reaches Completed and the pool
@@ -965,19 +1236,24 @@ public class ConnectionPoolTests
     [TestMethod]
     public async Task TerminalAbort_EvictsFromPool_ReacquireYieldsHealthy()
     {
-        await using var pool = NewPool(maxConnections: 1);
-        var conn1 = await pool.GetConnectionAsync(0L, Cap);
+        await using var tracker = new CommandTracker(maxAuto: 1, autoMinimumUses: 1);
+        await using var pool = NewPool(maxConnections: 1, sharedTracker: tracker);
+        var conn1 = await pool.GetAsync(Cap);
         await RunAsyncOn(conn1, "select 1"); // healthy before the abort
+        Assert.AreEqual(1, tracker.RegisteredConnectionCount);
 
         await conn1.Protocol.DisposeAsync(); // forceful terminal abort (fire-and-forget; teardown runs async)
         // Completion settles at the END of background shutdown, so it is eventually consistent,
         // not immediate. The pool's eviction gate keys off it, so it reclaims once it lands.
         await WaitUntilAsync(() => conn1.Completion.IsCompleted, Cap,
             "a terminally aborted connection must reach Completed — that is the pool's eviction gate.");
+        await WaitUntilAsync(() => tracker.RegisteredConnectionCount == 0, Cap,
+            "terminal completion must promptly release tracker membership");
 
-        var conn2 = await pool.GetConnectionAsync(0L, Cap);
+        var conn2 = await pool.GetAsync(Cap);
         Assert.AreNotSame(conn1, conn2, "the pool must replace the aborted connection, not hand it back.");
         Assert.IsFalse(conn2.Completion.IsCompleted, "the replacement connection must be live.");
+        Assert.AreEqual(1, tracker.RegisteredConnectionCount);
         await RunAsyncOn(conn2, "select 1"); // the replacement actually works
     }
 
@@ -989,7 +1265,7 @@ public class ConnectionPoolTests
     public async Task TerminalAbort_OutstandingPipelinedFlows_AllFaultClosed()
     {
         await using var pool = NewPool(maxConnections: 1);
-        var conn = await pool.GetConnectionAsync(0L, Cap);
+        var conn = await pool.GetAsync(Cap);
         await using var blocker = await PgAdvisoryLock.AcquireAsync();
 
         const int N = 8;
