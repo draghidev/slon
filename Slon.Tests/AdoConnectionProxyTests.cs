@@ -65,7 +65,7 @@ public class AdoConnectionProxyTests
     public async Task Sync_Completes()
     {
         await using var pool = NewPool();
-        var pg = await pool.GetConnectionAsync(0L, TimeSpan.FromSeconds(10));
+        var pg = await pool.GetAsync(TimeSpan.FromSeconds(10));
         var proxy = WrapInProxy(pg);
         await RunSyncOn(proxy, "select 1");
     }
@@ -74,7 +74,7 @@ public class AdoConnectionProxyTests
     public async Task Async_Completes()
     {
         await using var pool = NewPool();
-        var pg = await pool.GetConnectionAsync(0L, TimeSpan.FromSeconds(10));
+        var pg = await pool.GetAsync(TimeSpan.FromSeconds(10));
         var proxy = WrapInProxy(pg);
         await RunAsyncOn(proxy, "select 1");
     }
@@ -83,7 +83,7 @@ public class AdoConnectionProxyTests
     public async Task SyncWhileAsyncInFlight_SameProxy_BothComplete()
     {
         await using var pool = NewPool();
-        var pg = await pool.GetConnectionAsync(0L, TimeSpan.FromSeconds(10));
+        var pg = await pool.GetAsync(TimeSpan.FromSeconds(10));
         var proxy = WrapInProxy(pg);
 
         await RunAsyncOn(proxy, "select 1"); // warm

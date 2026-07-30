@@ -231,7 +231,6 @@ public class PgClientRequestBenchmark : ClientBenchmark
             protocol.TryQueue(flow);
             await using var reader = flow.GetAsyncEnumerator(cancellationToken);
         });
-        pool.OpenAllConnectionsAsync(TimeSpan.Zero, CancellationToken.None).GetAwaiter().GetResult();
         var objectPool = new ObjectPool<CommandFlow, PgClientFlowPolicy<CommandFlow>>(new(() => CommandFlow.CreateUninitialized()), ObjectPoolSize);
         var holder = new CtsHolder();
 

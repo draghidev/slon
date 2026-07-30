@@ -57,8 +57,8 @@ sealed class PgConnection : IPoolConnection<PgConnection>
     // Time-based maintenance cadence independent of heartbeat frequency.
     readonly TimeSpan _maintenanceInterval;
     TimeSpan _maintenanceAccum;
-    // Standalone protocols own this heartbeat; pooled protocols use the pool dispatcher.
-    Heartbeat? _selfHeartbeat;
+    // Standalone protocols own this heartbeat. Pooled protocols use the pool dispatcher.
+    IDisposable? _selfHeartbeat;
     IDisposable? _poolHeartbeatRegistration;
     int _sessionLifetimeReleased;
     // Session-wide explicit-prepare names remain unique across successive leases.
@@ -75,9 +75,12 @@ sealed class PgConnection : IPoolConnection<PgConnection>
         _protocol = protocol;
         _tracker = tracker;
         _maintenanceInterval = maintenanceInterval;
-        _tracker?.Register(this);
-        protocol.Completion.ConfigureAwait(false).GetAwaiter().UnsafeOnCompleted(ReleaseSessionLifetime);
     }
+
+    // Armed only after wiring succeeds, so release never races resource installation. On a
+    // protocol that already completed this fires inline and tears down what was just wired.
+    void ArmSessionLifetimeRelease()
+        => _protocol.Completion.ConfigureAwait(false).GetAwaiter().UnsafeOnCompleted(ReleaseSessionLifetime);
 
     public PgClientProtocol Protocol => _protocol;
 
@@ -91,7 +94,19 @@ sealed class PgConnection : IPoolConnection<PgConnection>
         protocol.Start(clientOptions, transport,
             poolContext is null ? NoopAvailability : conn.SignalAvailabilityIfStarted,
             timeout);
-        conn.WireHeartbeat(clientOptions, poolContext);
+        try
+        {
+            conn._tracker?.Register(conn);
+            conn.WireHeartbeat(clientOptions, poolContext);
+        }
+        catch (Exception ex)
+        {
+            protocol.CompleteAsync(ex).GetAwaiter().GetResult();
+            // Nothing armed the release yet. Tear down whatever wiring installed before surfacing.
+            conn.ReleaseSessionLifetime();
+            throw;
+        }
+        conn.ArmSessionLifetimeRelease();
         return conn;
     }
 
@@ -103,7 +118,19 @@ sealed class PgConnection : IPoolConnection<PgConnection>
         await protocol.StartAsync(clientOptions, transport,
             poolContext is null ? NoopAvailability : conn.SignalAvailabilityIfStarted,
             cancellationToken).ConfigureAwait(false);
-        conn.WireHeartbeat(clientOptions, poolContext);
+        try
+        {
+            conn._tracker?.Register(conn);
+            conn.WireHeartbeat(clientOptions, poolContext);
+        }
+        catch (Exception ex)
+        {
+            await protocol.CompleteAsync(ex).ConfigureAwait(false);
+            // Nothing armed the release yet. Tear down whatever wiring installed before surfacing.
+            conn.ReleaseSessionLifetime();
+            throw;
+        }
+        conn.ArmSessionLifetimeRelease();
         return conn;
     }
 
@@ -123,27 +150,14 @@ sealed class PgConnection : IPoolConnection<PgConnection>
     {
         if (poolContext is not null)
         {
-            SetPoolHeartbeatRegistration(poolContext.OnHeartbeat(static (conn, interval) => conn.OnHeartbeat(interval), this));
+            _poolHeartbeatRegistration = poolContext.OnHeartbeat(static (conn, interval) => conn.OnHeartbeat(interval), this);
         }
         else
         {
             var heartbeat = new Heartbeat(options.HeartbeatInterval);
             heartbeat.Register(OnHeartbeat);
-            SetSelfHeartbeat(heartbeat);
+            _selfHeartbeat = heartbeat;
         }
-    }
-
-    void SetSelfHeartbeat(Heartbeat heartbeat)
-    {
-        if (Volatile.Read(ref _sessionLifetimeReleased) != 0)
-        {
-            heartbeat.Dispose();
-            return;
-        }
-
-        _selfHeartbeat = heartbeat;
-        if (Volatile.Read(ref _sessionLifetimeReleased) != 0)
-            Interlocked.Exchange(ref _selfHeartbeat, null)?.Dispose();
     }
 
     // Starts due maintenance before advancing protocol heartbeat duties.
@@ -169,19 +183,6 @@ sealed class PgConnection : IPoolConnection<PgConnection>
 
     public Task CompleteAsync(Exception? exception = null) => _protocol.CompleteAsync(exception);
 
-    void SetPoolHeartbeatRegistration(IDisposable registration)
-    {
-        if (Volatile.Read(ref _sessionLifetimeReleased) != 0)
-        {
-            registration.Dispose();
-            return;
-        }
-
-        _poolHeartbeatRegistration = registration;
-        if (Volatile.Read(ref _sessionLifetimeReleased) != 0)
-            Interlocked.Exchange(ref _poolHeartbeatRegistration, null)?.Dispose();
-    }
-
     void ReleaseSessionLifetime()
     {
         if (Interlocked.Exchange(ref _sessionLifetimeReleased, 1) != 0)
@@ -189,7 +190,7 @@ sealed class PgConnection : IPoolConnection<PgConnection>
 
         Interlocked.Exchange(ref _poolHeartbeatRegistration, null)?.Dispose();
         Interlocked.Exchange(ref _selfHeartbeat, null)?.Dispose();
-        // PgConnection spans many ADO leases; tracker membership follows the protocol session,
+        // PgConnection spans many ADO leases. Tracker membership follows the protocol session,
         // ending at terminal completion/eviction rather than per-lease proxy disposal.
         _tracker?.Deregister(this);
     }

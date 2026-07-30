@@ -1,7 +1,9 @@
 using System.Diagnostics;
+using System.IO.Pipelines;
 using Slon.Pg;
 using Slon.Pg.Protocol;
 using Slon.Pg.Protocol.Flows;
+using Slon.Pools;
 using Slon.Tests.Pg;
 using Slon.Transport;
 
@@ -15,6 +17,16 @@ namespace Slon.Tests;
 [TestClass]
 public class PgConnectionTests
 {
+    sealed class AsyncOnlyTransport : TransportConnection
+    {
+        readonly Pipe _read = new();
+        readonly Pipe _write = new();
+
+        public override PipeReader Reader => _read.Reader;
+        public override PipeWriter Writer => _write.Writer;
+        public override void WaitWritable() { }
+    }
+
     static PgClientOptions NewOptions() => new()
     {
         EndPoint = TestEndPoint.Default,
@@ -54,6 +66,36 @@ public class PgConnectionTests
     static async Task DrainAsync(CommandFlow.Enumerator enumerator)
     {
         while (await enumerator.MoveNextAsync()) { }
+    }
+
+    [TestMethod]
+    public void FailedPreStartupConnection_DoesNotJoinTracker()
+    {
+        var options = NewOptions();
+        using var tracker = new CommandTracker(maxAuto: 1, autoMinimumUses: 1);
+
+        Assert.ThrowsExactly<InvalidOperationException>(() =>
+            PgConnection.Create(new PgClientProtocolOptions(options), options,
+                new AsyncOnlyTransport(), tracker));
+
+        Assert.AreEqual(0, tracker.RegisteredConnectionCount);
+    }
+
+    [TestMethod]
+    public async Task FailedPostStartupWiring_CompletesSessionLifetime()
+    {
+        var options = NewOptions();
+        var transport = await SocketStreamConnection.ConnectAsync(options.EndPoint);
+        await using var tracker = new CommandTracker(maxAuto: 1, autoMinimumUses: 1);
+        var context = new ConnectionPoolContext<PgConnection>(
+            static (_, _) => { },
+            static (_, _) => throw new InvalidOperationException("heartbeat wiring failed"));
+
+        await Assert.ThrowsExactlyAsync<InvalidOperationException>(async () =>
+            await PgConnection.CreateAsync(new PgClientProtocolOptions(options), options,
+                transport, tracker, context));
+
+        Assert.AreEqual(0, tracker.RegisteredConnectionCount);
     }
 
     [TestMethod]

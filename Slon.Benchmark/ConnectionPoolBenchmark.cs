@@ -31,8 +31,23 @@ public class ConnectionPoolBenchmark
     {
         _factory = new FakeFactory();
         _pool = new ConnectionPool<FakeConnection>(_factory, new ConnectionPoolOptions { MaxConnections = MaxConnections });
-        // Pre-warm: ensure all slots have live connections so we measure steady-state selection.
-        await _pool.OpenAllConnectionsAsync(timeout: TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+        // Demand-grow every slot, then restore their idle publications before measurement.
+        var connections = new FakeConnection[MaxConnections];
+        for (var i = 0; i < connections.Length; i++)
+        {
+            connections[i] = await _pool.GetAsync(
+                static (candidate, _) =>
+                {
+                    if (!candidate.IsIdleCandidate)
+                        return false;
+                    candidate.Connection.IncrementDepth();
+                    return true;
+                },
+                (object?)null,
+                TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+        }
+        foreach (var connection in connections)
+            connection.MarkIdleAndSignal();
     }
 
     [GlobalCleanup]

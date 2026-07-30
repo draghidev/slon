@@ -30,7 +30,6 @@ public class ConnectionPoolBenchmarks
             _flows[i] = new(i);
             _flows[i].Initialize(TimeSpan.FromSeconds(3));
         }
-        _connectionPool.OpenAllConnectionsAsync(TimeSpan.Zero, CancellationToken.None).GetAwaiter().GetResult();
     }
 
     [Benchmark]

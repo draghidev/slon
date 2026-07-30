@@ -124,7 +124,10 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
     // Undispatched source work. Together with depth, this is the protocol's outstanding load.
     public int Backlog => _source.Backlog;
     public int Outstanding => _pipeline.Depth + _source.Backlog;
-    ProtocolStatus Status => _status;
+    ProtocolStatus Status
+        => (ProtocolStatus)Volatile.Read(ref Unsafe.As<ProtocolStatus, int>(ref _status));
+    void SetStatus(ProtocolStatus status)
+        => Volatile.Write(ref Unsafe.As<ProtocolStatus, int>(ref _status), (int)status);
 
     // Used by the source before parking; pre-initialization has no unflushed bytes.
     internal long UnflushedBytes => _protocolDataWriter?.UnflushedBytes ?? 0;
@@ -144,7 +147,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
             if (_status is not ProtocolStatus.Ready || Outstanding != 0)
                 return false;
 
-            _status = ProtocolStatus.Draining;
+            SetStatus(ProtocolStatus.Draining);
             return true;
         }
     }
@@ -306,7 +309,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
             if (_drainingCount is 0 && _status is not ProtocolStatus.Completed)
             {
                 becameReady = _status is not ProtocolStatus.Ready;
-                _status = ProtocolStatus.Ready;
+                SetStatus(ProtocolStatus.Ready);
             }
         }
 
@@ -321,7 +324,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
             if (_status is ProtocolStatus.Completed)
                 return;
             _drainingCount++;
-            _status = ProtocolStatus.Draining;
+            SetStatus(ProtocolStatus.Draining);
         }
     }
 
@@ -329,7 +332,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
     {
         lock (_syncRoot)
         {
-            _status = ProtocolStatus.Completed;
+            SetStatus(ProtocolStatus.Completed);
         }
     }
 
@@ -615,7 +618,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
                 _close.MaterializeReason(closeReason);
                 _shutdownStarted = true;
                 if (_status is not ProtocolStatus.Completed)
-                    _status = ProtocolStatus.Draining;
+                    SetStatus(ProtocolStatus.Draining);
                 _drainingCount++;
             }
             completion = _completion;

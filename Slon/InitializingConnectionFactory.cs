@@ -8,15 +8,31 @@ sealed class InitializingConnectionFactory<T>(
     {
         var deadline = new Deadline(timeout);
         var connection = factory.Create(poolContext, deadline.GetRemaining());
-        initializer?.Invoke(connection, deadline.GetRemaining());
-        return connection;
+        try
+        {
+            initializer?.Invoke(connection, deadline.GetRemaining());
+            return connection;
+        }
+        catch (Exception ex)
+        {
+            connection.CompleteAsync(ex).GetAwaiter().GetResult();
+            throw;
+        }
     }
 
     public async ValueTask<T> CreateAsync(ConnectionPoolContext<T> poolContext, CancellationToken cancellationToken = default)
     {
         var connection = await factory.CreateAsync(poolContext, cancellationToken).ConfigureAwait(false);
-        if (asyncInitializer is not null)
-            await asyncInitializer(connection, cancellationToken).ConfigureAwait(false);
-        return connection;
+        try
+        {
+            if (asyncInitializer is not null)
+                await asyncInitializer(connection, cancellationToken).ConfigureAwait(false);
+            return connection;
+        }
+        catch (Exception ex)
+        {
+            await connection.CompleteAsync(ex).ConfigureAwait(false);
+            throw;
+        }
     }
 }

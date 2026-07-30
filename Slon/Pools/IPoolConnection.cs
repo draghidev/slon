@@ -4,6 +4,8 @@ namespace Slon.Pools;
 public interface IPoolConnection<TSelf>
     where TSelf : class, IPoolConnection<TSelf>
 {
+    /// Initiates terminal completion and completes only after the connection is fully quiet.
+    /// Pool disposal waits for this task.
     Task CompleteAsync(Exception? exception = null);
 
     bool IsIdle { get; }

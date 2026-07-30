@@ -25,7 +25,7 @@ public class ConnectionPoolOptions
 public sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
     where T : class, IPoolConnection<T>
 {
-    volatile bool _disposed;
+    bool _disposed;
     object SyncObj { get; } = new();
 
     readonly object?[] _connections;
@@ -225,7 +225,7 @@ public sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
         }
     }
 
-    bool DoSchedule<TState>(ConnectionCandidate<T> context, Func<ConnectionCandidate<T>, TState, bool>? schedule, TState state, bool newConnection = false)
+    bool DoSchedule<TState>(ConnectionCandidate<T> context, Func<ConnectionCandidate<T>, TState, bool>? schedule, TState state)
     {
         ThrowIfDisposed();
 
@@ -233,10 +233,7 @@ public sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
         if (!context.Connection.IsSchedulable)
             return false;
 
-        if (schedule is not null && schedule(context, state))
-            return true;
-
-        return false;
+        return schedule is not null && schedule(context, state);
     }
 
     bool ReturnIdleToken(T connection)
@@ -422,31 +419,31 @@ public sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
         Debug.Assert(!future.IsCompleted);
 
         T? conn = null;
-        var installed = false;
+        var admitted = false;
         bool scheduled;
         try
         {
             conn = _factory.Create(_context, timeout);
 
-            // Install ownership before admission; visibility alone does not make an idle connection rentable.
+            // The claimed future makes disposal wait for this opener. Check disposal before admission;
+            // visibility alone does not make the connection rentable.
             lock (SyncObj)
-            {
                 ThrowIfDisposed();
-                installed = true;
-            }
 
             // Admit before scheduling so synchronous completion can publish its idle edge.
             conn.Start();
+            admitted = true;
             ObserveCompletion(conn);
-            scheduled = DoSchedule(new(conn, CancellationToken.None), schedule, state, newConnection: true);
+            scheduled = DoSchedule(new(conn, CancellationToken.None), schedule, state);
             if (!scheduled)
                 PublishIdle(conn);
         }
         catch (Exception ex)
         {
-            if (!installed)
+            if (!admitted)
             {
-                // The connection never became a pool resource.
+                // Creation or admission failed. The pool owns cleanup after installation, but the
+                // unopened slot must remain replaceable.
                 conn?.CompleteAsync(ex).GetAwaiter().GetResult();
             }
             else
@@ -460,11 +457,7 @@ public sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
         }
         finally
         {
-            // Publication transfers opener ownership and wakes a racing disposal waiter.
-            lock (SyncObj)
-                future.Complete(installed ? conn : null);
-            if (!installed)
-                SignalAvailability();
+            SettleOpener(future, admitted ? conn : null);
         }
 
         return scheduled || schedule is null ? conn : throw new InvalidOperationException("Could not schedule work on a new connection.");
@@ -476,7 +469,7 @@ public sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
         Debug.Assert(!future.IsCompleted);
 
         T? conn = null;
-        var installed = false;
+        var admitted = false;
         PooledLinkedSource? timeoutSource = null;
         bool scheduled;
         try
@@ -492,15 +485,13 @@ public sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
                 await source.DisposeAsync().ConfigureAwait(false);
             }
 
-            // Install, admit, then allow work to begin.
+            // The pending future already owns the slot. Check disposal before admitting the connection.
             lock (SyncObj)
-            {
                 ThrowIfDisposed();
-                installed = true;
-            }
             conn.Start();
+            admitted = true;
             ObserveCompletion(conn);
-            scheduled = DoSchedule(new(conn, cancellationToken), schedule, state, newConnection: true);
+            scheduled = DoSchedule(new(conn, cancellationToken), schedule, state);
             if (!scheduled)
                 PublishIdle(conn);
         }
@@ -513,9 +504,9 @@ public sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
                 await timeoutSource.DisposeAsync().ConfigureAwait(false);
             }
 
-            if (!installed)
+            if (!admitted)
             {
-                // The connection never became a pool resource.
+                // See the synchronous path: creation/admission failure leaves the slot replaceable.
                 await (conn?.CompleteAsync(ex) ?? Task.CompletedTask).ConfigureAwait(false);
             }
             else
@@ -531,71 +522,19 @@ public sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
         }
         finally
         {
-            // Publication transfers opener ownership and wakes a racing disposal waiter.
-            lock (SyncObj)
-                future.Complete(installed ? conn : null);
-            if (!installed)
-                SignalAvailability();
+            SettleOpener(future, admitted ? conn : null);
         }
 
         return scheduled || schedule is null ? conn : throw new InvalidOperationException("Could not schedule work on a new connection.");
     }
 
-    public ValueTask<T> GetConnectionAsync(long id, TimeSpan timeout, CancellationToken cancellationToken = default)
+    // Publication transfers opener ownership. Wake after it becomes observable: an earlier
+    // connection signal may have raced while the slot still contained this future.
+    void SettleOpener(ConnectionFuture future, T? conn)
     {
-        ThrowIfDisposed();
-
-        if (GetInternal(id, out var future, out var result))
-            return new(result);
-
-        if (future is not null)
-            return OpenConnectionAsync<object?>(future, static (_,_) => true, null, timeout, cancellationToken);
-
-        return WaitForAvailabilityAsync(IdleOnly, (object?)null, timeout, cancellationToken);
-
-        bool GetInternal(long id, out ConnectionFuture? future, [NotNullWhen(true)]out T? result)
-        {
-            // Unsigned modulo handles negative ids.
-            var connections = _connections.AsSpan();
-            var index = (int)((ulong)id % (ulong)connections.Length);
-            T? connection = null;
-            for (var i = index; i < index + connections.Length; i++)
-            {
-                ref var item = ref connections[i < connections.Length ? i : i - connections.Length];
-                ConnectionFuture? mfuture = null;
-                if (TryGetConnection(ref item, out connection))
-                {
-                    // Replace completed connections in place.
-                    if (connection.Completion.IsCompleted && Interlocked.CompareExchange(ref item, mfuture ??= new(), connection) == connection)
-                    {
-                        future = mfuture;
-                        result = default;
-                        return false;
-                    }
-                }
-                else if (item is null && Interlocked.CompareExchange(ref item, mfuture ??= new(), null) == null)
-                {
-                    future = mfuture;
-                    result = default;
-                    return false;
-                }
-            }
-
-            future = default;
-            result = connection;
-            return connection is not null;
-        }
-    }
-
-    public async ValueTask OpenAllConnectionsAsync(TimeSpan timeout, CancellationToken cancellationToken = default)
-    {
-        var connections = _connections;
-        for (var i = 0; i < connections.Length; i++)
-        {
-            ConnectionFuture? future = null;
-            if (!TryGetConnection(ref connections[i], out var conn) && Interlocked.CompareExchange(ref connections[i], future ??= new(), conn) == conn)
-                await OpenConnectionAsync<object?>(future, null, null, timeout, cancellationToken).ConfigureAwait(false);
-        }
+        lock (SyncObj)
+            future.Complete(conn);
+        SignalAvailability();
     }
 
     T GetCore<TState>(Func<ConnectionCandidate<T>, TState, bool>? schedule, TState state, TimeSpan timeout)
@@ -812,7 +751,7 @@ public sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
 
     void ThrowIfDisposed()
     {
-        if (_disposed)
+        if (Volatile.Read(ref _disposed))
             ThrowObjectDisposed();
 
         static void ThrowObjectDisposed() => throw new ObjectDisposedException(nameof(ConnectionPool<T>));
@@ -846,7 +785,14 @@ public sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
         Waiter? _head;
         Waiter? _tail;
         int _count;
+        int _activeWakes;
         bool _disposed;
+
+        // Advisory rent-path gate, deliberately lock-free. Enqueue and CanRescan under the lock
+        // stay authoritative, and a stale read races a concurrent enqueue the same way the locked
+        // read did. Staleness can only route a caller onto the other path, never lose a wake.
+        public bool HasDemand
+            => Volatile.Read(ref _count) != 0 || Volatile.Read(ref _activeWakes) != 0;
 
         public int Count
         {
@@ -857,12 +803,13 @@ public sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
             }
         }
 
-        public Waiter Enqueue()
+        public Waiter Enqueue(bool synchronous = false)
         {
-            var waiter = new Waiter();
+            var waiter = new Waiter(synchronous);
             lock (_lock)
             {
                 ObjectDisposedException.ThrowIf(_disposed, this);
+                waiter.CanRescan = _head is null && _activeWakes == 0;
                 waiter.Previous = _tail;
                 if (_tail is null)
                     _head = waiter;
