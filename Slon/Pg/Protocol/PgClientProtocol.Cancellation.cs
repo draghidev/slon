@@ -61,10 +61,12 @@ sealed partial class PgClientProtocol
         internal byte Attempts;
         internal long RemainingDelayTicks;
         internal TaskCompletionSource? Delivery;
+        // Pre-registered reach for the current attempt.
+        internal CancellationExposure? Exposure;
     }
 
-    // Connection-owned residue from a Sent/Unknown request. It may outlive its instigating flow and is
-    // retained until idle or an RFQ boundary proves the request can no longer strike later work.
+    // Possible wire-wide reach of a cancellation request. It may outlive its instigating flow
+    // until idle or an RFQ boundary proves that it cannot strike later work.
     sealed class CancellationExposure(PgClientFlow instigator, Control control)
     {
         internal readonly PgClientFlow Instigator = instigator;
@@ -72,6 +74,8 @@ sealed partial class PgClientProtocol
         internal CancellationExposure? Next;
         internal PgClientFlow? BoundaryFlow;
         internal int BoundaryWindow;
+        // The sender still owns settlement, so an idle sweep must not remove this exposure.
+        internal bool PendingDispatch;
     }
 
     internal void RequestServerCancellation(PgClientFlow instigator, Control control,
@@ -154,6 +158,10 @@ sealed partial class PgClientProtocol
         intent.Dispatching = true;
         intent.Attempts++;
         ArmCancellationAttemptLocked();
+        // Register before sending so completion cannot erase the request's possible reach.
+        var exposure = new CancellationExposure(intent.Instigator, intent.Control) { PendingDispatch = true };
+        AppendCancellationExposureLocked(exposure);
+        intent.Exposure = exposure;
         return true;
     }
 
@@ -267,13 +275,17 @@ sealed partial class PgClientProtocol
 
         lock (_syncRoot)
         {
-            // Release admission before processing the result. The request attempt is over; all
-            // remaining state describes its possible reach and must not hold later writes.
+            // The attempt no longer needs to hold later writes.
             ReleaseCancellationAttemptLocked();
             intent.Dispatching = false;
             _cancellationDispatching = false;
+            var exposure = intent.Exposure!;
+            intent.Exposure = null;
+            exposure.PendingDispatch = false;
             if (state is CancelRequestState.NotSent)
             {
+                // Nothing reached the server.
+                RemoveCancellationExposureLocked(exposure);
                 if (intent.InstigatorCompleted || intent.Window < intent.Instigator.CancellationWindow)
                     RemoveCancellationIntentLocked(intent);
                 else if (intent.Attempts >= 2)
@@ -281,8 +293,14 @@ sealed partial class PgClientProtocol
             }
             else
             {
-                if (!intent.Control.IsIdle)
-                    AddCancellationExposureLocked(new(intent.Instigator, intent.Control));
+                if (intent.Control.IsIdle)
+                    RemoveCancellationExposureLocked(exposure);
+                else if (exposure.BoundaryFlow is null
+                    && intent.Control.ActivatedFlow is { IsCompleted: false } boundary)
+                {
+                    exposure.BoundaryFlow = boundary;
+                    exposure.BoundaryWindow = boundary.CancellationWindow;
+                }
                 RemoveCancellationIntentLocked(intent);
                 intent.Delivery?.TrySetResult();
             }
@@ -290,13 +308,8 @@ sealed partial class PgClientProtocol
         TryDispatchNextCancellation();
     }
 
-    void AddCancellationExposureLocked(CancellationExposure exposure)
+    void AppendCancellationExposureLocked(CancellationExposure exposure)
     {
-        if (exposure.Control.ActivatedFlow is { IsCompleted: false } boundary)
-        {
-            exposure.BoundaryFlow = boundary;
-            exposure.BoundaryWindow = boundary.CancellationWindow;
-        }
         if (_exposureTail is null)
             _exposureHead = exposure;
         else
@@ -410,7 +423,7 @@ sealed partial class PgClientProtocol
                 var next = exposure.Next;
                 if (ReferenceEquals(exposure.Control, control))
                 {
-                    if (remainingDepth is 0)
+                    if (remainingDepth is 0 && !exposure.PendingDispatch)
                         RemoveCancellationExposureLocked(exposure);
                     else if (ReferenceEquals(exposure.BoundaryFlow, flow))
                     {

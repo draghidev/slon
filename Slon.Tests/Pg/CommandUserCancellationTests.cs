@@ -561,50 +561,68 @@ public class CommandUserCancellationTests
         await using var blocker = await PgAdvisoryLock.AcquireAsync();
         var options = PgTestPool.NewOptions();
         var sender = PgTestPool.CreateCancelSender(options);
+        var senderEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var deliver = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var cancelDelivered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         await using var protocol = await PgTestPool.NewIsolatedAsync(
             o => o.CancelSender = async (processId, secretKey, token) =>
             {
+                senderEntered.TrySetResult();
+                await deliver.Task.WaitAsync(token);
                 await sender(processId, secretKey, token);
                 cancelDelivered.TrySetResult();
                 return CancelRequestState.Sent;
             });
 
-        using var cts = new CancellationTokenSource();
-        var canceledFlow = new CommandFlow(async: true, blocker.WaitCommand);
-        var priorSuccessor = new CommandFlow(async: true, blocker.WaitCommand);
-        Assert.IsTrue(protocol.TryQueue(canceledFlow, cancellationToken: cts.Token));
-        Assert.IsTrue(protocol.TryQueue(priorSuccessor));
+        try
+        {
+            using var cts = new CancellationTokenSource();
+            var canceledFlow = new CommandFlow(async: true, blocker.WaitCommand);
+            var priorSuccessor = new CommandFlow(async: true, blocker.WaitCommand);
+            Assert.IsTrue(protocol.TryQueue(canceledFlow, cancellationToken: cts.Token));
+            Assert.IsTrue(protocol.TryQueue(priorSuccessor));
 
-        var canceled = canceledFlow.GetAsyncEnumerator(cts.Token);
-        var canceledMove = canceled.MoveNextAsync(cts.Token).AsTask();
-        var successor = priorSuccessor.GetAsyncEnumerator();
-        var successorMove = successor.MoveNextAsync().AsTask();
+            var canceled = canceledFlow.GetAsyncEnumerator(cts.Token);
+            var canceledMove = canceled.MoveNextAsync(cts.Token).AsTask();
+            var successor = priorSuccessor.GetAsyncEnumerator();
+            var successorMove = successor.MoveNextAsync().AsTask();
 
-        await blocker.WaitUntilContendedAsync(protocol.FlowControl.BackendProcessId);
-        cts.Cancel();
-        await cancelDelivered.Task.WaitAsync(TimeSpan.FromSeconds(10));
-        Assert.IsTrue(protocol.HasPendingCancellation);
+            await blocker.WaitUntilContendedAsync(protocol.FlowControl.BackendProcessId);
+            cts.Cancel();
+            // Observe pending while the sender is provably in flight: deterministic (the intent is
+            // alive and the reach is pre-registered). Post-delivery pending is a legal transient,
+            // the strike can complete the instigator's window and retire the reach at any time.
+            await senderEntered.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            Assert.IsTrue(protocol.HasPendingCancellation);
+            deliver.TrySetResult();
+            await cancelDelivered.Task.WaitAsync(TimeSpan.FromSeconds(10));
 
-        var boundaryFlow = new CommandFlow(async: true, Command.Create("select 1"));
-        Assert.IsTrue(protocol.TryQueue(boundaryFlow));
-        var boundary = boundaryFlow.GetAsyncEnumerator();
-        var boundaryMove = boundary.MoveNextAsync().AsTask();
+            var boundaryFlow = new CommandFlow(async: true, Command.Create("select 1"));
+            Assert.IsTrue(protocol.TryQueue(boundaryFlow));
+            var boundary = boundaryFlow.GetAsyncEnumerator();
+            var boundaryMove = boundary.MoveNextAsync().AsTask();
 
-        var exception = await Assert.ThrowsExactlyAsync<OperationCanceledException>(
-            async () => await canceledMove.WaitAsync(TimeSpan.FromSeconds(10)));
-        Assert.AreEqual(cts.Token, exception.CancellationToken);
-        await canceled.DisposeAsync();
+            var exception = await Assert.ThrowsExactlyAsync<OperationCanceledException>(
+                async () => await canceledMove.WaitAsync(TimeSpan.FromSeconds(10)));
+            Assert.AreEqual(cts.Token, exception.CancellationToken);
+            await canceled.DisposeAsync();
 
-        await blocker.ReleaseAsync();
-        Assert.IsTrue(await successorMove.WaitAsync(TimeSpan.FromSeconds(10)));
-        Assert.IsFalse(await successor.MoveNextAsync());
-        await successor.DisposeAsync();
+            await blocker.ReleaseAsync();
+            Assert.IsTrue(await successorMove.WaitAsync(TimeSpan.FromSeconds(10)));
+            Assert.IsFalse(await successor.MoveNextAsync());
+            await successor.DisposeAsync();
 
-        Assert.IsTrue(await boundaryMove.WaitAsync(TimeSpan.FromSeconds(10)));
-        Assert.IsFalse(await boundary.MoveNextAsync());
-        await boundary.DisposeAsync();
-        Assert.IsFalse(protocol.HasPendingCancellation);
+            Assert.IsTrue(await boundaryMove.WaitAsync(TimeSpan.FromSeconds(10)));
+            Assert.IsFalse(await boundary.MoveNextAsync());
+            await boundary.DisposeAsync();
+            Assert.IsFalse(protocol.HasPendingCancellation);
+        }
+        finally
+        {
+            // A failure before the natural set must not strand the sender on the gate: a parked
+            // sender outlives the test and wedges teardown behind the in-flight dispatch.
+            deliver.TrySetResult();
+        }
     }
 
     [TestMethod]
@@ -627,48 +645,57 @@ public class CommandUserCancellationTests
             return state;
         });
 
-        using var cts = new CancellationTokenSource();
-        var canceledFlow = new CommandFlow(async: true, firstBlocker.WaitCommand);
-        var successorFlow = new CommandFlow(async: true, successorBlocker.WaitCommand);
-        Assert.IsTrue(protocol.TryQueue(canceledFlow, cancellationToken: cts.Token));
-        Assert.IsTrue(protocol.TryQueue(successorFlow));
+        try
+        {
+            using var cts = new CancellationTokenSource();
+            var canceledFlow = new CommandFlow(async: true, firstBlocker.WaitCommand);
+            var successorFlow = new CommandFlow(async: true, successorBlocker.WaitCommand);
+            Assert.IsTrue(protocol.TryQueue(canceledFlow, cancellationToken: cts.Token));
+            Assert.IsTrue(protocol.TryQueue(successorFlow));
 
-        var canceled = canceledFlow.GetAsyncEnumerator(cts.Token);
-        var canceledMove = canceled.MoveNextAsync(cts.Token).AsTask();
-        var successor = successorFlow.GetAsyncEnumerator();
-        var successorMove = successor.MoveNextAsync().AsTask();
+            var canceled = canceledFlow.GetAsyncEnumerator(cts.Token);
+            var canceledMove = canceled.MoveNextAsync(cts.Token).AsTask();
+            var successor = successorFlow.GetAsyncEnumerator();
+            var successorMove = successor.MoveNextAsync().AsTask();
 
-        await firstBlocker.WaitUntilContendedAsync(protocol.FlowControl.BackendProcessId);
-        await WaitUntilAsync(() => successorFlow.IsStarted);
-        cts.Cancel();
-        await senderEntered.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            await firstBlocker.WaitUntilContendedAsync(protocol.FlowControl.BackendProcessId);
+            await WaitUntilAsync(() => successorFlow.IsStarted);
+            cts.Cancel();
+            await senderEntered.Task.WaitAsync(TimeSpan.FromSeconds(10));
 
-        // Let the intended command finish before delivering the already-started side request.
-        // PostgreSQL then applies it to the pipelined successor that is now running.
-        await firstBlocker.ReleaseAsync();
-        var cancellation = await Assert.ThrowsExactlyAsync<OperationCanceledException>(
-            async () => await canceledMove.WaitAsync(TimeSpan.FromSeconds(10)));
-        Assert.AreEqual(cts.Token, cancellation.CancellationToken);
-        await canceled.DisposeAsync();
+            // Let the intended command finish before delivering the already-started side request.
+            // PostgreSQL then applies it to the pipelined successor that is now running.
+            await firstBlocker.ReleaseAsync();
+            var cancellation = await Assert.ThrowsExactlyAsync<OperationCanceledException>(
+                async () => await canceledMove.WaitAsync(TimeSpan.FromSeconds(10)));
+            Assert.AreEqual(cts.Token, cancellation.CancellationToken);
+            await canceled.DisposeAsync();
 
-        await successorBlocker.WaitUntilContendedAsync(protocol.FlowControl.BackendProcessId);
-        deliver.TrySetResult();
-        await delivered.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            await successorBlocker.WaitUntilContendedAsync(protocol.FlowControl.BackendProcessId);
+            deliver.TrySetResult();
+            await delivered.Task.WaitAsync(TimeSpan.FromSeconds(10));
 
-        Assert.IsTrue(await successorMove.WaitAsync(TimeSpan.FromSeconds(10)));
-        var result = successor.Current;
-        var rows = result.GetAsyncEnumerator();
-        while (await rows.MoveNextAsync()) { }
-        await rows.DisposeAsync();
-        var collateral = Assert.ThrowsExactly<PostgresException>(() => result.GetCommandComplete());
-        Assert.AreEqual(PgErrorCodes.QueryCanceled, collateral.SqlState);
-        Assert.IsTrue(collateral.IsCollateralCancellation);
-        StringAssert.Contains(collateral.Message, "clients cannot eliminate this race");
-        Assert.IsFalse(await successor.MoveNextAsync());
-        await successor.DisposeAsync();
+            Assert.IsTrue(await successorMove.WaitAsync(TimeSpan.FromSeconds(10)));
+            var result = successor.Current;
+            var rows = result.GetAsyncEnumerator();
+            while (await rows.MoveNextAsync()) { }
+            await rows.DisposeAsync();
+            var collateral = Assert.ThrowsExactly<PostgresException>(() => result.GetCommandComplete());
+            Assert.AreEqual(PgErrorCodes.QueryCanceled, collateral.SqlState);
+            Assert.IsTrue(collateral.IsCollateralCancellation);
+            StringAssert.Contains(collateral.Message, "clients cannot eliminate this race");
+            Assert.IsFalse(await successor.MoveNextAsync());
+            await successor.DisposeAsync();
 
-        await WaitUntilAsync(() => !protocol.HasPendingCancellation);
-        await PgTestPool.RunAsync(protocol, "select 1");
+            await WaitUntilAsync(() => !protocol.HasPendingCancellation);
+            await PgTestPool.RunAsync(protocol, "select 1");
+        }
+        finally
+        {
+            // A failure before the natural set must not strand the sender on the gate: a parked
+            // sender outlives the test and wedges teardown behind the in-flight dispatch.
+            deliver.TrySetResult();
+        }
     }
 
     [TestMethod]
