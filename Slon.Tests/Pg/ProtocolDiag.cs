@@ -4,11 +4,14 @@ using Slon.Pg.Protocol.Flows;
 
 namespace Slon.Tests.Pg;
 
-// Shared wedge readout for timeout diagnostics. A hang self-classifies from these gauges without a
-// live debugger: pumpTask is the pump-death detector (Faulted carries the killer's stack; a completed
-// task with the source still holding items means the pump exited while flows were pending); the armed
-// bit classifies a stranded backlog (armed with driving=0 = wake lost while idle-parked; not armed =
-// the pump never returned from an off-park suspension; driving=1 = a runner wedged mid-turn).
+// Shared wedge readout for the ARMED instruments (pre-turn strand classifier, scope-cascade
+// premise dump, forceful-shutdown amplifier) - the open hunts. Fixed families drop their dumps
+// with the fix (this file's consumers shrink as faces close; delete it when the last hunt does).
+// A hang self-classifies from these gauges without a live debugger: pumpTask is the pump-death
+// detector (Faulted carries the killer's stack; a completed task with the source still holding
+// items means the pump exited while flows were pending); the armed bit classifies a stranded
+// backlog (armed with driving=0 = wake lost while idle-parked; not armed = the pump never
+// returned from an off-park suspension; driving=1 = a runner wedged mid-turn).
 static class ProtocolDiag
 {
     const BindingFlags All = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
@@ -65,20 +68,10 @@ static class ProtocolDiag
             $"takeoverPending={S("TakeoverPending")} takeoverActive={S("TakeoverActive")}";
     }
 
-    internal static void JoinAllOrDump(Thread[] threads, PgClientProtocol protocol, string what)
-    {
-        foreach (var t in threads)
-        {
-            if (t.Join(TimeSpan.FromSeconds(30)))
-                continue;
-            Assert.Fail($"{what}\n{Gauges(protocol)}\nsource: {SourceState(protocol)}");
-        }
-    }
-
-    // Task-based analog of JoinAllOrDump for the Task.Run racing tests: await the named tasks bounded by
-    // timeout and, on a hang, name WHICH tasks are still unfinished plus the protocol/source gauges. Turns
-    // a bare TimeoutException (which task wedged? unknown) into a self-classifying capture. A task FAULT
-    // (not a hang) still surfaces its exception, same as a plain await Task.WhenAll(...).WaitAsync(timeout).
+    // Await the named tasks bounded by timeout and, on a hang, name WHICH tasks are still unfinished
+    // plus the protocol/source gauges. Turns a bare TimeoutException (which task wedged? unknown)
+    // into a self-classifying capture. A task FAULT (not a hang) still surfaces its exception, same
+    // as a plain await Task.WhenAll(...).WaitAsync(timeout).
     internal static async Task WhenAllOrDump(PgClientProtocol protocol, string what, TimeSpan timeout,
         params (string name, Task task)[] named)
     {

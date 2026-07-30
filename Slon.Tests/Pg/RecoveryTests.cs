@@ -143,6 +143,11 @@ public class RecoveryTests
         /// cross post-snapshot (the drain-count reconciliation probe).
         public int HeldReadConsumeCount { get; init; } = 1;
 
+        /// Completed by the held read after it consumes its first message: with a count of 1 it has
+        /// consumed everything it will, with a higher count it parks on the next. Orders a test's
+        /// trailing fault after the consume without a fixed delay.
+        public TaskCompletionSource? HeldReadConsumedFirst { get; init; }
+
         public bool RequestCancellation { get; init; }
 
         /// SQL for the QueryNoFlush / ParseBindExecuteNoSync shapes (defaults to a trivial select).
@@ -209,7 +214,7 @@ public class RecoveryTests
             if (ControllablePipeline is { } controllablePipeline)
                 pipelineTask = new ValueTask(controllablePipeline.Task);
             else if (ControllablePipelineRead is { } readGate)
-                pipelineTask = HoldReadTurn(context, readGate, PipelineReadAcquired, HeldReadConsumeCount);
+                pipelineTask = HoldReadTurn(context, readGate, PipelineReadAcquired, HeldReadConsumedFirst, HeldReadConsumeCount);
             else
                 pipelineTask = _phase is FaultPhase.PipelineTask ? FailedTask() : ValueTask.CompletedTask;
             ValueTask trailingTask;
@@ -238,13 +243,17 @@ public class RecoveryTests
             // release gate, then do a real read. This is the unfinished pipelineTask: when recovery activates and robs the
             // turn, this read's next decoder USE fails the per-use validity check and faults - and
             // that late fault on an already-recovering flow is the recovery-of-recovery trigger.
-            static async ValueTask HoldReadTurn(Context context, TaskCompletionSource gate, TaskCompletionSource? acquired, int consumeCount)
+            static async ValueTask HoldReadTurn(Context context, TaskCompletionSource gate, TaskCompletionSource? acquired, TaskCompletionSource? consumedFirst, int consumeCount)
             {
                 PgDecoder decoder = await context.GetDecoderAsync().ConfigureAwait(false);
                 acquired?.TrySetResult();
                 await gate.Task.ConfigureAwait(false);
                 for (var i = 0; i < consumeCount; i++)
+                {
                     await decoder.GetNextAsync().ConfigureAwait(false);
+                    if (i == 0)
+                        consumedFirst?.TrySetResult();
+                }
             }
         }
     }
@@ -270,10 +279,14 @@ public class RecoveryTests
     public async Task InFlightReadOnlyRecovery_BlocksNewAdmissionUntilRecovered()
     {
         await using var protocol = await ConnectAsync();
+        // The query blocks on the fixture-held advisory lock, so it is in flight by construction
+        // and recovery's drain parks on an RFQ that cannot arrive until the release below - the
+        // admission-suspended window provably spans the asserts, no timing margin involved.
+        await using var blocker = await PgAdvisoryLock.AcquireAsync();
         var pipeline = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var faulting = new FaultingFlow(async: true, FaultPhase.PipelineTask, WriteShape.QueryNoFlush)
         {
-            QueryText = "select pg_sleep(0.2)",
+            QueryText = $"select pg_advisory_xact_lock({blocker.Key})",
             ControllablePipeline = pipeline,
         };
         Assert.IsTrue(protocol.TryQueue(faulting));
@@ -290,6 +303,8 @@ public class RecoveryTests
         Assert.IsFalse(protocol.TryQueue(duringRecovery),
             "read-only recovery must not enlarge the set condemned if its inherited boundary is invalid");
 
+        // Unblock the in-flight query; its RFQ arrives and recovery's drain completes.
+        await blocker.ReleaseAsync();
         await Assert.ThrowsExactlyAsync<InvalidOperationException>(
             () => faulting.WaitForComplete().AsTask().WaitAsync(TimeSpan.FromSeconds(5)));
         Assert.IsTrue(protocol.IsSchedulable);
@@ -642,22 +657,14 @@ public class RecoveryTests
         };
         Assert.IsTrue(protocol.TryQueue(faulting));
 
-        // Complete the trailing on a small delay so the recovery genuinely takes the
-        // move-to-trailing await path (outstanding is pending at ExecuteAuto's IsCompletedSuccessfully
-        // check). Inline-await of outstanding in ExecuteAuto would wedge the executor pump
-        // until this completes (test still passes timing-wise, but the architecture is wrong);
-        // the move-to-trailing path lets DrainPhase progress concurrently.
-        _ = Task.Run(async () =>
-        {
-            await Task.Delay(50);
-            trailingTcs.TrySetResult();
-        });
-
-        // Sibling must complete despite the failed flow having a delayed-pending trailing.
-        // The recovery's drain reads the wire concurrently with awaiting outstanding -
-        // architectural requirement for TCP-window-deadlock safety on workloads where the
-        // failed flow's trailing might be parked on the send buffer.
-        await RunAsync(protocol, "select 1");
+        // Start the sibling, then release the trailing, then await: recovery's retirement awaits
+        // the moved-to-trailing outstanding and the sibling is queued behind recovery, so the
+        // trailing must resolve for the sibling to complete. Releasing after the sibling is
+        // in flight keeps the outstanding pending across recovery's move-to-trailing check
+        // without a timed release.
+        var sibling = RunAsync(protocol, "select 1");
+        trailingTcs.TrySetResult();
+        await sibling;
 
         await protocol.CompleteAsync();
     }
@@ -681,15 +688,13 @@ public class RecoveryTests
             };
             Assert.IsTrue(protocol.TryQueue(faulting));
 
-            _ = Task.Run(async () =>
-            {
-                await Task.Delay(50);
-                trailingTcs.TrySetResult();
-            });
-
             // Off-thread: RunSync's blocking MoveNext drives the wire on a TP thread, so a recovery
-            // deadlock surfaces as this timeout rather than wedging the test thread.
-            await Task.Run(() => RunSync(protocol, "select 1")).WaitAsync(TimeSpan.FromSeconds(10));
+            // deadlock surfaces as this timeout rather than wedging the test thread. Start the
+            // sibling, then release the trailing, then await: recovery's retirement awaits the
+            // moved trailing and the sibling queues behind recovery.
+            var sibling = Task.Run(() => RunSync(protocol, "select 1"));
+            trailingTcs.TrySetResult();
+            await sibling.WaitAsync(TimeSpan.FromSeconds(10));
         }
         finally
         {
@@ -767,18 +772,14 @@ public class RecoveryTests
         };
         Assert.IsTrue(protocol.TryQueue(faulting));
 
-        // Fault the trailing after a short delay - the recovery must catch and discard, not
-        // propagate it into a second policy consultation.
-        _ = Task.Run(async () =>
-        {
-            await Task.Delay(50);
-            trailingTcs.TrySetException(new InvalidOperationException("synthetic trailing fault"));
-        });
-
-        // Sibling completes despite the failed flow's BOTH pipeline AND trailing tasks having
-        // faulted. The wire is still intact (the WriteSync went out, the drain consumed the
-        // failed flow's inherited RFQs).
-        await RunAsync(protocol, "select 1");
+        // Start the sibling, then fault the trailing, then await: the recovery must catch and
+        // discard the trailing fault, not propagate it into a second policy consultation.
+        // Recovery's retirement awaits the moved trailing, so the fault must land for the
+        // sibling (queued behind recovery) to complete. The wire is still intact (the WriteSync
+        // went out, the drain consumed the failed flow's inherited RFQs).
+        var sibling = RunAsync(protocol, "select 1");
+        trailingTcs.TrySetException(new InvalidOperationException("synthetic trailing fault"));
+        await sibling;
 
         await protocol.CompleteAsync();
     }
@@ -829,12 +830,14 @@ public class RecoveryTests
         var acquired = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var trailing = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
 
+        var consumedFirst = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var faulting = new FaultingFlow(async: true, FaultPhase.TrailingTask, WriteShape.TwoQueriesNoFlush)
         {
             ControllablePipelineRead = releaseGate,
             PipelineReadAcquired = acquired,
             ControllableTrailing = trailing,
             HeldReadConsumeCount = heldReadConsumeCount,
+            HeldReadConsumedFirst = consumedFirst,
         };
         Assert.IsTrue(protocol.TryQueue(faulting));
         var completed = faulting.WaitForComplete().AsTask();
@@ -845,10 +848,13 @@ public class RecoveryTests
             releaseGate.TrySetResult();
 
             transport.ReleaseSegment(CommandComplete());
-            await Task.Delay(50);
+            await consumedFirst.Task.WaitAsync(TimeSpan.FromSeconds(10));
 
             trailing.TrySetException(new InvalidOperationException("synthetic trailing fault while read held"));
-            await Task.Delay(50);
+            // Recovery's resync ROLLBACK is written inline in its ExecuteAuto (read-outstanding
+            // shape), strictly after Create snapshots RfqCount - observing it proves the snapshot
+            // exists before RFQ#1 is released below, so the crossing stays post-snapshot.
+            await transport.WaitForWrittenAsync("ROLLBACK").WaitAsync(TimeSpan.FromSeconds(10));
 
             transport.ReleaseSegment(ReadyForQuery());
             transport.ReleaseSegment(CommandComplete());

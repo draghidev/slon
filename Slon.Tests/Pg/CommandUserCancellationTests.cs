@@ -47,7 +47,7 @@ public class CommandUserCancellationTests
         var oce = await Assert.ThrowsExactlyAsync<OperationCanceledException>(
             async () => await e.MoveNextAsync(cts.Token));
         Assert.AreEqual(cts.Token, oce.CancellationToken);
-        await DisposeOrDumpAsync(e, protocol, nameof(UserCt_PreFired_FirstMoveNextSurfacesOce));
+        await DisposeBoundedAsync(e);
     }
 
     // CT fires after the first result has been delivered: the next MoveNextAsync surfaces OCE, and a
@@ -73,7 +73,7 @@ public class CommandUserCancellationTests
         var oce = await Assert.ThrowsExactlyAsync<OperationCanceledException>(
             async () => await e.MoveNextAsync(cts.Token));
         Assert.AreEqual(cts.Token, oce.CancellationToken);
-        await DisposeOrDumpAsync(e, protocol, nameof(UserCt_FiresAfterFirstResult_NextMoveNextSurfacesOce_ProtocolUsable));
+        await DisposeBoundedAsync(e);
     }
 
     // CT fires while an outstanding MoveNextAsync is parked on a slow read: the parked pull surfaces
@@ -108,7 +108,7 @@ public class CommandUserCancellationTests
         var oce = await Assert.ThrowsExactlyAsync<OperationCanceledException>(
             async () => await moveNextTask.WaitAsync(TimeSpan.FromSeconds(10)));
         Assert.AreEqual(cts.Token, oce.CancellationToken);
-        await DisposeOrDumpAsync(e, protocol, nameof(UserCt_FiresMidRead_SurfacesOce_ProtocolUsable));
+        await DisposeBoundedAsync(e);
 
         await PgTestPool.RunAsync(protocol, "select 1");
     }
@@ -826,7 +826,6 @@ public class CommandUserCancellationTests
             await Task.Delay(1, timeout.Token);
     }
 
-    static Task DisposeOrDumpAsync(IAsyncDisposable enumerator, PgClientProtocol protocol, string test)
-        => ProtocolDiag.WhenAllOrDump(protocol, $"{test}: enumerator disposal did not retire the flow",
-            TimeSpan.FromSeconds(10), ("DisposeAsync", enumerator.DisposeAsync().AsTask()));
+    static Task DisposeBoundedAsync(IAsyncDisposable enumerator)
+        => enumerator.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(10));
 }

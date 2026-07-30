@@ -118,6 +118,35 @@ sealed class BackpressureWriteTransport : TransportConnection
         return seen;
     }
 
+    // Wait until the client's buffered writes contain `marker` (e.g. recovery's resync ROLLBACK).
+    // Examines without consuming, so send-window accounting is untouched and later drains see the
+    // full stream; each new flush re-triggers the scan. Do not run concurrently with the draining
+    // methods above - both sides read _toServer.
+    public async Task WaitForWrittenAsync(string marker)
+    {
+        var pattern = System.Text.Encoding.ASCII.GetBytes(marker);
+        while (true)
+        {
+            var result = await _toServer.Reader.ReadAsync().ConfigureAwait(false);
+            var buffer = result.Buffer;
+            var found = Contains(buffer, pattern);
+            _toServer.Reader.AdvanceTo(buffer.Start, buffer.End);
+            if (found)
+                return;
+            if (result.IsCompleted)
+                throw new InvalidOperationException($"client writer completed before '{marker}' was written");
+        }
+
+        static bool Contains(ReadOnlySequence<byte> buffer, ReadOnlySpan<byte> pattern)
+        {
+            if (buffer.IsSingleSegment)
+                return buffer.FirstSpan.IndexOf(pattern) >= 0;
+            var flat = new byte[buffer.Length];
+            buffer.CopyTo(flat);
+            return flat.AsSpan().IndexOf(pattern) >= 0;
+        }
+    }
+
     // Kill the wire: completing the reader with an exception makes the client's next FlushAsync
     // throw it - the dead-wire oracle case for recovery's flush WhenAny arm.
     public void KillWire(Exception exception) => _toServer.Reader.Complete(exception);

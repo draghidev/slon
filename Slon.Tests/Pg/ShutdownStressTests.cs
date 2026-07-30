@@ -149,7 +149,19 @@ public class ShutdownStressTests
             await RunIterationAsync(i, async () =>
             {
                 var a = protocol.BeginExclusiveScope(async: true);
-                await a.HandoffReady.WaitAsync(Cap);
+                try
+                {
+                    await a.HandoffReady.WaitAsync(Cap);
+                }
+                catch (TimeoutException)
+                {
+                    // Same self-classification as B's verdict wait: pin which population the holder
+                    // died in before any stop was even requested.
+                    Assert.Fail($"iter {i}: holder scope A STRANDED pre-handoff within {Cap} " +
+                        $"[a: pending={a.IsPending} started={a.IsStarted} completed={a.IsCompleted}, " +
+                        $"protocol: draining={protocol.IsDraining} completed={protocol.IsCompleted}]\n" +
+                        $"{ProtocolDiag.Gauges(protocol)}\nsource: {ProtocolDiag.SourceState(protocol)}");
+                }
                 var b = protocol.BeginExclusiveScope(async: true);
                 var bWait = b.HandoffReady;
 
@@ -173,7 +185,8 @@ public class ShutdownStressTests
                     // missed), or completed-verdict-less (backstop hole).
                     Assert.Fail($"iter {i}: pre-turn waiter STRANDED - no verdict on HandoffReady within {Cap} " +
                         $"[b: pending={b.IsPending} started={b.IsStarted} completed={b.IsCompleted}, " +
-                        $"protocol: draining={protocol.IsDraining} completed={protocol.IsCompleted}]");
+                        $"protocol: draining={protocol.IsDraining} completed={protocol.IsCompleted}]\n" +
+                        $"{ProtocolDiag.Gauges(protocol)}\nsource: {ProtocolDiag.SourceState(protocol)}");
                 }
                 catch (PgClientClosedException)
                 {
@@ -181,7 +194,8 @@ public class ShutdownStressTests
 
                 // The latch contract: Completed is only guaranteed once the drain is awaited
                 // (DisposeAsync is fire-and-forget); a false read after this await is a real latch bug.
-                await protocol.CompleteAsync().WaitAsync(Cap);
+                await ProtocolDiag.WhenAllOrDump(protocol, $"iter {i}: awaited drain did not converge", Cap,
+                    ("complete", protocol.CompleteAsync()));
                 Assert.IsTrue(protocol.IsCompleted, $"iter {i}: protocol not Completed after awaited drain");
             });
             try { await protocol.CompleteAsync().WaitAsync(Cap); }

@@ -98,19 +98,7 @@ public class CommandDrainTests
             var e = flow.GetAsyncEnumerator();
             Assert.IsTrue(await e.MoveNextAsync(), $"iter {i}: first result not delivered");
             e.Dispose(); // SYNC dispose of an async flow, mid-batch - the raced path.
-            try
-            {
-                await PgTestPool.RunAsync(protocol, "select 1").WaitAsync(TimeSpan.FromSeconds(10));
-            }
-            catch (TimeoutException)
-            {
-                // Self-classifying hang report. A pinned drain reads as activated={completed=False} (the
-                // disposed flow never finished draining, the probe dispatched but can't activate). A lost
-                // dispatch wake reads as backlog=1 with both slots null (the probe never left the source).
-                // A dead pump reads as pumpTask=Faulted with the killer's stack.
-                Assert.Fail($"iter {i}: usability probe timed out\n{ProtocolDiag.Gauges(protocol)}\n" +
-                    $"source: {ProtocolDiag.SourceState(protocol)}");
-            }
+            await PgTestPool.RunAsync(protocol, "select 1").WaitAsync(TimeSpan.FromSeconds(10));
         }
     }
 
@@ -225,13 +213,21 @@ public class CommandDrainTests
             Command.Create("select 'two'"));
         Assert.IsTrue(protocol.TryQueue(flow));
 
+        await WaitUntilStarted(flow).WaitAsync(TimeSpan.FromSeconds(10));
         var completeTask = protocol.CompleteAsync();
+        await protocol.Heartbeat(TimeSpan.Zero);
 
         var e = flow.GetAsyncEnumerator();
         await Assert.ThrowsExactlyAsync<PgClientClosedException>(async () => await e.MoveNextAsync());
         await e.DisposeAsync();
 
         await completeTask.WaitAsync(TimeSpan.FromSeconds(10));
+
+        static async Task WaitUntilStarted(CommandFlow flow)
+        {
+            while (!flow.IsStarted)
+                await Task.Yield();
+        }
     }
 
     // Pipelined multi-flow: both flows queued before any MoveNext, then CompleteAsync fires.
@@ -281,7 +277,7 @@ public class CommandDrainTests
     {
         // Narrow timeout, but safe parallelized: the body is parked on pg_sleep the whole window,
         // so the graceful->abort escalation is deterministic - there is no timing race to lose.
-        var protocol = await PgTestPool.NewIsolatedAsync(o => o.CompletionTimeout = TimeSpan.FromMilliseconds(100));
+        var protocol = await PgTestPool.NewIsolatedAsync(o => o.CompletionTimeout = TimeSpan.FromMilliseconds(20));
 
         var flow = new CommandFlow(async: true, Command.Create("select pg_sleep(30)"));
         Assert.IsTrue(protocol.TryQueue(flow));

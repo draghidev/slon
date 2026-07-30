@@ -19,6 +19,12 @@ public class FlowSourceDirectStressTests
     // value still flows under SLON_UNCAPPED=1 for a deliberate soak.
     static int Iterations => StressEnv.Iterations(fallback: 5_000, cap: 20_000);
 
+    // True only within the dynamic extent of the test's inline-driving Execute call. The budget
+    // invariant is stack-bounded, not thread-bounded: preferLocal dispatch may legally resume
+    // transferred work on the freed caller thread, so thread identity is not a valid oracle.
+    [ThreadStatic]
+    static bool _onInlineDriveStack;
+
     [TestMethod]
     public async Task IdleInlineDrive_IsBoundedToTheEnqueuingItem()
     {
@@ -29,7 +35,7 @@ public class FlowSourceDirectStressTests
         var second = CommandFlow.CreateUninitialized();
         var callerThread = Environment.CurrentManagedThreadId;
         var firstThread = 0;
-        var secondThread = 0;
+        var secondOnInlineDriveStack = false;
         var secondSeen = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
 
         async Task Consume()
@@ -47,7 +53,7 @@ public class FlowSourceDirectStressTests
                     }
                     else if (ReferenceEquals(item, second))
                     {
-                        secondThread = Environment.CurrentManagedThreadId;
+                        secondOnInlineDriveStack = _onInlineDriveStack;
                         secondSeen.TrySetResult();
                     }
                     continue;
@@ -58,11 +64,19 @@ public class FlowSourceDirectStressTests
         }
 
         var consumer = Consume();
-        source.Enqueue(first, inlineEligible: true).Execute(runContinuationsAsynchronously: false);
+        _onInlineDriveStack = true;
+        try
+        {
+            source.Enqueue(first, inlineEligible: true).Execute(runContinuationsAsynchronously: false);
+        }
+        finally
+        {
+            _onInlineDriveStack = false;
+        }
 
         Assert.AreEqual(callerThread, firstThread, "The idle claimant did not drive its own item inline.");
         await secondSeen.Task.WaitAsync(TimeSpan.FromSeconds(10));
-        Assert.AreNotEqual(callerThread, secondThread, "A successor escaped the one-item inline budget.");
+        Assert.IsFalse(secondOnInlineDriveStack, "A successor escaped the one-item inline budget.");
 
         enumerator.Complete();
         await consumer.WaitAsync(TimeSpan.FromSeconds(10));
