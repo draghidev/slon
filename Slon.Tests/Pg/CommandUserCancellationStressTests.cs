@@ -53,45 +53,34 @@ public class CommandUserCancellationStressTests
     // protocol+iteration index, then disposing the enumerator it returns. Collapses the Pool / loop /
     // Cleanup boilerplate every race test repeated.
     //
-    // LEASES from the shared pool (was NewIsolatedAsync, which both leaked - isolated protocols are
+    // Protocols come from the shared pool (was NewIsolatedAsync, which both leaked - isolated protocols are
     // never reaped by the assembly DrainAsync sweep - and burned a fresh connection per protocol; 8 per
     // test x 7 tests = ~56 connections that piled up against max_connections under repeated runs). The
     // cancel-drain leaves the wire at RFQ each iteration, so the protocol is reusable - exactly the
-    // lease contract. Leases return to the idle bag on DisposeAsync.
+    // shared-pool contract. Protocols publish themselves again when their work retires.
     static async Task RaceLoop(Func<PgClientProtocol, int, Task<CommandFlow.Enumerator>> body)
     {
-        var leases = new PgTestPool.Lease[8];
-        for (var p = 0; p < leases.Length; p++)
-            leases[p] = await PgTestPool.LeaseAsync();
-        try
+        var protocols = new PgClientProtocol[Math.Min(PgTestPool.MaxConnections, 8)];
+        for (var p = 0; p < protocols.Length; p++)
+            protocols[p] = await PgTestPool.GetProtocolAsync();
+        // One worker per protocol, each draining a strided slice of the iteration space. The full Iters
+        // attempt count is preserved while worker count follows available capacity.
+        var workers = new Task[protocols.Length];
+        for (var p = 0; p < protocols.Length; p++)
         {
-            // One worker per lease, each draining a strided slice of the iteration space. The full Iters
-            // attempt count (the coverage) is preserved; we just stop idling 7 of the 8 leased protocols.
-            // These are I/O-bound cancellation races, so overlapping the round-trips collapses wall-clock,
-            // and running every lease at once is a STRONGER concurrency stress, not a weaker one. Each
-            // protocol is still touched by a single worker, so per-protocol behavior is unchanged.
-            var workers = new Task[leases.Length];
-            for (var p = 0; p < leases.Length; p++)
+            var protocol = protocols[p];
+            var start = p;
+            workers[p] = Task.Run(async () =>
             {
-                var protocol = leases[p].Protocol;
-                var start = p;
-                workers[p] = Task.Run(async () =>
+                for (var i = start; i < Iters; i += protocols.Length)
                 {
-                    for (var i = start; i < Iters; i += leases.Length)
-                    {
-                        CommandFlow.Enumerator e = default;
-                        try { e = await body(protocol, i); }
-                        finally { await DisposeGuarded(e, i, "DisposeAsync"); }
-                    }
-                });
-            }
-            await Task.WhenAll(workers);
+                    CommandFlow.Enumerator e = default;
+                    try { e = await body(protocol, i); }
+                    finally { await DisposeGuarded(e, i, "DisposeAsync"); }
+                }
+            });
         }
-        finally
-        {
-            foreach (var lease in leases)
-                await lease.DisposeAsync();
-        }
+        await Task.WhenAll(workers);
     }
 
     static void AssertCancelOrClose(Exception? caught, int i)
@@ -151,51 +140,42 @@ public class CommandUserCancellationStressTests
     [TestMethod]
     public async Task Pipelined_SubmitBound_PreFired_NoTenureCollision()
     {
-        var leases = new PgTestPool.Lease[8];
-        for (var p = 0; p < leases.Length; p++)
-            leases[p] = await PgTestPool.LeaseAsync();
-        try
+        var protocols = new PgClientProtocol[Math.Min(PgTestPool.MaxConnections, 8)];
+        for (var p = 0; p < protocols.Length; p++)
+            protocols[p] = await PgTestPool.GetProtocolAsync();
+        // More pool capacity increases overlap; the total tenure attempts remain constant.
+        var workers = new Task[protocols.Length];
+        for (var p = 0; p < protocols.Length; p++)
         {
-            // One worker per lease over a strided slice - same Iters of concurrent-tenure attempts, with
-            // the 8 protocols overlapped instead of idled (each protocol still runs its a/b pairs in order).
-            var workers = new Task[leases.Length];
-            for (var p = 0; p < leases.Length; p++)
+            var protocol = protocols[p];
+            var start = p;
+            workers[p] = Task.Run(async () =>
             {
-                var protocol = leases[p].Protocol;
-                var start = p;
-                workers[p] = Task.Run(async () =>
+                for (var i = start; i < Iters; i += protocols.Length)
                 {
-                    for (var i = start; i < Iters; i += leases.Length)
+                    var ctsA = new CancellationTokenSource(); ctsA.Cancel();
+                    var ctsB = new CancellationTokenSource(); ctsB.Cancel();
+                    var a = TwoResultFlow();
+                    var b = TwoResultFlow();
+                    Assert.IsTrue(protocol.TryQueue(a, cancellationToken: ctsA.Token));
+                    Assert.IsTrue(protocol.TryQueue(b, cancellationToken: ctsB.Token));
+                    var ea = a.GetAsyncEnumerator(ctsA.Token);
+                    var eb = b.GetAsyncEnumerator(ctsB.Token);
+                    try
                     {
-                        var ctsA = new CancellationTokenSource(); ctsA.Cancel();
-                        var ctsB = new CancellationTokenSource(); ctsB.Cancel();
-                        var a = TwoResultFlow();
-                        var b = TwoResultFlow();
-                        Assert.IsTrue(protocol.TryQueue(a, cancellationToken: ctsA.Token));
-                        Assert.IsTrue(protocol.TryQueue(b, cancellationToken: ctsB.Token));
-                        var ea = a.GetAsyncEnumerator(ctsA.Token);
-                        var eb = b.GetAsyncEnumerator(ctsB.Token);
-                        try
-                        {
-                            await Task.WhenAll(
-                                MoveNextGuarded(ea, ctsA.Token, i),
-                                MoveNextGuarded(eb, ctsB.Token, i));
-                        }
-                        finally
-                        {
-                            await DisposeGuarded(ea, i, "DisposeAsync (a)");
-                            await DisposeGuarded(eb, i, "DisposeAsync (b)");
-                        }
+                        await Task.WhenAll(
+                            MoveNextGuarded(ea, ctsA.Token, i),
+                            MoveNextGuarded(eb, ctsB.Token, i));
                     }
-                });
-            }
-            await Task.WhenAll(workers);
+                    finally
+                    {
+                        await DisposeGuarded(ea, i, "DisposeAsync (a)");
+                        await DisposeGuarded(eb, i, "DisposeAsync (b)");
+                    }
+                }
+            });
         }
-        finally
-        {
-            foreach (var lease in leases)
-                await lease.DisposeAsync();
-        }
+        await Task.WhenAll(workers);
     }
 
     static CommandFlow ThreeResultFlow() => new(async: true,
@@ -264,10 +244,8 @@ public class CommandUserCancellationStressTests
     [TestMethod]
     public async Task WaitForDrainOnDispose_DrainHitsError_ThrowsBarePostgresException()
     {
-        // An input-caused ErrorResponse leaves the session fine (drains to RFQ), so this leases from the
-        // shared pool rather than burning an isolated connection.
-        await using var lease = await PgTestPool.LeaseAsync();
-        var protocol = lease.Protocol;
+        // An input-caused ErrorResponse leaves the session fine (drains to RFQ), so use the shared pool.
+        var protocol = await PgTestPool.GetProtocolAsync();
         // First command succeeds; the SECOND faults (undefined table). One trailing sync => one segment.
         var flow = new CommandFlow(async: true,
             Command.Create("select 1"),
@@ -288,8 +266,7 @@ public class CommandUserCancellationStressTests
     [TestMethod]
     public async Task WaitForDrainOnDispose_MultiSyncErrors_ThrowsAggregate()
     {
-        await using var lease = await PgTestPool.LeaseAsync();
-        var protocol = lease.Protocol;
+        var protocol = await PgTestPool.GetProtocolAsync();
         var bad1 = Command.Create("select * from no_such_table_a") with { PreferSimple = true, WithSync = true };
         var bad2 = Command.Create("select * from no_such_table_b") with { PreferSimple = true, WithSync = true };
         var flow = new CommandFlow(async: true, Command.Create("select 1") with { PreferSimple = true, WithSync = true }, bad1, bad2);

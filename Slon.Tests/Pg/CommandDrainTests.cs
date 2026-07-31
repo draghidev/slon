@@ -32,8 +32,7 @@ public class CommandDrainTests
     [DataRow(false, false, DisplayName = "sync flow, sync dispose")]
     public async Task NextCommandResult_DrainsCurrentCommandBodySide(bool flowAsync, bool useAsyncDispose)
     {
-        await using var lease = await PgTestPool.LeaseAsync();
-        var protocol = lease.Protocol;
+        var protocol = await PgTestPool.GetProtocolAsync();
 
         var flow = new CommandFlow(flowAsync,
             Command.Create("select generate_series(1, 100)"),
@@ -57,8 +56,7 @@ public class CommandDrainTests
     [DataRow(false, false, DisplayName = "sync flow, sync dispose")]
     public async Task ConsumerDispose_MidBatch_BodyDrainsRemaining_ConnectionUsable(bool flowAsync, bool useAsyncDispose)
     {
-        await using var lease = await PgTestPool.LeaseAsync();
-        var protocol = lease.Protocol;
+        var protocol = await PgTestPool.GetProtocolAsync();
 
         var flow = new CommandFlow(flowAsync,
             Command.Create("select generate_series(1, 50)"),
@@ -86,8 +84,7 @@ public class CommandDrainTests
     public async Task ConsumerDispose_MidBatch_SyncDispose_OpenBeforePark_Stress()
     {
         var iters = StressEnv.Iterations(fallback: 500, cap: 8_000);
-        await using var lease = await PgTestPool.LeaseAsync();
-        var protocol = lease.Protocol;
+        var protocol = await PgTestPool.GetProtocolAsync();
         for (var i = 0; i < iters; i++)
         {
             var flow = new CommandFlow(async: true,

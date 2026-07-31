@@ -26,7 +26,7 @@ namespace Slon.Tests.Pg;
 public class RecoveryTests
 {
     // Isolated per test by design: every recovery test faults a flow or kills the transport.
-    // Cannot share via PgTestPool's lease path. The fault-injection tests further down
+    // Cannot share via PgTestPool. The fault-injection tests further down
     // construct their own transport inline because they need to call transport.Writer/Reader
     // .Complete to synthesize wire death; this helper only covers the recoverable cases that
     // own a clean protocol up to the point of injecting the fault inside a FaultingFlow.

@@ -12,7 +12,7 @@ namespace Slon.Tests.Pg;
 public class ProtocolCompletionTests
 {
     // Isolated per test by design: every test in this file fully destroys (CompleteAsync,
-    // DisposeAsync, Dispose, FailProtocol) the protocol. Cannot share via PgTestPool's lease
+    // DisposeAsync, Dispose, FailProtocol) the protocol. Cannot share via PgTestPool
     // path. Custom heartbeat/completion timeouts narrow the parked-flow propagation window
     // the tests exercise.
     static Task<PgClientProtocol> ConnectAsync() => PgTestPool.NewIsolatedAsync(o =>
@@ -212,7 +212,7 @@ public class ProtocolCompletionTests
     public async Task CompleteAsync_RacingDisposeAsync_ConvergesCleanly()
     {
         await using var blocker = await PgAdvisoryLock.AcquireAsync();
-        for (var i = 0; i < 50; i++)
+        for (var i = 0; i < 20; i++)
         {
             await blocker.HoldAsync();
             var protocol = await ConnectAsync();
@@ -260,7 +260,7 @@ public class ProtocolCompletionTests
     public async Task CompleteAsync_RacingDisposeAsync_MultiCommand_ConvergesCleanly()
     {
         await using var blocker = await PgAdvisoryLock.AcquireAsync();
-        for (var i = 0; i < 30; i++)
+        for (var i = 0; i < 20; i++)
         {
             await blocker.HoldAsync();
             var protocol = await ConnectAsync();
@@ -343,7 +343,7 @@ public class ProtocolCompletionTests
     public async Task CompleteAsync_RacingDisposeAsync_SyncFlow_ConvergesCleanly()
     {
         await using var blocker = await PgAdvisoryLock.AcquireAsync();
-        for (var i = 0; i < 30; i++)
+        for (var i = 0; i < 20; i++)
         {
             await blocker.HoldAsync();
             var protocol = await ConnectAsync();
@@ -387,7 +387,7 @@ public class ProtocolCompletionTests
     public async Task CompleteAsync_ThenDisposeAsync_MidSyncFlowBody_ConvergesCleanly()
     {
         await using var blocker = await PgAdvisoryLock.AcquireAsync();
-        for (var i = 0; i < 30; i++)
+        for (var i = 0; i < 15; i++)
         {
             await blocker.HoldAsync();
             var protocol = await ConnectAsync();

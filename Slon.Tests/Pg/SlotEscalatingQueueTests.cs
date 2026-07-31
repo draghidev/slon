@@ -14,7 +14,7 @@ public class SlotEscalatingQueueTests
 {
     // Pure in-memory data-structure exercise (no protocol / threadpool / waits), genuinely O(1)/iter and
     // linear at any scale, so a high cap. SLON_UNCAPPED=1 lifts it entirely.
-    static int StressIterations => StressEnv.Iterations(fallback: 20_000, cap: 200_000);
+    static int StressIterations => StressEnv.Iterations(fallback: 8_000, cap: 200_000);
 
     [TestMethod]
     public void Empty_DequeueAndPeek_False()

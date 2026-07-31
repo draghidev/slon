@@ -15,15 +15,15 @@ public class ProtocolExecutionTests
     [TestMethod]
     public async Task Sync_OnRawProtocol_Completes()
     {
-        await using var lease = await PgTestPool.LeaseAsync();
-        await PgTestPool.RunSync(lease.Protocol, "select 1");
+        var protocol = await PgTestPool.GetProtocolAsync();
+        await PgTestPool.RunSync(protocol, "select 1");
     }
 
     [TestMethod]
     public async Task Async_OnRawProtocol_Completes()
     {
-        await using var lease = await PgTestPool.LeaseAsync();
-        await PgTestPool.RunAsync(lease.Protocol, "select 1");
+        var protocol = await PgTestPool.GetProtocolAsync();
+        await PgTestPool.RunAsync(protocol, "select 1");
     }
 
     // OnFlowRfq bookkeeping: the wire's transaction status is tracked on a SINGLE protocol field, routed
@@ -35,8 +35,8 @@ public class ProtocolExecutionTests
     [DoNotParallelize]
     public async Task TransactionStatus_TrackedAcrossOuterFlowAndExclusiveScope()
     {
-        await using var lease = await PgTestPool.LeaseAsync();
-        var p = lease.Protocol;
+        var protocol = await PgTestPool.GetProtocolAsync();
+        var p = protocol;
 
         // Outer Control: an autocommit command's RFQ is Idle.
         await PgTestPool.RunAsync(p, "select 1");
@@ -73,9 +73,9 @@ public class ProtocolExecutionTests
     [TestMethod]
     public async Task RepeatedSync_OnRawProtocol_Completes()
     {
-        await using var lease = await PgTestPool.LeaseAsync();
+        var protocol = await PgTestPool.GetProtocolAsync();
         for (int i = 0; i < 200; i++)
-            await PgTestPool.RunSync(lease.Protocol, "select 1");
+            await PgTestPool.RunSync(protocol, "select 1");
     }
 
     // Many async flows in a tight loop. The post-handoff drain path doesn't apply here (no
@@ -83,9 +83,9 @@ public class ProtocolExecutionTests
     [TestMethod]
     public async Task RepeatedAsync_OnRawProtocol_Completes()
     {
-        await using var lease = await PgTestPool.LeaseAsync();
+        var protocol = await PgTestPool.GetProtocolAsync();
         for (int i = 0; i < 200; i++)
-            await PgTestPool.RunAsync(lease.Protocol, "select 1");
+            await PgTestPool.RunAsync(protocol, "select 1");
     }
 
     // Alternating sync/async on the same protocol. Exercises the HandoffActive gate's
@@ -95,13 +95,13 @@ public class ProtocolExecutionTests
     [TestMethod]
     public async Task AlternatingSyncAsync_OnRawProtocol_Completes()
     {
-        await using var lease = await PgTestPool.LeaseAsync();
+        var protocol = await PgTestPool.GetProtocolAsync();
         for (int i = 0; i < 50; i++)
         {
             if ((i & 1) == 0)
-                await PgTestPool.RunSync(lease.Protocol, "select 1");
+                await PgTestPool.RunSync(protocol, "select 1");
             else
-                await PgTestPool.RunAsync(lease.Protocol, "select 1");
+                await PgTestPool.RunAsync(protocol, "select 1");
         }
     }
 
@@ -112,9 +112,9 @@ public class ProtocolExecutionTests
     [TestMethod]
     public async Task SyncAfterAsync_SameProtocol_Completes()
     {
-        await using var lease = await PgTestPool.LeaseAsync();
-        await PgTestPool.RunAsync(lease.Protocol, "select 1");
-        await PgTestPool.RunSync(lease.Protocol, "select 1");
+        var protocol = await PgTestPool.GetProtocolAsync();
+        await PgTestPool.RunAsync(protocol, "select 1");
+        await PgTestPool.RunSync(protocol, "select 1");
     }
 
     // A blocked async command is active on the protocol while a sync command queues behind it.
@@ -130,8 +130,7 @@ public class ProtocolExecutionTests
     [TestMethod]
     public async Task SyncWhileAsyncInFlight_SameProtocol_BothComplete()
     {
-        await using var lease = await PgTestPool.LeaseAsync();
-        var protocol = lease.Protocol;
+        var protocol = await PgTestPool.GetProtocolAsync();
 
         await PgTestPool.RunAsync(protocol, "select 1"); // warm
 

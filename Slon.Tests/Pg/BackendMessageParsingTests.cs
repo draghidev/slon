@@ -212,9 +212,9 @@ public class BackendMessageParsingTests
     [TestMethod]
     public async Task BackendSyntaxError_SurfacesRenderedPostgresException()
     {
-        await using var lease = await PgTestPool.LeaseAsync();
+        var protocol = await PgTestPool.GetProtocolAsync();
         var flow = new CommandFlow(async: true, Command.Create("SLECT 1"));
-        Assert.IsTrue(lease.Protocol.TryQueue(flow));
+        Assert.IsTrue(protocol.TryQueue(flow));
 
         PostgresException? thrown = null;
         var e = flow.GetAsyncEnumerator();

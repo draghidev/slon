@@ -143,11 +143,11 @@ public class SyncFlowHandoffTests
     [TestMethod]
     public async Task ReturnsOnCallerThread()
     {
-        await using var lease = await PgTestPool.LeaseAsync();
-        await PgTestPool.RunSync(lease.Protocol, "select 1"); // warm
+        var protocol = await PgTestPool.GetProtocolAsync();
+        await PgTestPool.RunSync(protocol, "select 1"); // warm
 
         var beforeId = Environment.CurrentManagedThreadId;
-        await PgTestPool.RunSync(lease.Protocol, "select 1");
+        await PgTestPool.RunSync(protocol, "select 1");
         var afterId = Environment.CurrentManagedThreadId;
 
         Assert.AreEqual(beforeId, afterId,
@@ -183,8 +183,8 @@ public class SyncFlowHandoffTests
     [Ignore("Global TP-counter oracle (counts untracked dispatches) needs a quiet process; run solo when touching sync flow / idle handoff. Not replaceable by a local counter.")]
     public async Task IdlePipeline_DoesNotChurnThreadPool()
     {
-        await using var lease = await PgTestPool.LeaseAsync();
-        await PgTestPool.RunSync(lease.Protocol, "select 1"); // warm
+        var protocol = await PgTestPool.GetProtocolAsync();
+        await PgTestPool.RunSync(protocol, "select 1"); // warm
 
         await Task.Delay(200);
 
@@ -193,7 +193,7 @@ public class SyncFlowHandoffTests
         var ambientDrift = ThreadPool.CompletedWorkItemCount - driftBefore;
 
         var workBefore = ThreadPool.CompletedWorkItemCount;
-        await PgTestPool.RunSync(lease.Protocol, "select 1");
+        await PgTestPool.RunSync(protocol, "select 1");
         var queryWork = ThreadPool.CompletedWorkItemCount - workBefore;
 
         var allowed = ambientDrift + 2;
@@ -209,12 +209,12 @@ public class SyncFlowHandoffTests
     [TestMethod]
     public async Task RepeatedSync_StaysOnCallerThread()
     {
-        await using var lease = await PgTestPool.LeaseAsync();
+        var protocol = await PgTestPool.GetProtocolAsync();
         const int iterations = 200;
         var callerThread = Environment.CurrentManagedThreadId;
         for (int i = 0; i < iterations; i++)
         {
-            await PgTestPool.RunSync(lease.Protocol, "select 1");
+            await PgTestPool.RunSync(protocol, "select 1");
             Assert.AreEqual(callerThread, Environment.CurrentManagedThreadId,
                 $"sync flow returned on a different thread at iteration {i}");
         }
@@ -227,58 +227,50 @@ public class SyncFlowHandoffTests
     [TestMethod]
     public async Task ConcurrentSync_AcrossProtocols_AllComplete()
     {
-        const int concurrency = 8;
-        var leases = new PgTestPool.Lease[concurrency];
-        var leased = 0;
-        try
-        {
-            for (int i = 0; i < concurrency; i++)
-            {
-                leases[i] = await PgTestPool.LeaseAsync();
-                leased++;
-                await PgTestPool.RunSync(leases[i].Protocol, "select 1"); // warm (awaited => protocols quiescent)
-            }
+        var concurrency = Math.Min(PgTestPool.MaxConnections, 8);
+        var protocols = new PgClientProtocol[concurrency];
+        for (int i = 0; i < concurrency; i++)
+            protocols[i] = await PgTestPool.GetProtocolAsync();
 
-            var threads = new Thread[concurrency];
-            var exceptions = new Exception?[concurrency];
-            var progress = new int[concurrency];
-            for (int i = 0; i < concurrency; i++)
+        for (int i = 0; i < concurrency; i++)
+        {
+            await PgTestPool.RunSync(protocols[i], "select 1"); // warm (awaited => protocols quiescent)
+        }
+
+        var threads = new Thread[concurrency];
+        var exceptions = new Exception?[concurrency];
+        var progress = new int[concurrency];
+        for (int i = 0; i < concurrency; i++)
+        {
+            int idx = i;
+            threads[i] = new Thread(() =>
             {
-                int idx = i;
-                threads[i] = new Thread(() =>
+                try
                 {
-                    try
+                    for (int j = 0; j < 20; j++)
                     {
-                        for (int j = 0; j < 20; j++)
-                        {
-                            Volatile.Write(ref progress[idx], j);
-                            PgTestPool.RunSync(leases[idx].Protocol, "select 1").GetAwaiter().GetResult();
-                        }
-                        Volatile.Write(ref progress[idx], 20);
+                        Volatile.Write(ref progress[idx], j);
+                        PgTestPool.RunSync(protocols[idx], "select 1").GetAwaiter().GetResult();
                     }
-                    catch (Exception ex) { exceptions[idx] = ex; }
-                });
-                threads[i].IsBackground = true;
-            }
-
-            foreach (var t in threads) t.Start();
-            foreach (var t in threads)
-            {
-                if (t.Join(TimeSpan.FromSeconds(30)))
-                    continue;
-                var diag = string.Join("\n", leases.Take(leased).Select((l, i) =>
-                    $"protocol {i}: progress={Volatile.Read(ref progress[i])}/20"));
-                Assert.Fail($"thread timed out\n{diag}");
-            }
-
-            for (int i = 0; i < concurrency; i++)
-                Assert.IsNull(exceptions[i], $"thread {i} threw: {exceptions[i]}");
+                    Volatile.Write(ref progress[idx], 20);
+                }
+                catch (Exception ex) { exceptions[idx] = ex; }
+            });
+            threads[i].IsBackground = true;
         }
-        finally
+
+        foreach (var t in threads) t.Start();
+        foreach (var t in threads)
         {
-            for (int i = 0; i < leased; i++)
-                await leases[i].DisposeAsync();
+            if (t.Join(TimeSpan.FromSeconds(30)))
+                continue;
+            var diag = string.Join("\n", protocols.Select((_, i) =>
+                $"protocol {i}: progress={Volatile.Read(ref progress[i])}/20"));
+            Assert.Fail($"thread timed out\n{diag}");
         }
+
+        for (int i = 0; i < concurrency; i++)
+            Assert.IsNull(exceptions[i], $"thread {i} threw: {exceptions[i]}");
     }
 
 
@@ -292,8 +284,8 @@ public class SyncFlowHandoffTests
     [TestMethod]
     public async Task ConcurrentSync_SameProtocol_EachReturnsOnItsOwnThread()
     {
-        await using var lease = await PgTestPool.LeaseAsync();
-        await PgTestPool.RunSync(lease.Protocol, "select 1"); // warm
+        var protocol = await PgTestPool.GetProtocolAsync();
+        await PgTestPool.RunSync(protocol, "select 1"); // warm
 
         const int concurrency = 8;
         const int iterations = 25;
@@ -316,7 +308,7 @@ public class SyncFlowHandoffTests
                     {
                         // Drive the synchronous handoff inline on THIS thread. RunSync's MoveNext
                         // loop is the takeover; it must return on the thread that called it.
-                        PgTestPool.RunSync(lease.Protocol, "select 1").GetAwaiter().GetResult();
+                        PgTestPool.RunSync(protocol, "select 1").GetAwaiter().GetResult();
                         if (Environment.CurrentManagedThreadId != ownThread)
                             mismatches[idx]++;
                     }
@@ -356,8 +348,7 @@ public class SyncFlowHandoffTests
     [TestMethod]
     public async Task MixedSyncAsync_SameProtocol_SyncReturnsOnOwnThreadAndAllComplete()
     {
-        await using var lease = await PgTestPool.LeaseAsync();
-        var protocol = lease.Protocol;
+        var protocol = await PgTestPool.GetProtocolAsync();
         await PgTestPool.RunSync(protocol, "select 1"); // warm
 
         const int syncThreads = 4;
@@ -469,8 +460,7 @@ public class SyncFlowHandoffTests
     [TestMethod]
     public async Task SyncFlow_DoesNotJumpAheadOfEarlierAsync_ExecutionOrderIsFifo()
     {
-        await using var lease = await PgTestPool.LeaseAsync();
-        var protocol = lease.Protocol;
+        var protocol = await PgTestPool.GetProtocolAsync();
         await PgTestPool.RunSync(protocol, "create temp sequence exec_rank");
 
         const int blocks = 50;
@@ -532,8 +522,7 @@ public class SyncFlowHandoffTests
     [TestMethod]
     public async Task ConcurrentSync_SameProtocol_EachThreadDrivesItsOwnFlow()
     {
-        await using var lease = await PgTestPool.LeaseAsync();
-        var protocol = lease.Protocol;
+        var protocol = await PgTestPool.GetProtocolAsync();
         await PgTestPool.RunSync(protocol, "select 1"); // warm
 
         const int concurrency = 8;

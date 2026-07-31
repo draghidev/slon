@@ -65,9 +65,9 @@ public class ExclusiveAccessFlowStressTests
     [TestMethod]
     public async Task Stress_RepeatedScopes_Reuse()
     {
-        await using var lease = await PgTestPool.LeaseAsync();
+        var protocol = await PgTestPool.GetProtocolAsync();
         for (int i = 0; i < Iterations; i++)
-            await Capped(RunScopeAsync(lease.Protocol), $"RepeatedScopes iter {i}");
+            await Capped(RunScopeAsync(protocol), $"RepeatedScopes iter {i}");
     }
 
     // Many commands within one scope, drained one-at-a-time (the consumer-driven read contract):
@@ -75,10 +75,10 @@ public class ExclusiveAccessFlowStressTests
     [TestMethod]
     public async Task Stress_ManyCommands_WithinScope()
     {
-        await using var lease = await PgTestPool.LeaseAsync();
+        var protocol = await PgTestPool.GetProtocolAsync();
         var iters = Math.Max(1, Iterations / 10);
         for (int i = 0; i < iters; i++)
-            await Capped(RunManyCommandsScopeAsync(lease.Protocol), $"ManyCommands iter {i}");
+            await Capped(RunManyCommandsScopeAsync(protocol), $"ManyCommands iter {i}");
     }
 
     // Sync subflow inside a scope: fires the RECURSIVE handoff (EnqueueSyncWithHandoff on the inner
@@ -86,40 +86,32 @@ public class ExclusiveAccessFlowStressTests
     [TestMethod]
     public async Task Stress_SyncSubflow_RecursiveHandoff()
     {
-        await using var lease = await PgTestPool.LeaseAsync();
+        var protocol = await PgTestPool.GetProtocolAsync();
         var iters = Math.Max(1, Iterations / 2);
         for (int i = 0; i < iters; i++)
-            await Capped(RunSyncSubflowScopeAsync(lease.Protocol), $"SyncSubflow iter {i}");
+            await Capped(RunSyncSubflowScopeAsync(protocol), $"SyncSubflow iter {i}");
     }
 
     // N protocols each running scopes concurrently: per-protocol isolation + concurrent takeovers.
     [TestMethod]
     public async Task Stress_ConcurrentScopes_AcrossProtocols()
     {
-        const int concurrency = 8;
+        var concurrency = Math.Min(PgTestPool.MaxConnections, 8);
         var perThread = Math.Max(1, Iterations / concurrency);
-        var leases = new PgTestPool.Lease[concurrency];
-        var leased = 0;
-        try
+        var protocols = new PgClientProtocol[concurrency];
+        for (int i = 0; i < concurrency; i++)
+            protocols[i] = await PgTestPool.GetProtocolAsync();
+        var tasks = new Task[concurrency];
+        for (int i = 0; i < concurrency; i++)
         {
-            for (int i = 0; i < concurrency; i++) { leases[i] = await PgTestPool.LeaseAsync(); leased++; }
-            var tasks = new Task[concurrency];
-            for (int i = 0; i < concurrency; i++)
+            var protocol = protocols[i];
+            var p = i;
+            tasks[i] = Task.Run(async () =>
             {
-                var protocol = leases[i].Protocol;
-                var p = i;
-                tasks[i] = Task.Run(async () =>
-                {
-                    for (int j = 0; j < perThread; j++)
-                        await Capped(RunScopeAsync(protocol), $"ConcurrentScopes p{p} iter {j}");
-                });
-            }
-            await Task.WhenAll(tasks);
+                for (int j = 0; j < perThread; j++)
+                    await Capped(RunScopeAsync(protocol), $"ConcurrentScopes p{p} iter {j}");
+            });
         }
-        finally
-        {
-            for (int i = 0; i < leased; i++)
-                await leases[i].DisposeAsync();
-        }
+        await Task.WhenAll(tasks);
     }
 }

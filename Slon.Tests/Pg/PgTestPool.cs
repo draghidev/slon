@@ -26,9 +26,12 @@ static class PgTestPool
 {
     // Core count by default - matches the pool's internal per-core striping, and with the test workers
     // contending it still drives multiplexing while leaving headroom so exclusive-scope holders don't
-    // starve. Override via PG_TEST_POOL_MAX for a deliberate soak or a tighter pipelining squeeze.
-    static readonly int MaxConnections =
-        int.TryParse(Environment.GetEnvironmentVariable("PG_TEST_POOL_MAX"), out var m) && m > 0 ? m : Environment.ProcessorCount;
+    // starve. Keep at least two connections so the across-protocol tests retain that coverage on
+    // single-core machines. Override via PG_TEST_POOL_MAX for a deliberate soak or tighter pressure.
+    internal static readonly int MaxConnections = Math.Max(2,
+        int.TryParse(Environment.GetEnvironmentVariable("PG_TEST_POOL_MAX"), out var m) && m > 0
+            ? m
+            : Environment.ProcessorCount);
     static readonly TimeSpan LeaseTimeout = TimeSpan.FromSeconds(30);
 
     static readonly ConnectionPool<PooledProtocol> _pool =
@@ -42,17 +45,17 @@ static class PgTestPool
         Database = "postgres",
     };
 
-    // Lease a clean protocol from the bounded shared pool. Use ONLY in tests that complete their flows
-    // cleanly. The protocol's busy-to-idle transition returns it to the pool.
-    internal static async ValueTask<Lease> LeaseAsync()
+    // Select an available protocol from the bounded shared pool. Selection consumes its availability
+    // publication; completing the caller's work publishes it again. Use only for work that retires cleanly.
+    internal static async ValueTask<PgClientProtocol> GetProtocolAsync()
     {
         try
         {
-            return new(await _pool.GetAsync(LeaseTimeout).ConfigureAwait(false));
+            return (await _pool.GetAsync(LeaseTimeout).ConfigureAwait(false)).Protocol;
         }
         catch (TimeoutException ex)
         {
-            // Self-classifying: a lease timeout without the slot census is undiagnosable after the
+            // Self-classifying: an acquisition timeout without the slot census is undiagnosable after the
             // fact (which state starved the rent - unschedulable conns, dead futures, non-idle?).
             throw new TimeoutException($"{ex.Message} [slots: {_pool.DescribeSlots()}]", ex);
         }
@@ -123,17 +126,9 @@ static class PgTestPool
     // [AssemblyCleanup] sweeps every helper pool.
     internal static async Task DrainAsync() => await _pool.DisposeAsync();
 
-    internal readonly struct Lease : IAsyncDisposable
-    {
-        readonly PooledProtocol _conn;
-        internal Lease(PooledProtocol conn) => _conn = conn;
-        public PgClientProtocol Protocol => _conn.Protocol;
-        public ValueTask DisposeAsync() => default;
-    }
-
     // Thin IPoolConnection<T> over a bare protocol - the test-pool analogue of PgConnection's pool-unit
     // wiring. Mirrors its Start gate: the protocol's idle signal is suppressed until the pool has committed
-    // the lease (Start), so a depth-0 transition during startup can't publish the wire before it is owned.
+    // admission (Start), so a depth-0 transition during startup can't publish the wire before it is owned.
     internal sealed class PooledProtocol : IPoolConnection<PooledProtocol>
     {
         int _started;
@@ -194,7 +189,7 @@ static class PgTestPool
     sealed class Factory : IPoolConnectionFactory<PooledProtocol>
     {
         public PooledProtocol Create(ConnectionPoolContext<PooledProtocol> poolContext, TimeSpan timeout = default)
-            => throw new NotSupportedException("PgTestPool leases asynchronously.");
+            => throw new NotSupportedException("PgTestPool opens protocols asynchronously.");
 
         public ValueTask<PooledProtocol> CreateAsync(ConnectionPoolContext<PooledProtocol> poolContext, CancellationToken cancellationToken = default)
             => PooledProtocol.CreateAsync(NewOptions(), poolContext, cancellationToken);

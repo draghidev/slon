@@ -28,8 +28,8 @@ public class ExclusiveAccessFlowTests
     [TestMethod]
     public async Task Scope_RoundTrip_RunsCommandOnInnerPipeline()
     {
-        await using var lease = await PgTestPool.LeaseAsync();
-        var scope = lease.Protocol.BeginExclusiveScope(async: true);
+        var protocol = await PgTestPool.GetProtocolAsync();
+        var scope = protocol.BeginExclusiveScope(async: true);
         await scope.HandoffReady;   // acquired exclusive access; the flow owns the wire
 
         var cmd = scope.Queue(new CommandFlow(async: true, Command.Create("select 1")));
@@ -41,8 +41,8 @@ public class ExclusiveAccessFlowTests
     [TestMethod]
     public async Task Scope_MultipleCommands_RunSequentially()
     {
-        await using var lease = await PgTestPool.LeaseAsync();
-        var scope = lease.Protocol.BeginExclusiveScope(async: true);
+        var protocol = await PgTestPool.GetProtocolAsync();
+        var scope = protocol.BeginExclusiveScope(async: true);
         await scope.HandoffReady;
 
         for (int i = 0; i < 5; i++)
@@ -54,10 +54,10 @@ public class ExclusiveAccessFlowTests
     [TestMethod]
     public async Task Scope_FlyweightReuse_AcrossScopes()
     {
-        await using var lease = await PgTestPool.LeaseAsync();
+        var protocol = await PgTestPool.GetProtocolAsync();
         for (int i = 0; i < 3; i++)
         {
-            var scope = lease.Protocol.BeginExclusiveScope(async: true);
+            var scope = protocol.BeginExclusiveScope(async: true);
             await scope.HandoffReady;
             await DrainAsync(scope.Queue(new CommandFlow(async: true, Command.Create("select 1"))));
             await scope.CompleteScopeAsync();
@@ -147,8 +147,7 @@ public class ExclusiveAccessFlowTests
     [TestMethod]
     public async Task Scope_Release_WithOpenTransaction_FailsAndRecoversWire()
     {
-        await using var lease = await PgTestPool.LeaseAsync();
-        var protocol = lease.Protocol;
+        var protocol = await PgTestPool.GetProtocolAsync();
         var scope = protocol.BeginExclusiveScope(async: true);
         await scope.HandoffReady;
 
@@ -275,10 +274,8 @@ public class ExclusiveAccessFlowTests
     [TestMethod]
     public async Task SqlErrorSubflow_InScope_ResyncsAndScopeStaysUsable()
     {
-        // Input-caused SQL error, scope stays usable (resyncs to RFQ) - so this leases from the shared
-        // pool rather than burning an isolated connection.
-        await using var lease = await PgTestPool.LeaseAsync();
-        var protocol = lease.Protocol;
+        // Input-caused SQL error, scope stays usable (resyncs to RFQ), so use the shared pool.
+        var protocol = await PgTestPool.GetProtocolAsync();
         {
             var scope = protocol.BeginExclusiveScope(async: true);
             await scope.HandoffReady;
@@ -315,8 +312,8 @@ public class ExclusiveAccessFlowTests
     [TestMethod]
     public async Task PipelinedSubflows_InScope_InnerSourceEscalatesAndPipelines()
     {
-        await using var lease = await PgTestPool.LeaseAsync();
-        var scope = lease.Protocol.BeginExclusiveScope(async: true);
+        var protocol = await PgTestPool.GetProtocolAsync();
+        var scope = protocol.BeginExclusiveScope(async: true);
         await scope.HandoffReady;
 
         const int batch = 8;
@@ -342,8 +339,7 @@ public class ExclusiveAccessFlowTests
     [Ignore("Per-thread allocation oracle needs a quiet process; run solo when touching the exclusive-scope flyweight. A concurrent test's allocations pollute GC.GetAllocatedBytesForCurrentThread.")]
     public async Task Scope_RepeatedCycles_NoPerCycleScopeSignalAlloc()
     {
-        await using var lease = await PgTestPool.LeaseAsync();
-        var protocol = lease.Protocol;
+        var protocol = await PgTestPool.GetProtocolAsync();
 
         async Task Cycle()
         {

@@ -1,3 +1,5 @@
+using Slon.Tests.Pg;
+
 namespace Slon.Tests;
 
 // Assembly-scoped SlonDataSource for ADO-layer tests that complete cleanly with the default
@@ -8,16 +10,15 @@ static class AdoTestPool
 {
     static readonly SlonDataSource _shared = new(NewOptions());
 
-    // MaxPoolSize deliberately small so concurrent test methods compete for wires and exercise
-    // the multiplexing / pipelining machinery under contention. Larger pool would dilute the
-    // pressure into one-wire-per-method and hide real concurrent-dispatch bugs.
+    // Match the low-level test pool so worker and connection pressure stay consistent across both
+    // surfaces. PG_TEST_POOL_MAX can tighten both pools for deliberate multiplexing stress.
     internal static SlonDataSourceOptions NewOptions() => new()
     {
         EndPoint = TestEndPoint.Default,
         Username = "postgres",
         Password = "postgres123",
         Database = "postgres",
-        MaxPoolSize = 4,
+        MaxPoolSize = PgTestPool.MaxConnections,
         HeartbeatInterval = TimeSpan.FromSeconds(1),
         MaintenanceInterval = TimeSpan.FromSeconds(1),
     };

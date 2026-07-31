@@ -32,8 +32,7 @@ public class CommandUserCancellationTests
     [TestMethod]
     public async Task UserCt_PreFired_FirstMoveNextSurfacesOce()
     {
-        await using var lease = await PgTestPool.LeaseAsync();
-        var protocol = lease.Protocol;
+        var protocol = await PgTestPool.GetProtocolAsync();
 
         var flow = new CommandFlow(async: true,
             Command.Create("select generate_series(1, 50)"),
@@ -55,8 +54,7 @@ public class CommandUserCancellationTests
     [TestMethod]
     public async Task UserCt_FiresAfterFirstResult_NextMoveNextSurfacesOce_ProtocolUsable()
     {
-        await using var lease = await PgTestPool.LeaseAsync();
-        var protocol = lease.Protocol;
+        var protocol = await PgTestPool.GetProtocolAsync();
 
         var flow = new CommandFlow(async: true,
             Command.Create("select 'one'"),
@@ -85,8 +83,7 @@ public class CommandUserCancellationTests
     {
         await using var blocker = await PgAdvisoryLock.AcquireAsync();
 
-        await using var lease = await PgTestPool.LeaseAsync();
-        var protocol = lease.Protocol;
+        var protocol = await PgTestPool.GetProtocolAsync();
 
         var flow = new CommandFlow(async: true,
             Command.Create("select 1") with { WithSync = true },

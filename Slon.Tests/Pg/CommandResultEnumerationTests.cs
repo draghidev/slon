@@ -10,8 +10,8 @@ public class CommandResultEnumerationTests
     [TestMethod]
     public async Task AsyncFlow_CanSwitchToSynchronousResultAdvancement()
     {
-        await using var lease = await PgTestPool.LeaseAsync();
-        var flow = lease.Protocol.Queue(new CommandFlow(async: true,
+        var protocol = await PgTestPool.GetProtocolAsync();
+        var flow = protocol.Queue(new CommandFlow(async: true,
             Command.Create("select 1"), Command.Create("select 2")));
         var e = flow.GetAsyncEnumerator();
 
@@ -26,8 +26,8 @@ public class CommandResultEnumerationTests
     [TestMethod]
     public async Task SuppressedResults_AreDrainedButNotPublished()
     {
-        await using var lease = await PgTestPool.LeaseAsync();
-        var flow = lease.Protocol.Queue(new CommandFlow(async: true,
+        var protocol = await PgTestPool.GetProtocolAsync();
+        var flow = protocol.Queue(new CommandFlow(async: true,
             Command.Create("select 1") with { SuppressEnumeration = true },
             Command.Create("select 2"),
             Command.Create("select 3") with { SuppressEnumeration = true },
@@ -47,8 +47,8 @@ public class CommandResultEnumerationTests
     [TestMethod]
     public async Task SuppressedResult_ErrorStillFaultsTheFlow()
     {
-        await using var lease = await PgTestPool.LeaseAsync();
-        var flow = lease.Protocol.Queue(new CommandFlow(async: true,
+        var protocol = await PgTestPool.GetProtocolAsync();
+        var flow = protocol.Queue(new CommandFlow(async: true,
             Command.Create("select 1") with { WithSync = true },
             Command.Create("SLECT 2") with { SuppressEnumeration = true, WithSync = true },
             Command.Create("select 3") with { WithSync = true }));
