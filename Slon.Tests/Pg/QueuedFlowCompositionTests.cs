@@ -63,4 +63,18 @@ public class QueuedFlowCompositionTests
         await scope.CompleteScopeAsync();
     }
 
+    [TestMethod]
+    public async Task SyncFlows_AroundExclusiveScope_QueueBeforeDrain()
+    {
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
+
+        var predecessor = protocol.Queue(new CommandFlow(async: false, Command.Create("select 1")));
+        var scope = protocol.BeginExclusiveScope(async: true);
+        var successor = protocol.Queue(new CommandFlow(async: false, Command.Create("select 2")));
+
+        await DrainExpecting(predecessor, async: false, expectedResults: 1);
+        await scope.HandoffReady;
+        await scope.CompleteScopeAsync();
+        await DrainExpecting(successor, async: false, expectedResults: 1);
+    }
 }

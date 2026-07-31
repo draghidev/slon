@@ -24,6 +24,8 @@ readonly struct CommandFlowOptions
 
 sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSource<FlowCallerInteractionCoreResult>, IValueTaskSource
 {
+    internal override bool DefersSyncHandoff => true;
+
     enum CancellationScope : byte
     {
         None,
@@ -1208,6 +1210,11 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
         {
             if (flow is null)
                 return false;
+
+            // Queueing only established FIFO position. This is the first point at which the caller
+            // is ready to take the source pump and drive the synchronous body.
+            if (!flow._consumerAdvanced && !flow.IsAsyncAtBind)
+                flow.WaitForSyncHandoff();
 
             var takeOverAsyncGate = false;
 

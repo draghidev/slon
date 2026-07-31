@@ -117,7 +117,13 @@ sealed class ExclusiveAccessFlow : PgClientFlow
             innerSource.Enqueue(subflow, inlineEligible).Execute(runContinuationsAsynchronously: false);
         }
         else
-            innerSource.EnqueueSyncWithHandoff(subflow);
+        {
+            innerSource.EnqueueSyncWaiter(subflow);
+            if (subflow.DefersSyncHandoff)
+                innerSource.SignalExecutor();
+            else
+                innerSource.WaitForExecutor(subflow);
+        }
         return subflow;
     }
 

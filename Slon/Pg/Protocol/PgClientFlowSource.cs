@@ -32,19 +32,8 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
         return new(_state, inlineEligible);
     }
 
-    /// Synchronously enqueues a sync-mode flow and blocks until the executor processes it on the
-    /// caller's thread, which drives the rendezvous and the body. No TP work item at any point.
-    /// The flow keeps its FIFO position until the executor holds it for this caller. The caller then
-    /// claims the reserved wait and drives one turn inline; the wake driver serializes concurrent
-    /// notifications and transfers any trailing work to the scheduler.
-    // Combined sync handoff for callers without an outer enqueue lock (the exclusive scope's inner
-    // source, a single sync producer): append at the FIFO tail and run the blocking rendezvous.
-    public void EnqueueSyncWithHandoff(PgClientFlow flow)
-        => WaitForExecutor(EnqueueSyncWaiter(flow));
-
-    // Two-phase split for callers that enqueue under an outer lock (TryQueueFlow under _syncRoot):
-    // EnqueueSyncWaiter appends the flow under the lock (FIFO order), WaitForExecutor runs the blocking
-    // rendezvous (parking on the flow's own handoff MRES) OUTSIDE it.
+    /// Publishes a sync flow at its FIFO position. The caller separately chooses when to take the
+    /// blocking handoff.
     public PgClientFlow EnqueueSyncWaiter(PgClientFlow flow)
     {
         if (Volatile.Read(ref _state.IsCompleted))
@@ -53,6 +42,9 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
     }
 
     public void WaitForExecutor(PgClientFlow flow) => _state.WaitForExecutor(flow);
+
+    // Wake the executor after publishing a sync flow. Its consumer claims the held head later.
+    internal void SignalExecutor() => _state.WakeDriver.Drive(runContinuationsAsynchronously: true);
 
     // Drain the inert head of the source: items enqueued but never picked up by the executor.
     // CompleteAsync only sees dispatched flows, so anything still in the SPSC queue needs separate
@@ -224,9 +216,7 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
             WakeDriver.Drive(runContinuationsAsynchronously: true);
         }
 
-        // Phase 1 of the sync handoff, under the protocol's _syncRoot: enqueue the sync flow at its real
-        // FIFO position in the one queue (no priority slot, no wait-node - the flow IS its own waiter via
-        // GetHandoffMres). Returns the flow for the out-of-lock rendezvous.
+        // Publish the flow at its real FIFO position. Its handoff event is also its wait node.
         public PgClientFlow EnqueueSyncWaiter(PgClientFlow flow)
         {
             // Capture the routing async-mode (sync here) as the flow's stable bind snapshot BEFORE it is
@@ -238,8 +228,7 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
             return flow;
         }
 
-        // Phase 2, OUTSIDE the lock (blocks): drive the executor to this flow's FIFO turn and take it
-        // over so the body runs on the caller's thread. Parks on the flow's OWN handoff MRES.
+        // Drive the executor to this flow's turn and take it over on the caller's thread.
         public void WaitForExecutor(PgClientFlow flow)
         {
             var wakeDriver = WakeDriver;

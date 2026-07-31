@@ -363,6 +363,8 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         // Bind
         var control = flow.GetExecutionControl(FlowControl);
         control.Bind(_options.FlowActivationTimeout);
+        if (flow.NeedsSyncHandoff && flow.DefersSyncHandoff)
+            _source.SignalExecutor();
         if (_scoringEnabled && !control.IsPipelined)
             Interlocked.Increment(ref _pipelineStalls);
 
@@ -394,12 +396,14 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
                 _source.EnqueueSyncWaiter(flow);
         }
 
-        if (!handoff)
-            enqueue.Execute(runContinuationsAsynchronously: false);
-        else
-            _source.WaitForExecutor(flow);
         var control = flow.GetExecutionControl(FlowControl);
         control.Bind(_options.FlowActivationTimeout);
+        if (!handoff)
+            enqueue.Execute(runContinuationsAsynchronously: false);
+        else if (flow.DefersSyncHandoff)
+            _source.SignalExecutor();
+        else
+            _source.WaitForExecutor(flow);
         if (_scoringEnabled && !control.IsPipelined)
             Interlocked.Increment(ref _pipelineStalls);
         return true;
@@ -481,9 +485,8 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
     bool TryQueueFlow(PgClientFlow flow, ProtocolStatus requiredStatus) => TryQueueFlow<bool>(flow, requiredStatus);
     bool TryQueueFlow<TState>(PgClientFlow flow, ProtocolStatus requiredStatus, Func<TState, bool>? predicate = null, TState state = default!)
     {
-        // Handoff only when a caller is parked to take the flow over (NeedsSyncHandoff): an async flow,
-        // or an autonomous sync flow (null handoff MRES, no waiter), takes the dispatch path so the
-        // executor drives it rather than holding it for a caller that never comes.
+        // A handoff-capable sync flow is held at its FIFO turn. Consumer-driven flows defer the
+        // handoff; self-driven flows take it as part of admission.
         var handoff = flow.NeedsSyncHandoff;
         PgClientFlowSource.EnqueueResult enqueue = default;
         lock (_syncRoot)
@@ -498,9 +501,8 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
 
             // Both modes write the SPSC storage, so the enqueue must serialize with concurrent
             // same-protocol producers (single-producer contract). The sync flow goes in at its real FIFO
-            // position (it IS its own waiter via GetHandoffMres); its blocking rendezvous runs OUTSIDE the
-            // lock (WaitForExecutor). Depth is counted at dispatch (executor-single-writer), so there is no
-            // producer-side increment to serialize.
+            // position; any blocking handoff happens outside the lock. Depth is counted at dispatch
+            // (executor-single-writer), so producers do not update it.
             if (!handoff)
                 enqueue = _source.Enqueue(flow, inlineEligible: _pipeline.Depth == 0 && _source.Backlog == 0);
             else
@@ -508,7 +510,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         }
         if (!handoff)
             enqueue.Execute(runContinuationsAsynchronously: false);
-        else
+        else if (!flow.DefersSyncHandoff)
             _source.WaitForExecutor(flow);
         return true;
     }
@@ -1142,6 +1144,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         public void BindSource(PgClientFlowSource source) => _source = source;
         public bool HasQueuedFlow => _source.Backlog != 0;
         public bool IsInlineDrive => _source.IsInlineDrive;
+        internal void WaitForSyncHandoff(PgClientFlow flow) => _source.WaitForExecutor(flow);
         // Cancellation needs a proof-quality idle level; the slot reads are deliberately stale-tolerant.
         bool _isIdle = true;
         public bool IsIdle => Volatile.Read(ref _isIdle);
