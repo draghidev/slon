@@ -1298,10 +1298,8 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
 
                     try
                     {
-                        if (newEncoding == "SQL_ASCII")
-                            protocol._protocolDataWriter.ClientEncoding = protocol._options.DefaultClientEncoding;
-
-                        protocol._protocolDataWriter.ClientEncoding = Encoding.GetEncoding(newEncoding);
+                        protocol._protocolDataWriter.ClientEncoding = ResolveClientEncoding(
+                            newEncoding, protocol._options.DefaultClientEncoding);
                     }
                     catch (ArgumentException ex)
                     {
@@ -1323,6 +1321,9 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
                 break;
             }
         }
+
+        internal static Encoding ResolveClientEncoding(string encodingName, Encoding defaultEncoding)
+            => encodingName == "SQL_ASCII" ? defaultEncoding : Encoding.GetEncoding(encodingName);
 
         // Connection-wide transaction-state bookkeeping. Routes to the single protocol field (NOT a
         // per-Control copy) so inner-scope and outer flows keep one consistent view of the one wire.
