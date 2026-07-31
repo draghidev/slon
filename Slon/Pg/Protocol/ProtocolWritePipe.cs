@@ -61,7 +61,7 @@ sealed class ProtocolWritePipe(IOutputWriter writer, Encoding clientEncoding, Ac
 
     // Buffered bytes above which a flush is forced rather than deferred. Sized to ~one MTU so a forced
     // flush maps to roughly a single segment. Single source of truth: the encoder's in-flow deferral
-    // (PgEncoder.CanDelayFlush) and the source's arm gate (PgClientFlowSource) both key off it.
+    // (PgEncoder.CanDeferFlush) and the source's arm gate (PgClientFlowSource) both key off it.
     internal const long UnflushedBytesFlushThreshold = 1000;
 
     // Validates the previous message, arms length tracking for the new one, then writes its

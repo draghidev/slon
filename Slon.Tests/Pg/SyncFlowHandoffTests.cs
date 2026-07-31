@@ -23,7 +23,7 @@ public class SyncFlowHandoffTests
 
     sealed class AutonomousSyncFlow : PgClientFlow
     {
-        public AutonomousSyncFlow() : base(supportsPipelining: false) => IsAsync = false;
+        public AutonomousSyncFlow() => IsAsync = false;
 
         protected override ValueTask<FlowTasks> ExecuteAuto(Context context) => new(new FlowTasks());
     }

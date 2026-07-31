@@ -36,7 +36,8 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
         control!.Activate(this);
     }
 
-    readonly bool _supportsPipelining;
+    readonly bool _supportsDeferredFlush;
+    internal bool SupportsDeferredFlush => _supportsDeferredFlush;
     Action<TimeSpan>? _decoderOnHeartbeatAction; // TODO should we have this here?
     int _rfqCount;
     int _cancellationWindow;
@@ -136,9 +137,14 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
         control.WaitForSyncHandoff(this);
     }
 
-    protected PgClientFlow(bool supportsPipelining)
+    /// <param name="supportsDeferredFlush">
+    /// Permits predecessor writes to remain buffered while this flow executes its first phase. Set
+    /// only when that phase will not wait for decoder input. Decoder work must live in the returned
+    /// pipeline task. The conservative default flushes before execution.
+    /// </param>
+    protected PgClientFlow(bool supportsDeferredFlush = false)
     {
-        _supportsPipelining = supportsPipelining;
+        _supportsDeferredFlush = supportsDeferredFlush;
         _activationTaskSource.CanCompleteConcurrently = true;
         _completionCore.CanCompleteConcurrently = true;
     }
@@ -472,8 +478,8 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
     {
         internal PgClientFlow Flow => flow;
 
-        // Any sync flow causes pipeline stalls (blocks execution loop until decoder is available) so effectively can't pipeline.
-        public bool IsPipelined => flow is { _supportsPipelining: true, _isAsyncAtBind: true };
+        public bool SupportsDeferredFlush => flow is { _supportsDeferredFlush: true, _isAsyncAtBind: true };
+        public bool StallsPipeline => !SupportsDeferredFlush;
         public bool IsAsync => flow.IsAsync;
         public bool HasQueuedFlow => control.HasQueuedFlow;
         public bool IsInlineDrive => control.IsInlineDrive;

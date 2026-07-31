@@ -15,7 +15,7 @@ public class CommandUserCancellationTests
     {
         readonly Action _onExecute;
 
-        public AdmissionProbeFlow(Action onExecute) : base(supportsPipelining: true)
+        public AdmissionProbeFlow(Action onExecute) : base(supportsDeferredFlush: true)
         {
             _onExecute = onExecute;
             IsAsync = true;

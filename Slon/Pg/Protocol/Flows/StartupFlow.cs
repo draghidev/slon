@@ -25,7 +25,7 @@ sealed class StartupFlow : PgClientFlow
     internal int BackendProcessId { get; private set; }
     internal int BackendSecretKey { get; private set; }
 
-    public StartupFlow(bool async, PgClientOptions options, TimeSpan startupTimeout = default) : base(supportsPipelining: false)
+    public StartupFlow(bool async, PgClientOptions options, TimeSpan startupTimeout = default)
     {
         _options = options;
         _startupTimeout = startupTimeout;

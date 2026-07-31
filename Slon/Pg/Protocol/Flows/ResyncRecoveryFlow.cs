@@ -65,7 +65,7 @@ sealed class ResyncRecoveryFlow : PgClientFlow
         bool canWriteSync,
         bool canWrite)
     {
-        var recovery = new ResyncRecoveryFlow(supportsPipelining: true) { IsAsync = failedFlow.IsAsyncAtBind };
+        var recovery = new ResyncRecoveryFlow { IsAsync = failedFlow.IsAsyncAtBind };
         recovery.GetExecutionControl(control).TransferInheritedRfqCount(inheritedRfqCount);
         recovery._control = control;
         recovery.FailedFlow = failedFlow;
@@ -83,7 +83,7 @@ sealed class ResyncRecoveryFlow : PgClientFlow
         return recovery;
     }
 
-    ResyncRecoveryFlow(bool supportsPipelining) : base(supportsPipelining) { }
+    ResyncRecoveryFlow() : base(supportsDeferredFlush: true) { }
 
     public new void Reset()
     {

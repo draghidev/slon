@@ -26,7 +26,6 @@ sealed class ExclusiveAccessFlow : PgClientFlow
     ManualResetEventSlim? _handoffMres;
 
     internal ExclusiveAccessFlow(PgClientProtocol protocol, PgClientProtocol.Control innerControl, PgClientProtocol.ExclusiveScopeState state, Func<Exception?, ValueTask> completeInner)
-        : base(supportsPipelining: false)
     {
         _protocol = protocol;
         _innerControl = innerControl;

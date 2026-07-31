@@ -125,7 +125,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
 
     ValueTask<bool> EnumeratorMoveNextTask => new(this, _enumeratorMoveNextTaskSource.Version);
 
-    CommandFlow() : base(supportsPipelining: true)
+    CommandFlow() : base(supportsDeferredFlush: true)
     {
         _callerInteractionCore.Initialize();
     }

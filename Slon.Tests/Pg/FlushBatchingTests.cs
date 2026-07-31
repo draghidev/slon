@@ -9,7 +9,7 @@ using Slon.Transport;
 namespace Slon.Tests.Pg;
 
 // Pins cross-flow flush batching (write coalescing). Async pipelined writes defer their flush
-// (PgEncoder.CanDelayFlush) and should coalesce into one wire write until the byte threshold - a "conga
+// (PgEncoder.CanDeferFlush) and should coalesce into one wire write until the byte threshold - a "conga
 // line" of P/B/D/E/S—flushed only when the executor genuinely parks. The
 // in-memory transport counts physical flushes (each non-empty FlushAsync = one wire segment). Flows park
 // on their reads (no responses fed), so we measure writes only and tear the protocol down at the end.
@@ -123,6 +123,29 @@ public class FlushBatchingTests
             var flushes = t.Counter.FlushCount - baseFlush;
             Assert.AreEqual(1, flushes,
                 $"{N} concurrent producers, co-queued before execution, produced {flushes} wire segments");
+        }
+        finally
+        {
+            scheduler.Resume();
+            await p.DisposeAsync();
+        }
+    }
+
+    [TestMethod]
+    public async Task NonPipelinedSuccessor_FlushesPipelinedPredecessor()
+    {
+        var (p, t, scheduler) = await CreateAsync();
+        try
+        {
+            var baseFlush = t.Counter.FlushCount;
+            await scheduler.PauseAsync();
+            Assert.IsTrue(p.TryQueue(Cmd()));
+            _ = p.BeginExclusiveScope(async: true);
+
+            scheduler.Resume();
+            await WaitForBytes(t, 1);
+            Assert.AreEqual(1, t.Counter.FlushCount - baseFlush,
+                "the exclusive activation boundary did not flush its pipelined predecessor");
         }
         finally
         {

@@ -19,7 +19,7 @@ sealed class MaintenanceFlow : PgClientFlow
     PgConnection? _connection;
     readonly ValueTaskSourcePromise<bool> _readPromise = new();
 
-    public MaintenanceFlow() : base(supportsPipelining: true)
+    public MaintenanceFlow() : base(supportsDeferredFlush: true)
     {
         IsAsync = true;
     }

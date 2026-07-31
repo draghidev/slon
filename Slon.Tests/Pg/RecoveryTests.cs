@@ -161,7 +161,7 @@ public class RecoveryTests
         public string[]? PipelinedStatements { get; init; }
 
         public FaultingFlow(bool async, FaultPhase phase, WriteShape shape)
-            : base(supportsPipelining: true)
+            : base(supportsDeferredFlush: true)
         {
             _phase = phase;
             _shape = shape;

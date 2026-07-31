@@ -400,10 +400,10 @@ readonly struct PgEncoder
     // Async-path flush deferral. A pipelined async flush isn't followed by a read in the first phase,
     // so it can be delayed when a successor is already queued to contribute another write. An inline
     // producer-driven turn flushes instead: reaching that successor requires returning through the
-    // executor's suspension boundary, making the batching delay counterproductive. The buffer threshold
+    // executor's suspension boundary, making the deferral counterproductive. The buffer threshold
     // still bounds accumulation and applies send-window backpressure. Sync flushes never defer.
-    bool CanDelayFlush
-        => _executionControl.IsPipelined
+    bool CanDeferFlush
+        => _executionControl.SupportsDeferredFlush
             && _executionControl.HasQueuedFlow
             && !_executionControl.IsInlineDrive
             && _writer.UnflushedBytes < ProtocolDataWriter.UnflushedBytesFlushThreshold;
@@ -428,7 +428,7 @@ readonly struct PgEncoder
     public ValueTask FlushAsync(CancellationToken cancellationToken = default)
     {
         _executionControl.ThrowIfCannotWrite();
-        if (CanDelayFlush)
+        if (CanDeferFlush)
             return new();
 
         return _writer.FlushAsync(cancellationToken);

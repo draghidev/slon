@@ -365,7 +365,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         control.Bind(_options.FlowActivationTimeout);
         if (flow.NeedsSyncHandoff && flow.DefersSyncHandoff)
             _source.SignalExecutor();
-        if (_scoringEnabled && !control.IsPipelined)
+        if (_scoringEnabled && control.StallsPipeline)
             Interlocked.Increment(ref _pipelineStalls);
 
         return true;
@@ -404,7 +404,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
             _source.SignalExecutor();
         else
             _source.WaitForExecutor(flow);
-        if (_scoringEnabled && !control.IsPipelined)
+        if (_scoringEnabled && control.StallsPipeline)
             Interlocked.Increment(ref _pipelineStalls);
         return true;
     }
@@ -451,7 +451,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
 
         var control = flow.GetExecutionControl(FlowControl);
         control.Bind(_options.FlowActivationTimeout);
-        if (_scoringEnabled && !control.IsPipelined)
+        if (_scoringEnabled && control.StallsPipeline)
             Interlocked.Increment(ref _pipelineStalls);
         return flow;
     }
@@ -970,11 +970,10 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
             {
                 await control.WaitForCancellationAttempt().ConfigureAwait(false);
 
-                // No cross-item pre-flush: buffered bytes are flushed by the writing flow's own
-                // end-of-write flush once accumulation crosses the writer's threshold (which reads the
-                // shared, cumulative UnflushedBytes), and any sub-threshold remainder is drained by the
-                // source's arm gate / idle flush before the executor parks. A pre-flush here would
-                // re-check the same cumulative bound the source and the flows already enforce.
+                // A flow may defer this flush only when its first phase cannot wait for decoder input.
+                if (!item.SupportsDeferredFlush && control.UnflushedBytes != 0)
+                    await control.FlushAsync(cancellationToken).ConfigureAwait(false);
+
                 var tasks = await control.Execute(item).ConfigureAwait(false);
                 return new PipelineItemResult(tasks.TrailingExecutionTask, tasks.PipelineTask);
             }
@@ -1144,6 +1143,8 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         public void BindSource(PgClientFlowSource source) => _source = source;
         public bool HasQueuedFlow => _source.Backlog != 0;
         public bool IsInlineDrive => _source.IsInlineDrive;
+        public long UnflushedBytes => protocol.UnflushedBytes;
+        public ValueTask FlushAsync(CancellationToken cancellationToken) => protocol.FlushAsync(cancellationToken);
         internal void WaitForSyncHandoff(PgClientFlow flow) => _source.WaitForExecutor(flow);
         // Cancellation needs a proof-quality idle level; the slot reads are deliberately stale-tolerant.
         bool _isIdle = true;
@@ -1405,7 +1406,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
             if (poolFacing && protocol._scoringEnabled)
             {
                 Interlocked.Increment(ref protocol._completionCount);
-                if (!flow.GetExecutionControl(this).IsPipelined)
+                if (flow.GetExecutionControl(this).StallsPipeline)
                     Interlocked.Decrement(ref protocol._pipelineStalls);
             }
 
