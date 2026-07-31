@@ -4,7 +4,7 @@ using Slon.Transport;
 
 namespace Slon.Tests.Pg;
 
-// Write-direction analogue of GatedReplayTransport (StoppingTokenInMemoryRace): accept up to a
+// Write-direction analogue of GatedReplayTransport (StoppingTokenInMemoryTests): accept up to a
 // bounded send window of client bytes, then stall the flush, so a real trailing write task /
 // partial flush is produced. This is the only way to manufacture write backpressure, torn
 // messages, and flush-failure - the cases recovery's wire-takeover model turns on. See

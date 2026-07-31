@@ -7,7 +7,6 @@ namespace Slon.Tests;
 // TEMP table created OUTSIDE the tx (so it survives a rollback), an INSERT inside it, then a DELETE whose
 // affected-row count reveals whether the INSERT persisted (commit) or was discarded (rollback / dispose).
 [TestClass]
-[DoNotParallelize]
 public class ExclusiveScopeTransactionTests
 {
     static async Task<int> Exec(SlonConnection conn, string sql)

@@ -1,5 +1,7 @@
 using System.Buffers.Binary;
 using System.IO.Pipelines;
+using System.Text;
+using Slon.Buffers;
 using Slon.Pg;
 using Slon.Tests;
 using Slon.Pg.Protocol;
@@ -14,7 +16,6 @@ namespace Slon.Tests.Pg;
 // real execution - the acceptance test that the exclusive flow actually owns the wire and runs user
 // subflows on its inner pipeline.
 [TestClass]
-[DoNotParallelize]
 public class ExclusiveAccessFlowTests
 {
     static async Task DrainAsync(CommandFlow flow)
@@ -517,5 +518,85 @@ public class ExclusiveAccessFlowTests
         public void ArmWriteFaults() => _stream.ArmWriteFaults();
 
         public void ReleaseHeldWrite() => _stream.ReleaseHeldWrite();
+    }
+
+    [TestMethod]
+    public async Task ScopeAbort_BreaksSubflowParkedOnRead_ProtocolSurvives()
+    {
+        var protocol = await PgTestPool.NewIsolatedAsync(o =>
+            o.HeartbeatInterval = TimeSpan.FromMilliseconds(50));
+        try
+        {
+            await using var blocker = await PgAdvisoryLock.AcquireAsync();
+            var scope = protocol.BeginExclusiveScope(async: true);
+            await scope.HandoffReady;
+            var sub = scope.Queue(new CommandFlow(async: true, blocker.WaitCommand));
+
+            var run = Task.Run(async () =>
+            {
+                var e = sub.GetAsyncEnumerator();
+                try
+                {
+                    while (await e.MoveNextAsync()) { }
+                    await e.DisposeAsync();
+                    return (Exception?)null;
+                }
+                catch (Exception ex)
+                {
+                    return ex;
+                }
+            });
+
+            protocol.AbortActiveScope();
+            await blocker.ReleaseAsync();
+
+            var observed = await run.WaitAsync(TimeSpan.FromSeconds(10));
+            Assert.IsNotNull(observed);
+            while (observed is not PgClientClosedException && observed.InnerException is not null)
+                observed = observed.InnerException;
+            Assert.IsInstanceOfType<PgClientClosedException>(observed);
+            Assert.IsFalse(protocol.IsCompleted);
+        }
+        finally
+        {
+            await protocol.DisposeAsync();
+        }
+    }
+
+    [TestMethod]
+    public async Task ScopeAbort_BreaksWriterParkedOnFlush()
+    {
+        var closedProtocol = await PgTestPool.NewIsolatedAsync();
+        await closedProtocol.DisposeAsync();
+        var control = new PgClientProtocol.Control(closedProtocol, poolFacing: true);
+
+        using var scopeAbort = new CancellationTokenSource();
+        var sink = new ParkOnFlushSink();
+        var baseWriter = new ProtocolDataWriter(sink, Encoding.UTF8, static () => { }, default, control);
+        var scopeWriter = ProtocolDataWriter.CreateScopeShell(baseWriter, scopeAbort.Token, control);
+        var flush = scopeWriter.FlushAsync(CancellationToken.None);
+        Assert.IsFalse(flush.IsCompleted);
+
+        scopeAbort.Cancel();
+        await Assert.ThrowsExactlyAsync<PgClientClosedException>(async () => await flush);
+    }
+
+    sealed class ParkOnFlushSink : IOutputWriter
+    {
+        readonly byte[] _buffer = new byte[4096];
+
+        public long UnflushedBytes => 0;
+        public void Advance(int count) { }
+        public Memory<byte> GetMemory(int sizeHint = 0) => _buffer;
+        public Span<byte> GetSpan(int sizeHint = 0) => _buffer;
+        public void Flush(TimeSpan timeout = default) { }
+
+        public async ValueTask FlushAsync(CancellationToken cancellationToken)
+        {
+            var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            using var registration = cancellationToken.Register(
+                static state => ((TaskCompletionSource)state!).TrySetCanceled(), completion);
+            await completion.Task.ConfigureAwait(false);
+        }
     }
 }

@@ -18,7 +18,6 @@ namespace Slon.Tests.Pg;
 // co-queueing a property of the fixture rather than a timing assumption, so physical flush count is a
 // stable assertion and production code needs no test-only park/flush counters.
 [TestClass]
-[DoNotParallelize]
 public class FlushBatchingTests
 {
     // 8 tiny "select 1" command frames stay under the 1000-byte flush threshold, so a coalesced run is one

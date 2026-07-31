@@ -21,8 +21,7 @@ namespace Slon.Tests.Pg;
 //
 // Regression test for the depth-0 fix (the Pipeline clears _activatedItem only when completion drains to empty).
 [TestClass]
-[DoNotParallelize]
-public class StoppingTokenInMemoryRace
+public class StoppingTokenInMemoryTests
 {
     static readonly TimeSpan Cap = TimeSpan.FromSeconds(10);
 

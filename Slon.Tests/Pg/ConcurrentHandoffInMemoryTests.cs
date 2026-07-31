@@ -17,9 +17,10 @@ namespace Slon.Tests.Pg;
 //
 // Caveat: the hang is timing-dependent; in-memory timing differs from network, so reproduction is not
 // guaranteed. This is a fast-iteration companion to the real soak, not a replacement.
-[TestClass, Ignore]
+[TestClass]
+[Ignore("Manual high-iteration handoff soak; run explicitly when changing sync/async source handoff.")]
 [DoNotParallelize]
-public class ConcurrentHandoffInMemory
+public class ConcurrentHandoffInMemoryTests
 {
     static int Iters => int.TryParse(Environment.GetEnvironmentVariable("SLON_INMEM_ITERS"), out var n) && n > 0 ? n : 200_000;
 
@@ -27,7 +28,7 @@ public class ConcurrentHandoffInMemory
     // so the sync<->async read-baton handoff is exercised each iteration (vs the loose loops above where
     // overlap is timing-incidental and rare). This is the deterministic driver for the read-order race.
     [TestMethod]
-    public async Task I ()
+    public async Task ForcedSyncAsyncOverlap_Soak()
     {
         var (handshake, response) = await CaptureOnce();
         var options = PgTestPool.NewOptions();

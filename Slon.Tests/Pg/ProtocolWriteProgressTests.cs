@@ -1,21 +1,16 @@
 using System.Buffers.Binary;
+using System.Text;
+using Slon.Buffers;
 using Slon.Pg;
 using Slon.Pg.Protocol;
 using Slon.Pg.Protocol.Flows;
 
 namespace Slon.Tests.Pg;
 
-// CommandFlow async write-path TCP-window-deadlock guard.
-//
-// Real-wire tests can't pin this: a small request flushes synchronously, so the trailing task is
-// already-complete and the read-concurrent-with-write property is never exercised. BackpressureWriteTransport
-// is the only place a genuine PENDING trailing task is produced - a send window smaller than the request
-// parks FlushAsync. For a pipelined async flow this only happens once the encoder's deferred-flush threshold
-// is crossed, at which point the parked flush must ride the trailing slot and be drained by the concurrently
-// dispatched read (there is no background read pump). An inline write-await before dispatching the read would
-// deadlock: the read never starts, the server's response is never consumed, and the flush parks forever.
+// Write-side progress when ordinary socket tests cannot isolate the mechanism: a pending async flush
+// must allow the read side to advance, and a fault in the synchronous write driver must reach its awaiter.
 [TestClass]
-public class BackpressureDeadlockTests
+public class ProtocolWriteProgressTests
 {
     // Window << request, and the request exceeds the encoder's deferred-flush threshold, so the
     // command's FlushAsync actually runs and parks.
@@ -124,5 +119,31 @@ public class BackpressureDeadlockTests
         BinaryPrimitives.WriteInt32BigEndian(msg.AsSpan(1), 5);
         msg[5] = (byte)'I';
         return msg;
+    }
+
+    [TestMethod]
+    public async Task RunResumableTask_WaitWritableThrowsUnderAbort_RoutesClosedToAwaiter()
+    {
+        // A real protocol, driven to closed, just to obtain the canonical ClosedException.
+        var closedProtocol = await PgTestPool.NewIsolatedAsync();
+        await closedProtocol.DisposeAsync();
+        var control = new PgClientProtocol.Control(closedProtocol, poolFacing: true);
+        Assert.IsNotNull(control.ClosedException, "protocol should be closed after DisposeAsync");
+
+        // WaitWritable stands in for the parked sync write's deadline/abort fault. A pre-cancelled
+        // abort token drives TranslateAbort to the closed exception (decoupled from the disposed CTS).
+        Action waitWritable = () => throw new TimeoutException("simulated write-deadline expiry");
+        var writer = new ProtocolDataWriter(
+            new BufferOutputWriter(), Encoding.UTF8, waitWritable, new CancellationToken(canceled: true), control);
+        var encoder = new PgEncoder(default, writer);
+
+        // The "write coroutine": parks on the signal exactly as FlushResumable does on WouldBlock.
+        async ValueTask Park() => await writer.ResumeSignal.Pending();
+        var body = Park();
+        Assert.IsFalse(body.IsCompleted, "the coroutine should be parked on the signal");
+
+        var driver = encoder.RunResumableTask(body);
+
+        await Assert.ThrowsExactlyAsync<PgClientClosedException>(async () => await driver);
     }
 }

@@ -5,7 +5,7 @@ using Slon.Pg.Protocol.Flows;
 namespace Slon.Tests.Pg;
 
 // Focus: the guarantees PgClientFlowSource's sync handoff promises that the basic completion
-// tests in ProtocolLevelTests don't measure - the sync caller's thread stays put and concurrent
+// tests in ProtocolExecutionTests don't measure - the sync caller's thread stays put and concurrent
 // sync producers across distinct protocols don't deadlock. Driven directly against
 // PgClientProtocol so the assertions attribute to the handoff rendezvous, not to anything the
 // ADO surface adds.
@@ -19,6 +19,8 @@ namespace Slon.Tests.Pg;
 [TestClass]
 public class SyncFlowHandoffTests
 {
+    static int StressIterations => StressEnv.Iterations(fallback: 500, cap: 8_000);
+
     sealed class AutonomousSyncFlow : PgClientFlow
     {
         public AutonomousSyncFlow() : base(supportsPipelining: false) => IsAsync = false;
@@ -32,6 +34,52 @@ public class SyncFlowHandoffTests
     }
 
     static ref FlowCallerInteractionCore<ValueTuple> GetWakeCore(WakeHolder holder) => ref holder.Core;
+
+    [TestMethod]
+    public async Task ConcurrentSyncAndAsync_NoSharedPromiseCollision()
+    {
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
+        Exception? failure = null;
+        void Capture(Exception ex) => Interlocked.CompareExchange(ref failure, ex, null);
+
+        var asyncLoop = Task.Run(async () =>
+        {
+            try
+            {
+                for (var i = 0; i < StressIterations && Volatile.Read(ref failure) is null; i++)
+                    await PgTestPool.RunAsync(protocol, "select 1").WaitAsync(TimeSpan.FromSeconds(20));
+            }
+            catch (Exception ex) { Capture(ex); }
+        });
+
+        var syncThread = new Thread(() =>
+        {
+            try
+            {
+                for (var i = 0; i < StressIterations && Volatile.Read(ref failure) is null; i++)
+                    PgTestPool.RunSync(protocol, "select 1").GetAwaiter().GetResult();
+            }
+            catch (Exception ex) { Capture(ex); }
+        }) { IsBackground = true, Name = "sync-flow-handoff" };
+
+        syncThread.Start();
+        await asyncLoop;
+        Assert.IsTrue(syncThread.Join(TimeSpan.FromSeconds(120)), "sync handoff thread did not finish");
+        if (failure is not null)
+            Assert.Fail($"concurrent sync/async raised {failure}");
+    }
+
+    [TestMethod]
+    public async Task PairedAsyncAndSync_NoSharedPromiseCollision()
+    {
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
+        for (var i = 0; i < StressIterations / 4; i++)
+        {
+            var asyncFlow = Task.Run(() => PgTestPool.RunAsync(protocol, "select 1"));
+            var syncFlow = Task.Run(() => PgTestPool.RunSync(protocol, "select 1"));
+            await Task.WhenAll(asyncFlow, syncFlow);
+        }
+    }
 
     [TestMethod]
     public void AutonomousSyncFlow_DispatchesInsteadOfWaitingForHandoff()

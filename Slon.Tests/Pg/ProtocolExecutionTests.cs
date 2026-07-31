@@ -10,7 +10,7 @@ namespace Slon.Tests.Pg;
 // shared assembly-scoped PgTestPool because they complete their flows cleanly; a poisoned
 // protocol can't end up here without a test bug.
 [TestClass]
-public class ProtocolLevelTests
+public class ProtocolExecutionTests
 {
     [TestMethod]
     public async Task Sync_OnRawProtocol_Completes()

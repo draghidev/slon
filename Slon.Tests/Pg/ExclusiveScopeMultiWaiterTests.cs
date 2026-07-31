@@ -9,7 +9,6 @@ namespace Slon.Tests.Pg;
 // consumer-detach (canceled BeginScopeAsync), done-before-executed fast retire, and the pre-turn cascade
 // path (a waiter torn down by a protocol stop before it ever won its turn).
 [TestClass]
-[DoNotParallelize]
 public class ExclusiveScopeMultiWaiterTests
 {
     static Task<PgClientProtocol> ConnectAsync() => PgTestPool.NewIsolatedAsync(o =>

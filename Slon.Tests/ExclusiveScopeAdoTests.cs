@@ -9,13 +9,21 @@ namespace Slon.Tests;
 // test pool would starve it / let one lease's failure poison the others. Stateless command tests use the
 // shared multiplexed path (AdoTestPool.ExecuteNonQueryAsync) instead.
 [TestClass]
-[DoNotParallelize]
 public class ExclusiveScopeAdoTests
 {
     static async Task<int> ExecNonQuery(SlonConnection conn, string sql)
     {
         await using var cmd = new SlonCommand(conn, sql);
         return await cmd.ExecuteNonQueryAsync(CancellationToken.None);
+    }
+
+    static int ExecNonQuerySync(SlonConnection connection, string sql)
+    {
+        var callerThread = Environment.CurrentManagedThreadId;
+        using var command = new SlonCommand(connection, sql);
+        var result = command.ExecuteNonQuery();
+        Assert.AreEqual(callerThread, Environment.CurrentManagedThreadId);
+        return result;
     }
 
     // Prove the current lease holds a real wire and runs session-local state on it: a uniquely-named TEMP
@@ -103,5 +111,40 @@ public class ExclusiveScopeAdoTests
         await conn.OpenAsync(CancellationToken.None);
         // The reopened lease must hold a freshly-acquired scope and run its own session-local state.
         await ProveHeldWire(conn);
+    }
+
+    [TestMethod]
+    public void Sync_SessionLocalTempTable_StaysOnCallerThread()
+    {
+        var callerThread = Environment.CurrentManagedThreadId;
+        using var dataSource = AdoTestPool.NewIsolatedDataSource();
+        using var connection = dataSource.OpenConnection();
+        Assert.AreEqual(callerThread, Environment.CurrentManagedThreadId);
+
+        var table = "slon_sync_" + Guid.NewGuid().ToString("N");
+        ExecNonQuerySync(connection, $"CREATE TEMP TABLE {table} (x int)");
+        Assert.AreEqual(1, ExecNonQuerySync(connection, $"INSERT INTO {table} VALUES (1)"));
+        ExecNonQuerySync(connection, $"DROP TABLE {table}");
+
+        connection.Close();
+        Assert.AreEqual(callerThread, Environment.CurrentManagedThreadId);
+    }
+
+    [TestMethod]
+    public void Sync_Reader_StaysOnCallerThread()
+    {
+        var callerThread = Environment.CurrentManagedThreadId;
+        using var dataSource = AdoTestPool.NewIsolatedDataSource();
+        using var connection = dataSource.OpenConnection();
+        ExecNonQuerySync(connection, "SET application_name = 'slon_sync_probe'");
+
+        for (var i = 0; i < 4; i++)
+        {
+            using var command = new SlonCommand(connection, "SHOW application_name");
+            using var reader = command.ExecuteReader();
+            Assert.IsTrue(reader.Read(), $"iteration {i}: no row");
+            Assert.AreEqual("slon_sync_probe", reader.GetString(0));
+            Assert.AreEqual(callerThread, Environment.CurrentManagedThreadId);
+        }
     }
 }

@@ -3,16 +3,10 @@ using Slon.Pg.Protocol.Flows;
 
 namespace Slon.Tests.Pg;
 
-// Hammers PgClientFlowSource's shutdown coordination directly, with no Pipeline, flow bodies, or wire.
-// A hand-rolled executor mirrors Pipeline.ExecuteSource's pull loop and the shutdown sequence mirrors
-// PgClientProtocol.Shutdown, leaving the source as the only thing under test.
-//
-// Invariant: every enqueued flow is consumed exactly once, dispatched by the executor xor drained as
-// inert. A torn SPSC dequeue surfaces as a null or double-consumed flow; a lost flow surfaces as a
-// flow consumed zero times. Override count via SLON_STRESS_ITERATIONS (default 5000).
+// PgClientFlowSource dispatch, inline-drive bounds and shutdown coordination without the pipeline,
+// flow bodies or wire. A hand-written consumer pins exactly-once dispatch-versus-drain ownership.
 [TestClass]
-[DoNotParallelize]
-public class FlowSourceDirectStressTests
+public class FlowSourceTests
 {
     // In-memory, but exercises the source's spin/Mres wait points (PgClientFlowSource), which escalate to
     // Sleep(1) once the threadpool is saturated - so a blanket high count goes super-linear. Cap; the raw
@@ -156,5 +150,137 @@ public class FlowSourceDirectStressTests
                     Assert.Fail($"iter {i}: flow {k} consumed {consume[k]} times - double dequeue (torn/corrupt).");
             }
         }
+    }
+
+    static readonly TimeSpan Cap = TimeSpan.FromSeconds(10);
+
+    [TestMethod]
+    public async Task QueuedSyncFlow_CompletesBeforeHandoff_CallerReturnsAndFlowResolvedOnce()
+    {
+        // The source only reads Protocol.UnflushedBytes on the pull path (0 before Initialize); nothing
+        // else of the protocol is touched.
+        var protocol = PgClientProtocol.Create(new PgClientProtocolOptions(PgTestPool.NewOptions()));
+        var source = PgClientFlowSource.Create(protocol, protocol.FlowControl);
+        var enumerator = source.CreateEnumerator();
+
+        var flow = CommandFlow.CreateUninitialized();
+        var consumed = 0;
+        void Record(PgClientFlow? f)
+        {
+            if (ReferenceEquals(f, flow))
+            {
+                Interlocked.Increment(ref consumed);
+                // Mirror the protocol's drain onInert (flow.Complete -> OnComplete -> SignalProgress -> MRES
+                // .Set): a never-held sync flow drained inert wakes its handoff caller, which bails on
+                // IsCompleted. With the wait-list-free source, this drain wake IS the completion-bail.
+                f.GetExecutionControl(protocol.FlowControl).GetHandoffMres()?.Set();
+            }
+        }
+
+        // Sync caller: append the flow (this alone makes HasSyncWaiter true), then block in WaitForExecutor.
+        // On the fixed source it is taken over or bailed; on the unfixed source it strands waiting for a
+        // signal the spinning executor never sends.
+        var node = source.EnqueueSyncWaiter(flow);
+        var caller = Task.Run(() => source.WaitForExecutor(node));
+
+        // Complete the source while the sync flow sits queued and un-held.
+        var drained = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        source.SetDrainSignal(drained);
+        enumerator.Complete();
+
+        // Executor: Pipeline.ExecuteSource's pull loop, with a spin guard. On the unfixed source the loop
+        // busy-spins on WaitCore.Retry; the guard trips and surfaces the hang as a failure rather than a
+        // timeout. Each Retry resolves synchronously, so the cap is reached in well under a second.
+        var executor = Task.Run(async () =>
+        {
+            long guard = 0;
+            while (true)
+            {
+                if (enumerator.TryGetNext(out var item))
+                {
+                    Record(item);
+                    continue;
+                }
+                if (++guard > 5_000_000)
+                    throw new InvalidOperationException(
+                        "executor busy-looped on WaitCore.Retry - the queued sync flow was never held or resolved.");
+                if (!await enumerator.WaitForNextAsync())
+                    break;
+            }
+        });
+
+        await Task.WhenAny(drained.Task, executor);
+        source.DrainInertItems(Record);
+        await executor.WaitAsync(Cap);
+        await caller.WaitAsync(Cap);
+        await enumerator.DisposeAsync();
+
+        Assert.AreEqual(1, consumed,
+            "the queued sync flow must resolve exactly once (taken over by its caller xor drained inert).");
+    }
+
+    [TestMethod]
+    public async Task AsyncAheadOfQueuedSyncFlow_CompletesBeforeHandoff_AllResolvedOnce()
+    {
+        var protocol = PgClientProtocol.Create(new PgClientProtocolOptions(PgTestPool.NewOptions()));
+        var source = PgClientFlowSource.Create(protocol, protocol.FlowControl);
+        var enumerator = source.CreateEnumerator();
+
+        // FIFO: an async flow queued AHEAD of the sync waiter. At completion the sync head can't be held
+        // until the async ahead of it is disposed - the async head is left for DrainInert, which can't
+        // run until the executor resolves Completed, which HasSyncWaiter gates off. Same spin family.
+        var asyncFlow = CommandFlow.CreateUninitialized();
+        var syncFlow = CommandFlow.CreateUninitialized();
+        var consumed = new Dictionary<PgClientFlow, int>(ReferenceEqualityComparer.Instance)
+        {
+            [asyncFlow] = 0,
+            [syncFlow] = 0,
+        };
+        void Record(PgClientFlow? f)
+        {
+            if (f is not null && consumed.ContainsKey(f))
+            {
+                lock (consumed) consumed[f]++;
+                // Mirror the protocol's drain onInert wake (see QueuedSyncFlow): waking the sync flow's
+                // handoff caller is the completion-bail under the wait-list-free source. Harmless on the
+                // async head (no caller parks on its MRES).
+                f.GetExecutionControl(protocol.FlowControl).GetHandoffMres()?.Set();
+            }
+        }
+
+        source.Enqueue(asyncFlow);
+        var node = source.EnqueueSyncWaiter(syncFlow);
+        var caller = Task.Run(() => source.WaitForExecutor(node));
+
+        var drained = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        source.SetDrainSignal(drained);
+        enumerator.Complete();
+
+        var executor = Task.Run(async () =>
+        {
+            long guard = 0;
+            while (true)
+            {
+                if (enumerator.TryGetNext(out var item))
+                {
+                    Record(item);
+                    continue;
+                }
+                if (++guard > 5_000_000)
+                    throw new InvalidOperationException(
+                        "executor busy-looped on WaitCore.Retry - an async flow ahead of the sync waiter never advanced.");
+                if (!await enumerator.WaitForNextAsync())
+                    break;
+            }
+        });
+
+        await Task.WhenAny(drained.Task, executor);
+        source.DrainInertItems(Record);
+        await executor.WaitAsync(Cap);
+        await caller.WaitAsync(Cap);
+        await enumerator.DisposeAsync();
+
+        Assert.AreEqual(1, consumed[asyncFlow], "the queued async flow must resolve exactly once.");
+        Assert.AreEqual(1, consumed[syncFlow], "the queued sync flow must resolve exactly once.");
     }
 }

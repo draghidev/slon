@@ -8,7 +8,6 @@ namespace Slon.Tests;
 // affected / null. Stateless: runs on the MULTIPLEXED data-source command path; each test then runs a
 // follow-up command to prove the wire recovered (an autocommit SQL error rolls back to Idle, no poison).
 [TestClass]
-[DoNotParallelize]
 public class AdoErrorSurfacingTests
 {
     const string Failing = "SELECT slon_no_such_column";

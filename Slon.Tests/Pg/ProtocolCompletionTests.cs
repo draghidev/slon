@@ -8,10 +8,7 @@ namespace Slon.Tests.Pg;
 // DisposeAsync, Dispose, FailProtocol. Verifies graceful vs forceful semantics, idempotency,
 // and the heartbeat-based parked-flow propagation that fails activation sources when AbortToken
 // fires on a flow that's enqueued but not yet activated.
-// Class-serial: every test runs with a 50ms HeartbeatInterval to narrow parked-flow
-// propagation. Method-level parallelism would multiply concurrent fast-tick heartbeats.
 [TestClass]
-[DoNotParallelize]
 public class ProtocolCompletionTests
 {
     // Isolated per test by design: every test in this file fully destroys (CompleteAsync,
@@ -511,5 +508,36 @@ public class ProtocolCompletionTests
         for (int i = 0; i < tasks.Length; i++)
             tasks[i] = protocol.CompleteAsync();
         await Task.WhenAll(tasks);
+    }
+
+    [TestMethod]
+    public async Task ForcefulDispose_BreaksParkedSynchronousRead()
+    {
+        var protocol = await ConnectAsync();
+        Exception? observed = null;
+        var run = Task.Run(() =>
+        {
+            try
+            {
+                var flow = new CommandFlow(async: false, Command.Create("select pg_sleep(30)"));
+                Assert.IsTrue(protocol.TryQueue(flow));
+                var e = flow.GetEnumerator();
+                while (e.MoveNext()) { }
+                e.Dispose();
+            }
+            catch (Exception ex)
+            {
+                observed = ex;
+            }
+        });
+
+        await Task.Delay(30);
+        await protocol.DisposeAsync();
+        await run.WaitAsync(TimeSpan.FromSeconds(10));
+
+        Assert.IsNotNull(observed);
+        while (observed is not PgClientClosedException && observed.InnerException is not null)
+            observed = observed.InnerException;
+        Assert.IsInstanceOfType<PgClientClosedException>(observed);
     }
 }

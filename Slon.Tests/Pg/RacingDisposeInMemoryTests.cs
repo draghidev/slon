@@ -20,7 +20,7 @@ namespace Slon.Tests.Pg;
 //   gate-fault  - the heartbeat's OnAbort/OnStopping calls CancelPendingWait, faulting the gate the
 //                 body parks on between results and setting the sticky CancelException.
 //
-// The existing in-memory harness (StoppingTokenInMemoryRace) already gives us:
+// The existing in-memory harness (StoppingTokenInMemoryTests) already gives us:
 //   - capture-once-replay-on-demand of real server bytes (CaptureAsync + GatedReplayTransport),
 //   - ArmReadPark to detect a flow parked mid-read,
 //   - FakeTimeProvider to fire heartbeat/abort at chosen instants.
@@ -37,8 +37,7 @@ namespace Slon.Tests.Pg;
 //   3. Mirror lost-completion - never reachable (self-deliver / live-generation delivery cover it);
 //      asserts convergence so a future regression of that protection trips here.
 [TestClass]
-[DoNotParallelize]
-public class RacingDisposeInMemoryRace
+public class RacingDisposeInMemoryTests
 {
     static readonly TimeSpan Cap = TimeSpan.FromSeconds(10);
     static readonly TimeSpan HangCap = TimeSpan.FromSeconds(3);
@@ -437,7 +436,7 @@ public class RacingDisposeInMemoryRace
     }
 
     // ---------------------------------------------------------------------------------------------
-    // Capture machinery (shared shape with StoppingTokenInMemoryRace).
+    // Capture machinery (shared shape with StoppingTokenInMemoryTests).
     // ---------------------------------------------------------------------------------------------
     static async Task<(byte[] handshake, byte[] response)> CaptureAsync(PgClientOptions options, params Command[] commands)
     {

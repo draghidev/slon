@@ -10,7 +10,6 @@ namespace Slon.Tests.Pg;
 // while the consumer concurrently takes that head. A lost item surfaces as a consumer timeout; a
 // reorder or torn dequeue surfaces as a wrong-identity / out-of-position assert.
 [TestClass]
-[DoNotParallelize]
 public class SlotEscalatingQueueTests
 {
     // Pure in-memory data-structure exercise (no protocol / threadpool / waits), genuinely O(1)/iter and

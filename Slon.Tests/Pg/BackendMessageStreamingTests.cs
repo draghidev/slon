@@ -7,13 +7,10 @@ using static Slon.Pg.Protocol.PgTypes;
 
 namespace Slon.Tests.Pg;
 
-// Regression: a PipeSegmentEnumerator re-driven past completion (as the recovery drain loop does after
-// a mid-exchange peer close) must not re-apply its deferred consume position. The deferred advance
-// stores a SequencePosition into the segment it just produced. After that segment is fully consumed and
-// pool-recycled, a re-applied advance drove SegmentChainBuilder's buffer accounting negative, so the
-// next ReadResult build hit ArgumentOutOfRangeException('length') from GetReadOnlySequence.
+// Backend-message framing across fragmented, extended and sliding buffers, including terminal
+// re-drive and preservation of messages following a partially consumed DataRow.
 [TestClass]
-public class PipeSegmentEnumeratorEofTests
+public class BackendMessageStreamingTests
 {
     // Treats the first 4 big-endian bytes as the total segment length. Fully buffered => Done (so the
     // enumerator takes the deferred-consume branch, exactly the state the defect needs).
