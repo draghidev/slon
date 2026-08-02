@@ -40,9 +40,19 @@ abstract class TransportConnection
 
     public abstract class Factory(TransportConnectionOptions? options = null)
     {
+        static readonly Func<Stream, Stream> IdentityTransform = static stream => stream;
+
         public TransportConnectionOptions Options { get; } = options ?? new();
         public abstract bool SupportsSynchronousIO { get; }
-        public abstract TransportConnection Connect(TimeSpan timeout = default);
-        public abstract ValueTask<TransportConnection> ConnectAsync(CancellationToken cancellationToken = default);
+
+        public TransportConnection Connect(TimeSpan timeout = default)
+            => ConnectTransformed(IdentityTransform, timeout);
+
+        public ValueTask<TransportConnection> ConnectAsync(CancellationToken cancellationToken = default)
+            => ConnectTransformedAsync(IdentityTransform, cancellationToken);
+
+        public abstract TransportConnection ConnectTransformed(Func<Stream, Stream> transform, TimeSpan timeout = default);
+        public abstract ValueTask<TransportConnection> ConnectTransformedAsync(Func<Stream, Stream> transform, CancellationToken cancellationToken = default);
+        public abstract TransportConnection Upgrade(TransportConnection connection, Func<Stream, Stream> transform);
     }
 }

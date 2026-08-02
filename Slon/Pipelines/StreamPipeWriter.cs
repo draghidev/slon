@@ -176,6 +176,12 @@ abstract class StreamPipeWriter : PipeWriter, IOutputWriter
     /// <inheritdoc />
     public override long UnflushedBytes => Segments.BufferedBytes;
 
+    internal void EnsureCanUpgradeStream()
+    {
+        if (IsWriterCompleted || _isFlushActive || Segments.BufferedBytes is not 0)
+            throw new InvalidOperationException("The writer must be open, idle, and flushed before its stream can be upgraded.");
+    }
+
     public virtual void Write(ReadOnlySpan<byte> source, TimeSpan timeout = default)
     {
         FlushCore(writeToStream: true, source, timeout: timeout);

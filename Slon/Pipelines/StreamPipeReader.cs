@@ -196,6 +196,12 @@ abstract class StreamPipeReader : PipeReader
 
     internal bool SupportsDirectRead => PendingReadTokenSource is null;
 
+    internal void EnsureCanUpgradeStream()
+    {
+        if (IsReaderCompleted || _isReadActive || Segments.BufferedBytes is not 0)
+            throw new InvalidOperationException("The reader must be open, idle, and empty before its stream can be upgraded.");
+    }
+
     // Direct leaf handoff. The caller awaits the stream's ValueTask<int> directly, then returns
     // the byte count through CompleteDirectRead. This keeps buffer ownership and PipeReader read tenure
     // here while removing the intermediate ReadAsyncCore completion frame.

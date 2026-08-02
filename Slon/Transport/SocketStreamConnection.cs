@@ -7,19 +7,35 @@ namespace Slon.Transport;
 
 sealed class SocketStreamConnection : TransportConnection
 {
-    readonly SealedNetworkStream _stream;
+    readonly Factory _factory;
+    readonly SealedNetworkStream _networkStream;
+    readonly TransportConnectionOptions _options;
+    DefaultStreamPipeReader _reader;
+    DefaultStreamPipeWriter _writer;
+    DisposalStream _disposalStream;
+    Stream _stream;
     bool _aborted;
 
-    SocketStreamConnection(SealedNetworkStream stream, TransportConnectionOptions options)
+    SocketStreamConnection(Factory factory, SealedNetworkStream networkStream, Stream stream, TransportConnectionOptions options)
     {
+        _factory = factory;
+        _networkStream = networkStream;
         _stream = stream;
+        _options = options;
+        (_reader, _writer, _disposalStream) = CreatePipes(stream, options);
+    }
+
+    static (DefaultStreamPipeReader Reader, DefaultStreamPipeWriter Writer, DisposalStream DisposalStream) CreatePipes(Stream stream, TransportConnectionOptions options)
+    {
+        var disposalStream = new DisposalStream(stream);
         // NetworkStream cancels natively from the token passed to Read/Write, so
         // CancelPending* (and its per-op token-source registration) is dead weight here.
-        Reader = new DefaultStreamPipeReader(stream, new StreamPipeReaderOptions(bufferSize: options.ReaderSegmentSize, useZeroByteReads: options.UseZeroByteReads), supportCancelPending: false);
-        Writer = new DefaultStreamPipeWriter(stream, new StreamPipeWriterOptions(minimumBufferSize: options.WriterSegmentSize), supportCancelPending: false)
+        var reader = new DefaultStreamPipeReader(disposalStream, new StreamPipeReaderOptions(bufferSize: options.ReaderSegmentSize, useZeroByteReads: options.UseZeroByteReads), supportCancelPending: false);
+        var writer = new DefaultStreamPipeWriter(disposalStream, new StreamPipeWriterOptions(minimumBufferSize: options.WriterSegmentSize), supportCancelPending: false)
         {
             RetainBuffer = !options.UseZeroByteReads
         };
+        return (reader, writer, disposalStream);
     }
 
     static Socket CreateUnconnectedSocket(AddressFamily addressFamily)
@@ -38,59 +54,45 @@ sealed class SocketStreamConnection : TransportConnection
         }
     }
 
-    public override PipeReader Reader { get; }
-    public override PipeWriter Writer { get; }
-    public override void WaitWritable() => _stream.WaitWritable();
+    public override PipeReader Reader => _reader;
+    public override PipeWriter Writer => _writer;
+    public override void WaitWritable() => _networkStream.WaitWritable();
 
     public static Factory CreateFactory(EndPoint endPoint, TransportConnectionOptions? options = null) => new(endPoint, options);
 
     public static ValueTask<SocketStreamConnection> ConnectAsync(EndPoint endPoint, TransportConnectionOptions? options = null, CancellationToken cancellationToken = default)
-        => ConnectAsync<SocketStreamConnection>(endPoint, options ?? new(), cancellationToken);
-
-    static async ValueTask<T> ConnectAsync<T>(EndPoint endPoint, TransportConnectionOptions options, CancellationToken cancellationToken)
-        where T : TransportConnection
     {
-        var resolvedEndpoint = await ResolveEndPointAsync(endPoint, cancellationToken).ConfigureAwait(false);
-        var socket = CreateUnconnectedSocket(resolvedEndpoint.AddressFamily);
-        await socket.ConnectAsync(resolvedEndpoint, cancellationToken).ConfigureAwait(false);
-        return (T)(object)new SocketStreamConnection(new SealedNetworkStream(socket, ownsSocket: true), options);
+        var factory = new Factory(endPoint, options);
+        return ConnectAsync(factory, cancellationToken);
+
+        static async ValueTask<SocketStreamConnection> ConnectAsync(Factory factory, CancellationToken cancellationToken)
+            => (SocketStreamConnection)await factory.ConnectAsync(cancellationToken).ConfigureAwait(false);
     }
 
     public static SocketStreamConnection Connect(EndPoint endPoint, TransportConnectionOptions? options = null, TimeSpan timeout = default)
+        => (SocketStreamConnection)new Factory(endPoint, options).Connect(timeout);
+
+    static void ConnectWithTimeout(Socket socket, EndPoint endPoint, TimeSpan timeout)
     {
-        options ??= new();
-        var deadline = new Deadline(timeout);
-        var resolvedEndpoint = ResolveEndPoint(endPoint);
-        var socket = CreateUnconnectedSocket(resolvedEndpoint.AddressFamily);
-        if (deadline.TotalDuration == Timeout.InfiniteTimeSpan)
-            socket.Connect(resolvedEndpoint);
-        else
-            ConnectWithTimeout(socket, resolvedEndpoint, deadline.GetRemaining());
-
-        return new(new SealedNetworkStream(socket, ownsSocket: true), options);
-
-        static void ConnectWithTimeout(Socket socket, EndPoint endPoint, TimeSpan timeout)
+        socket.Blocking = false;
+        try
         {
-            socket.Blocking = false;
-            try
-            {
-                socket.Connect(endPoint);
-            }
-            catch (SocketException e)
-            {
-                if (e.SocketErrorCode != SocketError.WouldBlock)
-                    throw;
-            }
-            var write = new List<Socket> {socket};
-            var error = new List<Socket> {socket};
-            Socket.Select(null, write, error, checked((int)timeout.Ticks / (int)TimeSpan.TicksPerMicrosecond));
-            var errorCode = (int) socket.GetSocketOption(SocketOptionLevel.Socket, SocketOptionName.Error)!;
-            if (errorCode != 0)
-                throw new SocketException(errorCode);
-            if (!write.Any())
-                throw new TimeoutException("Timeout during connection attempt");
-            socket.Blocking = true;
+            socket.Connect(endPoint);
         }
+        catch (SocketException e)
+        {
+            if (e.SocketErrorCode != SocketError.WouldBlock)
+                throw;
+        }
+        var write = new List<Socket> {socket};
+        var error = new List<Socket> {socket};
+        Socket.Select(null, write, error, checked((int)timeout.Ticks / (int)TimeSpan.TicksPerMicrosecond));
+        var errorCode = (int) socket.GetSocketOption(SocketOptionLevel.Socket, SocketOptionName.Error)!;
+        if (errorCode != 0)
+            throw new SocketException(errorCode);
+        if (!write.Any())
+            throw new TimeoutException("Timeout during connection attempt");
+        socket.Blocking = true;
     }
 
     // No connection-level DISPOSAL: the Reader and Writer own the stream (LeaveOpen is false), so
@@ -105,7 +107,7 @@ sealed class SocketStreamConnection : TransportConnection
     public override void Abort()
     {
         if (!Interlocked.Exchange(ref _aborted, true))
-            _stream.Socket.Close(0);
+            _networkStream.Socket.Close(0);
     }
 
     static EndPoint ResolveEndPoint(EndPoint endPoint)
@@ -139,11 +141,127 @@ sealed class SocketStreamConnection : TransportConnection
 
         public override bool SupportsSynchronousIO => true;
 
-        public override TransportConnection Connect(TimeSpan timeout = default)
-            => SocketStreamConnection.Connect(_endPoint, Options, timeout);
+        public override TransportConnection ConnectTransformed(Func<Stream, Stream> transform, TimeSpan timeout = default)
+        {
+            ArgumentNullException.ThrowIfNull(transform);
+            var deadline = new Deadline(timeout);
+            var resolvedEndpoint = ResolveEndPoint(_endPoint);
+            var socket = CreateUnconnectedSocket(resolvedEndpoint.AddressFamily);
+            try
+            {
+                if (deadline.TotalDuration == Timeout.InfiniteTimeSpan)
+                    socket.Connect(resolvedEndpoint);
+                else
+                    ConnectWithTimeout(socket, resolvedEndpoint, deadline.GetRemaining());
 
-        public override ValueTask<TransportConnection> ConnectAsync(CancellationToken cancellationToken = default)
-            => SocketStreamConnection.ConnectAsync<TransportConnection>(_endPoint, Options, cancellationToken);
+                return CreateTransformed(new SealedNetworkStream(socket, ownsSocket: true), transform);
+            }
+            catch
+            {
+                socket.Dispose();
+                throw;
+            }
+        }
+
+        public override async ValueTask<TransportConnection> ConnectTransformedAsync(Func<Stream, Stream> transform, CancellationToken cancellationToken = default)
+        {
+            ArgumentNullException.ThrowIfNull(transform);
+            var resolvedEndpoint = await ResolveEndPointAsync(_endPoint, cancellationToken).ConfigureAwait(false);
+            var socket = CreateUnconnectedSocket(resolvedEndpoint.AddressFamily);
+            try
+            {
+                await socket.ConnectAsync(resolvedEndpoint, cancellationToken).ConfigureAwait(false);
+                return CreateTransformed(new SealedNetworkStream(socket, ownsSocket: true), transform);
+            }
+            catch
+            {
+                socket.Dispose();
+                throw;
+            }
+        }
+
+        public override TransportConnection Upgrade(TransportConnection connection, Func<Stream, Stream> transform)
+        {
+            ArgumentNullException.ThrowIfNull(connection);
+            ArgumentNullException.ThrowIfNull(transform);
+            if (connection is not SocketStreamConnection socketConnection || !ReferenceEquals(socketConnection._factory, this))
+                throw new ArgumentException("The connection was not created by this factory.", nameof(connection));
+
+            socketConnection._reader.EnsureCanUpgradeStream();
+            socketConnection._writer.EnsureCanUpgradeStream();
+            var transformed = ApplyTransform(socketConnection._stream, transform);
+            try
+            {
+                socketConnection._disposalStream.LeaveOpen();
+                socketConnection._reader.Complete();
+                socketConnection._writer.Complete();
+                (socketConnection._reader, socketConnection._writer, socketConnection._disposalStream) = CreatePipes(transformed, socketConnection._options);
+                socketConnection._stream = transformed;
+                return socketConnection;
+            }
+            catch
+            {
+                socketConnection.Abort();
+                throw;
+            }
+        }
+
+        SocketStreamConnection CreateTransformed(SealedNetworkStream networkStream, Func<Stream, Stream> transform)
+        {
+            var transformed = ApplyTransform(networkStream, transform);
+            return new(this, networkStream, transformed, Options);
+        }
+
+        static Stream ApplyTransform(Stream stream, Func<Stream, Stream> transform)
+            => transform(stream) ?? throw new InvalidOperationException("The connection transform returned null.");
+    }
+
+    sealed class DisposalStream(Stream stream) : Stream
+    {
+        bool _leaveOpen;
+        int _disposed;
+
+        internal void LeaveOpen() => _leaveOpen = true;
+
+        public override bool CanRead => stream.CanRead;
+        public override bool CanSeek => stream.CanSeek;
+        public override bool CanTimeout => stream.CanTimeout;
+        public override bool CanWrite => stream.CanWrite;
+        public override long Length => stream.Length;
+        public override long Position { get => stream.Position; set => stream.Position = value; }
+        public override int ReadTimeout { get => stream.ReadTimeout; set => stream.ReadTimeout = value; }
+        public override int WriteTimeout { get => stream.WriteTimeout; set => stream.WriteTimeout = value; }
+
+        public override void Flush() => stream.Flush();
+        public override Task FlushAsync(CancellationToken cancellationToken) => stream.FlushAsync(cancellationToken);
+        public override int Read(byte[] buffer, int offset, int count) => stream.Read(buffer, offset, count);
+        public override int Read(Span<byte> buffer) => stream.Read(buffer);
+        public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+            => stream.ReadAsync(buffer, offset, count, cancellationToken);
+        public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+            => stream.ReadAsync(buffer, cancellationToken);
+        public override long Seek(long offset, SeekOrigin origin) => stream.Seek(offset, origin);
+        public override void SetLength(long value) => stream.SetLength(value);
+        public override void Write(byte[] buffer, int offset, int count) => stream.Write(buffer, offset, count);
+        public override void Write(ReadOnlySpan<byte> buffer) => stream.Write(buffer);
+        public override Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+            => stream.WriteAsync(buffer, offset, count, cancellationToken);
+        public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default)
+            => stream.WriteAsync(buffer, cancellationToken);
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing && Interlocked.Exchange(ref _disposed, 1) is 0 && !_leaveOpen)
+                stream.Dispose();
+            base.Dispose(disposing);
+        }
+
+        public override ValueTask DisposeAsync()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) is not 0 || _leaveOpen)
+                return default;
+            return stream.DisposeAsync();
+        }
     }
 
     // Reads TransportConnection.SyncNonBlockingSignal to decide whether WriteAsync does sync

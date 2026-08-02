@@ -183,6 +183,123 @@ public class TransportTests
         CollectionAssert.AreEqual(payload, received);
     }
 
+    [TestMethod]
+    public async Task SslStream_OverSealedNetworkStream_WouldBlock_ResumesFromWritableSignal()
+    {
+        var cert = TlsTestCertificate.Instance;
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var endpoint = (IPEndPoint)listener.LocalEndpoint;
+        var allowRead = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        const int payloadLength = 4 * 1024 * 1024;
+        var serverTask = AcceptAndDecrypt(listener, cert, allowRead.Task, payloadLength);
+
+        var clientSocket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp)
+        {
+            SendBufferSize = 4096
+        };
+        await clientSocket.ConnectAsync(endpoint);
+        var inner = new SocketStreamConnection.SealedNetworkStream(clientSocket, ownsSocket: true);
+        await using var clientSsl = new SslStream(inner, leaveInnerStreamOpen: false,
+            userCertificateValidationCallback: (_, _, _, _) => true);
+        await clientSsl.AuthenticateAsClientAsync("localhost");
+
+        var payload = new byte[payloadLength];
+        Random.Shared.NextBytes(payload);
+        var signal = new WriteResumeSignal();
+        ValueTask writeTask;
+        using (new ResumableScope(signal))
+            writeTask = clientSsl.WriteAsync(payload);
+
+        Assert.IsFalse(writeTask.IsCompleted,
+            "with the peer held and a constrained send buffer, the TLS write must reach WouldBlock");
+
+        allowRead.SetResult();
+        while (!writeTask.IsCompleted)
+        {
+            var spin = new SpinWait();
+            while (!writeTask.IsCompleted && !signal.IsPending)
+                spin.SpinOnce();
+            if (writeTask.IsCompleted)
+                break;
+            inner.WaitWritable();
+            signal.Signal();
+        }
+        await writeTask;
+
+        CollectionAssert.AreEqual(payload, await serverTask);
+    }
+
+    [TestMethod]
+    public async Task SocketFactory_ConnectTransformed_MaterializesOverTls()
+    {
+        using var cert = CreateSelfSignedCert();
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var serverTask = AcceptAndDecrypt(listener, cert);
+        var factory = SocketStreamConnection.CreateFactory((IPEndPoint)listener.LocalEndpoint);
+
+        SslStream? ssl = null;
+        var connection = await factory.ConnectTransformedAsync(stream =>
+            ssl = new SslStream(stream, leaveInnerStreamOpen: false,
+                userCertificateValidationCallback: (_, _, _, _) => true));
+        await ssl!.AuthenticateAsClientAsync("localhost");
+
+        var payload = new byte[] { 0x10, 0x20, 0x30, 0x40 };
+        await connection.Writer.WriteAsync(payload);
+        CollectionAssert.AreEqual(payload, await serverTask);
+        connection.Writer.Complete();
+        connection.Reader.Complete();
+    }
+
+    [TestMethod]
+    public async Task SocketFactory_Upgrade_ReplacesFlushedPlaintextPipesWithTls()
+    {
+        using var cert = CreateSelfSignedCert();
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var serverTask = AcceptUpgradeAndDecrypt(listener, cert);
+        var factory = SocketStreamConnection.CreateFactory((IPEndPoint)listener.LocalEndpoint);
+        var connection = await factory.ConnectAsync();
+
+        await connection.Writer.WriteAsync(new byte[] { 0x42 });
+        var response = await connection.Reader.ReadAsync();
+        Assert.AreEqual((byte)'S', response.Buffer.FirstSpan[0]);
+        connection.Reader.AdvanceTo(response.Buffer.End);
+
+        SslStream? ssl = null;
+        var upgraded = factory.Upgrade(connection, stream =>
+            ssl = new SslStream(stream, leaveInnerStreamOpen: false,
+                userCertificateValidationCallback: (_, _, _, _) => true));
+        Assert.AreSame(connection, upgraded);
+        await ssl!.AuthenticateAsClientAsync("localhost");
+
+        var payload = new byte[] { 0x10, 0x20, 0x30, 0x40 };
+        await upgraded.Writer.WriteAsync(payload);
+        CollectionAssert.AreEqual(payload, await serverTask);
+        upgraded.Writer.Complete();
+        upgraded.Reader.Complete();
+    }
+
+    [TestMethod]
+    public async Task SocketFactory_Upgrade_RejectsUnflushedWrites()
+    {
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var acceptTask = listener.AcceptSocketAsync();
+        var factory = SocketStreamConnection.CreateFactory((IPEndPoint)listener.LocalEndpoint);
+        var connection = await factory.ConnectAsync();
+        using var server = await acceptTask;
+
+        connection.Writer.GetSpan(1)[0] = 0x42;
+        connection.Writer.Advance(1);
+        Assert.ThrowsExactly<InvalidOperationException>(() =>
+            factory.Upgrade(connection, static stream => stream));
+
+        connection.Writer.Complete(new InvalidOperationException("test cleanup"));
+        connection.Reader.Complete();
+    }
+
     static async Task<byte[]> AcceptAndDecrypt(TcpListener listener, X509Certificate2 cert)
     {
         var serverSocket = await listener.AcceptSocketAsync();
@@ -201,6 +318,56 @@ public class TransportTests
         }
         var result = new byte[total];
         Array.Copy(buf, result, total);
+        return result;
+    }
+
+    static async Task<byte[]> AcceptAndDecrypt(TcpListener listener, X509Certificate2 cert,
+        Task allowRead, int length)
+    {
+        var serverSocket = await listener.AcceptSocketAsync();
+        await using var serverNet = new NetworkStream(serverSocket, ownsSocket: true);
+        await using var serverSsl = new SslStream(serverNet, leaveInnerStreamOpen: false);
+        await serverSsl.AuthenticateAsServerAsync(cert, clientCertificateRequired: false,
+            enabledSslProtocols: System.Security.Authentication.SslProtocols.None,
+            checkCertificateRevocation: false);
+        await allowRead;
+
+        var result = new byte[length];
+        var total = 0;
+        while (total < result.Length)
+        {
+            var read = await serverSsl.ReadAsync(result.AsMemory(total));
+            if (read is 0)
+                break;
+            total += read;
+        }
+        Assert.AreEqual(result.Length, total);
+        return result;
+    }
+
+    static async Task<byte[]> AcceptUpgradeAndDecrypt(TcpListener listener, X509Certificate2 cert)
+    {
+        var serverSocket = await listener.AcceptSocketAsync();
+        await using var serverNet = new NetworkStream(serverSocket, ownsSocket: true);
+        var request = new byte[1];
+        Assert.AreEqual(1, await serverNet.ReadAsync(request));
+        Assert.AreEqual(0x42, request[0]);
+        await serverNet.WriteAsync(new byte[] { (byte)'S' });
+
+        await using var serverSsl = new SslStream(serverNet, leaveInnerStreamOpen: false);
+        await serverSsl.AuthenticateAsServerAsync(cert, clientCertificateRequired: false,
+            enabledSslProtocols: System.Security.Authentication.SslProtocols.None, checkCertificateRevocation: false);
+
+        var result = new byte[4];
+        var total = 0;
+        while (total < result.Length)
+        {
+            var read = await serverSsl.ReadAsync(result.AsMemory(total));
+            if (read is 0)
+                break;
+            total += read;
+        }
+        Assert.AreEqual(result.Length, total);
         return result;
     }
 

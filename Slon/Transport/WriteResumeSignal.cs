@@ -11,11 +11,19 @@ namespace Slon.Transport;
 sealed class WriteResumeSignal : IValueTaskSource
 {
     Slon.Threading.Tasks.Sources.ManualResetValueTaskSourceCore<bool> _core;
+    bool _pending;
 
-    public ValueTask Pending() => new(this, _core.Version);
+    internal bool IsPending => Volatile.Read(ref _pending);
+
+    public ValueTask Pending()
+    {
+        Volatile.Write(ref _pending, true);
+        return new(this, _core.Version);
+    }
 
     public void Signal(Exception? exception = null)
     {
+        Volatile.Write(ref _pending, false);
         if (exception is null)
             _core.SetResult(true, runContinuationsAsynchronously: false);
         else
@@ -25,7 +33,11 @@ sealed class WriteResumeSignal : IValueTaskSource
     void IValueTaskSource.GetResult(short token)
     {
         try { _core.GetResult(token); }
-        finally { _core.Reset(); }
+        finally
+        {
+            Volatile.Write(ref _pending, false);
+            _core.Reset();
+        }
     }
     ValueTaskSourceStatus IValueTaskSource.GetStatus(short token) => _core.GetStatus(token);
     void IValueTaskSource.OnCompleted(Action<object?> continuation, object? state, short token, ValueTaskSourceOnCompletedFlags flags)
