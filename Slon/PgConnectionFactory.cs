@@ -1,3 +1,5 @@
+using System.Net.Security;
+using System.Net.Sockets;
 using Slon.Pg;
 using Slon.Pg.Protocol;
 using Slon.Pools;
@@ -33,22 +35,30 @@ sealed class PgConnectionFactory : IPoolConnectionFactory<PgConnection>
         return options;
     }
 
-    // Side-channel cancel orchestration: opens a fresh transport matching the main connection's
-    // policy, delivers the CancelRequest via the protocol-layer wire helper, disposes the
-    // transport on every path. Passed to PgClientProtocolOptions.CancelSender so the protocol
-    // layer can fire-and-forget without knowing about transports.
-    async ValueTask<CancelRequestState> SendCancelAsync(int processId, int secretKey, CancellationToken cancellationToken)
+    // Side-channel cancel orchestration. Apply the main connection's TLS policy before sending the
+    // CancelRequest, then dispose the temporary transport on every path.
+    internal async ValueTask<CancelRequestState> SendCancelAsync(int processId, int secretKey, CancellationToken cancellationToken)
     {
-        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        timeout.CancelAfter(_clientOptions.ConnectionTimeout);
+        using var timeout = CreateTimeoutSource(cancellationToken, _clientOptions.ConnectionTimeout);
         var token = timeout.Token;
-        TransportConnection transport;
+        TransportConnection? transport = null;
         try
         {
-            transport = await _transportConnectionFactory.ConnectAsync(token).ConfigureAwait(false);
+            transport = await ConnectAsync(_clientOptions, token, static () => { }).ConfigureAwait(false);
+            if (_clientOptions.Ssl.ShouldNegotiateTls(_clientOptions.EndPoint)
+                && await PgClientProtocol.NegotiateSslAsync(
+                    transport, _clientOptions.Ssl.Mode, token).ConfigureAwait(false))
+                transport = await UpgradeAsync(
+                    _clientOptions, transport, token, static () => { }).ConfigureAwait(false);
         }
-        catch
+        catch (Exception ex)
         {
+            if (transport is not null)
+            {
+                transport.Abort();
+                await transport.Writer.CompleteAsync(ex).ConfigureAwait(false);
+                await transport.Reader.CompleteAsync().ConfigureAwait(false);
+            }
             return CancelRequestState.NotSent;
         }
         Exception? sendError = null;
@@ -78,10 +88,101 @@ sealed class PgConnectionFactory : IPoolConnectionFactory<PgConnection>
 
     PgConnection Create(ConnectionPoolContext<PgConnection>? poolContext, TimeSpan timeout = default)
     {
-        var transport = _transportConnectionFactory.Connect(timeout);
+        var deadline = new Deadline(timeout == default ? _clientOptions.ConnectionTimeout : timeout);
+        var connected = false;
+        var encrypted = false;
+        var protocolStarted = false;
+        var protocolOptions = CreateOptions();
         try
         {
-            return PgConnection.Create(CreateOptions(), _clientOptions, transport, _tracker, poolContext, timeout);
+            return CreateAttempt(_clientOptions);
+        }
+        catch (Exception ex) when (ShouldRetry(_clientOptions, connected, encrypted, protocolStarted, ex))
+        {
+            connected = encrypted = false;
+            return CreateAttempt(_clientOptions.WithSsl(InverseFallback(_clientOptions.Ssl)));
+        }
+
+        PgConnection CreateAttempt(PgClientOptions options)
+        {
+            var transport = Connect(options, deadline, () => encrypted = true);
+            connected = true;
+            try
+            {
+                return PgConnection.Create(protocolOptions, options, transport, _tracker, poolContext,
+                    deadline.GetRemaining(), (connection, remaining) =>
+                        Upgrade(options, connection, remaining, () => encrypted = true),
+                    () => protocolStarted = true);
+            }
+            catch (Exception ex)
+            {
+                ReleaseTransport(transport, ex);
+                throw;
+            }
+        }
+    }
+
+    async ValueTask<PgConnection> CreateAsync(ConnectionPoolContext<PgConnection>? poolContext, CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        using var timeout = CreateTimeoutSource(cancellationToken, _clientOptions.ConnectionTimeout);
+        var token = timeout.Token;
+        var connected = false;
+        var encrypted = false;
+        var protocolStarted = false;
+        var protocolOptions = CreateOptions();
+        try
+        {
+            return await CreateAttemptAsync(_clientOptions).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ShouldRetry(_clientOptions, connected, encrypted, protocolStarted, ex))
+        {
+            connected = encrypted = false;
+            return await CreateAttemptAsync(_clientOptions.WithSsl(InverseFallback(_clientOptions.Ssl))).ConfigureAwait(false);
+        }
+
+        async ValueTask<PgConnection> CreateAttemptAsync(PgClientOptions options)
+        {
+            var transport = await ConnectAsync(options, token, () => encrypted = true).ConfigureAwait(false);
+            connected = true;
+            try
+            {
+                return await PgConnection.CreateAsync(protocolOptions, options, transport, _tracker, poolContext,
+                    token, (connection, ct) => UpgradeAsync(options, connection, ct, () => encrypted = true),
+                    () => protocolStarted = true).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                ReleaseTransport(transport, ex);
+                throw;
+            }
+        }
+    }
+
+    static CancellationTokenSource CreateTimeoutSource(CancellationToken cancellationToken, TimeSpan timeout)
+    {
+        var source = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        if (timeout != default)
+            source.CancelAfter(timeout);
+        return source;
+    }
+
+    TransportConnection Connect(PgClientOptions options, Deadline deadline, Action onTlsEstablished)
+    {
+        if (!options.Ssl.ShouldUseDirectTls(options.EndPoint))
+            return _transportConnectionFactory.Connect(deadline.GetRemaining());
+
+        SslStream? ssl = null;
+        var transport = _transportConnectionFactory.ConnectTransformed(stream =>
+            ssl = new SslStream(stream, leaveInnerStreamOpen: false), deadline.GetRemaining());
+        try
+        {
+            var remaining = ToStreamTimeout(deadline.GetRemaining());
+            ssl!.ReadTimeout = remaining;
+            ssl.WriteTimeout = remaining;
+            ssl.AuthenticateAsClient(options.Ssl.CreateAuthenticationOptions(options.EndPoint));
+            onTlsEstablished();
+            return transport;
         }
         catch (Exception ex)
         {
@@ -90,13 +191,20 @@ sealed class PgConnectionFactory : IPoolConnectionFactory<PgConnection>
         }
     }
 
-    async ValueTask<PgConnection> CreateAsync(ConnectionPoolContext<PgConnection>? poolContext, CancellationToken cancellationToken = default)
+    async ValueTask<TransportConnection> ConnectAsync(PgClientOptions options, CancellationToken cancellationToken, Action onTlsEstablished)
     {
-        cancellationToken.ThrowIfCancellationRequested();
-        var transport = await _transportConnectionFactory.ConnectAsync(cancellationToken).ConfigureAwait(false);
+        if (!options.Ssl.ShouldUseDirectTls(options.EndPoint))
+            return await _transportConnectionFactory.ConnectAsync(cancellationToken).ConfigureAwait(false);
+
+        SslStream? ssl = null;
+        var transport = await _transportConnectionFactory.ConnectTransformedAsync(stream =>
+            ssl = new SslStream(stream, leaveInnerStreamOpen: false), cancellationToken).ConfigureAwait(false);
         try
         {
-            return await PgConnection.CreateAsync(CreateOptions(), _clientOptions, transport, _tracker, poolContext, cancellationToken).ConfigureAwait(false);
+            await ssl!.AuthenticateAsClientAsync(
+                options.Ssl.CreateAuthenticationOptions(options.EndPoint), cancellationToken).ConfigureAwait(false);
+            onTlsEstablished();
+            return transport;
         }
         catch (Exception ex)
         {
@@ -104,6 +212,70 @@ sealed class PgConnectionFactory : IPoolConnectionFactory<PgConnection>
             throw;
         }
     }
+
+    TransportConnection Upgrade(PgClientOptions options, TransportConnection connection, TimeSpan timeout, Action onTlsEstablished)
+    {
+        SslStream? ssl = null;
+        var upgraded = _transportConnectionFactory.Upgrade(connection, stream =>
+            ssl = new SslStream(stream, leaveInnerStreamOpen: false));
+        try
+        {
+            var timeoutMilliseconds = ToStreamTimeout(timeout);
+            ssl!.ReadTimeout = timeoutMilliseconds;
+            ssl.WriteTimeout = timeoutMilliseconds;
+            ssl.AuthenticateAsClient(options.Ssl.CreateAuthenticationOptions(options.EndPoint));
+            onTlsEstablished();
+            return upgraded;
+        }
+        catch (Exception ex)
+        {
+            ReleaseTransport(upgraded, ex);
+            throw;
+        }
+    }
+
+    async ValueTask<TransportConnection> UpgradeAsync(PgClientOptions options, TransportConnection connection,
+        CancellationToken cancellationToken, Action onTlsEstablished)
+    {
+        SslStream? ssl = null;
+        var upgraded = _transportConnectionFactory.Upgrade(connection, stream =>
+            ssl = new SslStream(stream, leaveInnerStreamOpen: false));
+        try
+        {
+            await ssl!.AuthenticateAsClientAsync(
+                options.Ssl.CreateAuthenticationOptions(options.EndPoint), cancellationToken).ConfigureAwait(false);
+            onTlsEstablished();
+            return upgraded;
+        }
+        catch (Exception ex)
+        {
+            ReleaseTransport(upgraded, ex);
+            throw;
+        }
+    }
+
+    static int ToStreamTimeout(TimeSpan timeout)
+        => timeout == Timeout.InfiniteTimeSpan
+            ? Timeout.Infinite
+            : (int)Math.Clamp(Math.Ceiling(timeout.TotalMilliseconds), 1, int.MaxValue);
+
+    // Fallback applies only after the socket connected and before protocol startup completed.
+    // Prefer retries only after a completed TLS handshake; Allow starts plaintext.
+    static bool ShouldRetry(PgClientOptions options, bool connected, bool encrypted, bool protocolStarted, Exception exception)
+        => options.EndPoint is not UnixDomainSocketEndPoint
+            && connected && !protocolStarted && exception is not OperationCanceledException
+            && (options.Ssl.Mode is PostgreSqlSslMode.Prefer && encrypted
+                || options.Ssl.Mode is PostgreSqlSslMode.Allow && !encrypted);
+
+    static PostgreSqlSslOptions InverseFallback(PostgreSqlSslOptions options)
+        => options with
+        {
+            Mode = options.Mode is PostgreSqlSslMode.Prefer
+                ? PostgreSqlSslMode.Disable
+                : PostgreSqlSslMode.Require,
+            Negotiation = PostgreSqlSslNegotiation.Automatic,
+            EndpointVersion = null
+        };
 
     // The transport is the factory's until PgConnection takes ownership (inside its protocol.Start). A
     // throw before that - pool/idle-signal wiring, options, or Start's own pre-pipeline failure (which

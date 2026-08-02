@@ -24,6 +24,8 @@ public record SlonDataSourceOptions
     public required string Username { get; init; }
     public string? Password { get; init; }
     public string? Database { get; init; }
+    /// <summary>Configures PostgreSQL TLS negotiation and server authentication.</summary>
+    public PostgreSqlSslOptions Ssl { get; init; } = new();
     public TimeSpan ConnectionTimeout { get; init; } = TimeSpan.FromSeconds(10);
     public TimeSpan CancellationTimeout { get; init; } = TimeSpan.FromSeconds(10);
     public int MinPoolSize { get; init; } = 1;
@@ -73,6 +75,7 @@ public record SlonDataSourceOptions
         Username = Username,
         Database = Database,
         Password = Password,
+        Ssl = Ssl.Snapshot(),
         HeartbeatInterval = HeartbeatInterval,
         MaintenanceInterval = MaintenanceInterval,
         ScopeReset = ScopeReset.Snapshot(),
@@ -81,6 +84,8 @@ public record SlonDataSourceOptions
 
     internal bool Validate()
     {
+        ArgumentNullException.ThrowIfNull(Ssl);
+        Ssl.Validate();
         // etc
         return true;
     }

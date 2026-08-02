@@ -33,6 +33,7 @@ public class PgConnectionTests
         Username = "postgres",
         Password = "postgres123",
         Database = "postgres",
+        Ssl = new() { Mode = PostgreSqlSslMode.Disable }
     };
 
     static async Task<PgConnection> ConnectAsync()

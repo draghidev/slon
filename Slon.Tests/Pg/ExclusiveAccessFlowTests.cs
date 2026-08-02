@@ -379,6 +379,7 @@ public class ExclusiveAccessFlowTests
             Username = "postgres",
             Password = "postgres123",
             Database = "postgres",
+            Ssl = new() { Mode = PostgreSqlSslMode.Disable },
             ScopeReset = new ScopeResetOptions { ClearListeners = true },
         };
 

@@ -86,14 +86,15 @@ sealed class PgConnection : IPoolConnection<PgConnection>
 
     // Creates a fully open but unpublished connection. Start enables idle publication only after
     // the pool commits the initial lease. Heartbeats route through this wrapper for maintenance.
-    public static PgConnection Create(PgClientProtocolOptions protocolOptions, PgClientOptions clientOptions, TransportConnection transport, CommandTracker? tracker = null, ConnectionPoolContext<PgConnection>? poolContext = null, TimeSpan timeout = default)
+    public static PgConnection Create(PgClientProtocolOptions protocolOptions, PgClientOptions clientOptions, TransportConnection transport, CommandTracker? tracker = null, ConnectionPoolContext<PgConnection>? poolContext = null, TimeSpan timeout = default, Func<TransportConnection, TimeSpan, TransportConnection>? upgradeTransport = null, Action? onProtocolStarted = null)
     {
         var protocol = PgClientProtocol.Create(protocolOptions);
         var conn = new PgConnection(protocol, tracker, clientOptions.MaintenanceInterval);
         conn._poolContext = poolContext;
         protocol.Start(clientOptions, transport,
             poolContext is null ? NoopAvailability : conn.SignalAvailabilityIfStarted,
-            timeout);
+            timeout, upgradeTransport);
+        onProtocolStarted?.Invoke();
         try
         {
             conn._tracker?.Register(conn);
@@ -110,14 +111,15 @@ sealed class PgConnection : IPoolConnection<PgConnection>
         return conn;
     }
 
-    public static async ValueTask<PgConnection> CreateAsync(PgClientProtocolOptions protocolOptions, PgClientOptions clientOptions, TransportConnection transport, CommandTracker? tracker = null, ConnectionPoolContext<PgConnection>? poolContext = null, CancellationToken cancellationToken = default)
+    public static async ValueTask<PgConnection> CreateAsync(PgClientProtocolOptions protocolOptions, PgClientOptions clientOptions, TransportConnection transport, CommandTracker? tracker = null, ConnectionPoolContext<PgConnection>? poolContext = null, CancellationToken cancellationToken = default, Func<TransportConnection, CancellationToken, ValueTask<TransportConnection>>? upgradeTransport = null, Action? onProtocolStarted = null)
     {
         var protocol = PgClientProtocol.Create(protocolOptions);
         var conn = new PgConnection(protocol, tracker, clientOptions.MaintenanceInterval);
         conn._poolContext = poolContext;
         await protocol.StartAsync(clientOptions, transport,
             poolContext is null ? NoopAvailability : conn.SignalAvailabilityIfStarted,
-            cancellationToken).ConfigureAwait(false);
+            cancellationToken, upgradeTransport).ConfigureAwait(false);
+        onProtocolStarted?.Invoke();
         try
         {
             conn._tracker?.Register(conn);

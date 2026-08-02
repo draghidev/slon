@@ -218,15 +218,24 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
     }
 
     public void Start(PgClientOptions options, TransportConnection connection,
-        Action<bool>? onAvailability = null, TimeSpan timeout = default)
+        Action<bool>? onAvailability = null, TimeSpan timeout = default,
+        Func<TransportConnection, TimeSpan, TransportConnection>? upgradeTransport = null)
     {
         try
         {
             if (connection.Reader is not StreamPipeReader || connection.Writer is not StreamPipeWriter)
                 ThrowHelper.ThrowInvalidOperation("Transport does not support synchronous I/O.");
 
+            var deadline = new Deadline(timeout == default ? options.ConnectionTimeout : timeout);
+            if (options.Ssl.ShouldNegotiateTls(options.EndPoint))
+            {
+                if (upgradeTransport is null)
+                    throw new InvalidOperationException("The transport does not support PostgreSQL TLS negotiation.");
+                if (NegotiateSsl(connection, options.Ssl.Mode, deadline.GetRemaining()))
+                    connection = upgradeTransport(connection, deadline.GetRemaining());
+            }
             Initialize(connection, onAvailability);
-            var flow = new StartupFlow(async: false, options, timeout == default ? options.ConnectionTimeout : timeout);
+            var flow = new StartupFlow(async: false, options, deadline.GetRemaining());
             var task = StartAsync(flow, flow.WaitForComplete());
             Debug.Assert(task.IsCompleted);
             task.AsTask().GetAwaiter().GetResult();
@@ -239,10 +248,18 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
     }
 
     public async ValueTask StartAsync(PgClientOptions options, TransportConnection connection,
-        Action<bool>? onAvailability = null, CancellationToken cancellationToken = default)
+        Action<bool>? onAvailability = null, CancellationToken cancellationToken = default,
+        Func<TransportConnection, CancellationToken, ValueTask<TransportConnection>>? upgradeTransport = null)
     {
         try
         {
+            if (options.Ssl.ShouldNegotiateTls(options.EndPoint))
+            {
+                if (upgradeTransport is null)
+                    throw new InvalidOperationException("The transport does not support PostgreSQL TLS negotiation.");
+                if (await NegotiateSslAsync(connection, options.Ssl.Mode, cancellationToken).ConfigureAwait(false))
+                    connection = await upgradeTransport(connection, cancellationToken).ConfigureAwait(false);
+            }
             Initialize(connection, onAvailability);
             var flow = new StartupFlow(async: true, options, options.ConnectionTimeout);
             await StartAsync(flow, flow.WaitForComplete(cancellationToken), cancellationToken).ConfigureAwait(false);
@@ -252,6 +269,78 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
             ReleaseTransportOnStartFailure(connection, ex);
             throw;
         }
+    }
+
+    /// <summary>Performs PostgreSQL SSLRequest negotiation.</summary>
+    /// <returns><see langword="true"/> when the caller must upgrade the transport before performing further I/O; otherwise <see langword="false"/>.</returns>
+    public static bool NegotiateSsl(TransportConnection connection, PostgreSqlSslMode mode, TimeSpan timeout = default)
+    {
+        ArgumentNullException.ThrowIfNull(connection);
+
+        var deadline = new Deadline(timeout);
+        Span<byte> request = stackalloc byte[8];
+        System.Buffers.Binary.BinaryPrimitives.WriteInt32BigEndian(request, 8);
+        System.Buffers.Binary.BinaryPrimitives.WriteInt32BigEndian(request[4..], 80877103);
+        ((StreamPipeWriter)connection.Writer).Write(request, deadline.GetRemaining());
+        var read = ((StreamPipeReader)connection.Reader).ReadAtLeast(1, deadline.GetRemaining());
+        if (read.Buffer.IsEmpty)
+            throw new EndOfStreamException("PostgreSQL closed the connection before answering the SSL request.");
+        var response = read.Buffer.FirstSpan[0];
+        connection.Reader.AdvanceTo(read.Buffer.GetPosition(1));
+        EnsureNoAdditionalSslResponseData(read.Buffer);
+        return EnsureSslAccepted(response, mode);
+    }
+
+    /// <summary>Performs PostgreSQL SSLRequest negotiation.</summary>
+    /// <returns><see langword="true"/> when the caller must upgrade the transport before performing further I/O; otherwise <see langword="false"/>.</returns>
+    public static async ValueTask<bool> NegotiateSslAsync(TransportConnection connection,
+        PostgreSqlSslMode mode, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(connection);
+
+        var request = new byte[8];
+        System.Buffers.Binary.BinaryPrimitives.WriteInt32BigEndian(request, 8);
+        System.Buffers.Binary.BinaryPrimitives.WriteInt32BigEndian(request.AsSpan(4), 80877103);
+        var write = await connection.Writer.WriteAsync(request, cancellationToken).ConfigureAwait(false);
+        if (write.IsCanceled)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            throw new OperationCanceledException();
+        }
+        if (write.IsCompleted)
+            throw new EndOfStreamException("The transport completed while sending the PostgreSQL SSL request.");
+
+        var read = await connection.Reader.ReadAtLeastAsync(1, cancellationToken).ConfigureAwait(false);
+        if (read.IsCanceled)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            throw new OperationCanceledException();
+        }
+        if (read.Buffer.IsEmpty)
+            throw new EndOfStreamException("PostgreSQL closed the connection before answering the SSL request.");
+        var response = read.Buffer.FirstSpan[0];
+        connection.Reader.AdvanceTo(read.Buffer.GetPosition(1));
+        EnsureNoAdditionalSslResponseData(read.Buffer);
+        return EnsureSslAccepted(response, mode);
+    }
+
+    static bool EnsureSslAccepted(byte response, PostgreSqlSslMode mode)
+    {
+        if (response is (byte)'S')
+            return true;
+        if (response is (byte)'N')
+        {
+            if (mode is PostgreSqlSslMode.Prefer)
+                return false;
+            throw new InvalidOperationException("PostgreSQL rejected the required TLS connection.");
+        }
+        throw new InvalidDataException($"PostgreSQL returned an invalid SSL response byte: 0x{response:X2}.");
+    }
+
+    static void EnsureNoAdditionalSslResponseData(ReadOnlySequence<byte> buffer)
+    {
+        if (buffer.Length != 1)
+            throw new InvalidDataException("PostgreSQL sent additional unencrypted data with the SSL response.");
     }
 
     // Startup failed before the protocol could take over teardown - the sync-capability check,

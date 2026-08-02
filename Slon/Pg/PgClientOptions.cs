@@ -16,6 +16,14 @@ sealed class PgClientOptions
     public required string Username { get; init; }
     public string? Password { get; init; }
     public string? Database { get; init; }
+    public PostgreSqlSslOptions Ssl { get; internal set; } = new();
+
+    internal PgClientOptions WithSsl(PostgreSqlSslOptions ssl)
+    {
+        var copy = (PgClientOptions)MemberwiseClone();
+        copy.Ssl = ssl;
+        return copy;
+    }
     public TimeSpan ReadTimeout { get; init; } = Timeout.InfiniteTimeSpan; // TimeSpan.FromSeconds(2);
     public TimeSpan WriteTimeout { get; init; } = TimeSpan.FromSeconds(10);
 

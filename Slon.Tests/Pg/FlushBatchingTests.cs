@@ -38,7 +38,7 @@ public class FlushBatchingTests
 
     static async Task<(PgClientProtocol, FlushCountingTransport, PausableScheduler)> CreateAsync()
     {
-        var options = new PgClientOptions { EndPoint = TestEndPoint.Default, Username = "postgres", Password = "postgres123", Database = "postgres" };
+        var options = new PgClientOptions { EndPoint = TestEndPoint.Default, Username = "postgres", Password = "postgres123", Database = "postgres", Ssl = new() { Mode = PostgreSqlSslMode.Disable } };
         var transport = new FlushCountingTransport(Handshake());
         var scheduler = new PausableScheduler();
         // Long timeouts so the parked (response-less) flows aren't aborted while we measure writes.

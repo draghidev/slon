@@ -43,6 +43,7 @@ static class PgTestPool
         Username = "postgres",
         Password = "postgres123",
         Database = "postgres",
+        Ssl = new() { Mode = PostgreSqlSslMode.Disable }
     };
 
     // Select an available protocol from the bounded shared pool. Selection consumes its availability
