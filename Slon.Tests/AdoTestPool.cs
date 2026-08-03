@@ -53,6 +53,9 @@ static class AdoTestPool
     // themselves (e.g. assert ExecuteScalar throws). Runs on a pool-picked wire - no connection lease.
     internal static SlonCommand CreateCommand(string sql) => new(_shared, sql);
 
+    internal static async Task WarmAsync()
+        => Assert.AreEqual(0, await ExecuteNonQueryAsync("SELECT 1"));
+
     // Construct a fresh, non-pooled SlonDataSource the caller owns end to end. Use in tests
     // that need non-default configuration (auto-prepare thresholds, tight heartbeat ticks,
     // alternate pool sizing) or that intentionally fault the wire / break the pool's state.

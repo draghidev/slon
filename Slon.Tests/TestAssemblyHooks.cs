@@ -12,6 +12,10 @@ namespace Slon.Tests;
 [TestClass]
 public static class TestAssemblyHooks
 {
+    [AssemblyInitialize]
+    public static async Task WarmAsync(TestContext _)
+        => await AdoTestPool.WarmAsync();
+
     [AssemblyCleanup]
     public static async Task DrainAsync()
     {
