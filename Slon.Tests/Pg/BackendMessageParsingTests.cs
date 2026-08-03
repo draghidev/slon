@@ -44,6 +44,19 @@ public class BackendMessageParsingTests
         => new(BlockBytes(fields));
 
     [TestMethod]
+    public void UnexpectedMessageType_IsAProtocolFailure()
+    {
+        var message = Message(PgTypes.BackendType.CommandComplete, "SELECT 1\0"u8);
+
+        Assert.ThrowsExactly<PgProtocolException>(() =>
+            message.EnsureExpected(PgTypes.BackendType.ReadyForQuery));
+        Assert.ThrowsExactly<PgProtocolException>(() =>
+            message.EnsureExpectedOrError(PgTypes.BackendType.ReadyForQuery));
+        Assert.ThrowsExactly<PgProtocolException>(() =>
+            message.EnsureExpected(PgTypes.BackendType.ReadyForQuery, PgTypes.BackendType.ErrorResponse));
+    }
+
+    [TestMethod]
     public void ParsesAllStandardFields()
     {
         var msg = ErrorOrNoticeMessage.FromFieldBlock(Block(
@@ -109,14 +122,14 @@ public class BackendMessageParsingTests
     }
 
     [TestMethod]
-    public void PostgresException_RendersSelfDiagnosingMessage()
+    public void PgErrorException_RendersSelfDiagnosingMessage()
     {
         PgError error = ErrorOrNoticeMessage.FromFieldBlock(Block(
             ('S', "FATAL"),
             ('C', "53300"),
             ('M', "sorry, too many clients already")));
 
-        var ex = Assert.Throws<PostgresException>(() => PostgresException.Throw(error));
+        var ex = Assert.Throws<PgErrorException>(() => PgErrorException.Throw(error));
 
         // No longer the opaque "Exception of type ... was thrown".
         StringAssert.Contains(ex.Message, "FATAL");
@@ -194,8 +207,10 @@ public class BackendMessageParsingTests
     public void RowDescription_RejectsTruncatedFieldCount()
     {
         var description = new RowDescription();
-        Assert.ThrowsExactly<InvalidDataException>(() =>
+        var exception = Assert.ThrowsExactly<PgProtocolException>(() =>
             description.Initialize(new SequenceReader<byte>(new ReadOnlySequence<byte>(new byte[1]))));
+        StringAssert.Contains(exception.Message, "enough data");
+        Assert.IsNull(exception.InnerException);
     }
 
     [TestMethod]
@@ -210,20 +225,20 @@ public class BackendMessageParsingTests
     }
 
     [TestMethod]
-    public async Task BackendSyntaxError_SurfacesRenderedPostgresException()
+    public async Task BackendSyntaxError_SurfacesRenderedPgErrorException()
     {
         var protocol = await PgTestPool.GetProtocolAsync();
         var flow = new CommandFlow(async: true, Command.Create("SLECT 1"));
         Assert.IsTrue(protocol.TryQueue(flow));
 
-        PostgresException? thrown = null;
+        PgErrorException? thrown = null;
         var e = flow.GetAsyncEnumerator();
         try
         {
             while (await e.MoveNextAsync())
                 e.Current.GetCommandComplete();
         }
-        catch (PostgresException ex)
+        catch (PgErrorException ex)
         {
             thrown = ex;
         }

@@ -583,10 +583,11 @@ public class RecoveryTests
             completion = ex;
         }
 
-        Assert.IsInstanceOfType<AggregateException>(completion,
+        Assert.IsInstanceOfType<PgClientException>(completion,
             $"Failed flow must complete with both terminal facts when the recovery also died. Got: {completion}");
-        var aggregate = (AggregateException)completion;
+        var aggregate = (AggregateException)completion.InnerException!;
         Assert.AreEqual(2, aggregate.InnerExceptions.Count);
+        Assert.IsFalse(aggregate.InnerExceptions.Any(e => e is PgClientException));
         Assert.IsInstanceOfType<InvalidOperationException>(aggregate.InnerExceptions[0],
             "The original failure is the primary.");
         StringAssert.Contains(aggregate.InnerExceptions[0].Message, "synthetic");
@@ -626,10 +627,11 @@ public class RecoveryTests
             completion = ex;
         }
 
-        Assert.IsInstanceOfType<AggregateException>(completion,
+        Assert.IsInstanceOfType<PgClientException>(completion,
             $"Failed flow must complete with both terminal facts when the recovery also died. Got: {completion}");
-        var aggregate = (AggregateException)completion;
+        var aggregate = (AggregateException)completion.InnerException!;
         Assert.AreEqual(2, aggregate.InnerExceptions.Count);
+        Assert.IsFalse(aggregate.InnerExceptions.Any(e => e is PgClientException));
         Assert.IsInstanceOfType<InvalidOperationException>(aggregate.InnerExceptions[0],
             "The original failure is the primary.");
         StringAssert.Contains(aggregate.InnerExceptions[0].Message, "synthetic");

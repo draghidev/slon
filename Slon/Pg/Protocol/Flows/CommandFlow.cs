@@ -53,7 +53,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
     bool _deliverCancelOce;
     // Errors encountered while draining are surfaced by a waiting DisposeAsync. Live consumers observe
     // their errors directly, and the list remains unallocated on the successful path.
-    List<PostgresException>? _drainErrors;
+    List<PgErrorException>? _drainErrors;
     // Set only by ConsumeNonQueryAsync, after enqueue but before any consumer-side gate release.
     // The body cannot reach first publication until such a release, and every release publishes
     // this write, so plain accesses suffice and the body observes the mode at first wake.
@@ -519,7 +519,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                 var capturedThisCommand = false;
                 if (IsConsumingAutonomously && _pgError is { } readError && !IsOwnCancellation(readError))
                 {
-                    (_drainErrors ??= new()).Add(new PostgresException(readError));
+                    (_drainErrors ??= new()).Add(new PgErrorException(readError));
                     capturedThisCommand = true;
                 }
 
@@ -664,7 +664,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
 
                 if (suppressEnumeration && result.Error is { } suppressedError && !IsOwnCancellation(suppressedError))
                 {
-                    (_drainErrors ??= new()).Add(new PostgresException(suppressedError));
+                    (_drainErrors ??= new()).Add(new PgErrorException(suppressedError));
                     capturedThisCommand = true;
                     if (!IsDraining)
                         MarkConsumerGoneByBody();
@@ -685,7 +685,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                     // above (current-mode check), so its errors are collected there.
                     if ((consumeInternally || IsConsumingNonQuery || IsDraining && !_isResultReady)
                         && !capturedThisCommand && completeError is { } err && !IsOwnCancellation(err.Error))
-                        (_drainErrors ??= new()).Add(new PostgresException(err.Error));
+                        (_drainErrors ??= new()).Add(new PgErrorException(err.Error));
                 }
             }
 
@@ -700,7 +700,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                 if (_decoder.TryGetNext(out var message))
                 {
                     if (message.EnsureExpectedOrError(PgTypes.BackendType.ReadyForQuery) is { } rfqError)
-                        PostgresException.Throw(rfqError);
+                        PgErrorException.Throw(rfqError);
                 }
                 else if (IsAsync)
                 {
@@ -817,14 +817,14 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
         {
             var message = await decoder.GetNextAsync().ConfigureAwait(false);
             if (message.EnsureExpectedOrError(PgTypes.BackendType.ReadyForQuery) is { } rfqError)
-                PostgresException.Throw(rfqError);
+                PgErrorException.Throw(rfqError);
         }
 
         static void ReadRfq(PgDecoder decoder)
         {
             var message = decoder.GetNext();
             if (message.EnsureExpectedOrError(PgTypes.BackendType.ReadyForQuery) is { } rfqError)
-                PostgresException.Throw(rfqError);
+                PgErrorException.Throw(rfqError);
         }
     }
 
@@ -903,7 +903,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
     {
         // Drained ErrorResponses win: a Postgres error hit while draining is connection-state truth that
         // must surface (Npgsql parity), over a clean end or a user-cancel OCE. One error => a bare
-        // PostgresException (the common case); several (a per-command-sync batch that faulted in multiple
+        // PgErrorException (the common case); several (a per-command-sync batch that faulted in multiple
         // segments) => an AggregateException, lossless - the ADO layer can take InnerExceptions[0] if it
         // only wants the first. An await-drain DisposeAsync (WaitForDrainOnDispose) rethrows this via
         // WaitForComplete; a fault-and-return dispose returns before this, so the error is observed by the
@@ -941,7 +941,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
             return;
         }
         // The drain reached RFQ. Surface any ErrorResponses hit while draining (Npgsql parity): one => a
-        // bare PostgresException, several (multi-sync) => an AggregateException (ADO takes InnerExceptions[0]
+        // bare PgErrorException, several (multi-sync) => an AggregateException (ADO takes InnerExceptions[0]
         // if it only wants the first). WaitForComplete keys off the completion signal, which resolves
         // successfully even when the drain saw command errors - those are accumulated separately, surfaced
         // here so they escape await DisposeAsync().

@@ -1,4 +1,5 @@
 using System.Buffers;
+using Slon.Pg.Protocol;
 
 namespace Slon.Pg;
 
@@ -9,7 +10,7 @@ sealed class RowDescription
     public void Initialize(SequenceReader<byte> reader)
     {
         if (!reader.TryReadBigEndian(out short fieldCount))
-            ThrowHelper.ThrowNotEnoughData();
+            throw PgProtocolException.NotEnoughData();
         FieldCount = fieldCount;
     }
 

@@ -240,9 +240,9 @@ public class CommandUserCancellationStressTests
 
     // ErrorResponse surfacing on a consumer-gone drain (Npgsql parity). A command faults; the reader is
     // disposed mid-batch with WaitForDrainOnDispose, so DisposeAsync parks on the drain and rethrows the
-    // Postgres error. Single faulting sync segment => a BARE PostgresException.
+    // Postgres error. Single faulting sync segment => a BARE PgErrorException.
     [TestMethod]
-    public async Task WaitForDrainOnDispose_DrainHitsError_ThrowsBarePostgresException()
+    public async Task WaitForDrainOnDispose_DrainHitsError_ThrowsBarePgErrorException()
     {
         // An input-caused ErrorResponse leaves the session fine (drains to RFQ), so use the shared pool.
         var protocol = await PgTestPool.GetProtocolAsync();
@@ -255,14 +255,14 @@ public class CommandUserCancellationStressTests
         var e = flow.GetAsyncEnumerator();
         Assert.IsTrue(await e.MoveNextAsync(), "first result not delivered");
 
-        var ex = await Assert.ThrowsExactlyAsync<PostgresException>(async () => await e.DisposeAsync());
+        var ex = await Assert.ThrowsExactlyAsync<PgErrorException>(async () => await e.DisposeAsync());
         Assert.AreEqual("42P01", ex.SqlState, "expected undefined_table");
 
         await PgTestPool.RunAsync(protocol, "select 1");  // connection still usable (drained to RFQ)
     }
 
     // Multi-sync: per-command-sync (PreferSimple+WithSync) commands that EACH fault => multiple fault
-    // segments => DisposeAsync throws an AggregateException of PostgresExceptions (full fidelity).
+    // segments => DisposeAsync throws an AggregateException of PgErrorExceptions (full fidelity).
     [TestMethod]
     public async Task WaitForDrainOnDispose_MultiSyncErrors_ThrowsAggregate()
     {
@@ -277,7 +277,7 @@ public class CommandUserCancellationStressTests
 
         var agg = await Assert.ThrowsExactlyAsync<AggregateException>(async () => await e.DisposeAsync());
         Assert.IsTrue(agg.InnerExceptions.Count >= 2, $"expected >=2 errors, got {agg.InnerExceptions.Count}");
-        Assert.IsTrue(agg.InnerExceptions[0] is PostgresException, "inner should be PostgresException");
+        Assert.IsTrue(agg.InnerExceptions[0] is PgErrorException, "inner should be PgErrorException");
 
         await PgTestPool.RunAsync(protocol, "select 1");
     }

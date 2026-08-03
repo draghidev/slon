@@ -252,7 +252,7 @@ readonly struct BackendMessage
         return null;
 
         static void Throw(BackendType actual, BackendType expected)
-            => throw new InvalidOperationException($"Unexpected backend message: {actual}, expected: {expected}.");
+            => throw new PgProtocolException($"Unexpected backend message: {actual}, expected: {expected}.");
     }
 
     public void EnsureExpected(BackendType expected)
@@ -261,7 +261,7 @@ readonly struct BackendMessage
             Throw(Type, expected);
 
         static void Throw(BackendType actual, BackendType expected)
-            => throw new InvalidOperationException($"Unexpected backend message: {actual}, expected: {expected}.");
+            => throw new PgProtocolException($"Unexpected backend message: {actual}, expected: {expected}.");
     }
 
     // Inlining helps as it's usually run over a few RVA items at most.
@@ -280,7 +280,7 @@ readonly struct BackendMessage
         return default;
 
         static void Throw(BackendType actual, ReadOnlySpan<BackendType> expected)
-            => throw new InvalidOperationException($"Unexpected backend message: {actual}, expected: {string.Join(" or ", expected.ToArray())}.");
+            => throw new PgProtocolException($"Unexpected backend message: {actual}, expected: {string.Join(" or ", expected.ToArray())}.");
     }
 
     public void EnsureBuffered()

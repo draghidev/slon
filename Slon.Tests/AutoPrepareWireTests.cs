@@ -313,7 +313,7 @@ public class AutoPrepareWireTests
                 $"pg_prepared_statements still holds {sqlAName} after the drained maintenance Close: the Close never took effect server-side.");
         }
         await using var deallocate = new SlonCommand(reacquired, $"deallocate {sqlAName}");
-        var error = await Assert.ThrowsExactlyAsync<PostgresException>(async () =>
+        var error = await Assert.ThrowsExactlyAsync<PgErrorException>(async () =>
             await deallocate.ExecuteNonQueryAsync(CancellationToken.None));
         Assert.AreEqual(PgErrorCodes.InvalidSqlStatementName, error.SqlState,
             "The maintenance Close must remove the named statement from PostgreSQL, not just client presence.");
@@ -397,7 +397,7 @@ public class AutoPrepareWireTests
             Assert.AreEqual(PgErrorCodes.InvalidSqlStatementName, error.SqlState, $"Iteration {i}");
         }
 
-        async Task<PostgresException?> Deallocate(string name)
+        async Task<PgErrorException?> Deallocate(string name)
         {
             await using var command = new SlonCommand(conn, $"deallocate {name}");
             try
@@ -405,7 +405,7 @@ public class AutoPrepareWireTests
                 await command.ExecuteNonQueryAsync(CancellationToken.None);
                 return null;
             }
-            catch (PostgresException error)
+            catch (PgErrorException error)
             {
                 return error;
             }
@@ -443,7 +443,7 @@ public class AutoPrepareWireTests
 
         await using (var command = new SlonCommand(conn, sql))
         {
-            var error = await Assert.ThrowsExactlyAsync<PostgresException>(async () =>
+            var error = await Assert.ThrowsExactlyAsync<PgErrorException>(async () =>
                 await command.ExecuteNonQueryAsync(CancellationToken.None));
             Assert.AreEqual(PgErrorCodes.InvalidSqlStatementName, error.SqlState);
         }
@@ -475,7 +475,7 @@ public class AutoPrepareWireTests
 
         await using (var command = new SlonCommand(conn, sql))
         {
-            var error = await Assert.ThrowsExactlyAsync<PostgresException>(async () =>
+            var error = await Assert.ThrowsExactlyAsync<PgErrorException>(async () =>
                 await command.ExecuteNonQueryAsync(CancellationToken.None));
             Assert.AreEqual(PgErrorCodes.FeatureNotSupported, error.SqlState);
         }

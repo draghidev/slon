@@ -216,7 +216,7 @@ sealed class ExclusiveAccessFlow : PgClientFlow
     internal static void ThrowSessionResetError(PgError? error)
     {
         if (error is not null)
-            PostgresException.Throw(error);
+            PgErrorException.Throw(error);
     }
 
     // Close cascades must stop the inner executor and release both body and pre-activation caller gates.

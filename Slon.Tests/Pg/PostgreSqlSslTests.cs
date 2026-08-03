@@ -116,8 +116,9 @@ public class PostgreSqlSslTests
         listener.Start();
         var server = RejectAsync(listener, (byte)'X');
 
-        await Assert.ThrowsExactlyAsync<InvalidDataException>(async () =>
+        var exception = await Assert.ThrowsExactlyAsync<PgProtocolException>(async () =>
             await CreateFactory(listener, PostgreSqlSslNegotiation.PostgreSql).CreateAsync());
+        Assert.IsInstanceOfType<InvalidDataException>(exception.InnerException);
         await server;
     }
 
@@ -367,9 +368,10 @@ public class PostgreSqlSslTests
         listener.Start();
         var server = RejectWithAdditionalDataAsync(listener, response);
 
-        await Assert.ThrowsExactlyAsync<InvalidDataException>(async () =>
+        var exception = await Assert.ThrowsExactlyAsync<PgProtocolException>(async () =>
             await CreateFactory(listener, PostgreSqlSslNegotiation.PostgreSql,
                 PostgreSqlSslMode.Prefer).CreateAsync());
+        Assert.IsInstanceOfType<InvalidDataException>(exception.InnerException);
         await server;
     }
 

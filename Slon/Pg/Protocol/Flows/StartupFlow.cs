@@ -80,7 +80,7 @@ sealed class StartupFlow : PgClientFlow
             case AuthenticationType.MD5Password:
                 Span<byte> salt = stackalloc byte[4];
                 if (!reader.TryCopyTo(salt))
-                    ThrowHelper.ThrowNotEnoughData(nameof(salt));
+                    throw PgProtocolException.NotEnoughData(nameof(salt));
                 reader.Advance(4);
 
                 if (_options.Password is null)
@@ -107,19 +107,19 @@ sealed class StartupFlow : PgClientFlow
         // PgClientFlow will handle ParameterStatus messages, so we just need to handle BackendKeyData and RFQ.
         message = await decoder.GetNextAuto().ConfigureAwait(false);
         if (message.EnsureExpectedOrError(BackendType.BackendKeyData) is { } keyDataError)
-            PostgresException.Throw(keyDataError);
+            PgErrorException.Throw(keyDataError);
         message.DebugEnsureBuffered();
         var keyReader = message.BodyReader;
         if (!keyReader.TryReadBigEndian(out int processId))
-            ThrowHelper.ThrowNotEnoughData(nameof(processId));
+            throw PgProtocolException.NotEnoughData(nameof(processId));
         if (!keyReader.TryReadBigEndian(out int secretKey))
-            ThrowHelper.ThrowNotEnoughData(nameof(secretKey));
+            throw PgProtocolException.NotEnoughData(nameof(secretKey));
         BackendProcessId = processId;
         BackendSecretKey = secretKey;
 
         message = await decoder.GetNextAuto().ConfigureAwait(false);
         if (message.EnsureExpectedOrError(BackendType.ReadyForQuery) is { } rfqError)
-            PostgresException.Throw(rfqError);
+            PgErrorException.Throw(rfqError);
 
         return ValueTask.CompletedTask;
     }
@@ -127,13 +127,13 @@ sealed class StartupFlow : PgClientFlow
     AuthenticationType ParseAuthMessage(BackendMessage message, out SequenceReader<byte> reader)
     {
         if (message.EnsureExpectedOrError(BackendType.AuthenticationRequest) is { } startupError)
-            PostgresException.Throw(startupError);
+            PgErrorException.Throw(startupError);
 
         message.DebugEnsureBuffered();
 
         reader = message.BodyReader;
         if (!reader.TryReadBigEndian(out int rq))
-            ThrowHelper.ThrowNotEnoughData(nameof(AuthenticationType));
+            throw PgProtocolException.NotEnoughData(nameof(AuthenticationType));
         return (AuthenticationType)rq;
     }
 

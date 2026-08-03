@@ -56,7 +56,7 @@ public class CommandResultEnumerationTests
 
         Assert.IsTrue(await e.MoveNextAsync());
         await e.Current.DisposeAsync();
-        await Assert.ThrowsExactlyAsync<PostgresException>(async () => await e.MoveNextAsync());
-        await Assert.ThrowsExactlyAsync<PostgresException>(async () => await e.DisposeAsync());
+        await Assert.ThrowsExactlyAsync<PgErrorException>(async () => await e.MoveNextAsync());
+        await Assert.ThrowsExactlyAsync<PgErrorException>(async () => await e.DisposeAsync());
     }
 }

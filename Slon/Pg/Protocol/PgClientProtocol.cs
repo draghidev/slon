@@ -334,13 +334,15 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
                 return false;
             throw new InvalidOperationException("PostgreSQL rejected the required TLS connection.");
         }
-        throw new InvalidDataException($"PostgreSQL returned an invalid SSL response byte: 0x{response:X2}.");
+        throw new PgProtocolException(
+            new InvalidDataException($"PostgreSQL returned an invalid SSL response byte: 0x{response:X2}."));
     }
 
     static void EnsureNoAdditionalSslResponseData(ReadOnlySequence<byte> buffer)
     {
         if (buffer.Length != 1)
-            throw new InvalidDataException("PostgreSQL sent additional unencrypted data with the SSL response.");
+            throw new PgProtocolException(
+                new InvalidDataException("PostgreSQL sent additional unencrypted data with the SSL response."));
     }
 
     // Startup failed before the protocol could take over teardown - the sync-capability check,
@@ -1010,10 +1012,14 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
                 // recovery always aggregates two real faults.
                 // Single-level by construction: TryRecoverItemFailure refuses ResyncRecoveryFlow items.
                 var shutdownClose = _control.ClosedException;
-                var combined = exception is null
+                Exception combined = exception is null
                     || (shutdownClose is not null && (ReferenceEquals(exception, shutdownClose) || ReferenceEquals(failureException, shutdownClose)))
                     ? failureException
-                    : new AggregateException(failureException, exception);
+                    : new PgClientException(new AggregateException(
+                        failureException is PgClientException { InnerException: { } failureCause } ? failureCause : failureException,
+                        exception is PgClientException { InnerException: { } recoveryCause } ? recoveryCause : exception));
+                if (combined is PgProtocolException)
+                    combined = new PgClientException(combined);
 
                 // Recovery retirement made the wire schedulable. Publish that state before completing
                 // the supplanted flow: its completion continuation may immediately submit new work.

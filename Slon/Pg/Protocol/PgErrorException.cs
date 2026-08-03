@@ -3,13 +3,13 @@ using System.Diagnostics.CodeAnalysis;
 
 namespace Slon.Pg.Protocol;
 
-sealed class PostgresException : Exception
+sealed class PgErrorException : Exception
 {
     // Throwing is the escape boundary: the exception can propagate anywhere and be inspected long
     // after the message buffer is recycled, so it captures its message eagerly and Preserve()s the
     // underlying field bytes (one copy) up front, while the buffer is still valid. The field
     // accessors then decode lazily from that owned copy - safe to read from anywhere.
-    internal PostgresException(PgError error) : base(BuildMessage(error))
+    internal PgErrorException(PgError error) : base(BuildMessage(error))
         => OriginalPgError = error.Preserve();
 
     internal PgError OriginalPgError { get; }
@@ -50,5 +50,5 @@ sealed class PostgresException : Exception
 
     [DoesNotReturn]
     [StackTraceHidden]
-    public static void Throw(PgError error) => throw new PostgresException(error);
+    internal static void Throw(PgError error) => throw new PgErrorException(error);
 }

@@ -20,7 +20,7 @@ public class AdoErrorSurfacingTests
     public void ExecuteNonQuery_FailedCommand_Throws()
     {
         using var cmd = Failed();
-        Assert.ThrowsExactly<PostgresException>(() => cmd.ExecuteNonQuery());
+        Assert.ThrowsExactly<PgErrorException>(() => cmd.ExecuteNonQuery());
         AssertUsable();
     }
 
@@ -28,7 +28,7 @@ public class AdoErrorSurfacingTests
     public async Task ExecuteNonQueryAsync_FailedCommand_Throws()
     {
         await using var cmd = Failed();
-        await Assert.ThrowsExactlyAsync<PostgresException>(async () => await cmd.ExecuteNonQueryAsync(CancellationToken.None));
+        await Assert.ThrowsExactlyAsync<PgErrorException>(async () => await cmd.ExecuteNonQueryAsync(CancellationToken.None));
         AssertUsable();
     }
 
@@ -40,7 +40,7 @@ public class AdoErrorSurfacingTests
         batch.BatchCommands.Add(batch.CreateBatchCommand("SELECT 1"));
         batch.BatchCommands.Add(batch.CreateBatchCommand(Failing));
 
-        await Assert.ThrowsExactlyAsync<PostgresException>(async () => await batch.ExecuteNonQueryAsync(CancellationToken.None));
+        await Assert.ThrowsExactlyAsync<PgErrorException>(async () => await batch.ExecuteNonQueryAsync(CancellationToken.None));
         await using var command = new SlonCommand(connection, "SELECT 1");
         Assert.AreEqual(0, await command.ExecuteNonQueryAsync());
     }
@@ -49,7 +49,7 @@ public class AdoErrorSurfacingTests
     public void ExecuteScalar_FailedCommand_Throws()
     {
         using var cmd = Failed();
-        Assert.ThrowsExactly<PostgresException>(() => cmd.ExecuteScalar());
+        Assert.ThrowsExactly<PgErrorException>(() => cmd.ExecuteScalar());
         AssertUsable();
     }
 
@@ -57,7 +57,7 @@ public class AdoErrorSurfacingTests
     public async Task ExecuteScalarAsync_FailedCommand_Throws()
     {
         await using var cmd = Failed();
-        await Assert.ThrowsExactlyAsync<PostgresException>(async () => await cmd.ExecuteScalarAsync(CancellationToken.None));
+        await Assert.ThrowsExactlyAsync<PgErrorException>(async () => await cmd.ExecuteScalarAsync(CancellationToken.None));
         AssertUsable();
     }
 }

@@ -409,7 +409,7 @@ static class CommandExtensions
         var message = decoder.GetNext();
         // When an error is returned while we expect an RFQ it's going to be some unexpected server issue, just throw it.
         if (message.TryCreateError(out var syncError))
-            PostgresException.Throw(syncError);
+            PgErrorException.Throw(syncError);
 
         var transactionStatus = ReadyForQueryMessage.Create(message).TransactionStatus;
         return errorMessage is not null && transactionStatus is TransactionStatus.Error
@@ -441,7 +441,7 @@ static class CommandExtensions
 
         // When an error is returned while we expect an RFQ it's going to be some unexpected server issue, just throw it.
         if (message.TryCreateError(out var syncError))
-            PostgresException.Throw(syncError);
+            PgErrorException.Throw(syncError);
 
         var transactionStatus = ReadyForQueryMessage.Create(message).TransactionStatus;
         return errorMessage is not null && transactionStatus is TransactionStatus.Error
@@ -454,7 +454,7 @@ static class CommandExtensions
             var message = await decoder.GetNextAsync().ConfigureAwait(false);
             // When an error is returned while we expect an RFQ it's going to be some unexpected server issue, just throw it.
             if (message.TryCreateError(out var syncError))
-                PostgresException.Throw(syncError);
+                PgErrorException.Throw(syncError);
 
             var transactionStatus = ReadyForQueryMessage.Create(message).TransactionStatus;
             return errorMessage is not null && transactionStatus is TransactionStatus.Error

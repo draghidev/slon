@@ -102,7 +102,7 @@ abstract class CommandResult : IDisposable, IAsyncDisposable, IEnumerable<Row>, 
             return true;
         }
         if (_errorMessage is not null)
-            PostgresException.Throw(_errorMessage);
+            PgErrorException.Throw(_errorMessage);
 
         value = null;
         return false;
@@ -152,10 +152,10 @@ abstract class CommandResult : IDisposable, IAsyncDisposable, IEnumerable<Row>, 
             if (!IsComplete)
                 ThrowHelper.ThrowInvalidOperation("RecordsAffected is unavailable until the command result has been read to its CommandComplete (check IsComplete first).");
             // A failed command is complete (terminal ErrorResponse) but has no valid count: surface the
-            // failure as a PostgresException rather than silently reporting 0, consistent with
+            // failure as a PgErrorException rather than silently reporting 0, consistent with
             // GetCommandComplete. IsComplete keys on _errorMessage too, so the guard above doesn't cover it.
             if (_errorMessage is not null)
-                PostgresException.Throw(_errorMessage);
+                PgErrorException.Throw(_errorMessage);
             return _recordsAffected;
         }
     }

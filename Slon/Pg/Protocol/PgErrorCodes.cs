@@ -474,7 +474,7 @@ public static class PgErrorCodes
         "XX" // Internal error (database is dying)
     ];
 
-    // internal static bool IsCriticalFailure(PostgresException e, bool clusterError = true)
+    // internal static bool IsCriticalFailure(PgErrorException e, bool clusterError = true)
     // {
     //     foreach (var x in CriticalFailureCodes)
     //         if (e.SqlState.StartsWith(x, StringComparison.Ordinal))

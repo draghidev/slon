@@ -61,7 +61,7 @@ sealed class PgAdvisoryLock : IAsyncDisposable
         {
             await PgTestPool.RunAsync(owner, $"select pg_advisory_lock({key})");
         }
-        catch (PostgresException ex) when (ex.SqlState == "55P03")
+        catch (PgErrorException ex) when (ex.SqlState == "55P03")
         {
             var holders = await ReadSingleValueAsync(owner,
                 "select coalesce(string_agg(a.pid || ' age=' || (now() - a.backend_start)::text || ' ' || coalesce(left(a.query, 40), ''), '; '), '<none>') " +

@@ -585,7 +585,7 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
         {
             // Drive the result to its CommandComplete so RecordsAffected is populated (we discard any
             // rows - this is ExecuteNonQuery). Only data-modifying statements contribute a non-zero count.
-            // RecordsAffected throws a PostgresException on a failed command, so the error surfaces here
+            // RecordsAffected throws a PgErrorException on a failed command, so the error surfaces here
             // instead of silently reporting 0 affected.
             foreach (var _ in result) { }
             recordsAffected = checked(recordsAffected + result.RecordsAffected);

@@ -287,10 +287,10 @@ public class ExclusiveAccessFlowTests
             var errFlow = scope.Queue(new CommandFlow(async: true, Command.Create("select 1/0")));
             var e = errFlow.GetAsyncEnumerator();
             Assert.IsTrue(await e.MoveNextAsync(), "the error command's result should be delivered");
-            PostgresException? thrown = null;
+            PgErrorException? thrown = null;
             try { e.Current.GetCommandComplete(); }
-            catch (PostgresException ex) { thrown = ex; }
-            Assert.IsNotNull(thrown, "division by zero should surface a PostgresException on consumption");
+            catch (PgErrorException ex) { thrown = ex; }
+            Assert.IsNotNull(thrown, "division by zero should surface a PgErrorException on consumption");
             StringAssert.StartsWith(thrown!.SqlState, "22", "numeric error class (division by zero = 22012)");
             while (await e.MoveNextAsync()) { }
             await e.DisposeAsync();

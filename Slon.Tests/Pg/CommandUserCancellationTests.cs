@@ -677,7 +677,7 @@ public class CommandUserCancellationTests
             var rows = result.GetAsyncEnumerator();
             while (await rows.MoveNextAsync()) { }
             await rows.DisposeAsync();
-            var collateral = Assert.ThrowsExactly<PostgresException>(() => result.GetCommandComplete());
+            var collateral = Assert.ThrowsExactly<PgErrorException>(() => result.GetCommandComplete());
             Assert.AreEqual(PgErrorCodes.QueryCanceled, collateral.SqlState);
             Assert.IsTrue(collateral.IsCollateralCancellation);
             StringAssert.Contains(collateral.Message, "clients cannot eliminate this race");
