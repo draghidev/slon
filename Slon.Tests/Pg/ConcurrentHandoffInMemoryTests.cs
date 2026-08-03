@@ -200,7 +200,7 @@ public class ConcurrentHandoffInMemoryTests
         var full = rec.Snapshot();
         await protocol.CompleteAsync().WaitAsync(TimeSpan.FromSeconds(10));
 
-        var handshake = full.AsSpan(0, handshakeLen).ToArray();
+        var handshake = StartupTranscript.MakeReplayable(full.AsSpan(0, handshakeLen));
         var response = full.AsSpan(handshakeLen, total - handshakeLen).ToArray();
         Assert.IsTrue(response.Length > 0, "captured an empty select-1 response");
         return (handshake, response);

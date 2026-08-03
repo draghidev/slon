@@ -233,7 +233,7 @@ public class StoppingTokenInMemoryTests
         await protocol.CompleteAsync().WaitAsync(Cap);
         Log($"capture: complete, total={full.Length}");
 
-        var handshake = full.AsSpan(0, handshakeLen).ToArray();
+        var handshake = StartupTranscript.MakeReplayable(full.AsSpan(0, handshakeLen));
         var flowAResponse = full.AsSpan(handshakeLen, afterA - handshakeLen).ToArray();
         var flowBResponse = full.AsSpan(afterA, afterB - afterA).ToArray();
         Assert.IsTrue(flowAResponse.Length > 0, "captured an empty flowA response");

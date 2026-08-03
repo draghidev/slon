@@ -550,7 +550,7 @@ public class RacingDisposeInMemoryTests
         var full = recStream.Snapshot();
         await protocol.CompleteAsync().WaitAsync(Cap);
 
-        var handshake = full.AsSpan(0, handshakeLen).ToArray();
+        var handshake = StartupTranscript.MakeReplayable(full.AsSpan(0, handshakeLen));
         var response = full.AsSpan(handshakeLen, afterFlow - handshakeLen).ToArray();
         Assert.IsTrue(response.Length > 0, "captured an empty response");
         return (handshake, response);
