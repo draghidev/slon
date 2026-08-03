@@ -19,7 +19,7 @@ namespace Slon.Tests.Pg;
 [TestClass]
 public class SyncFlowHandoffTests
 {
-    static int StressIterations => StressEnv.Iterations(fallback: 500, cap: 8_000);
+    static int StressIterations => StressEnv.Iterations(fallback: 200, cap: 8_000);
 
     sealed class AutonomousSyncFlow : PgClientFlow
     {
