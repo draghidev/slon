@@ -72,6 +72,7 @@ public class RacingDisposeInMemoryTests
     sealed class Scenario : IAsyncDisposable
     {
         public required PgClientProtocol Protocol { get; init; }
+        public required CommandFlow Flow { get; init; }
         public required GatedReplayTransport Transport { get; init; }
         public required FakeTimeProvider Clock { get; init; }
         public required CommandFlow.Enumerator Enumerator { get; set; }
@@ -139,6 +140,7 @@ public class RacingDisposeInMemoryTests
         return new Scenario
         {
             Protocol = protocol,
+            Flow = flow,
             Transport = transport,
             Clock = clock,
             Enumerator = e,
@@ -196,6 +198,7 @@ public class RacingDisposeInMemoryTests
         return new Scenario
         {
             Protocol = protocol,
+            Flow = flow,
             Transport = transport,
             Clock = clock,
             Enumerator = e,
@@ -247,6 +250,26 @@ public class RacingDisposeInMemoryTests
         });
     }
 
+    static Task<Exception?> StartSyncDispose(CommandFlow.Enumerator enumerator,
+        out ManualResetEventSlim started)
+    {
+        started = new();
+        var signal = started;
+        return Task.Factory.StartNew<Exception?>(() =>
+        {
+            signal.Set();
+            try
+            {
+                enumerator.Dispose();
+                return null;
+            }
+            catch (Exception ex)
+            {
+                return ex;
+            }
+        }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+    }
+
     // =============================================================================================
     // Regression tests for the racing-teardown fix. Each pins an interleaving that produced an uncaught
     // PgClientClosedException out of DisposeAsync (or a hang) before the fix, and asserts the fixed
@@ -281,6 +304,43 @@ public class RacingDisposeInMemoryTests
             $"ordering 1: PgClientClosedException escaped DisposeAsync: {escaped?.GetType().Name}");
     }
 
+    // Synchronous counterpart to ordering 1. Dispose takes over the async body and drives it until the
+    // held read proves the takeover reached the decoder. Forceful shutdown then faults that exact read.
+    // This isolates terminal publication and the continuation handoff without ThreadPool admission,
+    // PostgreSQL timing, or an advisory lock.
+    [TestMethod]
+    public async Task SyncDispose_InFlightReadFault_Converges()
+    {
+        var iterations = Math.Clamp(StressEnv.Iterations(fallback: 1, cap: int.MaxValue), 1, 500);
+        for (var i = 0; i < iterations; i++)
+        {
+            await using var s = await BuildToFirstResultParked();
+            var bodyReParked = s.Transport.ArmReadPark();
+            var dispose = StartSyncDispose(s.Enumerator, out var started);
+            using (started)
+                Assert.IsTrue(started.Wait(Cap), $"iteration {i}: disposer thread did not start");
+            await bodyReParked.WaitAsync(Cap);
+
+            var abort = s.Protocol.DisposeAsync().AsTask();
+            Exception? escaped;
+            try
+            {
+                escaped = await dispose.WaitAsync(Cap);
+            }
+            catch (TimeoutException)
+            {
+                Assert.Fail($"iteration {i}: synchronous disposal did not converge\n" +
+                    $"flow: {ProtocolDiag.Describe(s.Flow)}\n{ProtocolDiag.Gauges(s.Protocol)}\n" +
+                    $"source: {ProtocolDiag.SourceState(s.Protocol)}\nabort={abort.Status}");
+                return;
+            }
+            await abort.WaitAsync(Cap);
+
+            Assert.IsNull(escaped,
+                $"iteration {i}: {escaped} escaped synchronous disposal");
+        }
+    }
+
     // Ordering 2 - GATE-FIRST GRACEFUL DRAIN. Body parked on the inter-result gate, graceful CompleteAsync
     // sets StoppingToken, a heartbeat tick faults the gate. The body switches to a graceful wire-drain
     // (AwaitResultGate) rather than throwing, so the next pipelined flow would read a clean wire. DisposeAsync
@@ -306,6 +366,32 @@ public class RacingDisposeInMemoryTests
 
         Assert.IsNull(escaped,
             $"ordering 2: PgClientClosedException escaped DisposeAsync: {escaped?.GetType().Name}");
+    }
+
+    // A graceful close publishes gate progress before synchronous disposal begins. The disposer may
+    // consume that progress without receiving a continuation and transfer to AwaitDrainOnDispose.
+    // Escalation must still redrive/fault the held read and complete both teardown participants.
+    [TestMethod]
+    public async Task SyncDispose_GateProgressBeforeTakeover_Converges()
+    {
+        var iterations = Math.Clamp(StressEnv.Iterations(fallback: 1, cap: int.MaxValue), 1, 500);
+        for (var i = 0; i < iterations; i++)
+        {
+            await using var s = await BuildToFirstResultParked();
+            var complete = s.Protocol.CompleteAsync();
+            s.Heartbeat();
+            await SettleAsync();
+
+            var dispose = StartSyncDispose(s.Enumerator, out var started);
+            using (started)
+                Assert.IsTrue(started.Wait(Cap), $"iteration {i}: disposer thread did not start");
+            s.Clock.Advance(TimeSpan.FromSeconds(120));
+
+            var escaped = await dispose.WaitAsync(Cap);
+            await complete.WaitAsync(Cap);
+            Assert.IsNull(escaped,
+                $"iteration {i}: {escaped?.GetType().Name} escaped synchronous disposal");
+        }
     }
 
     // Ordering 3 (gate-fault) - the predicted lost-completion HANG is NOT reachable: the heartbeat-
@@ -574,20 +660,29 @@ public class RacingDisposeInMemoryTests
     {
         readonly Pipe _toClient = new();
         readonly Pipe _toServer = new();
-        readonly ReadParkSignalingReader _reader;
+        readonly PipeReader _reader;
+        readonly ReadParkSignalingStream _readingStream;
 
         public override PipeReader Reader => _reader;
         public override PipeWriter Writer => _toServer.Writer;
         public override void WaitWritable() { }
+        public override void Abort()
+        {
+            try { _toClient.Writer.Complete(new IOException("The in-memory transport was aborted.")); }
+            catch (InvalidOperationException) { }
+        }
 
         public GatedReplayTransport(byte[] handshake)
         {
-            _reader = new ReadParkSignalingReader(_toClient.Reader);
+            _readingStream = new ReadParkSignalingStream(_toClient.Reader.AsStream());
+            _reader = new Slon.Pipelines.DefaultStreamPipeReader(_readingStream,
+                new StreamPipeReaderOptions(bufferSize: 8192, useZeroByteReads: false),
+                supportCancelPending: false);
             _toClient.Writer.WriteAsync(handshake).AsTask().GetAwaiter().GetResult();
             _ = DrainClient();
         }
 
-        public Task ArmReadPark() => _reader.ArmReadPark();
+        public Task ArmReadPark() => _readingStream.ArmReadPark();
 
         public void ReleaseSegment(byte[] bytes)
         {
@@ -618,12 +713,9 @@ public class RacingDisposeInMemoryTests
         }
     }
 
-    sealed class ReadParkSignalingReader : PipeReader
+    sealed class ReadParkSignalingStream(Stream inner) : Stream
     {
-        readonly PipeReader _inner;
         TaskCompletionSource? _park;
-
-        public ReadParkSignalingReader(PipeReader inner) => _inner = inner;
 
         public Task ArmReadPark()
         {
@@ -632,19 +724,40 @@ public class RacingDisposeInMemoryTests
             return tcs.Task;
         }
 
-        public override ValueTask<ReadResult> ReadAsync(CancellationToken cancellationToken = default)
+        public override int Read(byte[] buffer, int offset, int count)
         {
-            var vt = _inner.ReadAsync(cancellationToken);
+            Volatile.Read(ref _park)?.TrySetResult();
+            return inner.Read(buffer, offset, count);
+        }
+
+        public override int Read(Span<byte> buffer)
+        {
+            Volatile.Read(ref _park)?.TrySetResult();
+            return inner.Read(buffer);
+        }
+
+        public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            var vt = inner.ReadAsync(buffer, cancellationToken);
             if (!vt.IsCompleted)
                 Volatile.Read(ref _park)?.TrySetResult();
             return vt;
         }
 
-        public override bool TryRead(out ReadResult result) => _inner.TryRead(out result);
-        public override void AdvanceTo(SequencePosition consumed) => _inner.AdvanceTo(consumed);
-        public override void AdvanceTo(SequencePosition consumed, SequencePosition examined) => _inner.AdvanceTo(consumed, examined);
-        public override void CancelPendingRead() => _inner.CancelPendingRead();
-        public override void Complete(Exception? exception = null) => _inner.Complete(exception);
-        public override ValueTask CompleteAsync(Exception? exception = null) => _inner.CompleteAsync(exception);
+        public override void Flush() => inner.Flush();
+        public override long Seek(long offset, SeekOrigin origin) => inner.Seek(offset, origin);
+        public override void SetLength(long value) => inner.SetLength(value);
+        public override void Write(byte[] buffer, int offset, int count) => inner.Write(buffer, offset, count);
+        public override bool CanRead => inner.CanRead;
+        public override bool CanSeek => inner.CanSeek;
+        public override bool CanWrite => inner.CanWrite;
+        public override long Length => inner.Length;
+        public override long Position { get => inner.Position; set => inner.Position = value; }
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+                inner.Dispose();
+            base.Dispose(disposing);
+        }
     }
 }

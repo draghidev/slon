@@ -1,3 +1,4 @@
+using System.Reflection;
 using Slon.Pg;
 using Slon.Pg.Protocol;
 using Slon.Pg.Protocol.Flows;
@@ -11,6 +12,8 @@ namespace Slon.Tests.Pg;
 [TestClass]
 public class CommandDrainTests
 {
+    const BindingFlags NonPublicInstance = BindingFlags.Instance | BindingFlags.NonPublic;
+
     sealed class ResultObserver : ICommandFlowObserver
     {
         public TaskCompletionSource Entered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -18,6 +21,73 @@ public class CommandDrainTests
         public void OnFlowStarted(CommandFlow flow) { }
         public void OnCommandResult(CommandFlow flow, CommandResult result) => Entered.TrySetResult();
         public void OnFlowEnded(CommandFlow flow) { }
+    }
+
+    [TestMethod]
+    public void TerminalProgress_IsStickyBeforeSyncDisposerArms()
+    {
+        var flow = new CommandFlow(async: true, Command.Create("select 1"));
+        typeof(CommandFlow).GetMethod("WakePumpOnCompletion", NonPublicInstance)!.Invoke(flow, null);
+
+        var core = typeof(CommandFlow).GetField("_callerInteractionCore", NonPublicInstance)!.GetValue(flow)!;
+        var progress = (int)core.GetType().GetField("_progressSignaled", NonPublicInstance)!.GetValue(core)!;
+        Assert.AreNotEqual(0, progress,
+            "terminal progress must remain sticky when delivery precedes synchronous-disposer arming");
+    }
+
+    [TestMethod]
+    public async Task SyncCompletionWait_DoesNotDependOnAsyncContinuationDispatch()
+    {
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
+        var flow = new CommandFlow(async: true, Command.Create("select 1"));
+        var enumerator = flow.GetAsyncEnumerator();
+
+        // Model the observed ordering directly: the body publishes terminal progress, the synchronous
+        // disposal pump consumes it without a continuation, and lifecycle retirement is withheld.
+        typeof(CommandFlow).GetMethod("WakePumpOnCompletion", NonPublicInstance)!.Invoke(flow, null);
+
+        var waiter = Task.Factory.StartNew(
+            () => enumerator.Dispose(),
+            CancellationToken.None,
+            TaskCreationOptions.LongRunning,
+            TaskScheduler.Default);
+
+        Assert.IsTrue(SpinWait.SpinUntil(() => flow.CompletionWaiterPending, TimeSpan.FromSeconds(10)),
+            "synchronous completion waiter did not arm");
+
+        var completionCore = typeof(PgClientFlow)
+            .GetField("_completionCore", NonPublicInstance)!.GetValue(flow)!;
+        var continuation = completionCore.GetType()
+            .GetField("_continuation", NonPublicInstance)!.GetValue(completionCore);
+        Assert.IsNull(continuation,
+            "synchronous completion must park on its event rather than register scheduler work");
+
+        await Task.Factory.StartNew(
+            () => flow.GetExecutionControl(protocol.FlowControl).Complete(),
+            CancellationToken.None,
+            TaskCreationOptions.LongRunning,
+            TaskScheduler.Default);
+        await waiter.WaitAsync(TimeSpan.FromSeconds(10));
+    }
+
+    [TestMethod]
+    public async Task SyncCompletionBeforeEventRegistration_DoesNotPark()
+    {
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
+        var flow = new CommandFlow(async: true, Command.Create("select 1"));
+        var enumerator = flow.GetAsyncEnumerator();
+
+        // Complete before synchronous disposal has created its lazy event. Completion installs the
+        // core's sentinel, so GetStatus observes the terminal level and disposal must not park.
+        typeof(CommandFlow).GetMethod("WakePumpOnCompletion", NonPublicInstance)!.Invoke(flow, null);
+        flow.GetExecutionControl(protocol.FlowControl).Complete();
+
+        var dispose = Task.Factory.StartNew(
+            () => enumerator.Dispose(),
+            CancellationToken.None,
+            TaskCreationOptions.LongRunning,
+            TaskScheduler.Default);
+        await dispose.WaitAsync(TimeSpan.FromSeconds(10));
     }
 
     static async ValueTask Dispose(CommandFlow.Enumerator e, bool useAsyncDispose)
@@ -108,16 +178,11 @@ public class CommandDrainTests
         }
     }
 
-    // PATH coverage for the sync-dispose pump's cross-thread completion (the WakeHandshake -
-    // CommandFlow.WakePumpOnCompletion). The pump parks in WaitForContinuation on an in-flight body; here a
+    // Path coverage for the sync-dispose pump's cross-thread completion. The pump parks in
+    // WaitForContinuation on an in-flight body; here a
     // forceful abort closes the socket so the in-flight read faults ON ITS POOL THREAD (SetResult(null)->
     // DeliverTerminal, or HandleException), completing the body cross-thread while the pump is parked - the
-    // handshake must wake it. No other test reaches this interleaving (pump parked + completion off-thread).
-    // NOTE: this does NOT reliably redden if the fence is removed - the actual lost-wake is a sub-microsecond
-    // visibility window (a stale IsAsync read), and the abort->completion chain always lands microseconds
-    // AFTER the disposer's IsAsync=false write, so the completion observes it and signals regardless (locally
-    // it stays green even with the handshake fully neutered, 1200+ iters). The fence's correctness rests on
-    // the model (WakeHandshake.tla) + reasoning; this guards the surrounding logic and documents the scenario.
+    // sticky terminal publication must wake it. No other live-server test reaches this interleaving.
     [TestMethod]
     public async Task InFlightCompletion_RacesSyncDispose_PumpNeverStrands_Stress()
     {
@@ -142,8 +207,18 @@ public class CommandDrainTests
             var abortTask = Task.Run(async () => { try { await protocol.DisposeAsync(); } catch { } });
             await blocker.ReleaseAsync();
 
-            try { await Task.WhenAll(disposeTask, abortTask).WaitAsync(cap); }
-            catch (TimeoutException) { Assert.Fail($"iter {i}: sync-dispose pump stranded - WakeHandshake lost-wake."); }
+            try
+            {
+                await Task.WhenAll(disposeTask, abortTask).WaitAsync(cap);
+            }
+            catch (TimeoutException)
+            {
+                var stuck = string.Join(", ", new[] { ("dispose", disposeTask), ("abort", abortTask) }
+                    .Where(x => !x.Item2.IsCompleted).Select(x => x.Item1));
+                Assert.Fail($"iter {i}: dispose/abort race did not converge\n  stuck: {stuck}\n" +
+                    $"flow: {ProtocolDiag.Describe(flow)}\n{ProtocolDiag.Gauges(protocol)}\n" +
+                    $"source: {ProtocolDiag.SourceState(protocol)}");
+            }
             try { await moveNext.WaitAsync(cap); } catch { }
         }
     }

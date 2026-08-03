@@ -80,17 +80,14 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
     void MarkConsumerGone()
     {
         Volatile.Write(ref _consumerDisposed, true);
-        // The full fence pairs with the body's register-then-recheck. The following gate open may
-        // no-op, so a release store alone could leave both the edge and drain level unobserved.
-        Interlocked.Exchange(ref _draining, true);
+        Volatile.Write(ref _draining, true);
     }
 
     // Consumer disposal while waiting for the autonomous drain.
     void MarkConsumerWaitForDrain()
     {
         Volatile.Write(ref _consumerDisposed, true);
-        // Full fence, same pairing as MarkConsumerGone.
-        Interlocked.Exchange(ref _draining, true);
+        Volatile.Write(ref _draining, true);
     }
 
     // A body-initiated drain keeps the consumer attached for terminal cancellation or close delivery.
@@ -878,7 +875,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
             observedScope = priorScope;
         }
         Volatile.Write(ref _cancelRequested, true);
-        Interlocked.Exchange(ref _draining, true);
+        Volatile.Write(ref _draining, true);
         RequestBackendCancellation(delivery: Volatile.Read(ref _cancelDelivery));
         _callerInteractionCore.OpenGate(runContinuationsAsynchronously: true);
         _callerInteractionCore.RequestWake(useDedicatedDriver: !IsAsync && Volatile.Read(ref _cancelDelivery) is not null);
@@ -949,6 +946,25 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
             throw errors.Count == 1 ? errors[0] : new AggregateException(errors);
     }
 
+    void AwaitDrainOnDisposeSynchronously()
+    {
+        try
+        {
+            WaitForCompleteSynchronously(_flowCancellationToken);
+        }
+        catch (OperationCanceledException) when (_flowCancellationToken.IsCancellationRequested)
+        {
+            // Caller cancelled the wait; the body continues draining autonomously.
+        }
+        catch (PgClientClosedException)
+        {
+            return;
+        }
+
+        if (_drainErrors is { Count: > 0 } errors)
+            throw errors.Count == 1 ? errors[0] : new AggregateException(errors);
+    }
+
     void DeliverClose(Exception closeException)
     {
         _enumeratorMoveNextTaskSource.TrySetException(closeException, runContinuationsAsynchronously: true);
@@ -966,23 +982,11 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
         }
     }
 
-    // Wake a sync caller parked in WaitForContinuation once the body's completion is recorded
-    // (_enumeratorCompleted set by the caller). TWO waiters: a genuine sync flow (!IsAsync), and a sync
-    // DISPOSER PUMPING the rendezvous for an async flow - it set _consumerDisposed before it parked. The
-    // full fence pairs with the disposer's fence before it reads _enumeratorCompleted (the WakeHandshake,
-    // machine-checked in WakeHandshake.tla): if it didn't see our completion it WILL see its own arm here,
-    // so neither misses the other. Reached cross-thread when the body COMPLETES on its own pool thread
-    // without handing off - an in-flight read that faults (HandleException) or, under a concurrent protocol
-    // close, takes the IsProtocolClosed catch -> SetResult(null) -> DeliverTerminal. LOAD-BEARING and
-    // effectively UNTESTABLE: the trigger is a sub-microsecond visibility window (a stale IsAsync read
-    // racing the disposer's IsAsync=false), so no test reliably reddens if the fence is dropped - do NOT
-    // remove it.
+    // Publish terminal progress unconditionally. A terminal delivery can lose its task-source CAS to an
+    // already-completed generation and leave _enumeratorCompleted false. A later synchronous disposer
+    // must still observe this sticky level rather than park for a completer that has already gone away.
     void WakePumpOnCompletion()
-    {
-        Interlocked.MemoryBarrier();
-        if (!IsAsync || Volatile.Read(ref _consumerDisposed))
-            _callerInteractionCore.SignalProgress();
-    }
+        => _callerInteractionCore.SignalProgress();
 
     // Repair a version-less terminal (_enumeratorCompleted) that survived onto a fresh PENDING generation
     // with no completer (the lost-completion shape), shared by the sync and async MoveNext short-circuits.
@@ -1375,9 +1379,8 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                 flow._callerInteractionCore.OpenGate(runContinuationsAsynchronously: false);
                 if (flow.WaitForDrainOnDispose)
                 {
-                    // Pump handed-off continuations inline until terminal progress wakes us without one.
-                    // Fence the drain arm against completion before deciding to park.
-                    Interlocked.MemoryBarrier();
+                    // Pump handed-off continuations inline until sticky terminal progress wakes us
+                    // without one.
                     while (!Volatile.Read(ref flow._enumeratorCompleted))
                     {
                         var continuation = flow._callerInteractionCore.WaitForContinuation();
@@ -1386,7 +1389,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                         continuation.Invoke();
                     }
                     // Drain ran on this thread; surface accumulated drain errors (completes immediately).
-                    flow.AwaitDrainOnDispose().AsTask().GetAwaiter().GetResult();
+                    flow.AwaitDrainOnDisposeSynchronously();
                 }
                 else
                 {

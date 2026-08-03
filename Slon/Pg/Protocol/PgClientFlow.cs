@@ -62,6 +62,7 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
     // pattern). At most one pending waiter per tenure; post-completion awaits resolve
     // synchronously.
     Slon.Threading.Tasks.Sources.ManualResetValueTaskSourceCore<PgClientFlow> _completionCore;
+    ManualResetEventSlim? _completionEvent;
     // 1 while a WaitForComplete token is live (set at capture, cleared after GetResult consumed the
     // core). Guards reuse: Reset bumps the core's version, so it must not run while this is set.
     int _completionWaiterPending;
@@ -193,6 +194,28 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
         return new(this, _completionCore.Version);
     }
 
+    // Synchronous consumers must not block on an async continuation whose dispatch requires another
+    // scheduler turn. The event is allocated only for that uncommon path and is signaled after the
+    // completion core has published its result.
+    internal PgClientFlow WaitForCompleteSynchronously(CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        Volatile.Write(ref _completionWaiterPending, 1);
+        var token = _completionCore.Version;
+        var completionEvent = _completionEvent;
+        if (completionEvent is null)
+        {
+            var created = new ManualResetEventSlim();
+            completionEvent = Interlocked.CompareExchange(ref _completionEvent, created, null) ?? created;
+            if (!ReferenceEquals(completionEvent, created))
+                created.Dispose();
+        }
+
+        if (_completionCore.GetStatus(token) is ValueTaskSourceStatus.Pending)
+            completionEvent.Wait();
+        return ((IValueTaskSource<PgClientFlow>)this).GetResult(token);
+    }
+
     /// True while a completion waiter holds an unconsumed token on this tenure's signal. Reuse
     /// paths (the exclusive flyweight's rent) must not Reset the flow while set: the waiter's
     /// continuation may still be in dispatch and its GetResult would land on a bumped version.
@@ -219,6 +242,7 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
         // Version bump per tenure. Cross-tenure completer staleness rests on the done -> torn-down
         // -> retired layering (Complete precedes recycle), the same basis as the rest of this reset.
         _completionCore.Reset();
+        _completionEvent?.Reset();
         _activationTaskSource.Reset();
         _rfqCount = 0;
         _cancellationWindow = 0;
@@ -736,6 +760,7 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
                 flow._completionCore.TrySetException(exception, runContinuationsAsynchronously: true);
             else
                 flow._completionCore.TrySetResult(flow, runContinuationsAsynchronously: true);
+            flow._completionEvent?.Set();
             try { flow.OnExecutionCompleted(exception); }
             catch (Exception ex) { /* TODO log */ control.FailProtocol(ex); }
             // The completion callback runs from CompleteItem in the advancer/retirement work-item

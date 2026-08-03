@@ -17,10 +17,10 @@ struct FlowCallerInteractionCore<TResult>
     // deliberately stays set after the caller takes it (HasContinuation acts as a "handoff
     // already done" marker). Re-queueing the stale _continuation on TP after the body has
     // already resumed crashes the process: that continuation points at a completed state
-    // machine. _wakeContinuation has claim-and-clear semantics: set in OnCompleted,
-    // Exchange-claimed by WaitForContinuation OR RequestWake. Verified: WakeProtocol.tla.
+    // machine. _wakeContinuation has claim-and-clear semantics: set in OnCompleted and
+    // exchange-claimed by WaitForContinuation or RequestWake.
     Action? _wakeContinuation;
-    bool _progressSignaled;
+    int _progressSignaled;
     // One-shot flag set by RequestWake; consumed by the OnCompleted post-store re-check.
     bool _wakeRequested;
     // Cancellation may have to take ownership from a sync caller that will not return. Once set,
@@ -45,7 +45,6 @@ struct FlowCallerInteractionCore<TResult>
     // load-bearing knob - inline = a sync disposer's park-before-open takeover resumes the body on its own
     // thread; async = an autonomous wake that must not run the body inline on the signaller's stack.
     Slon.Threading.Tasks.Sources.ManualResetValueTaskSourceCore<TResult> _gate;
-
     public void Initialize()
     {
         _gate.CanCompleteConcurrently = true;
@@ -118,18 +117,12 @@ struct FlowCallerInteractionCore<TResult>
             // Check progress BEFORE blocking. A SignalProgress that ran before this GetMres (e.g. a body
             // that faulted while _mres was still null) left the mres unset but _progressSignaled true; without
             // this pre-check mres.Wait would block forever waiting for a Set that already (no-op) happened.
-            if (Volatile.Read(ref _progressSignaled))
-            {
-                _progressSignaled = false;
+            if (ConsumeProgress())
                 return null;
-            }
             mres.Wait();
             mres.Reset();
-            if (Volatile.Read(ref _progressSignaled))
-            {
-                _progressSignaled = false;
+            if (ConsumeProgress())
                 return null;
-            }
             // Claim wake-eligibility so a concurrent RequestWake doesn't also queue the
             // continuation. _continuation itself stays for HasContinuation's marker role.
             Interlocked.Exchange(ref _wakeContinuation, null);
@@ -150,7 +143,7 @@ struct FlowCallerInteractionCore<TResult>
     }
 
     // External wake request from consumer-side state changes (Enumerator.Dispose /
-    // DisposeAsync). Spec: WakeProtocol.tla. Fires both wake mechanisms:
+    // DisposeAsync). Fires both wake mechanisms:
     //   - SignalProgress wakes a sync caller blocked in WaitForContinuation.
     //   - Interlocked.Exchange on _wakeContinuation claims the body's resume action if present,
     //     covering consumer abandonment while a sync body is suspended. Ordinary wakes use the
@@ -159,7 +152,7 @@ struct FlowCallerInteractionCore<TResult>
     {
         if (useDedicatedDriver)
             Volatile.Write(ref _dedicatedWakeRequested, true);
-        Interlocked.Exchange(ref _wakeRequested, true);
+        Volatile.Write(ref _wakeRequested, true);
         SignalProgress();
         var stored = Interlocked.Exchange(ref _wakeContinuation, null);
         if (stored is not null)
@@ -193,10 +186,15 @@ struct FlowCallerInteractionCore<TResult>
     // routing through SetContinuationAndUnblockWaiter.
     public void SignalProgress()
     {
-        // Volatile so WaitForContinuation's pre-block check sees it even when _mres is null (the Set no-ops).
-        Volatile.Write(ref _progressSignaled, true);
+        // Atomic publication is load-bearing in both directions. Its full fence orders this level
+        // before the following _mres read: if that read misses a concurrently-installed event, the
+        // waiter's fenced install and consume must observe the level instead. Atomic consume in
+        // WaitForContinuation also cannot erase a newer publication with a trailing false store.
+        Interlocked.Exchange(ref _progressSignaled, 1);
         _mres?.Set();
     }
+
+    bool ConsumeProgress() => Interlocked.Exchange(ref _progressSignaled, 0) != 0;
 
     public ContinuationCapturingAwaitable SetContinuationAndUnblockWaiter(FieldRef<FlowCallerInteractionCore<TResult>> fieldRef)
         => new(fieldRef);
@@ -206,7 +204,7 @@ struct FlowCallerInteractionCore<TResult>
         _mres?.Reset();
         _continuation = null;
         _wakeContinuation = null;
-        _progressSignaled = false;
+        _progressSignaled = 0;
         _wakeRequested = false;
         _dedicatedWakeRequested = false;
         _closeException = null;
