@@ -13,8 +13,12 @@ namespace Slon.Tests;
 public static class TestAssemblyHooks
 {
     [AssemblyInitialize]
-    public static async Task WarmAsync(TestContext _)
-        => await AdoTestPool.WarmAsync();
+    public static async Task WarmAsync(TestContext context)
+    {
+        var certificateWarm = Task.Run(static () => TlsTestCertificate.Instance);
+        await AdoTestPool.WarmAsync();
+        _ = await certificateWarm;
+    }
 
     [AssemblyCleanup]
     public static async Task DrainAsync()

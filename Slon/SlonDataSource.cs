@@ -26,6 +26,10 @@ public record SlonDataSourceOptions
     public string? Database { get; init; }
     /// <summary>Configures PostgreSQL TLS negotiation and server authentication.</summary>
     public PostgreSqlSslOptions Ssl { get; init; } = new();
+    /// <summary>Configures authentication policy. The data source snapshots these values when built.</summary>
+    public PostgreSqlAuthenticationOptions Authentication { get; init; } = new();
+    public PostgreSqlOAuthOptions? OAuth { get; init; }
+    public PostgreSqlIntegratedSecurityOptions? IntegratedSecurity { get; init; }
     public TimeSpan ConnectionTimeout { get; init; } = TimeSpan.FromSeconds(10);
     public TimeSpan CancellationTimeout { get; init; } = TimeSpan.FromSeconds(10);
     public int MinPoolSize { get; init; } = 1;
@@ -69,13 +73,16 @@ public record SlonDataSourceOptions
     internal TimeSpan HeartbeatInterval { get; init; } = TimeSpan.FromSeconds(1);
     internal TimeSpan MaintenanceInterval { get; init; } = TimeSpan.FromSeconds(1);
 
-    internal PgClientOptions ToPgClientOptions() => new()
+    internal PgClientOptions ToPgClientOptions(OAuthTokenCache? oauthTokens = null) => new()
     {
         EndPoint = EndPoint,
         Username = Username,
         Database = Database,
         Password = Password,
         Ssl = Ssl.Snapshot(),
+        AllowInsecureTransport = Authentication.AllowInsecureTransport,
+        OAuthTokens = oauthTokens,
+        IntegratedSecurity = IntegratedSecurity,
         HeartbeatInterval = HeartbeatInterval,
         MaintenanceInterval = MaintenanceInterval,
         ScopeReset = ScopeReset.Snapshot(),
@@ -85,7 +92,10 @@ public record SlonDataSourceOptions
     internal bool Validate()
     {
         ArgumentNullException.ThrowIfNull(Ssl);
+        ArgumentNullException.ThrowIfNull(Authentication);
         Ssl.Validate();
+        OAuth?.Validate();
+        IntegratedSecurity?.Validate();
         // etc
         return true;
     }
@@ -197,7 +207,10 @@ public sealed class SlonDataSource: DbDataSource
 
                 var connectionInit = _options.ConnectionInitializer;
                 var asyncConnectionInit = _options.AsyncConnectionInitializer;
-                var clientOptions = _options.ToPgClientOptions();
+                var oauthTokens = _options.OAuth is { } oauth
+                    ? new OAuthTokenCache(oauth, new(_options.EndPoint, _options.Username, _options.Database))
+                    : null;
+                var clientOptions = _options.ToPgClientOptions(oauthTokens);
                 var transportFactory = SocketStreamConnection.CreateFactory(clientOptions.EndPoint);
 
                 var factory = new InitializingConnectionFactory<PgConnection>(

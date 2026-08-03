@@ -1,6 +1,8 @@
 using System.Buffers;
+using System.Buffers.Binary;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
+using System.Security.Authentication;
 using System.Text;
 using Slon.Pipelines;
 using Slon.Runtime.CompilerServices;
@@ -235,7 +237,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
                     connection = upgradeTransport(connection, deadline.GetRemaining());
             }
             Initialize(connection, onAvailability);
-            var flow = new StartupFlow(async: false, options, deadline.GetRemaining());
+            var flow = new StartupFlow(async: false, options, connection.RemoteCertificate, deadline.GetRemaining());
             var task = StartAsync(flow, flow.WaitForComplete());
             Debug.Assert(task.IsCompleted);
             task.AsTask().GetAwaiter().GetResult();
@@ -261,7 +263,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
                     connection = await upgradeTransport(connection, cancellationToken).ConfigureAwait(false);
             }
             Initialize(connection, onAvailability);
-            var flow = new StartupFlow(async: true, options, options.ConnectionTimeout);
+            var flow = new StartupFlow(async: true, options, connection.RemoteCertificate, options.ConnectionTimeout);
             await StartAsync(flow, flow.WaitForComplete(cancellationToken), cancellationToken).ConfigureAwait(false);
         }
         catch (Exception ex) when (Status is ProtocolStatus.Created)
@@ -279,8 +281,8 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
 
         var deadline = new Deadline(timeout);
         Span<byte> request = stackalloc byte[8];
-        System.Buffers.Binary.BinaryPrimitives.WriteInt32BigEndian(request, 8);
-        System.Buffers.Binary.BinaryPrimitives.WriteInt32BigEndian(request[4..], 80877103);
+        BinaryPrimitives.WriteInt32BigEndian(request, 8);
+        BinaryPrimitives.WriteInt32BigEndian(request[4..], 80877103);
         ((StreamPipeWriter)connection.Writer).Write(request, deadline.GetRemaining());
         var read = ((StreamPipeReader)connection.Reader).ReadAtLeast(1, deadline.GetRemaining());
         if (read.Buffer.IsEmpty)
@@ -288,7 +290,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         var response = read.Buffer.FirstSpan[0];
         connection.Reader.AdvanceTo(read.Buffer.GetPosition(1));
         EnsureNoAdditionalSslResponseData(read.Buffer);
-        return EnsureSslAccepted(response, mode);
+        return ShouldUpgradeTransport(response, mode);
     }
 
     /// <summary>Performs PostgreSQL SSLRequest negotiation.</summary>
@@ -299,8 +301,8 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         ArgumentNullException.ThrowIfNull(connection);
 
         var request = new byte[8];
-        System.Buffers.Binary.BinaryPrimitives.WriteInt32BigEndian(request, 8);
-        System.Buffers.Binary.BinaryPrimitives.WriteInt32BigEndian(request.AsSpan(4), 80877103);
+        BinaryPrimitives.WriteInt32BigEndian(request, 8);
+        BinaryPrimitives.WriteInt32BigEndian(request.AsSpan(4), 80877103);
         var write = await connection.Writer.WriteAsync(request, cancellationToken).ConfigureAwait(false);
         if (write.IsCanceled)
         {
@@ -321,10 +323,10 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         var response = read.Buffer.FirstSpan[0];
         connection.Reader.AdvanceTo(read.Buffer.GetPosition(1));
         EnsureNoAdditionalSslResponseData(read.Buffer);
-        return EnsureSslAccepted(response, mode);
+        return ShouldUpgradeTransport(response, mode);
     }
 
-    static bool EnsureSslAccepted(byte response, PostgreSqlSslMode mode)
+    static bool ShouldUpgradeTransport(byte response, PostgreSqlSslMode mode)
     {
         if (response is (byte)'S')
             return true;
@@ -332,17 +334,18 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         {
             if (mode is PostgreSqlSslMode.Prefer)
                 return false;
-            throw new InvalidOperationException("PostgreSQL rejected the required TLS connection.");
+            throw new PgClientException(new AuthenticationException(
+                "PostgreSQL rejected the required TLS connection."));
         }
-        throw new PgProtocolException(
-            new InvalidDataException($"PostgreSQL returned an invalid SSL response byte: 0x{response:X2}."));
+        throw new PgClientException(new PgProtocolException(
+            $"PostgreSQL returned an invalid SSL response byte: 0x{response:X2}."));
     }
 
     static void EnsureNoAdditionalSslResponseData(ReadOnlySequence<byte> buffer)
     {
         if (buffer.Length != 1)
-            throw new PgProtocolException(
-                new InvalidDataException("PostgreSQL sent additional unencrypted data with the SSL response."));
+            throw new PgClientException(new PgProtocolException(
+                "PostgreSQL sent additional unencrypted data with the SSL response."));
     }
 
     // Startup failed before the protocol could take over teardown - the sync-capability check,

@@ -2,7 +2,7 @@ using System.Buffers.Binary;
 using System.Net;
 using System.Net.Security;
 using System.Net.Sockets;
-using System.Security.Cryptography;
+using System.Security.Authentication;
 using System.Security.Cryptography.X509Certificates;
 using Slon.Pg;
 using Slon.Pg.Protocol;
@@ -13,9 +13,33 @@ namespace Slon.Tests.Pg;
 [TestClass]
 public class PostgreSqlSslTests
 {
+    static X509Certificate2 Certificate => TlsTestCertificate.Instance;
+
     [TestMethod]
     public void DefaultMode_PrefersTls()
         => Assert.AreEqual(PostgreSqlSslMode.Prefer, new PostgreSqlSslOptions().Mode);
+
+    [TestMethod]
+    public void RequiredChannelBinding_BlocksOnlyPlaintextDowngradeRetry()
+    {
+        var options = new PgClientOptions
+        {
+            EndPoint = new DnsEndPoint("localhost", 5432),
+            Username = "user",
+            Ssl = new()
+            {
+                Mode = PostgreSqlSslMode.Prefer,
+                ChannelBinding = PostgreSqlChannelBinding.Require
+            }
+        };
+
+        Assert.IsFalse(PgConnectionFactory.ShouldRetry(options, connected: true, encrypted: true,
+            protocolStarted: false, new IOException()));
+
+        options.Ssl.Mode = PostgreSqlSslMode.Allow;
+        Assert.IsTrue(PgConnectionFactory.ShouldRetry(options, connected: true, encrypted: false,
+            protocolStarted: false, new IOException()));
+    }
 
     [TestMethod]
     [DataRow(PostgreSqlSslMode.Allow)]
@@ -34,7 +58,7 @@ public class PostgreSqlSslTests
     [TestMethod]
     public async Task PostgreSqlNegotiation_UpgradesBeforeStartup()
     {
-        using var cert = CreateSelfSignedCert();
+        var cert = Certificate;
         using var listener = new TcpListener(IPAddress.Loopback, 0);
         listener.Start();
         var server = ServeAsync(listener, cert, direct: false);
@@ -47,7 +71,7 @@ public class PostgreSqlSslTests
     [TestMethod]
     public async Task DirectNegotiation_StartsWithTls()
     {
-        using var cert = CreateSelfSignedCert();
+        var cert = Certificate;
         using var listener = new TcpListener(IPAddress.Loopback, 0);
         listener.Start();
         var server = ServeAsync(listener, cert, direct: true);
@@ -60,7 +84,7 @@ public class PostgreSqlSslTests
     [TestMethod]
     public async Task AutomaticNegotiation_UsesDirectTlsForPostgreSql17()
     {
-        using var cert = CreateSelfSignedCert();
+        var cert = Certificate;
         using var listener = new TcpListener(IPAddress.Loopback, 0);
         listener.Start();
         var server = ServeAsync(listener, cert, direct: true);
@@ -74,7 +98,7 @@ public class PostgreSqlSslTests
     [TestMethod]
     public async Task PostgreSqlNegotiation_SynchronousUpgradeBeforeStartup()
     {
-        using var cert = CreateSelfSignedCert();
+        var cert = Certificate;
         using var listener = new TcpListener(IPAddress.Loopback, 0);
         listener.Start();
         var server = ServeAsync(listener, cert, direct: false);
@@ -87,7 +111,7 @@ public class PostgreSqlSslTests
     [TestMethod]
     public async Task DirectNegotiation_SynchronousTlsBeforeStartup()
     {
-        using var cert = CreateSelfSignedCert();
+        var cert = Certificate;
         using var listener = new TcpListener(IPAddress.Loopback, 0);
         listener.Start();
         var server = ServeAsync(listener, cert, direct: true);
@@ -104,8 +128,9 @@ public class PostgreSqlSslTests
         listener.Start();
         var server = RejectAsync(listener, (byte)'N');
 
-        await Assert.ThrowsExactlyAsync<InvalidOperationException>(async () =>
+        var exception = await Assert.ThrowsExactlyAsync<PgClientException>(async () =>
             await CreateFactory(listener, PostgreSqlSslNegotiation.PostgreSql).CreateAsync());
+        Assert.IsInstanceOfType<AuthenticationException>(exception.InnerException);
         await server;
     }
 
@@ -116,9 +141,13 @@ public class PostgreSqlSslTests
         listener.Start();
         var server = RejectAsync(listener, (byte)'X');
 
-        var exception = await Assert.ThrowsExactlyAsync<PgProtocolException>(async () =>
+        var exception = await Assert.ThrowsExactlyAsync<PgClientException>(async () =>
             await CreateFactory(listener, PostgreSqlSslNegotiation.PostgreSql).CreateAsync());
-        Assert.IsInstanceOfType<InvalidDataException>(exception.InnerException);
+        var protocolException = exception.InnerException as PgProtocolException;
+        Assert.IsNotNull(protocolException);
+        StringAssert.Contains(protocolException.Message, "invalid SSL response byte");
+        StringAssert.Contains(exception.Message, protocolException.Message);
+        Assert.IsNull(protocolException.InnerException);
         await server;
     }
 
@@ -137,7 +166,7 @@ public class PostgreSqlSslTests
     [TestMethod]
     public async Task VerifyFull_RejectsUntrustedCertificate()
     {
-        using var cert = CreateSelfSignedCert();
+        var cert = Certificate;
         using var listener = new TcpListener(IPAddress.Loopback, 0);
         listener.Start();
         var server = ServeAsync(listener, cert, direct: true);
@@ -152,7 +181,7 @@ public class PostgreSqlSslTests
     [TestMethod]
     public async Task VerifyCA_RejectsUntrustedCertificate()
     {
-        using var cert = CreateSelfSignedCert();
+        var cert = Certificate;
         using var listener = new TcpListener(IPAddress.Loopback, 0);
         listener.Start();
         var server = ServeAsync(listener, cert, direct: true);
@@ -228,20 +257,24 @@ public class PostgreSqlSslTests
     {
         using var listener = new TcpListener(IPAddress.Loopback, 0);
         listener.Start();
-        var secondConnection = RejectTlsHandshakeAndObserveReconnectAsync(listener);
+        var server = RejectTlsHandshakeAsync(listener);
+        var transportFactory = new CountingTransportFactory(
+            SocketStreamConnection.CreateFactory((IPEndPoint)listener.LocalEndpoint));
 
         Exception? error = null;
         try
         {
             await CreateFactory(listener, PostgreSqlSslNegotiation.PostgreSql,
-                PostgreSqlSslMode.Prefer).CreateAsync();
+                PostgreSqlSslMode.Prefer, transportFactory: transportFactory).CreateAsync();
         }
         catch (Exception ex)
         {
             error = ex;
         }
         Assert.IsNotNull(error);
-        Assert.IsFalse(await secondConnection, "A failed TLS handshake must not trigger plaintext fallback.");
+        Assert.AreEqual(1, transportFactory.Attempts,
+            "A failed TLS handshake must not trigger plaintext fallback.");
+        await server;
     }
 
     [TestMethod]
@@ -278,22 +311,31 @@ public class PostgreSqlSslTests
     [TestMethod]
     public async Task Prefer_CancellationAfterTls_DoesNotRetry()
     {
-        using var cert = CreateSelfSignedCert();
+        var cert = Certificate;
         using var listener = new TcpListener(IPAddress.Loopback, 0);
         listener.Start();
-        var secondConnection = HoldEncryptedStartupAndObserveReconnectAsync(listener, cert);
-        using var cancellation = new CancellationTokenSource(TimeSpan.FromMilliseconds(100));
+        var startupReceived = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseServer = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var server = HoldEncryptedStartupAsync(listener, cert, startupReceived, releaseServer.Task);
+        var transportFactory = new CountingTransportFactory(
+            SocketStreamConnection.CreateFactory((IPEndPoint)listener.LocalEndpoint));
+        using var cancellation = new CancellationTokenSource();
+        var opening = CreateFactory(listener, PostgreSqlSslNegotiation.PostgreSql,
+            PostgreSqlSslMode.Prefer, transportFactory: transportFactory).CreateAsync(cancellation.Token).AsTask();
 
-        await Assert.ThrowsAsync<OperationCanceledException>(async () =>
-            await CreateFactory(listener, PostgreSqlSslNegotiation.PostgreSql,
-                PostgreSqlSslMode.Prefer).CreateAsync(cancellation.Token));
-        Assert.IsFalse(await secondConnection, "Cancellation must not trigger plaintext fallback.");
+        await startupReceived.Task;
+        cancellation.Cancel();
+        releaseServer.SetResult();
+
+        await Assert.ThrowsAsync<OperationCanceledException>(async () => await opening);
+        Assert.AreEqual(1, transportFactory.Attempts, "Cancellation must not trigger plaintext fallback.");
+        await server;
     }
 
     [TestMethod]
     public async Task Prefer_EncryptedStartupFailure_RetriesPlaintext()
     {
-        using var cert = CreateSelfSignedCert();
+        var cert = Certificate;
         using var listener = new TcpListener(IPAddress.Loopback, 0);
         listener.Start();
         var server = ServePreferFallbackAsync(listener, cert);
@@ -307,7 +349,7 @@ public class PostgreSqlSslTests
     [TestMethod]
     public async Task Prefer_EncryptedStartupFailure_RetriesPlaintextSynchronously()
     {
-        using var cert = CreateSelfSignedCert();
+        var cert = Certificate;
         using var listener = new TcpListener(IPAddress.Loopback, 0);
         listener.Start();
         var server = ServePreferFallbackAsync(listener, cert);
@@ -321,7 +363,7 @@ public class PostgreSqlSslTests
     [TestMethod]
     public async Task Allow_PlaintextStartupFailure_RetriesTls()
     {
-        using var cert = CreateSelfSignedCert();
+        var cert = Certificate;
         using var listener = new TcpListener(IPAddress.Loopback, 0);
         listener.Start();
         var server = ServeAllowFallbackAsync(listener, cert);
@@ -335,7 +377,7 @@ public class PostgreSqlSslTests
     [TestMethod]
     public async Task Allow_PlaintextStartupFailure_RetriesTlsSynchronously()
     {
-        using var cert = CreateSelfSignedCert();
+        var cert = Certificate;
         using var listener = new TcpListener(IPAddress.Loopback, 0);
         listener.Start();
         var server = ServeAllowFallbackAsync(listener, cert);
@@ -368,17 +410,20 @@ public class PostgreSqlSslTests
         listener.Start();
         var server = RejectWithAdditionalDataAsync(listener, response);
 
-        var exception = await Assert.ThrowsExactlyAsync<PgProtocolException>(async () =>
+        var exception = await Assert.ThrowsExactlyAsync<PgClientException>(async () =>
             await CreateFactory(listener, PostgreSqlSslNegotiation.PostgreSql,
                 PostgreSqlSslMode.Prefer).CreateAsync());
-        Assert.IsInstanceOfType<InvalidDataException>(exception.InnerException);
+        var protocolException = exception.InnerException as PgProtocolException;
+        Assert.IsNotNull(protocolException);
+        StringAssert.Contains(protocolException.Message, "additional unencrypted data");
+        Assert.IsNull(protocolException.InnerException);
         await server;
     }
 
     [TestMethod]
     public async Task PostgreSqlNegotiation_EncryptsCancelRequest()
     {
-        using var cert = CreateSelfSignedCert();
+        var cert = Certificate;
         using var listener = new TcpListener(IPAddress.Loopback, 0);
         listener.Start();
         var server = ServeEncryptedCancelAsync(listener, cert, 123, 456);
@@ -391,7 +436,8 @@ public class PostgreSqlSslTests
     }
 
     static PgConnectionFactory CreateFactory(TcpListener listener, PostgreSqlSslNegotiation negotiation,
-        PostgreSqlSslMode mode = PostgreSqlSslMode.Require, Version? endpointVersion = null)
+        PostgreSqlSslMode mode = PostgreSqlSslMode.Require, Version? endpointVersion = null,
+        TransportConnection.Factory? transportFactory = null)
     {
         var endpoint = (IPEndPoint)listener.LocalEndpoint;
         var options = new PgClientOptions
@@ -407,7 +453,7 @@ public class PostgreSqlSslTests
             },
             ConnectionTimeout = TimeSpan.FromSeconds(5)
         };
-        return new PgConnectionFactory(options, SocketStreamConnection.CreateFactory(endpoint));
+        return new PgConnectionFactory(options, transportFactory ?? SocketStreamConnection.CreateFactory(endpoint));
     }
 
     static async Task ServeAsync(TcpListener listener, X509Certificate2 cert, bool direct)
@@ -513,7 +559,7 @@ public class PostgreSqlSslTests
         await ReadStartupAndRespondAsync(stream);
     }
 
-    static async Task<bool> RejectTlsHandshakeAndObserveReconnectAsync(TcpListener listener)
+    static async Task RejectTlsHandshakeAsync(TcpListener listener)
     {
         using (var socket = await listener.AcceptSocketAsync())
         await using (var stream = new NetworkStream(socket, ownsSocket: false))
@@ -521,20 +567,10 @@ public class PostgreSqlSslTests
             await ExpectSslRequestAsync(stream);
             await stream.WriteAsync(new byte[] { (byte)'S' });
         }
-
-        using var timeout = new CancellationTokenSource(TimeSpan.FromMilliseconds(500));
-        try
-        {
-            using var second = await listener.AcceptSocketAsync(timeout.Token);
-            return true;
-        }
-        catch (OperationCanceledException) when (timeout.IsCancellationRequested)
-        {
-            return false;
-        }
     }
 
-    static async Task<bool> HoldEncryptedStartupAndObserveReconnectAsync(TcpListener listener, X509Certificate2 cert)
+    static async Task HoldEncryptedStartupAsync(TcpListener listener, X509Certificate2 cert,
+        TaskCompletionSource startupReceived, Task release)
     {
         using var socket = await listener.AcceptSocketAsync();
         await using var network = new NetworkStream(socket, ownsSocket: false);
@@ -543,17 +579,8 @@ public class PostgreSqlSslTests
         await using var ssl = new SslStream(network, leaveInnerStreamOpen: true);
         await AuthenticateServerAsync(ssl, cert);
         await ReadStartupAsync(ssl);
-
-        using var timeout = new CancellationTokenSource(TimeSpan.FromMilliseconds(500));
-        try
-        {
-            using var second = await listener.AcceptSocketAsync(timeout.Token);
-            return true;
-        }
-        catch (OperationCanceledException) when (timeout.IsCancellationRequested)
-        {
-            return false;
-        }
+        startupReceived.SetResult();
+        await release;
     }
 
     static async Task ExpectSslRequestAsync(Stream stream)
@@ -604,16 +631,6 @@ public class PostgreSqlSslTests
         return response;
     }
 
-    static X509Certificate2 CreateSelfSignedCert()
-    {
-        using var ecdsa = ECDsa.Create(ECCurve.NamedCurves.nistP256);
-        var request = new CertificateRequest("CN=localhost", ecdsa, HashAlgorithmName.SHA256);
-        var names = new SubjectAlternativeNameBuilder();
-        names.AddDnsName("localhost");
-        request.CertificateExtensions.Add(names.Build());
-        return request.CreateSelfSigned(DateTimeOffset.UtcNow.AddDays(-1), DateTimeOffset.UtcNow.AddDays(1));
-    }
-
     sealed class FailingTransportFactory : TransportConnection.Factory
     {
         public int Attempts { get; private set; }
@@ -634,5 +651,28 @@ public class PostgreSqlSslTests
 
         public override TransportConnection Upgrade(TransportConnection connection, Func<Stream, Stream> transform)
             => throw new InvalidOperationException();
+    }
+
+    sealed class CountingTransportFactory(TransportConnection.Factory inner) : TransportConnection.Factory
+    {
+        public int Attempts { get; private set; }
+        public override bool SupportsSynchronousIO => inner.SupportsSynchronousIO;
+
+        public override TransportConnection ConnectTransformed(Func<Stream, Stream> transform,
+            TimeSpan timeout = default)
+        {
+            Attempts++;
+            return inner.ConnectTransformed(transform, timeout);
+        }
+
+        public override ValueTask<TransportConnection> ConnectTransformedAsync(Func<Stream, Stream> transform,
+            CancellationToken cancellationToken = default)
+        {
+            Attempts++;
+            return inner.ConnectTransformedAsync(transform, cancellationToken);
+        }
+
+        public override TransportConnection Upgrade(TransportConnection connection, Func<Stream, Stream> transform)
+            => inner.Upgrade(connection, transform);
     }
 }

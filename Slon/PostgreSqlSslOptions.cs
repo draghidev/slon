@@ -30,22 +30,34 @@ public enum PostgreSqlSslNegotiation
     Direct
 }
 
-public sealed record PostgreSqlSslOptions
+public enum PostgreSqlChannelBinding
+{
+    /// <summary>Do not use SCRAM channel binding.</summary>
+    Disable,
+    /// <summary>Use SCRAM channel binding when both PostgreSQL and the TLS transport support it.</summary>
+    Prefer,
+    /// <summary>Require SCRAM-SHA-256-PLUS authentication with channel binding.</summary>
+    Require
+}
+
+public sealed class PostgreSqlSslOptions
 {
     static readonly SslApplicationProtocol PostgreSqlAlpn = new("postgresql");
     static readonly RemoteCertificateValidationCallback TrustServerCertificate = static (_, _, _, _) => true;
     static readonly RemoteCertificateValidationCallback VerifyCertificateAuthority = static (_, _, _, errors)
         => (errors & ~SslPolicyErrors.RemoteCertificateNameMismatch) is SslPolicyErrors.None;
 
-    public PostgreSqlSslMode Mode { get; init; } = PostgreSqlSslMode.Prefer;
-    public PostgreSqlSslNegotiation Negotiation { get; init; }
+    public PostgreSqlSslMode Mode { get; set; } = PostgreSqlSslMode.Prefer;
+
+    public PostgreSqlChannelBinding ChannelBinding { get; set; } = PostgreSqlChannelBinding.Prefer;
+    public PostgreSqlSslNegotiation Negotiation { get; set; }
     /// <summary>
     /// Declares the PostgreSQL version implemented by the endpoint itself. An asserted version of
     /// 17 or newer selects direct TLS when <see cref="Negotiation"/> is automatic.
     /// </summary>
-    public Version? EndpointVersion { get; init; }
+    public Version? EndpointVersion { get; set; }
     /// <summary>Configures the fresh TLS authentication options used for each connection.</summary>
-    public Action<SslClientAuthenticationOptions>? ConfigureClientAuthenticationOptions { get; init; }
+    public Action<SslClientAuthenticationOptions>? ConfigureClientAuthenticationOptions { get; set; }
 
     internal bool UsesTlsInitially
         => Mode is PostgreSqlSslMode.Prefer or PostgreSqlSslMode.Require
@@ -66,13 +78,18 @@ public sealed record PostgreSqlSslOptions
         => endpoint is not UnixDomainSocketEndPoint && UseDirectNegotiation;
 
     internal PostgreSqlSslOptions Snapshot()
-        => new()
-        {
-            Mode = Mode,
-            Negotiation = Negotiation,
-            EndpointVersion = EndpointVersion,
-            ConfigureClientAuthenticationOptions = ConfigureClientAuthenticationOptions
-        };
+        => (PostgreSqlSslOptions)MemberwiseClone();
+
+    internal PostgreSqlSslOptions CreateFallback()
+    {
+        var copy = Snapshot();
+        copy.Mode = Mode is PostgreSqlSslMode.Prefer
+            ? PostgreSqlSslMode.Disable
+            : PostgreSqlSslMode.Require;
+        copy.Negotiation = PostgreSqlSslNegotiation.Automatic;
+        copy.EndpointVersion = null;
+        return copy;
+    }
 
     internal void Validate()
     {
@@ -80,6 +97,8 @@ public sealed record PostgreSqlSslOptions
             throw new ArgumentOutOfRangeException(nameof(Mode));
         if (!Enum.IsDefined(Negotiation))
             throw new ArgumentOutOfRangeException(nameof(Negotiation));
+        if (!Enum.IsDefined(ChannelBinding))
+            throw new ArgumentOutOfRangeException(nameof(ChannelBinding));
         if (Mode is PostgreSqlSslMode.Disable && Negotiation is not PostgreSqlSslNegotiation.Automatic)
             throw new InvalidOperationException("TLS negotiation cannot be selected while TLS is disabled.");
         if (Negotiation is PostgreSqlSslNegotiation.Direct && !SupportsDirectNegotiation)

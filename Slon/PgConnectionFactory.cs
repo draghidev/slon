@@ -100,7 +100,7 @@ sealed class PgConnectionFactory : IPoolConnectionFactory<PgConnection>
         catch (Exception ex) when (ShouldRetry(_clientOptions, connected, encrypted, protocolStarted, ex))
         {
             connected = encrypted = false;
-            return CreateAttempt(_clientOptions.WithSsl(InverseFallback(_clientOptions.Ssl)));
+            return CreateAttempt(_clientOptions.WithSsl(_clientOptions.Ssl.CreateFallback()));
         }
 
         PgConnection CreateAttempt(PgClientOptions options)
@@ -138,22 +138,30 @@ sealed class PgConnectionFactory : IPoolConnectionFactory<PgConnection>
         catch (Exception ex) when (ShouldRetry(_clientOptions, connected, encrypted, protocolStarted, ex))
         {
             connected = encrypted = false;
-            return await CreateAttemptAsync(_clientOptions.WithSsl(InverseFallback(_clientOptions.Ssl))).ConfigureAwait(false);
+            return await CreateAttemptAsync(
+                _clientOptions.WithSsl(_clientOptions.Ssl.CreateFallback())).ConfigureAwait(false);
         }
 
         async ValueTask<PgConnection> CreateAttemptAsync(PgClientOptions options)
         {
-            var transport = await ConnectAsync(options, token, () => encrypted = true).ConfigureAwait(false);
-            connected = true;
+            TransportConnection? transport = null;
             try
             {
+                transport = await ConnectAsync(options, token, () => encrypted = true).ConfigureAwait(false);
+                connected = true;
                 return await PgConnection.CreateAsync(protocolOptions, options, transport, _tracker, poolContext,
                     token, (connection, ct) => UpgradeAsync(options, connection, ct, () => encrypted = true),
                     () => protocolStarted = true).ConfigureAwait(false);
             }
             catch (Exception ex)
             {
-                ReleaseTransport(transport, ex);
+                if (transport is not null)
+                    ReleaseTransport(transport, ex);
+                if (token.IsCancellationRequested)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    token.ThrowIfCancellationRequested();
+                }
                 throw;
             }
         }
@@ -261,21 +269,12 @@ sealed class PgConnectionFactory : IPoolConnectionFactory<PgConnection>
 
     // Fallback applies only after the socket connected and before protocol startup completed.
     // Prefer retries only after a completed TLS handshake; Allow starts plaintext.
-    static bool ShouldRetry(PgClientOptions options, bool connected, bool encrypted, bool protocolStarted, Exception exception)
+    internal static bool ShouldRetry(PgClientOptions options, bool connected, bool encrypted, bool protocolStarted, Exception exception)
         => options.EndPoint is not UnixDomainSocketEndPoint
             && connected && !protocolStarted && exception is not OperationCanceledException
             && (options.Ssl.Mode is PostgreSqlSslMode.Prefer && encrypted
+                    && options.Ssl.ChannelBinding is not PostgreSqlChannelBinding.Require
                 || options.Ssl.Mode is PostgreSqlSslMode.Allow && !encrypted);
-
-    static PostgreSqlSslOptions InverseFallback(PostgreSqlSslOptions options)
-        => options with
-        {
-            Mode = options.Mode is PostgreSqlSslMode.Prefer
-                ? PostgreSqlSslMode.Disable
-                : PostgreSqlSslMode.Require,
-            Negotiation = PostgreSqlSslNegotiation.Automatic,
-            EndpointVersion = null
-        };
 
     // The transport is the factory's until PgConnection takes ownership (inside its protocol.Start). A
     // throw before that - pool/idle-signal wiring, options, or Start's own pre-pipeline failure (which

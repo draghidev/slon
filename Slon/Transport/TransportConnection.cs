@@ -1,4 +1,5 @@
 using System.IO.Pipelines;
+using System.Security.Cryptography.X509Certificates;
 
 namespace Slon.Transport;
 
@@ -25,6 +26,8 @@ abstract class TransportConnection
 
     public abstract PipeReader Reader { get; }
     public abstract PipeWriter Writer { get; }
+
+    public virtual X509Certificate? RemoteCertificate => null;
 
     // Parks the calling thread until the transport is writable.
     public abstract void WaitWritable();

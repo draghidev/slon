@@ -1,7 +1,6 @@
 using System.Net;
 using System.Net.Security;
 using System.Net.Sockets;
-using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using Slon.Transport;
 
@@ -157,7 +156,7 @@ public class TransportTests
     [TestMethod]
     public async Task SslStream_OverSealedNetworkStream_WriteWithSignal_DeliversBytes()
     {
-        using var cert = CreateSelfSignedCert();
+        var cert = TlsTestCertificate.Instance;
         using var listener = new TcpListener(IPAddress.Loopback, 0);
         listener.Start();
         var endpoint = (IPEndPoint)listener.LocalEndpoint;
@@ -233,7 +232,7 @@ public class TransportTests
     [TestMethod]
     public async Task SocketFactory_ConnectTransformed_MaterializesOverTls()
     {
-        using var cert = CreateSelfSignedCert();
+        var cert = TlsTestCertificate.Instance;
         using var listener = new TcpListener(IPAddress.Loopback, 0);
         listener.Start();
         var serverTask = AcceptAndDecrypt(listener, cert);
@@ -255,7 +254,7 @@ public class TransportTests
     [TestMethod]
     public async Task SocketFactory_Upgrade_ReplacesFlushedPlaintextPipesWithTls()
     {
-        using var cert = CreateSelfSignedCert();
+        var cert = TlsTestCertificate.Instance;
         using var listener = new TcpListener(IPAddress.Loopback, 0);
         listener.Start();
         var serverTask = AcceptUpgradeAndDecrypt(listener, cert);
@@ -371,13 +370,4 @@ public class TransportTests
         return result;
     }
 
-    static X509Certificate2 CreateSelfSignedCert()
-    {
-        using var ecdsa = ECDsa.Create(ECCurve.NamedCurves.nistP256);
-        var req = new CertificateRequest("CN=localhost", ecdsa, HashAlgorithmName.SHA256);
-        var sanBuilder = new SubjectAlternativeNameBuilder();
-        sanBuilder.AddDnsName("localhost");
-        req.CertificateExtensions.Add(sanBuilder.Build());
-        return req.CreateSelfSigned(DateTimeOffset.UtcNow.AddDays(-1), DateTimeOffset.UtcNow.AddDays(1));
-    }
 }

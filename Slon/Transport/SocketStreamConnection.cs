@@ -1,6 +1,8 @@
 using System.IO.Pipelines;
 using System.Net;
 using System.Net.Sockets;
+using System.Net.Security;
+using System.Security.Cryptography.X509Certificates;
 using Slon.Pipelines;
 
 namespace Slon.Transport;
@@ -56,6 +58,7 @@ sealed class SocketStreamConnection : TransportConnection
 
     public override PipeReader Reader => _reader;
     public override PipeWriter Writer => _writer;
+    public override X509Certificate? RemoteCertificate => (_stream as SslStream)?.RemoteCertificate;
     public override void WaitWritable() => _networkStream.WaitWritable();
 
     public static Factory CreateFactory(EndPoint endPoint, TransportConnectionOptions? options = null) => new(endPoint, options);

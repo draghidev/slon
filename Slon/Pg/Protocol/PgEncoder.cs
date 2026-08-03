@@ -335,45 +335,26 @@ readonly struct PgEncoder
 
     internal void CopyStartupBuffer(ReadOnlySpan<byte> buffer) => _writer.WriteRaw(buffer);
 
-    internal void WriteStartupMD5Password(string username, string plainPassword, ReadOnlySpan<byte> salt, Encoding encoding)
+    internal void WritePasswordResponse(string response, Encoding encoding)
     {
-        var hashed = HashPassword(username, plainPassword, salt, encoding);
+        var responseLength = GetStringWithNullTerminatorByteCount(response, encoding);
+        StartMessage(FrontendType.Authentication, responseLength);
+        _writer.WriteStringWithNullTerminator(response, encoding, responseLength);
+    }
 
-        var hashedPasswordLength = GetStringWithNullTerminatorByteCount(hashed, encoding);
-        StartMessage(FrontendType.Authentication, bodyLength: hashedPasswordLength);
-        _writer.WriteStringWithNullTerminator(hashed, encoding, hashedPasswordLength);
+    internal void WriteSaslInitialResponse(string mechanism, ReadOnlySpan<byte> response)
+    {
+        var mechanismLength = GetStringWithNullTerminatorByteCount(mechanism, Encoding.UTF8);
+        StartMessage(FrontendType.Authentication, mechanismLength + sizeof(int) + response.Length);
+        _writer.WriteStringWithNullTerminator(mechanism, Encoding.UTF8, mechanismLength);
+        _writer.WriteInt(response.Length);
+        _writer.WriteRaw(response);
+    }
 
-        static string HashPassword(string username, string plainPassword, ReadOnlySpan<byte> salt, Encoding encoding)
-        {
-            ArgumentNullException.ThrowIfNull(plainPassword);
-            if (salt.Length != 4)
-                throw new ArgumentException("4 byte salt was not provided");
-
-            var plaintext = ArrayPool<byte>.Shared.Rent(encoding.GetByteCount(plainPassword) + encoding.GetByteCount(username));
-            var passwordEncodedCount = encoding.GetBytes(plainPassword.AsSpan(), plaintext);
-            var usernameEncodedCount = encoding.GetBytes(username.AsSpan(), plaintext.AsSpan(passwordEncodedCount));
-
-            var pgHash = ArrayPool<byte>.Shared.Rent(MD5.HashSizeInBytes);
-            if (MD5.HashData(plaintext.AsSpan(0, passwordEncodedCount + usernameEncodedCount), pgHash) != MD5.HashSizeInBytes)
-                ThrowInvalidLength();
-            ArrayPool<byte>.Shared.Return(plaintext, clearArray: true);
-            var pgHexHash = Convert.ToHexString((ReadOnlySpan<byte>)pgHash).ToLowerInvariant();
-
-            var plainChallenge = ArrayPool<byte>.Shared.Rent(encoding.GetByteCount(pgHexHash) + salt.Length);
-            var hexHashEncodedCount = encoding.GetBytes(pgHexHash.AsSpan(), plainChallenge);
-            salt.CopyTo(plainChallenge.AsSpan(hexHashEncodedCount));
-            // We reuse pghash as the final output given md5 is always the same size.
-            var challengeHash = pgHash;
-            if (MD5.HashData(plainChallenge.AsSpan(0, hexHashEncodedCount + salt.Length), challengeHash) != MD5.HashSizeInBytes)
-                ThrowInvalidLength();
-            ArrayPool<byte>.Shared.Return(plainChallenge, clearArray: true);
-
-            var result = string.Concat("md5", Convert.ToHexString((ReadOnlySpan<byte>)challengeHash).ToLowerInvariant());
-            ArrayPool<byte>.Shared.Return(challengeHash, clearArray: true);
-            return result;
-
-            static void ThrowInvalidLength() => throw new InvalidOperationException("Dev error, md5 is not a variable size algo.");
-        }
+    internal void WriteAuthenticationResponse(ReadOnlySpan<byte> response)
+    {
+        StartMessage(FrontendType.Authentication, response.Length);
+        _writer.WriteRaw(response);
     }
 
     void StartMessage(FrontendType type, int bodyLength)

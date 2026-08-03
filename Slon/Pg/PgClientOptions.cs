@@ -17,13 +17,10 @@ sealed class PgClientOptions
     public string? Password { get; init; }
     public string? Database { get; init; }
     public PostgreSqlSslOptions Ssl { get; internal set; } = new();
+    internal bool AllowInsecureTransport { get; init; }
+    internal OAuthTokenCache? OAuthTokens { get; init; }
+    internal PostgreSqlIntegratedSecurityOptions? IntegratedSecurity { get; init; }
 
-    internal PgClientOptions WithSsl(PostgreSqlSslOptions ssl)
-    {
-        var copy = (PgClientOptions)MemberwiseClone();
-        copy.Ssl = ssl;
-        return copy;
-    }
     public TimeSpan ReadTimeout { get; init; } = Timeout.InfiniteTimeSpan; // TimeSpan.FromSeconds(2);
     public TimeSpan WriteTimeout { get; init; } = TimeSpan.FromSeconds(10);
 
@@ -38,6 +35,13 @@ sealed class PgClientOptions
     internal Encoding PasswordEncoding => Encoding.UTF8;
 
     internal static Encoding PreStartupEncoding => Encoding.ASCII;
+
+    internal PgClientOptions WithSsl(PostgreSqlSslOptions ssl)
+    {
+        var copy = (PgClientOptions)MemberwiseClone();
+        copy.Ssl = ssl;
+        return copy;
+    }
 
     public static EndPoint ParseIpOrDnsEndPoint(string host) => IPOrDnsEndPoint.Parse(host, defaultPort: 5432);
 }
