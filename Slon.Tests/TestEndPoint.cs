@@ -9,7 +9,22 @@ static class TestEndPoint
 {
     const string UnixSocketPath = "/tmp/.s.PGSQL.5432";
 
-    public static EndPoint Default => File.Exists(UnixSocketPath)
-        ? new UnixDomainSocketEndPoint(UnixSocketPath)
-        : new IPEndPoint(IPAddress.Loopback, 5432);
+    public static EndPoint Default
+    {
+        get
+        {
+            var host = Environment.GetEnvironmentVariable("SLON_TEST_HOST");
+            var port = int.TryParse(Environment.GetEnvironmentVariable("SLON_TEST_PORT"), out var value)
+                ? value
+                : 5432;
+
+            if (host is null && port == 5432 && File.Exists(UnixSocketPath))
+                return new UnixDomainSocketEndPoint(UnixSocketPath);
+
+            host ??= "127.0.0.1";
+            return IPAddress.TryParse(host, out var address)
+                ? new IPEndPoint(address, port)
+                : new DnsEndPoint(host, port);
+        }
+    }
 }
