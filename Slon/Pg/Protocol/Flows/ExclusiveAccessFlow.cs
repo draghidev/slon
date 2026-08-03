@@ -23,7 +23,7 @@ sealed class ExclusiveAccessFlow : PgClientFlow
     bool _innerStopping;
     bool _innerAborting;
     // Lazily allocated and reused rendezvous for caller-thread execution of synchronous scopes.
-    ManualResetEventSlim? _handoffMres;
+    ManualResetEventSlim? _handoffEvent;
 
     internal ExclusiveAccessFlow(PgClientProtocol protocol, PgClientProtocol.Control innerControl, PgClientProtocol.ExclusiveScopeState state, Func<Exception?, ValueTask> completeInner)
     {
@@ -58,11 +58,11 @@ sealed class ExclusiveAccessFlow : PgClientFlow
         }, _state);
         // Async scopes never allocate the synchronous handoff.
         if (!async)
-            _handoffMres ??= new(false);
+            _handoffEvent ??= new(false);
     }
 
     // Non-null only for caller-thread execution of a synchronous scope.
-    protected override ManualResetEventSlim? GetHandoffMres() => _handoffMres;
+    protected override ManualResetEventSlim? HandoffEvent => _handoffEvent;
 
     protected override void OnReset()
     {
@@ -71,7 +71,7 @@ sealed class ExclusiveAccessFlow : PgClientFlow
         _consumerGone = new(TaskCreationOptions.RunContinuationsAsynchronously);
         _innerStopping = false;
         _innerAborting = false;
-        _handoffMres?.Reset();
+        _handoffEvent?.Reset();
     }
 
     /// Resolves once this flow is activated and owns the wire - the caller awaits it to gain exclusive

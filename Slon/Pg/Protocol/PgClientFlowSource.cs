@@ -128,7 +128,7 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
 
         // Sync-handoff FIFO is just _storage (sync+async in submission order); the current sync head the
         // executor is holding for its caller is HeldSyncFlow. No separate wait-list: each parked caller
-        // parks on its OWN flow's MRES (PgClientFlow.GetHandoffMres), which the executor signals when it
+        // parks on its OWN flow's MRES (PgClientFlow.HandoffEvent), which the executor signals when it
         // holds that flow. The old intrusive-list-of-wait-nodes (and its lagging-link spin) is gone.
         // One-shot takeover. The head caller's inline claim re-enters the pump on the caller's thread:
         // _takeoverPending makes that pull dequeue the head sync flow (its own), then _takeoverActive
@@ -147,7 +147,7 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
         public bool InlineHandBack;
 
         // The Control every flow in this source is bound to. Used to mint a flow's ExecutionControl so the
-        // source pulls the handoff MRES through it rather than off a bare flow ref (GetHandoffMres is
+        // source pulls the handoff MRES through it rather than off a bare flow ref (HandoffEvent is
         // protected on PgClientFlow).
         readonly PgClientProtocol.Control _control;
 
@@ -191,7 +191,7 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
         }
 
         internal void SignalHeldSyncFlow()
-            => HeldSyncFlow?.GetExecutionControl(_control).GetHandoffMres()?.Set();
+            => HeldSyncFlow?.GetExecutionControl(_control).HandoffEvent?.Set();
 
         // Register Complete as the completion-token callback. Done here (not in Enumerator) so Complete
         // can stay private: its single-writer safety depends on the CTS firing it at most once, so the
@@ -236,7 +236,7 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
             // NeedsSyncHandoff) sends autonomous sync flows (null MRES, no parked caller) down the async
             // dispatch path instead, so a flow that reaches here always carries its waiter MRES. Fail loud
             // rather than NRE if that invariant is ever bypassed.
-            var mres = flow.GetExecutionControl(_control).GetHandoffMres()
+            var mres = flow.GetExecutionControl(_control).HandoffEvent
                 ?? throw new InvalidOperationException("WaitForExecutor reached with a null handoff MRES: an autonomous sync flow must route via async dispatch (NeedsSyncHandoff), not the caller-handoff park.");
             // Kick the executor so it pulls and drains earlier flows in FIFO order, dequeue-and-holding the
             // first sync head and parking - OnHandoffReady then signals THAT held flow's MRES. A no-op

@@ -105,11 +105,10 @@ public class RecoveryTests
         readonly FaultPhase _phase;
         readonly WriteShape _shape;
         readonly ValueTaskSourcePromise<bool> _readPromise = new();
-        // The wait-list-free sync handoff parks the caller on the flow's OWN MRES (GetHandoffMres). A
+        // The wait-list-free sync handoff parks the caller on the flow's OWN MRES (HandoffEvent). A
         // standalone one is enough for a test flow that is taken over (OnExecutorSuspended Sets it, the
         // caller Waits); it does not reuse a caller-core like CommandFlow.
-        readonly ManualResetEventSlim _handoffMres = new(false);
-        protected override ManualResetEventSlim? GetHandoffMres() => _handoffMres;
+        protected override ManualResetEventSlim? HandoffEvent { get; } = new(false);
 
         /// Runs after the write shape lands but before the fault fires. Lets a test kill the
         /// transport at the exact point where the flow's own writes succeeded but the

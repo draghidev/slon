@@ -78,6 +78,31 @@ public class FlowSourceTests
     }
 
     [TestMethod]
+    public async Task HeldSyncFlow_WithConsumedNotification_ClaimsPublishedWaitBeforeParking()
+    {
+        var protocol = PgClientProtocol.Create(new PgClientProtocolOptions(PgTestPool.NewOptions()));
+        var source = PgClientFlowSource.Create(protocol, protocol.FlowControl);
+        var enumerator = source.CreateEnumerator();
+        var flow = CommandFlow.CreateUninitialized();
+        source.EnqueueSyncWaiter(flow);
+
+        Assert.IsFalse(enumerator.TryGetNext(out _));
+        var wait = enumerator.WaitForNextAsync();
+        var resumed = 0;
+        wait.GetAwaiter().UnsafeOnCompleted(() => Interlocked.Increment(ref resumed));
+
+        // The notification is an edge; the held head and published source wait remain claimable.
+        flow.GetExecutionControl(protocol.FlowControl).HandoffEvent!.Reset();
+        source.WaitForExecutor(flow);
+
+        Assert.AreEqual(1, resumed);
+        Assert.IsTrue(enumerator.TryGetNext(out var taken));
+        Assert.AreSame(flow, taken);
+        enumerator.Complete();
+        await enumerator.DisposeAsync();
+    }
+
+    [TestMethod]
     public async Task Stress_SourceDispatchVsDrain_SingleConsumerHolds()
     {
         // Uninitialized protocol: the source only reads Protocol.UnflushedBytes on the pull path, which
@@ -173,7 +198,7 @@ public class FlowSourceTests
                 // Mirror the protocol's drain onInert (flow.Complete -> OnComplete -> SignalProgress -> MRES
                 // .Set): a never-held sync flow drained inert wakes its handoff caller, which bails on
                 // IsCompleted. With the wait-list-free source, this drain wake IS the completion-bail.
-                f.GetExecutionControl(protocol.FlowControl).GetHandoffMres()?.Set();
+                f.GetExecutionControl(protocol.FlowControl).HandoffEvent?.Set();
             }
         }
 
@@ -244,7 +269,7 @@ public class FlowSourceTests
                 // Mirror the protocol's drain onInert wake (see QueuedSyncFlow): waking the sync flow's
                 // handoff caller is the completion-bail under the wait-list-free source. Harmless on the
                 // async head (no caller parks on its MRES).
-                f.GetExecutionControl(protocol.FlowControl).GetHandoffMres()?.Set();
+                f.GetExecutionControl(protocol.FlowControl).HandoffEvent?.Set();
             }
         }
 

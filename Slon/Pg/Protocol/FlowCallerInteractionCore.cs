@@ -80,7 +80,7 @@ struct FlowCallerInteractionCore<TResult>
         SignalProgress();
     }
 
-    // Public: a sync flow exposes this as its handoff rendezvous primitive (GetHandoffMres) for the
+    // Public: a sync flow exposes this as its handoff rendezvous primitive (HandoffEvent) for the
     // wait-list-free source handoff. The turn-handshake is strictly sequential BEFORE any body<->caller
     // WaitForContinuation, so reusing the one MRES across both roles is safe.
     public ManualResetEventSlim GetMres()

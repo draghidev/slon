@@ -123,7 +123,7 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
 
     // A sync flow with a handoff event is held for its eventual consumer. Autonomous sync flows have no
     // event and run through normal executor dispatch instead.
-    internal bool NeedsSyncHandoff => !IsAsyncForEnqueue && GetHandoffMres() is not null;
+    internal bool NeedsSyncHandoff => !IsAsyncForEnqueue && HandoffEvent is not null;
 
     // Consumer-driven flows establish their FIFO position at admission and take the handoff on their
     // first synchronous consumer operation. Other sync flows take it as part of admission.
@@ -269,9 +269,9 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
     // runs it autonomously on the executor, nothing to rendezvous. null/non-null IS the waiter-presence gate.
     // The sync handoff MRES a caller parks on (null = autonomous, no waiter). protected, NOT internal:
     // it is reachable only by the flow's own subclasses (which override it) and by ExecutionControl (the
-    // nested write-side handle) - the source pulls it via ExecutionControl.GetHandoffMres, never off a
+    // nested write-side handle) - the source pulls it via ExecutionControl.HandoffEvent, never off a
     // bare flow ref. Keeps the handoff primitive off PgClientFlow's internal API, like _rfqCount.
-    protected virtual ManualResetEventSlim? GetHandoffMres() => null;
+    protected virtual ManualResetEventSlim? HandoffEvent => null;
 
     PgClientFlow IValueTaskSource<PgClientFlow>.GetResult(short token)
     {
@@ -493,9 +493,9 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
 
         // The flow's sync handoff MRES (null = autonomous). The ONLY way to reach it: the source pulls it
         // through this control-mediated handle rather than off a bare flow ref, so the primitive stays
-        // encapsulated on the flow (GetHandoffMres is protected). Used by the source's WaitForExecutor /
+        // encapsulated on the flow (HandoffEvent is protected). Used by the source's WaitForExecutor /
         // OnExecutorSuspended.
-        public ManualResetEventSlim? GetHandoffMres() => flow.GetHandoffMres();
+        public ManualResetEventSlim? HandoffEvent => flow.HandoffEvent;
 
         // Initializes a recovery flow's RFQ obligation to what the failed flow's wire activity
         // left outstanding. Routed through the write-side handle (alongside OnMessageWrite) so
