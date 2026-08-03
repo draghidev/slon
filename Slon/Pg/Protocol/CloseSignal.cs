@@ -19,6 +19,8 @@ sealed class CloseSignal : IDisposable
     PgClientClosedException? _reason;
     readonly CancellationTokenSource _stoppingCts;
     readonly CancellationTokenSource _abortCts;
+    readonly CancellationToken _stoppingToken;
+    readonly CancellationToken _abortToken;
     readonly CloseSignal? _parent;
     readonly CancellationTokenRegistration _parentStoppingRegistration;
     readonly CancellationTokenRegistration _parentAbortRegistration;
@@ -32,6 +34,8 @@ sealed class CloseSignal : IDisposable
     {
         _stoppingCts = stoppingCts;
         _abortCts = abortCts;
+        _stoppingToken = stoppingCts.Token;
+        _abortToken = abortCts.Token;
         _parent = parent;
         _parentStoppingRegistration = parentStoppingRegistration;
         _parentAbortRegistration = parentAbortRegistration;
@@ -74,8 +78,10 @@ sealed class CloseSignal : IDisposable
     /// trip resolves the parent's reason. Null until the first trip materializes it.
     public PgClientClosedException? Reason => Volatile.Read(ref _reason) ?? _parent?.Reason;
 
-    public CancellationToken StoppingToken => _stoppingCts.Token;
-    public CancellationToken AbortToken => _abortCts.Token;
+    // Captured tokens remain readable after disposal. Heartbeat callbacks already in flight
+    // may observe terminal state after the protocol has released the owning CTSes.
+    public CancellationToken StoppingToken => _stoppingToken;
+    public CancellationToken AbortToken => _abortToken;
 
     // Set the reason once (first writer wins), wrapping the cause in the exception consumers throw.
     // Volatile fast-path so repeat trips are alloc-free and don't CAS. A null cause still produces a
