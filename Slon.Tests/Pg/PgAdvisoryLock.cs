@@ -145,6 +145,23 @@ sealed class PgAdvisoryLock : IAsyncDisposable
             end $$
             """);
 
+    public Task WaitUntilBackendGoneAsync(int backendProcessId)
+        => PgTestPool.RunAsync(_owner, $$"""
+            do $$
+            declare i int := 0;
+            begin
+                while exists (select 1 from pg_stat_activity where pid = {{backendProcessId}})
+                loop
+                    perform pg_stat_clear_snapshot();
+                    perform pg_sleep(0.001);
+                    i := i + 1;
+                    if i > 20000 then
+                        raise exception 'backend termination poll expired';
+                    end if;
+                end loop;
+            end $$
+            """);
+
     public async ValueTask DisposeAsync()
     {
         try
@@ -153,7 +170,7 @@ sealed class PgAdvisoryLock : IAsyncDisposable
         }
         finally
         {
-            await _owner.DisposeAsync();
+            await _owner.CompleteAsync();
         }
     }
 }

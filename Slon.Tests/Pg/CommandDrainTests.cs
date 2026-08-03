@@ -11,6 +11,15 @@ namespace Slon.Tests.Pg;
 [TestClass]
 public class CommandDrainTests
 {
+    sealed class ResultObserver : ICommandFlowObserver
+    {
+        public TaskCompletionSource Entered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public void OnFlowStarted(CommandFlow flow) { }
+        public void OnCommandResult(CommandFlow flow, CommandResult result) => Entered.TrySetResult();
+        public void OnFlowEnded(CommandFlow flow) { }
+    }
+
     static async ValueTask Dispose(CommandFlow.Enumerator e, bool useAsyncDispose)
     {
         if (useAsyncDispose)
@@ -204,27 +213,41 @@ public class CommandDrainTests
     public async Task StoppingToken_PreFireAsync_BodyFaultsWithoutDelivery()
     {
         var protocol = await PgTestPool.NewIsolatedAsync();
+        var observer = new ResultObserver();
 
-        var flow = new CommandFlow(async: true,
-            Command.Create("select generate_series(1, 50)"),
-            Command.Create("select 'two'"));
+        var flow = new CommandFlow(async: true, new CommandFlowOptions
+        {
+            Commands = new(Command.Create("select generate_series(1, 50)"), Command.Create("select 'two'")),
+            Observer = observer
+        });
         Assert.IsTrue(protocol.TryQueue(flow));
 
-        await WaitUntilStarted(flow).WaitAsync(TimeSpan.FromSeconds(10));
+        await observer.Entered.Task.WaitAsync(TimeSpan.FromSeconds(10));
         var completeTask = protocol.CompleteAsync();
+        Assert.IsTrue(protocol.IsDraining);
+        var stoppingTimeout = Task.Delay(TimeSpan.FromSeconds(10));
+        while (!protocol.FlowControl.StoppingToken.IsCancellationRequested)
+        {
+            await Task.Yield();
+            if (stoppingTimeout.IsCompleted)
+                Assert.Fail("shutdown did not publish the stopping token");
+        }
+        flow.GetExecutionControl(protocol.FlowControl).OnHeartbeat(TimeSpan.Zero);
         await protocol.Heartbeat(TimeSpan.Zero);
 
         var e = flow.GetAsyncEnumerator();
         await Assert.ThrowsExactlyAsync<PgClientClosedException>(async () => await e.MoveNextAsync());
         await e.DisposeAsync();
 
-        await completeTask.WaitAsync(TimeSpan.FromSeconds(10));
-
-        static async Task WaitUntilStarted(CommandFlow flow)
+        var timeout = Task.Delay(TimeSpan.FromSeconds(10));
+        while (!completeTask.IsCompleted)
         {
-            while (!flow.IsStarted)
-                await Task.Yield();
+            await protocol.Heartbeat(TimeSpan.Zero);
+            await Task.Yield();
+            if (timeout.IsCompleted)
+                Assert.Fail("shutdown did not converge while heartbeats were driven");
         }
+        await completeTask;
     }
 
     // Pipelined multi-flow: both flows queued before any MoveNext, then CompleteAsync fires.
@@ -263,29 +286,32 @@ public class CommandDrainTests
         await completeTask.WaitAsync(TimeSpan.FromSeconds(10));
     }
 
-    // Graceful-then-abort escalation: a body parked on actual I/O (pg_sleep keeps the server
-    // busy for 30s) can't observe StoppingToken via the per-CommandResult check because it
-    // never gets there. CompleteAsync's graceful path schedules AbortToken via
+    // Graceful-then-abort escalation: a body parked on an advisory lock can't observe StoppingToken
+    // through the per-result check. CompleteAsync's graceful path schedules AbortToken via
     // CancelAfter(CompletionTimeout); when the timeout fires the decoder's CTS-linked CT
     // throws, the body's catch routes the closed exception out, and the consumer's pending
     // MoveNextAsync surfaces PgClientClosedException.
     [TestMethod]
     public async Task StoppingToken_GracefulEscalatesToAbort_AsyncFlowFaultsWithClosedException()
     {
-        // Narrow timeout, but safe parallelized: the body is parked on pg_sleep the whole window,
+        // Narrow timeout, but safe parallelized: the body is parked on the advisory lock for the whole window,
         // so the graceful->abort escalation is deterministic - there is no timing race to lose.
+        await using var blocker = await PgAdvisoryLock.AcquireAsync();
         var protocol = await PgTestPool.NewIsolatedAsync(o => o.CompletionTimeout = TimeSpan.FromMilliseconds(20));
 
-        var flow = new CommandFlow(async: true, Command.Create("select pg_sleep(30)"));
+        var flow = new CommandFlow(async: true, blocker.WaitCommand);
         Assert.IsTrue(protocol.TryQueue(flow));
 
         var e = flow.GetAsyncEnumerator();
         var moveNextTask = e.MoveNextAsync().AsTask();
+        await blocker.WaitUntilContendedAsync(protocol.FlowControl.BackendProcessId);
 
         var completeTask = protocol.CompleteAsync();
 
         await Assert.ThrowsExactlyAsync<PgClientClosedException>(
             async () => await moveNextTask.WaitAsync(TimeSpan.FromSeconds(10)));
+        await blocker.ReleaseAsync();
+        await blocker.WaitUntilBackendGoneAsync(protocol.FlowControl.BackendProcessId);
         await e.DisposeAsync();
 
         await completeTask.WaitAsync(TimeSpan.FromSeconds(10));

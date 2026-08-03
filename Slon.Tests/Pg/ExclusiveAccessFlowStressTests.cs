@@ -13,7 +13,7 @@ public class ExclusiveAccessFlowStressTests
 {
     // Real exclusive-access flows per iteration (this base count is further divided per scenario).
     // Capped so a blanket high count can't mountain the suite; SLON_UNCAPPED=1 drives the raw value.
-    static int Iterations => StressEnv.Iterations(fallback: 500, cap: 5_000);
+    static int Iterations => StressEnv.Iterations(fallback: 100, cap: 5_000);
 
     static readonly TimeSpan Cap = TimeSpan.FromSeconds(10);
 

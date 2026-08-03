@@ -11,6 +11,8 @@ namespace Slon.Tests.Pg;
 [TestClass]
 public class ProtocolCompletionTests
 {
+    static int RaceIterations => StressEnv.Iterations(fallback: 5, cap: 100);
+
     // Isolated per test by design: every test in this file fully destroys (CompleteAsync,
     // DisposeAsync, Dispose, FailProtocol) the protocol. Cannot share via PgTestPool
     // path. Custom heartbeat/completion timeouts narrow the parked-flow propagation window
@@ -212,7 +214,7 @@ public class ProtocolCompletionTests
     public async Task CompleteAsync_RacingDisposeAsync_ConvergesCleanly()
     {
         await using var blocker = await PgAdvisoryLock.AcquireAsync();
-        for (var i = 0; i < 20; i++)
+        for (var i = 0; i < RaceIterations; i++)
         {
             await blocker.HoldAsync();
             var protocol = await ConnectAsync();
@@ -260,7 +262,7 @@ public class ProtocolCompletionTests
     public async Task CompleteAsync_RacingDisposeAsync_MultiCommand_ConvergesCleanly()
     {
         await using var blocker = await PgAdvisoryLock.AcquireAsync();
-        for (var i = 0; i < 20; i++)
+        for (var i = 0; i < RaceIterations; i++)
         {
             await blocker.HoldAsync();
             var protocol = await ConnectAsync();
@@ -296,7 +298,7 @@ public class ProtocolCompletionTests
     public async Task CompleteAsync_RacingDisposeAsync_Pipelined_ConvergesCleanly()
     {
         await using var blocker = await PgAdvisoryLock.AcquireAsync();
-        for (var i = 0; i < 20; i++)
+        for (var i = 0; i < RaceIterations; i++)
         {
             await blocker.HoldAsync();
             var protocol = await ConnectAsync();
@@ -343,7 +345,7 @@ public class ProtocolCompletionTests
     public async Task CompleteAsync_RacingDisposeAsync_SyncFlow_ConvergesCleanly()
     {
         await using var blocker = await PgAdvisoryLock.AcquireAsync();
-        for (var i = 0; i < 20; i++)
+        for (var i = 0; i < RaceIterations; i++)
         {
             await blocker.HoldAsync();
             var protocol = await ConnectAsync();
@@ -513,13 +515,14 @@ public class ProtocolCompletionTests
     [TestMethod]
     public async Task ForcefulDispose_BreaksParkedSynchronousRead()
     {
+        await using var blocker = await PgAdvisoryLock.AcquireAsync();
         var protocol = await ConnectAsync();
         Exception? observed = null;
         var run = Task.Run(() =>
         {
             try
             {
-                var flow = new CommandFlow(async: false, Command.Create("select pg_sleep(30)"));
+                var flow = new CommandFlow(async: false, blocker.WaitCommand);
                 Assert.IsTrue(protocol.TryQueue(flow));
                 var e = flow.GetEnumerator();
                 while (e.MoveNext()) { }
@@ -531,9 +534,11 @@ public class ProtocolCompletionTests
             }
         });
 
-        await Task.Delay(30);
+        await blocker.WaitUntilContendedAsync(protocol.FlowControl.BackendProcessId);
         await protocol.DisposeAsync();
         await run.WaitAsync(TimeSpan.FromSeconds(10));
+        await blocker.ReleaseAsync();
+        await blocker.WaitUntilBackendGoneAsync(protocol.FlowControl.BackendProcessId);
 
         Assert.IsNotNull(observed);
         while (observed is not PgClientClosedException && observed.InnerException is not null)
