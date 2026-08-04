@@ -59,4 +59,59 @@ public class CommandResultEnumerationTests
         await Assert.ThrowsExactlyAsync<PgErrorException>(async () => await e.MoveNextAsync());
         await Assert.ThrowsExactlyAsync<PgErrorException>(async () => await e.DisposeAsync());
     }
+
+    [TestMethod]
+    [DataRow(true, DisplayName = "async")]
+    [DataRow(false, DisplayName = "sync")]
+    public async Task ErrorWithoutSync_SkipsCommandsThroughRfq(bool async)
+    {
+        var protocol = await PgTestPool.GetProtocolAsync();
+        var flow = protocol.Queue(new CommandFlow(async,
+            Command.Create("SLECT 1"), Command.Create("select 2"), Command.Create("select 3")));
+        var e = async ? flow.GetAsyncEnumerator() : flow.GetEnumerator();
+
+        Assert.IsTrue(async ? await e.MoveNextAsync() : e.MoveNext());
+        var result = e.Current;
+        if (async)
+            await result.DisposeAsync();
+        else
+            result.Dispose();
+        Assert.ThrowsExactly<PgErrorException>(() => result.GetCommandComplete());
+
+        Assert.IsFalse(async ? await e.MoveNextAsync() : e.MoveNext());
+        await e.DisposeAsync();
+        await PgTestPool.RunAsync(protocol, "select 1");
+    }
+
+    [TestMethod]
+    [DataRow(true, DisplayName = "async")]
+    [DataRow(false, DisplayName = "sync")]
+    public async Task ErrorWithoutSync_ResumesAfterInternalSync(bool async)
+    {
+        var protocol = await PgTestPool.GetProtocolAsync();
+        var flow = protocol.Queue(new CommandFlow(async,
+            Command.Create("SLECT 1"),
+            Command.Create("select 2") with { WithSync = true },
+            Command.Create("select 3")));
+        var e = async ? flow.GetAsyncEnumerator() : flow.GetEnumerator();
+
+        Assert.IsTrue(async ? await e.MoveNextAsync() : e.MoveNext());
+        var failed = e.Current;
+        if (async)
+            await failed.DisposeAsync();
+        else
+            failed.Dispose();
+        Assert.ThrowsExactly<PgErrorException>(() => failed.GetCommandComplete());
+
+        Assert.IsTrue(async ? await e.MoveNextAsync() : e.MoveNext());
+        Assert.AreEqual(2, e.Current.GetMetadata().CommandIndex);
+        if (async)
+            await e.Current.DisposeAsync();
+        else
+            e.Current.Dispose();
+
+        Assert.IsFalse(async ? await e.MoveNextAsync() : e.MoveNext());
+        await e.DisposeAsync();
+        await PgTestPool.RunAsync(protocol, "select 1");
+    }
 }

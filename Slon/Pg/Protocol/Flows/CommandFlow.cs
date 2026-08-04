@@ -684,6 +684,22 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                         && !capturedThisCommand && completeError is { } err && !IsOwnCancellation(err.Error))
                         (_drainErrors ??= new()).Add(new PgErrorException(err.Error));
                 }
+
+                // Extended-query errors discard every following command through the next Sync. Skip
+                // those commands locally and consume the RFQ which is their only wire response.
+                if (completeError is { TransactionStatus: TransactionStatus.Unknown })
+                {
+                    while (++_commandIndex < CommandCount && !_options.Commands[_commandIndex].WithSync) { }
+
+                    if (IsAsync)
+                        await ReadRfqAsync(_decoder).ConfigureAwait(false);
+                    else
+                        ReadRfq(_decoder);
+
+                    // Reaching the end means the discarded segment terminated at our appended Sync.
+                    if (_commandIndex == CommandCount)
+                        _readFlowRfq = false;
+                }
             }
 
             // Write failures are framework-observed via the trailing-task slot. The framework
