@@ -89,6 +89,10 @@ sealed class ProtocolDataWriter
         {
             _pipe.Flush(timeout);
         }
+        catch (Exception) when (_control.ClosedException is { } closed)
+        {
+            throw closed;
+        }
         catch (Exception ex) when (_abortToken.IsCancellationRequested)
         {
             // Sync writers park on the socket deadline, not the abort token, so an abort that
@@ -104,7 +108,15 @@ sealed class ProtocolDataWriter
     /// coordination-boundary check in connection-preserving flows.
     public ValueTask FlushAsync(CancellationToken cancellationToken)
     {
-        var task = _pipe.FlushAsync(_cts.Token);
+        ValueTask task;
+        try
+        {
+            task = _pipe.FlushAsync(_cts.Token);
+        }
+        catch (Exception) when (_control.ClosedException is { } closed)
+        {
+            throw closed;
+        }
         if (task.IsCompletedSuccessfully)
             return task;
         return Core(task, cancellationToken);
@@ -115,6 +127,10 @@ sealed class ProtocolDataWriter
             try
             {
                 await task.ConfigureAwait(false);
+            }
+            catch (Exception) when (_control.ClosedException is { } closed)
+            {
+                throw closed;
             }
             catch (Exception ex) when (_abortToken.IsCancellationRequested)
             {

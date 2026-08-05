@@ -41,19 +41,17 @@ sealed class CloseSignal : IDisposable
         _parentAbortRegistration = parentAbortRegistration;
     }
 
-    // Root: both CTSes on the time provider so a FakeTimeProvider drives the abort escalation
-    // deterministically in tests.
-    public static CloseSignal CreateRoot(TimeProvider timeProvider)
-        => new(new CancellationTokenSource(Timeout.InfiniteTimeSpan, timeProvider),
-               new CancellationTokenSource(Timeout.InfiniteTimeSpan, timeProvider),
+    public static CloseSignal CreateRoot()
+        => new(new CancellationTokenSource(),
+               new CancellationTokenSource(),
                parent: null);
 
     // Linked child: its tokens fire when the parent's do (and can be tripped independently). Chains
     // Reason to the parent.
-    public static CloseSignal CreateLinked(CloseSignal parent, TimeProvider timeProvider)
+    public static CloseSignal CreateLinked(CloseSignal parent)
     {
-        var stopping = new CancellationTokenSource(Timeout.InfiniteTimeSpan, timeProvider);
-        var abort = new CancellationTokenSource(Timeout.InfiniteTimeSpan, timeProvider);
+        var stopping = new CancellationTokenSource();
+        var abort = new CancellationTokenSource();
         CancellationTokenRegistration stoppingRegistration = default;
         CancellationTokenRegistration abortRegistration = default;
         try
@@ -98,7 +96,7 @@ sealed class CloseSignal : IDisposable
     public void MaterializeReason(Exception? cause) => Materialize(cause);
 
     /// Graceful stop: materialize, then fire the stopping token. The wire keeps running so it can reach
-    /// a clean state; the abort token is armed separately (ArmAbortTimeout) to escalate.
+    /// a clean state; the protocol owns any later forceful escalation.
     public Task StopAsync()
     {
         Materialize(null);
@@ -111,14 +109,6 @@ sealed class CloseSignal : IDisposable
         Materialize(null);
         _abortCts.Cancel();
     }
-
-    public void ArmAbortTimeout(TimeSpan delay)
-    {
-        Materialize(null);
-        _abortCts.CancelAfter(delay);
-    }
-
-    public void DisarmAbortTimeout() => _abortCts.CancelAfter(Timeout.InfiniteTimeSpan);
 
     // Disposes only its own CTSes (a linked child's CTSes hold a registration on the parent's tokens;
     // disposing them releases that registration). Never disposes the parent.

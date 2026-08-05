@@ -110,7 +110,7 @@ sealed class SocketStreamConnection : TransportConnection
     public override void Abort()
     {
         if (!Interlocked.Exchange(ref _aborted, true))
-            _networkStream.Socket.Close(0);
+            _networkStream.Close(0);
     }
 
     static EndPoint ResolveEndPoint(EndPoint endPoint)

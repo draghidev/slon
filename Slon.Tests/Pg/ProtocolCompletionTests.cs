@@ -1,6 +1,9 @@
+using System.Buffers.Binary;
+using System.IO.Pipelines;
 using Slon.Pg;
 using Slon.Pg.Protocol;
 using Slon.Pg.Protocol.Flows;
+using Slon.Transport;
 
 namespace Slon.Tests.Pg;
 
@@ -30,6 +33,23 @@ public class ProtocolCompletionTests
         var e = flow.GetAsyncEnumerator();
         while (await e.MoveNextAsync()) { }
         await e.DisposeAsync();
+    }
+
+    static byte[] Handshake()
+    {
+        var bytes = new byte[64];
+        var offset = 0;
+        bytes[offset++] = (byte)'R';
+        BinaryPrimitives.WriteInt32BigEndian(bytes.AsSpan(offset), 8); offset += 4;
+        BinaryPrimitives.WriteInt32BigEndian(bytes.AsSpan(offset), 0); offset += 4;
+        bytes[offset++] = (byte)'K';
+        BinaryPrimitives.WriteInt32BigEndian(bytes.AsSpan(offset), 12); offset += 4;
+        BinaryPrimitives.WriteInt32BigEndian(bytes.AsSpan(offset), 4321); offset += 4;
+        BinaryPrimitives.WriteInt32BigEndian(bytes.AsSpan(offset), 8765); offset += 4;
+        bytes[offset++] = (byte)'Z';
+        BinaryPrimitives.WriteInt32BigEndian(bytes.AsSpan(offset), 5); offset += 4;
+        bytes[offset++] = (byte)'I';
+        return bytes.AsSpan(0, offset).ToArray();
     }
 
     [TestMethod]
@@ -151,7 +171,10 @@ public class ProtocolCompletionTests
         });
 
         await reading.Task;
+        Assert.IsTrue(protocol.FlowControl.QueryProtocolEstablished);
         var completeTask = protocol.CompleteAsync();
+        Assert.IsTrue(protocol.FlowControl.QueryProtocolEstablished,
+            "graceful draining must not erase the fact that query-protocol recovery is available");
         await blocker.ReleaseAsync();
 
         await runTask;
@@ -204,12 +227,41 @@ public class ProtocolCompletionTests
         }
     }
 
+    [TestMethod]
+    public async Task FailProtocol_PendingReadCompletesAsEof_OriginalReasonWins()
+    {
+        var options = PgTestPool.NewOptions();
+        var transport = new ControlledEofTransport(Handshake());
+        var protocol = PgClientProtocol.Create(new PgClientProtocolOptions(options));
+        await protocol.StartAsync(options, transport);
+
+        var flow = new CommandFlow(async: true, Command.Create("select 1"));
+        Assert.IsTrue(protocol.TryQueue(flow));
+        var e = flow.GetAsyncEnumerator();
+        var move = e.MoveNextAsync().AsTask();
+        await transport.ReadParked.WaitAsync(TimeSpan.FromSeconds(5));
+
+        var violation = new PgProtocolException("synthetic framing violation");
+        protocol.FailProtocol(violation);
+        var canonicalClose = protocol.FlowControl.ClosedException;
+        Assert.IsNotNull(canonicalClose);
+        Assert.AreSame(violation, canonicalClose.InnerException);
+
+        transport.CompleteServerOutput();
+
+        var observed = await Assert.ThrowsExactlyAsync<PgClientClosedException>(
+            () => move.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.AreSame(canonicalClose, observed,
+            "EOF after FailProtocol must surface the already-published canonical close instance");
+        Assert.AreSame(violation, observed.InnerException,
+            "a synthesized unexpected-EOF failure must not displace the FailProtocol reason");
+        await protocol.Completion.WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
     // Graceful CompleteAsync racing forceful DisposeAsync on the SAME protocol under maximal
-    // overlap, with an in-flight flow so the drain has real residual work. SignalDraining only
-    // returns false once Completed, so during the drain window BOTH calls can run a Shutdown body:
-    // double _source.SetDrainSignal (second overwrites the first's executorStopped TCS), double
-    // _pipeline.CompleteAsync, double DrainInertItems. Asserts teardown still converges - no hang,
-    // ends Completed, the consumer sees only a clean closed exception. Looped to surface the race.
+    // overlap, with an in-flight flow so the drain has real residual work. The forceful caller must
+    // escalate the transport while aliasing the graceful caller's single shutdown body. Asserts
+    // teardown converges, ends Completed, and surfaces only the canonical closed exception.
     [TestMethod]
     public async Task CompleteAsync_RacingDisposeAsync_ConvergesCleanly()
     {
@@ -544,5 +596,82 @@ public class ProtocolCompletionTests
         while (observed is not PgClientClosedException && observed.InnerException is not null)
             observed = observed.InnerException;
         Assert.IsInstanceOfType<PgClientClosedException>(observed);
+    }
+
+    sealed class ControlledEofTransport : TransportConnection
+    {
+        readonly Pipe _toClient = new();
+        readonly Pipe _toServer = new(new PipeOptions(
+            pauseWriterThreshold: 1 << 30,
+            resumeWriterThreshold: 1 << 29));
+        readonly CancellationIgnoringReader _reader;
+
+        public ControlledEofTransport(byte[] handshake)
+        {
+            _reader = new(_toClient.Reader);
+            _toClient.Writer.WriteAsync(handshake).AsTask().GetAwaiter().GetResult();
+        }
+
+        public Task ReadParked => _reader.ReadParked;
+        public override PipeReader Reader => _reader;
+        public override PipeWriter Writer => _toServer.Writer;
+        public override void WaitWritable() { }
+
+        public void CompleteServerOutput() => _toClient.Writer.Complete();
+
+        sealed class CancellationIgnoringReader(PipeReader inner) : PipeReader
+        {
+            readonly TaskCompletionSource _readParked = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+            public Task ReadParked => _readParked.Task;
+
+            public override ValueTask<ReadResult> ReadAsync(CancellationToken cancellationToken = default)
+            {
+                var read = inner.ReadAsync(CancellationToken.None);
+                if (read.IsCompletedSuccessfully)
+                    return read;
+
+                _readParked.TrySetResult();
+                return Core(this, read);
+
+                static async ValueTask<ReadResult> Core(CancellationIgnoringReader self, ValueTask<ReadResult> read)
+                {
+                    Interlocked.Exchange(ref self._readActive, 1);
+                    try
+                    {
+                        return await read.ConfigureAwait(false);
+                    }
+                    finally
+                    {
+                        Interlocked.Exchange(ref self._readActive, 0);
+                    }
+                }
+            }
+
+            public override bool TryRead(out ReadResult result) => inner.TryRead(out result);
+            public override void AdvanceTo(SequencePosition consumed) => inner.AdvanceTo(consumed);
+            public override void AdvanceTo(SequencePosition consumed, SequencePosition examined)
+                => inner.AdvanceTo(consumed, examined);
+            public override void CancelPendingRead() { }
+            public override void Complete(Exception? exception = null)
+            {
+                ThrowIfReadActive();
+                inner.Complete(exception);
+            }
+
+            public override ValueTask CompleteAsync(Exception? exception = null)
+            {
+                ThrowIfReadActive();
+                return inner.CompleteAsync(exception);
+            }
+
+            int _readActive;
+
+            void ThrowIfReadActive()
+            {
+                if (Volatile.Read(ref _readActive) is not 0)
+                    throw new InvalidOperationException("Reader completion raced its active ReadAsync.");
+            }
+        }
     }
 }

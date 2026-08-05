@@ -32,7 +32,7 @@ sealed partial class PgClientProtocol
             var innerControl = new Control(protocol, poolFacing: false);
 
             // Protocol closure cascades through this reusable child signal.
-            var scopeClose = CloseSignal.CreateLinked(protocol._close, protocol._options.TimeProvider);
+            var scopeClose = CloseSignal.CreateLinked(protocol._close);
             innerControl.BindScopeClose(scopeClose);
 
             // Scope shells share the physical pipes but carry the scope's abort token.

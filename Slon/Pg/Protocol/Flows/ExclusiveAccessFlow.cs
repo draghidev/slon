@@ -205,7 +205,7 @@ sealed class ExclusiveAccessFlow : PgClientFlow
         {
             var message = await decoder.GetNextAsync().ConfigureAwait(false);
             if (message.TryCreateError(out var currentError))
-                error ??= currentError;
+                error ??= currentError.Preserve();
             if (message.Header.Type is PgTypes.BackendType.ReadyForQuery)
                 break;
         }

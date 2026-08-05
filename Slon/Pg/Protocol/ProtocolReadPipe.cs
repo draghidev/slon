@@ -14,6 +14,7 @@ sealed class ProtocolReadPipe(PipeSegmentEnumerator<BackendMessageBatch.Segmente
     readonly BackendMessageContext _messageContext = new();
 
     public BackendMessage Current => _messageContext.Current;
+    public bool TryGetCurrent(out BackendMessage message) => _messageContext.TryGetCurrent(out message);
 
     public bool TryMoveNext() => _messageContext.TryMoveNext();
     public bool TryPeekNext(out BackendHeader header) => _messageContext.TryPeekNext(out header);
@@ -23,6 +24,7 @@ sealed class ProtocolReadPipe(PipeSegmentEnumerator<BackendMessageBatch.Segmente
 
     public bool TryMoveNextBatch(out bool completed)
     {
+        _messageContext.RetireCurrentBatch();
         if (!messageBatchEnumerator.TryMoveNext(out completed))
             return false;
         CommitBatch();
@@ -47,6 +49,7 @@ sealed class ProtocolReadPipe(PipeSegmentEnumerator<BackendMessageBatch.Segmente
 
     public bool TryMoveNextBatch(ReadResult result, CancellationToken cancellationToken, out bool completed)
     {
+        _messageContext.RetireCurrentBatch();
         if (!messageBatchEnumerator.TryMoveNext(result, cancellationToken, out completed))
             return false;
         CommitBatch();
@@ -73,12 +76,30 @@ sealed class ProtocolReadPipe(PipeSegmentEnumerator<BackendMessageBatch.Segmente
     public CurrentSegmentBuffer ExtendCurrentMessage(TimeSpan timeout)
         => messageBatchEnumerator.ExtendCurrentSegment(timeout);
 
-    public ValueTask<bool> MoveNextAsync(CancellationToken cancellationToken) => messageBatchEnumerator.MoveNextAsync(cancellationToken);
-    public bool MoveNext(TimeSpan timeout) => messageBatchEnumerator.MoveNext(timeout);
+    public ValueTask<bool> MoveNextAsync(CancellationToken cancellationToken)
+    {
+        _messageContext.RetireCurrentBatch();
+        return messageBatchEnumerator.MoveNextAsync(cancellationToken);
+    }
+
+    public bool MoveNext(TimeSpan timeout)
+    {
+        _messageContext.RetireCurrentBatch();
+        return messageBatchEnumerator.MoveNext(timeout);
+    }
 
     // Publishes the just-read batch as the current batch the message context iterates.
     public void CommitBatch() => _messageContext.SetBatch(messageBatchEnumerator.Current);
 
-    public void Dispose() => messageBatchEnumerator.Dispose();
-    public ValueTask DisposeAsync() => messageBatchEnumerator.DisposeAsync();
+    public void Dispose()
+    {
+        _messageContext.RetireCurrentBatch();
+        messageBatchEnumerator.Dispose();
+    }
+
+    public ValueTask DisposeAsync()
+    {
+        _messageContext.RetireCurrentBatch();
+        return messageBatchEnumerator.DisposeAsync();
+    }
 }

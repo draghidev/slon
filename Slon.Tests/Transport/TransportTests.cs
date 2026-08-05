@@ -190,14 +190,16 @@ public class TransportTests
         listener.Start();
         var endpoint = (IPEndPoint)listener.LocalEndpoint;
         var allowRead = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        const int payloadLength = 4 * 1024 * 1024;
-        var serverTask = AcceptAndDecrypt(listener, cert, allowRead.Task, payloadLength);
 
         var clientSocket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp)
         {
             SendBufferSize = 4096
         };
         await clientSocket.ConnectAsync(endpoint);
+        // Kernels may clamp or scale SO_SNDBUF. Base the pressure on the effective value instead of
+        // assuming the requested size, with room for TLS and socket-stack buffering above it.
+        var payloadLength = Math.Max(64 * 1024, checked(clientSocket.SendBufferSize * 8));
+        var serverTask = AcceptAndDecrypt(listener, cert, allowRead.Task, payloadLength);
         var inner = new SocketStreamConnection.SealedNetworkStream(clientSocket, ownsSocket: true);
         await using var clientSsl = new SslStream(inner, leaveInnerStreamOpen: false,
             userCertificateValidationCallback: (_, _, _, _) => true);

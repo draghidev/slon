@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using Slon.Pipelines;
 using Slon.Runtime.CompilerServices;
@@ -38,6 +39,8 @@ sealed class BackendMessageBodyReader
             ThrowHelper.ThrowInvalidOperation();
         if (consumedLength < 0 || consumedLength > _buffer.Length)
             throw new ArgumentOutOfRangeException(nameof(consumedLength));
+        Debug.Assert(_buffer.Slice(0, consumed).Length == consumedLength,
+            "The consumed position and consumed length must identify the same byte.");
 
         _consumed = consumed;
         _consumedLength = consumedLength + (_initial ? _segmentOffset + BackendHeader.ByteCount : 0);

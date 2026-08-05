@@ -86,9 +86,21 @@ sealed class PipeSegmentEnumerator<TSegmenter, TSegment>(PipeReader reader, TSeg
     // Returns false so completion sites read as return EndOfData().
     bool EndOfData()
     {
+        _consumePosition = null;
+        _examinedPosition = default;
+        _currentSegmentStart = default;
         _currentLength = -1;
         _currentSegmentReadPending = 0;
         return false;
+    }
+
+    static bool IsEmptyCompletion(in ReadResult result)
+        => result.IsCompleted && result.Buffer.IsEmpty;
+
+    static void ThrowIfTruncatedCompletion(in ReadResult result)
+    {
+        if (result.IsCompleted)
+            throw new EndOfStreamException("The pipe completed within a framed segment.");
     }
 
     ValueTask<bool> IAsyncEnumerator<TSegment>.MoveNextAsync() => MoveNextAsync(CancellationToken.None);
@@ -215,20 +227,23 @@ sealed class PipeSegmentEnumerator<TSegmenter, TSegment>(PipeReader reader, TSeg
 
         if (_currentLength is not -1)
         {
+            var segmentReadPending = _currentSegmentReadPending != 0;
             _currentSegmentReadPending = 0;
             if (_consumePosition is null)
             {
+                // A supplied read is already the result of the advance performed by the poll which
+                // returned false. Advancing again would retire that result before we inspect it.
+                if (!segmentReadPending && !hasRead)
+                    reader.AdvanceTo(_currentSegmentStart, _examinedPosition);
                 if (!TryTakeRead(out var consumeResult))
                     return false;
-                if (consumeResult.IsCompleted)
-                {
-                    completed = true;
-                    return EndOfData();
-                }
+                if (IsEmptyCompletion(consumeResult))
+                    ThrowIfTruncatedCompletion(consumeResult);
                 if (consumeResult.IsCanceled)
                     ThrowHelper.ThrowOperationCanceled(CancellationToken.None);
                 if (consumeResult.Buffer.Length < _currentLength)
                 {
+                    ThrowIfTruncatedCompletion(consumeResult);
                     reader.AdvanceTo(consumeResult.Buffer.Start, consumeResult.Buffer.End);
                     return false;
                 }
@@ -246,7 +261,7 @@ sealed class PipeSegmentEnumerator<TSegmenter, TSegment>(PipeReader reader, TSeg
 
         if (!TryTakeRead(out var result))
             return false;
-        if (result.IsCompleted)
+        if (IsEmptyCompletion(result))
         {
             completed = true;
             return EndOfData();
@@ -265,7 +280,9 @@ sealed class PipeSegmentEnumerator<TSegmenter, TSegment>(PipeReader reader, TSeg
                 _examinedPosition = _consumePosition ?? result.Buffer.End;
                 return true;
             case OperationStatus.NeedMoreData:
+                ThrowIfTruncatedCompletion(result);
                 reader.AdvanceTo(result.Buffer.Start, result.Buffer.End);
+                _currentLength = -1;
                 return false;
             case OperationStatus.InvalidData:
                 reader.Complete(new Exception("Segmenter encountered invalid data."));
@@ -300,19 +317,27 @@ sealed class PipeSegmentEnumerator<TSegmenter, TSegment>(PipeReader reader, TSeg
         // Advance past current segment.
         if (_currentLength is not -1)
         {
+            var segmentReadPending = _currentSegmentReadPending != 0;
             _currentSegmentReadPending = 0;
             // Not everything was buffered when the segment was returned (e.g. with length prefixed segments).
             if (_consumePosition is null)
             {
+                if (!segmentReadPending)
+                    reader.AdvanceTo(_currentSegmentStart, _examinedPosition);
                 task = reader.ReadAtLeastAsync((int)long.Min(_currentLength, int.MaxValue), cancellationToken);
                 if (!task.IsCompletedSuccessfully)
                     return Core(task, cancellationToken, consume: true);
                 result = task.Result;
-                if (result.IsCompleted)
-                    return new(EndOfData());
+                if (IsEmptyCompletion(result))
+                    ThrowIfTruncatedCompletion(result);
                 if (result.IsCanceled)
                     return new(Task.FromException<bool>(new OperationCanceledException(cancellationToken)));
 
+                if (result.Buffer.Length < _currentLength)
+                {
+                    ThrowIfTruncatedCompletion(result);
+                    return Core(new(result), cancellationToken, consume: true);
+                }
                 if (result.Buffer.Length > _currentLength)
                     return Core(new(result), cancellationToken, consume: true);
                 reader.AdvanceTo(result.Buffer.GetPosition(_currentLength));
@@ -330,7 +355,7 @@ sealed class PipeSegmentEnumerator<TSegmenter, TSegment>(PipeReader reader, TSeg
             return Core(task, cancellationToken);
 
         result = task.Result;
-        if (result.IsCompleted)
+        if (IsEmptyCompletion(result))
             return new(EndOfData());
         if (result.IsCanceled)
             return new(Task.FromException<bool>(new OperationCanceledException(cancellationToken)));
@@ -350,6 +375,7 @@ sealed class PipeSegmentEnumerator<TSegmenter, TSegment>(PipeReader reader, TSeg
                 ThrowHelper.ThrowInvalidOperation();
                 return default;
             case OperationStatus.NeedMoreData:
+                ThrowIfTruncatedCompletion(result);
                 return Core(new(result), cancellationToken, needMoreData: true);
             case OperationStatus.InvalidData:
                 return InvalidData();
@@ -365,8 +391,12 @@ sealed class PipeSegmentEnumerator<TSegmenter, TSegment>(PipeReader reader, TSeg
             while (true)
             {
                 var result = await task.ConfigureAwait(false);
-                if (result.IsCompleted)
+                if (IsEmptyCompletion(result))
+                {
+                    if (consume || needMoreData)
+                        ThrowIfTruncatedCompletion(result);
                     return EndOfData();
+                }
                 if (result.IsCanceled)
                     ThrowHelper.ThrowOperationCanceled(cancellationToken);
 
@@ -374,6 +404,7 @@ sealed class PipeSegmentEnumerator<TSegmenter, TSegment>(PipeReader reader, TSeg
                 {
                     if (result.Buffer.Length < _currentLength)
                     {
+                        ThrowIfTruncatedCompletion(result);
                         reader.AdvanceTo(result.Buffer.Start, result.Buffer.End);
                         task = reader.ReadAsync(cancellationToken);
                         continue;
@@ -386,6 +417,7 @@ sealed class PipeSegmentEnumerator<TSegmenter, TSegment>(PipeReader reader, TSeg
                 if (needMoreData)
                 {
                     reader.AdvanceTo(result.Buffer.Start, result.Buffer.End);
+                    _currentLength = -1;
                     task = reader.ReadAtLeastAsync(_segmenter.MinimumSize, cancellationToken);
                     needMoreData = false;
                     continue;
@@ -406,6 +438,7 @@ sealed class PipeSegmentEnumerator<TSegmenter, TSegment>(PipeReader reader, TSeg
                         ThrowHelper.ThrowInvalidOperation();
                         return default;
                     case OperationStatus.NeedMoreData:
+                        ThrowIfTruncatedCompletion(result);
                         needMoreData = true;
                         break;
                     case OperationStatus.InvalidData:
@@ -437,15 +470,24 @@ sealed class PipeSegmentEnumerator<TSegmenter, TSegment>(PipeReader reader, TSeg
         // Advance past current segment.
         if (_currentLength is not -1)
         {
+            var segmentReadPending = _currentSegmentReadPending != 0;
             _currentSegmentReadPending = 0;
             if (_consumePosition is null)
             {
+                if (!segmentReadPending)
+                    reader.AdvanceTo(_currentSegmentStart, _examinedPosition);
                 result = syncReader.ReadAtLeast((int)long.Min(_currentLength, int.MaxValue), timeout);
-                if (result.IsCompleted)
-                    return EndOfData();
+                if (IsEmptyCompletion(result))
+                    ThrowIfTruncatedCompletion(result);
                 if (result.IsCanceled)
                     ThrowHelper.ThrowOperationCanceled(CancellationToken.None);
 
+                if (result.Buffer.Length < _currentLength)
+                {
+                    ThrowIfTruncatedCompletion(result);
+                    consume = true;
+                    goto loop;
+                }
                 if (result.Buffer.Length > _currentLength)
                 {
                     consume = true;
@@ -466,8 +508,12 @@ sealed class PipeSegmentEnumerator<TSegmenter, TSegment>(PipeReader reader, TSeg
         loop:
         while (true)
         {
-            if (result.IsCompleted)
+            if (IsEmptyCompletion(result))
+            {
+                if (consume || needMoreData)
+                    ThrowIfTruncatedCompletion(result);
                 return EndOfData();
+            }
             if (result.IsCanceled)
                 ThrowHelper.ThrowOperationCanceled(CancellationToken.None);
 
@@ -475,6 +521,7 @@ sealed class PipeSegmentEnumerator<TSegmenter, TSegment>(PipeReader reader, TSeg
             {
                 if (result.Buffer.Length < _currentLength)
                 {
+                    ThrowIfTruncatedCompletion(result);
                     reader.AdvanceTo(result.Buffer.Start, result.Buffer.End);
                     result = syncReader.Read(timeout);
                     continue;
@@ -487,6 +534,7 @@ sealed class PipeSegmentEnumerator<TSegmenter, TSegment>(PipeReader reader, TSeg
             if (needMoreData)
             {
                 reader.AdvanceTo(result.Buffer.Start, result.Buffer.End);
+                _currentLength = -1;
                 result = syncReader.ReadAtLeast(_segmenter.MinimumSize, timeout);
                 needMoreData = false;
                 continue;
@@ -507,6 +555,7 @@ sealed class PipeSegmentEnumerator<TSegmenter, TSegment>(PipeReader reader, TSeg
                     ThrowHelper.ThrowInvalidOperation();
                     return default;
                 case OperationStatus.NeedMoreData:
+                    ThrowIfTruncatedCompletion(result);
                     needMoreData = true;
                     break;
                 case OperationStatus.InvalidData:

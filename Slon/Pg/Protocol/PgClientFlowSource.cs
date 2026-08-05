@@ -56,7 +56,8 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
         _state.DrainInert(onInert);
     }
 
-    // Arm the drain gate (see State.DrainSignal). Set before Complete is triggered.
+    // Arm before source completion is published. The executor fires this when its pull resolves
+    // completed and it will no longer dequeue source items.
     public void SetDrainSignal(TaskCompletionSource drainSignal) => _state.DrainSignal = drainSignal;
 
     public Enumerator CreateEnumerator(CancellationToken cancellationToken = default)
@@ -120,12 +121,9 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
         // idle boundary, keeping executor ownership out of the queue implementation below.
         public readonly SourceWakeEvent WakeEvent;
         public readonly PgFlowSourceDriver WakeDriver;
-        // Drain gate. Fired once from WaitCore's completed-resolution when the executor's pull
-        // resolves completed (WaitForNextAsync delivers false). Shutdown awaits it before draining
-        // the residual so the drain is the sole consumer of the SPSC queue (a concurrent executor
-        // dequeue would tear the read). Set before Complete.
+        // Fired from the executor's completed pull. Shutdown then becomes the sole source consumer
+        // and may migrate/fault inert items without waiting for dispatched flows to drain.
         public TaskCompletionSource? DrainSignal;
-
         // Sync-handoff FIFO is just _storage (sync+async in submission order); the current sync head the
         // executor is holding for its caller is HeldSyncFlow. No separate wait-list: each parked caller
         // parks on its OWN flow's MRES (PgClientFlow.HandoffEvent), which the executor signals when it
@@ -201,8 +199,7 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
 
         // Private and single-writer by construction: the ONLY caller is the CompletionToken registration
         // above, which the CTS fires at most once however many threads race _cts.Cancel (external
-        // CompleteAsync + the executor's terminal DisposeAsync). That once-only guarantee is what lets the
-        // IsCompleted store below be a plain release write (no Interlocked) - do not add a direct caller.
+        // CompleteAsync + the executor's terminal DisposeAsync).
         void Complete()
         {
             Volatile.Write(ref IsCompleted, true);

@@ -8,13 +8,15 @@ namespace Slon.Pipelines;
 abstract class StreamPipeReader : PipeReader
 {
     readonly ValueTaskSourcePromise<ReadResult> _readAsyncCorePromise = new();
-    bool _isReadActive;
+    int _isReadActive;
+    int _readerCompleted;
+    int _readerDisposed;
     bool _directReadAwaitingData;
 
     // Null in direct-read mode (CancelPendingRead unsupported): the caller's token threads straight to
     // the underlying stream read, so neither this source nor a per-read registration is allocated.
     protected AutoResetCancellationTokenSource? PendingReadTokenSource { get; }
-    protected bool IsReaderCompleted { get; set; }
+    protected bool IsReaderCompleted => Volatile.Read(ref _readerCompleted) is not 0;
     protected SegmentChainBuilder Segments { get; }
     protected bool LeaveOpen { get; }
     protected bool UseZeroByteReads { get; }
@@ -72,10 +74,12 @@ abstract class StreamPipeReader : PipeReader
     /// <inheritdoc />
     public override void Complete(Exception? exception = null)
     {
-        if (IsReaderCompleted)
+        if (Volatile.Read(ref _readerDisposed) is not 0)
+            return;
+        BeginCompletion();
+        if (Interlocked.Exchange(ref _readerDisposed, 1) is not 0)
             return;
 
-        IsReaderCompleted = true;
         PendingReadTokenSource?.Dispose();
         Segments.Dispose();
         if (!LeaveOpen)
@@ -85,13 +89,24 @@ abstract class StreamPipeReader : PipeReader
     /// <inheritdoc />
     public override ValueTask CompleteAsync(Exception? exception = null)
     {
-        if (IsReaderCompleted)
+        if (Volatile.Read(ref _readerDisposed) is not 0)
+            return new();
+        BeginCompletion();
+        if (Interlocked.Exchange(ref _readerDisposed, 1) is not 0)
             return new();
 
-        IsReaderCompleted = true;
         PendingReadTokenSource?.Dispose();
         Segments.Dispose();
         return !LeaveOpen ? Stream.DisposeAsync() : new();
+    }
+
+    void BeginCompletion()
+    {
+        // Complete is a terminal admission boundary, not a concurrent-read join. The exchange and
+        // TryStartRead's CAS/recheck close both orders without returning live receive storage.
+        Interlocked.Exchange(ref _readerCompleted, 1);
+        if (Volatile.Read(ref _isReadActive) is not 0)
+            throw new InvalidOperationException("The reader cannot be completed while a read is active.");
     }
 
     public virtual bool CanTimeout { get; }
@@ -194,11 +209,14 @@ abstract class StreamPipeReader : PipeReader
         return TryReadCore(out result);
     }
 
+    // Direct reads retain reader tenure until their continuation returns through CompleteDirectRead
+    // or AbortDirectRead. The protocol must interrupt and join that tenure before completing the
+    // reader and returning its destination buffer.
     internal bool SupportsDirectRead => PendingReadTokenSource is null;
 
     internal void EnsureCanUpgradeStream()
     {
-        if (IsReaderCompleted || _isReadActive || Segments.BufferedBytes is not 0)
+        if (IsReaderCompleted || Volatile.Read(ref _isReadActive) is not 0 || Segments.BufferedBytes is not 0)
             throw new InvalidOperationException("The reader must be open, idle, and empty before its stream can be upgraded.");
     }
 
@@ -261,7 +279,7 @@ abstract class StreamPipeReader : PipeReader
         // The decoder uses one cleanup path for failures before and after CompleteDirectRead.
         // A pre-cancelled begin never acquires tenure, while framing can fail after completion
         // released it, so abort must tolerate either boundary.
-        if (_isReadActive)
+        if (Volatile.Read(ref _isReadActive) is not 0)
             EndStartedRead();
     }
 
@@ -295,6 +313,7 @@ abstract class StreamPipeReader : PipeReader
             {
                 // Wait for data by doing 0 byte read before
                 _ = Stream.Read(Span<byte>.Empty);
+                ThrowIfCompleted();
             }
 
             int length;
@@ -336,11 +355,15 @@ abstract class StreamPipeReader : PipeReader
         }
         finally
         {
-            if (CanTimeout)
+            try
             {
-                Stream.ReadTimeout = originalTimeout;
+                if (CanTimeout)
+                    Stream.ReadTimeout = originalTimeout;
             }
-            EndStartedRead();
+            finally
+            {
+                EndStartedRead();
+            }
         }
 
     }
@@ -358,18 +381,13 @@ abstract class StreamPipeReader : PipeReader
         }
 
         [AsyncMethodBuilder(typeof(PromiseAsyncValueTaskMethodBuilder<>))]
-        async ValueTask<ReadResult> ReadAsyncCore(int minimumSize, AutoResetCancellationTokenSource? tokenSource, CancellationToken cancellationToken)
+        async ValueTask<ReadResult> ReadAsyncCore(int minimumSize,
+            AutoResetCancellationTokenSource? tokenSource, CancellationToken cancellationToken)
         {
             // Cancellation token was already checked before getting here.
-
-            // To map conceptually to pipelines, only one operation can be active.
             if (!TryStartRead())
-            {
                 ThrowAlreadyReading();
-            }
 
-            // Direct-read mode (no source): caller's token threads straight to the stream read, no
-            // registration. Otherwise hook the caller's token onto the source.
             CancellationTokenRegistration reg = default;
             CancellationToken token;
             if (tokenSource is { } src)
@@ -382,33 +400,26 @@ abstract class StreamPipeReader : PipeReader
                 token = cancellationToken;
             try
             {
-                // This optimization only makes sense if we don't have anything buffered
                 if (Segments.BufferedBytes is 0 && UseZeroByteReads)
                 {
-                    // Wait for data by doing 0 byte read before
                     _ = await Stream.ReadAsync(Memory<byte>.Empty, token).ConfigureAwait(false);
+                    ThrowIfCompleted();
                 }
 
                 int length;
                 do
                 {
-                    // We know minimumSize must be null or larger than what we have buffered to get here.
                     var segmentSize = minimumSize;
                     if (minimumSize is not 0)
                     {
-                        // We must request a segment that is minimumSize - BufferedBytes.
                         Debug.Assert(Segments.BufferedBytes <= minimumSize);
                         segmentSize -= (int)Segments.BufferedBytes;
                     }
 
-                    // We don't mind if we get smaller segments, we just want to make progress towards minimumSize.
                     var buffer = Segments.Reserve(segmentSize, enforceHint: false);
                     length = await Stream.ReadAsync(buffer, token).ConfigureAwait(false);
-
                     if (length is 0)
-                    {
                         break;
-                    }
 
                     ExaminedEverything = false;
                     Segments.Grow(length);
@@ -419,87 +430,92 @@ abstract class StreamPipeReader : PipeReader
             catch (OperationCanceledException ex)
             {
                 if (cancellationToken.IsCancellationRequested)
-                {
-                    // Simulate an OCE triggered directly by the cancellationToken rather than the InternalTokenSource
                     throw new OperationCanceledException(null, ex, cancellationToken);
-                }
-                else if (token.IsCancellationRequested)
-                {
-                    // Catch cancellation and translate it into setting isCanceled = true
+                if (token.IsCancellationRequested)
                     return new ReadResult(default, isCanceled: true, isCompleted: false);
-                }
-                else
-                {
-                    throw;
-                }
+                throw;
             }
             finally
             {
-                await reg.DisposeAsync().ConfigureAwait(false);
-                EndStartedRead();
+                try
+                {
+                    await reg.DisposeAsync().ConfigureAwait(false);
+                }
+                finally
+                {
+                    EndStartedRead();
+                }
             }
         }
     }
 
     protected async Task CopyToAsyncCore(PipeWriter destination, CancellationToken cancellationToken = default)
     {
-        var tokenSource = PendingReadTokenSource;
-        CancellationTokenRegistration reg = default;
-        CancellationToken token;
-        if (tokenSource is { } src)
-        {
-            token = src.Token;
-            if (token.IsCancellationRequested)
-                ThrowReadCanceled();
-            if (cancellationToken.CanBeCanceled)
-                reg = src.UnsafeRegister(cancellationToken);
-        }
-        else
-        {
-            token = cancellationToken;
-            if (token.IsCancellationRequested)
-                ThrowReadCanceled();
-        }
+        if (!TryStartRead())
+            ThrowAlreadyReading();
 
         try
         {
-            var (segment, segmentIndex) = Segments.HeadInfo;
+            var tokenSource = PendingReadTokenSource;
+            CancellationTokenRegistration reg = default;
+            CancellationToken token;
+            if (tokenSource is { } src)
+            {
+                token = src.Token;
+                if (token.IsCancellationRequested)
+                    ThrowReadCanceled();
+                if (cancellationToken.CanBeCanceled)
+                    reg = src.UnsafeRegister(cancellationToken);
+            }
+            else
+            {
+                token = cancellationToken;
+                if (token.IsCancellationRequested)
+                    ThrowReadCanceled();
+            }
 
             try
             {
-                while (segment != null)
+                var (segment, segmentIndex) = Segments.HeadInfo;
+                SequencePosition consumed = default;
+                var hasConsumed = false;
+
+                try
                 {
-                    FlushResult flushResult = await destination.WriteAsync(segment.Memory.Slice(segmentIndex), token).ConfigureAwait(false);
-
-                    if (flushResult.IsCanceled)
+                    while (segment != null)
                     {
-                        ThrowFlushCanceled();
-                    }
+                        FlushResult flushResult = await destination.WriteAsync(segment.Memory.Slice(segmentIndex), token).ConfigureAwait(false);
 
-                    segment = segment.NextSegment;
-                    segmentIndex = 0;
+                        if (flushResult.IsCanceled)
+                            ThrowFlushCanceled();
 
-                    if (flushResult.IsCompleted)
-                    {
-                        return;
+                        consumed = new(segment, segment.End);
+                        hasConsumed = true;
+                        segment = segment.NextSegment;
+                        segmentIndex = 0;
+
+                        if (flushResult.IsCompleted)
+                            return;
                     }
                 }
+                finally
+                {
+                    // Advance even if WriteAsync throws so the PipeReader is not left in the
+                    // currently reading state.
+                    if (hasConsumed)
+                        Segments.AdvanceTo(consumed);
+                }
+
+                await Stream.CopyToAsync(destination, token).ConfigureAwait(false);
             }
             finally
             {
-                // Advance even if WriteAsync throws so the PipeReader is not left in the
-                // currently reading state
-                if (segment != null)
-                {
-                    Segments.AdvanceTo(new(segment, segment.End));
-                }
+                await reg.DisposeAsync().ConfigureAwait(false);
             }
-
-            await Stream.CopyToAsync(destination, token).ConfigureAwait(false);
         }
         finally
         {
-            await reg.DisposeAsync().ConfigureAwait(false);
+            EndStartedRead();
         }
 
         static void ThrowFlushCanceled()
@@ -508,53 +524,65 @@ abstract class StreamPipeReader : PipeReader
 
     protected async Task CopyToAsyncCore(Stream destination, CancellationToken cancellationToken = default)
     {
-        var tokenSource = PendingReadTokenSource;
-        CancellationTokenRegistration reg = default;
-        CancellationToken token;
-        if (tokenSource is { } src)
-        {
-            token = src.Token;
-            if (token.IsCancellationRequested)
-                ThrowReadCanceled();
-            if (cancellationToken.CanBeCanceled)
-                reg = src.UnsafeRegister(cancellationToken);
-        }
-        else
-        {
-            token = cancellationToken;
-            if (token.IsCancellationRequested)
-                ThrowReadCanceled();
-        }
+        if (!TryStartRead())
+            ThrowAlreadyReading();
 
         try
         {
-            var (segment, segmentIndex) = Segments.HeadInfo;
+            var tokenSource = PendingReadTokenSource;
+            CancellationTokenRegistration reg = default;
+            CancellationToken token;
+            if (tokenSource is { } src)
+            {
+                token = src.Token;
+                if (token.IsCancellationRequested)
+                    ThrowReadCanceled();
+                if (cancellationToken.CanBeCanceled)
+                    reg = src.UnsafeRegister(cancellationToken);
+            }
+            else
+            {
+                token = cancellationToken;
+                if (token.IsCancellationRequested)
+                    ThrowReadCanceled();
+            }
 
             try
             {
-                while (segment != null)
-                {
-                    await destination.WriteAsync(segment.Memory.Slice(segmentIndex), token).ConfigureAwait(false);
+                var (segment, segmentIndex) = Segments.HeadInfo;
+                SequencePosition consumed = default;
+                var hasConsumed = false;
 
-                    segment = segment.NextSegment;
-                    segmentIndex = 0;
+                try
+                {
+                    while (segment != null)
+                    {
+                        await destination.WriteAsync(segment.Memory.Slice(segmentIndex), token).ConfigureAwait(false);
+
+                        consumed = new(segment, segment.End);
+                        hasConsumed = true;
+                        segment = segment.NextSegment;
+                        segmentIndex = 0;
+                    }
                 }
+                finally
+                {
+                    // Advance even if WriteAsync throws so the PipeReader is not left in the
+                    // currently reading state.
+                    if (hasConsumed)
+                        Segments.AdvanceTo(consumed);
+                }
+
+                await Stream.CopyToAsync(destination, token).ConfigureAwait(false);
             }
             finally
             {
-                // Advance even if WriteAsync throws so the PipeReader is not left in the
-                // currently reading state
-                if (segment != null)
-                {
-                    Segments.AdvanceTo(new(segment, segment.End));
-                }
+                await reg.DisposeAsync().ConfigureAwait(false);
             }
-
-            await Stream.CopyToAsync(destination, token).ConfigureAwait(false);
         }
         finally
         {
-            await reg.DisposeAsync().ConfigureAwait(false);
+            EndStartedRead();
         }
     }
 
@@ -576,26 +604,33 @@ abstract class StreamPipeReader : PipeReader
     // "Ensure that only one context "owns" a PipeReader or PipeWriter or accesses them. These types are not thread-safe."
     protected bool TryStartRead()
     {
-        if (_isReadActive)
+        if (Interlocked.CompareExchange(ref _isReadActive, 1, 0) is not 0)
             return false;
 
-        return _isReadActive = true;
+        // Close read-admission versus sideband completion: completion either observes this tenure,
+        // or this observes completion and retires itself before touching reader-owned memory.
+        if (IsReaderCompleted)
+        {
+            EndStartedRead();
+            ThrowCompleted();
+        }
+        return true;
     }
 
     protected void EndStartedRead()
     {
-        Debug.Assert(_isReadActive);
-        _isReadActive = false;
+        Debug.Assert(Volatile.Read(ref _isReadActive) is not 0);
+        Volatile.Write(ref _isReadActive, 0);
     }
 
     protected void ThrowIfCompleted()
     {
         if (IsReaderCompleted)
             ThrowCompleted();
-
-        static void ThrowCompleted()
-            => throw new InvalidOperationException("Reading is not allowed after reader was completed.");
     }
+
+    static void ThrowCompleted()
+        => throw new InvalidOperationException("Reading is not allowed after reader was completed.");
 
     static void ThrowReadCanceled()
         => throw new OperationCanceledException("Read was canceled on underlying PipeReader.");

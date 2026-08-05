@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using Slon.Pipelines;
 
@@ -27,7 +28,20 @@ sealed class BackendMessageContext
     public BackendMessage Current
     {
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        get => _current;
+        get
+        {
+            var current = _current;
+            if (current.IsDefault)
+                ThrowHelper.ThrowInvalidOperation("The decoder has no current backend message.");
+            return current;
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public bool TryGetCurrent(out BackendMessage current)
+    {
+        current = _current;
+        return !current.IsDefault;
     }
 
     public BackendMessage GetCurrent(short token)
@@ -71,7 +85,7 @@ sealed class BackendMessageContext
 
     public bool TryExtend(short token, out CurrentSegmentBuffer result)
     {
-        Validate(token);
+        EnsureBodyWindowAvailable(token);
         if (!_decoder.TryExtendCurrentMessage(out result))
             return false;
         result = GetBodyBuffer(token, result);
@@ -80,13 +94,13 @@ sealed class BackendMessageContext
 
     public async ValueTask<CurrentSegmentBuffer> ExtendAsync(short token, CancellationToken cancellationToken)
     {
-        Validate(token);
+        EnsureBodyWindowAvailable(token);
         return GetBodyBuffer(token, await _decoder.ExtendCurrentMessageAsync(cancellationToken).ConfigureAwait(false));
     }
 
     public CurrentSegmentBuffer Extend(short token)
     {
-        Validate(token);
+        EnsureBodyWindowAvailable(token);
         return GetBodyBuffer(token, _decoder.ExtendCurrentMessage());
     }
 
@@ -180,8 +194,31 @@ sealed class BackendMessageContext
                 _peekedBuffer.Length >= _peekedHeader.MessageLength);
             return true;
         }
-        _currentMessageOffset = _remainingBatch.ConsumedLength;
-        return BackendMessage.TryCreateFromBatch(ref _remainingBatch, this, ++_version, out _current);
+        var messageOffset = _remainingBatch.ConsumedLength;
+        if (!_remainingBatch.TryReadNextInPlace(out var header, out var buffer, out var bufferLength))
+            return false;
+        _currentMessageOffset = messageOffset;
+        BackendMessage.Initialize(ref _current, header, buffer, this, ++_version,
+            bufferLength >= header.MessageLength);
+        return true;
+    }
+
+    public void RetireCurrentBatch()
+    {
+        // Moving the batch enumerator may return or refill the memory backing every view held here.
+        // A failed message poll preserves Current, but crossing this ownership boundary cannot.
+        var invalidateToken = !_current.IsDefault || _hasPeeked;
+        _current = default;
+        _hasPeeked = false;
+        _peekedHeader = default;
+        _peekedBuffer = default;
+        _remainingBatch = default;
+        _currentMessageOffset = 0;
+        _peekedMessageOffset = 0;
+        _bodyWindowAdvanced = false;
+        _hasPriorCancellationExposure = false;
+        if (invalidateToken)
+            _version++;
     }
 
     // Reads the next message WITHOUT publishing it as Current. The remaining batch cursor
@@ -208,14 +245,24 @@ sealed class BackendMessageContext
         return true;
     }
 
-    public BackendMessage Peeked => new(_peekedHeader, _peekedBuffer, this, _version);
+    public BackendMessage Peeked
+    {
+        get
+        {
+            Debug.Assert(_hasPeeked);
+            return new(_peekedHeader, _peekedBuffer, this, _version);
+        }
+    }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void SetBatch(BackendMessageBatch batch)
     {
-        // A fresh batch retires the prior peek. The inactive buffer may stay populated because
+        Debug.Assert(_current.IsDefault && !_hasPeeked,
+            "The prior batch must be retired before publishing replacement storage.");
+        // Keep release behavior defensive. The inactive buffer may stay populated because
         // _hasPeeked owns validity and the next peek overwrites it.
         _hasPeeked = false;
         _remainingBatch = batch;
     }
+
 }

@@ -50,7 +50,118 @@ public class RacingDisposeInMemoryTests
     // Three-command flow capture: command boundaries (CommandComplete) inside one Sync, so the body
     // parks on the INTER-RESULT gate between commands - the multi-command lost-completion window.
     static IReadOnlyList<byte[]>? _multiMessages;
+    static IReadOnlyList<byte[]>? _largeRowMessages;
     static PgClientOptions? _options;
+
+    sealed class WriteThenWaitFlow(TaskCompletionSource written, TaskCompletionSource release) : PgClientFlow(supportsDeferredFlush: true)
+    {
+        public WriteThenWaitFlow(TaskCompletionSource written, TaskCompletionSource release, bool async)
+            : this(written, release)
+            => IsAsync = async;
+
+        protected override async ValueTask<FlowTasks> ExecuteAuto(Context context)
+        {
+            context.GetEncoder().WriteQuery("select 1");
+            written.SetResult();
+            await release.Task.ConfigureAwait(false);
+            return new FlowTasks();
+        }
+    }
+
+    [TestMethod]
+    public async Task GracefulCloseWriteCompletionSurfacesClosedException()
+    {
+        var clock = new FakeTimeProvider();
+        var transport = new GatedReplayTransport(_handshake!);
+        var protocol = PgClientProtocol.Create(new PgClientProtocolOptions(_options!)
+        {
+            TimeProvider = clock,
+            HeartbeatInterval = TimeSpan.FromSeconds(1),
+        });
+        await protocol.StartAsync(_options!, transport);
+
+        var written = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var flow = new WriteThenWaitFlow(written, release, async: true);
+        Assert.IsTrue(protocol.TryQueue(flow));
+        await written.Task.WaitAsync(Cap);
+
+        var completion = protocol.CompleteAsync();
+        transport.CompleteWriteCleanly();
+        await Assert.ThrowsExactlyAsync<PgClientClosedException>(async () => await protocol.FlushAsync(CancellationToken.None));
+        release.SetResult();
+
+        await completion.WaitAsync(Cap);
+    }
+
+    [TestMethod]
+    public async Task GracefulCloseReadEofSurfacesClosedException()
+    {
+        var clock = new FakeTimeProvider();
+        var transport = new GatedReplayTransport(_handshake!);
+        var protocol = PgClientProtocol.Create(new PgClientProtocolOptions(_options!)
+        {
+            TimeProvider = clock,
+            HeartbeatInterval = TimeSpan.FromSeconds(1),
+        });
+        await protocol.StartAsync(_options!, transport);
+
+        var readParked = transport.ArmReadPark();
+        var flow = new CommandFlow(async: true, Command.Create("select 1"));
+        Assert.IsTrue(protocol.TryQueue(flow));
+        var enumerator = flow.GetAsyncEnumerator();
+        var moveNext = enumerator.MoveNextAsync().AsTask();
+        await readParked.WaitAsync(Cap);
+
+        var completion = protocol.CompleteAsync();
+        transport.CompleteReadCleanly();
+        await Assert.ThrowsExactlyAsync<PgClientClosedException>(async () => await moveNext.WaitAsync(Cap));
+        await enumerator.DisposeAsync();
+        await completion.WaitAsync(Cap);
+    }
+
+    [TestMethod]
+    public async Task GracefulCloseMidRowEofSurfacesClosedException()
+    {
+        var clock = new FakeTimeProvider();
+        var transport = new GatedReplayTransport(_handshake!);
+        var protocol = PgClientProtocol.Create(new PgClientProtocolOptions(_options!)
+        {
+            TimeProvider = clock,
+            HeartbeatInterval = TimeSpan.FromSeconds(1),
+        });
+        await protocol.StartAsync(_options!, transport);
+
+        var initialReadParked = transport.ArmReadPark();
+        var flow = new CommandFlow(async: true, Command.Create("select repeat('x', 131072)"));
+        Assert.IsTrue(protocol.TryQueue(flow));
+        var flowEnumerator = flow.GetAsyncEnumerator();
+        var resultPending = flowEnumerator.MoveNextAsync().AsTask();
+        await initialReadParked.WaitAsync(Cap);
+
+        var messages = _largeRowMessages!;
+        var dataRowIndex = messages.ToList().FindIndex(static message => message[0] == (byte)'D');
+        Assert.IsGreaterThanOrEqualTo(0, dataRowIndex);
+        for (var i = 0; i < dataRowIndex; i++)
+            transport.ReleaseSegment(messages[i]);
+        transport.ReleaseSegment(messages[dataRowIndex]
+            .AsSpan(0, BackendMessageBatch.Segmenter.DefaultDataRowStreamingThreshold).ToArray());
+
+        Assert.IsTrue(await resultPending.WaitAsync(Cap));
+        var rows = flowEnumerator.Current.GetAsyncEnumerator(CommandResult.RowBuffering.Streaming);
+        Assert.IsTrue(await rows.MoveNextAsync().AsTask().WaitAsync(Cap));
+
+        var continuationReadParked = transport.ArmReadPark();
+        var valuePending = rows.Current.GetValueAsync<string>(0).AsTask();
+        await continuationReadParked.WaitAsync(Cap);
+
+        var completion = protocol.CompleteAsync();
+        transport.CompleteReadCleanly();
+        await Assert.ThrowsExactlyAsync<PgClientClosedException>(async () => await valuePending.WaitAsync(Cap));
+        try { await rows.DisposeAsync().AsTask().WaitAsync(Cap); } catch (PgClientClosedException) { }
+        try { await flowEnumerator.DisposeAsync().AsTask().WaitAsync(Cap); } catch (PgClientClosedException) { }
+        await completion.WaitAsync(Cap);
+    }
 
     [ClassInitialize]
     public static async Task ClassInit(TestContext _)
@@ -63,6 +174,9 @@ public class RacingDisposeInMemoryTests
         var (_, multiResponse) = await CaptureAsync(_options,
             Command.Create("select 1"), Command.Create("select 2"), Command.Create("select 3"));
         _multiMessages = SplitMessages(multiResponse);
+
+        var (_, largeRowResponse) = await CaptureAsync(_options, Command.Create("select repeat('x', 131072)"));
+        _largeRowMessages = SplitMessages(largeRowResponse);
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -661,10 +775,11 @@ public class RacingDisposeInMemoryTests
         readonly Pipe _toClient = new();
         readonly Pipe _toServer = new();
         readonly PipeReader _reader;
+        readonly CompletingPipeWriter _writer;
         readonly ReadParkSignalingStream _readingStream;
 
         public override PipeReader Reader => _reader;
-        public override PipeWriter Writer => _toServer.Writer;
+        public override PipeWriter Writer => _writer;
         public override void WaitWritable() { }
         public override void Abort()
         {
@@ -674,6 +789,7 @@ public class RacingDisposeInMemoryTests
 
         public GatedReplayTransport(byte[] handshake)
         {
+            _writer = new CompletingPipeWriter(_toServer.Writer);
             _readingStream = new ReadParkSignalingStream(_toClient.Reader.AsStream());
             _reader = new Slon.Pipelines.DefaultStreamPipeReader(_readingStream,
                 new StreamPipeReaderOptions(bufferSize: 8192, useZeroByteReads: false),
@@ -681,6 +797,10 @@ public class RacingDisposeInMemoryTests
             _toClient.Writer.WriteAsync(handshake).AsTask().GetAwaiter().GetResult();
             _ = DrainClient();
         }
+
+        public void CompleteReadCleanly() => _toClient.Writer.Complete();
+
+        public void CompleteWriteCleanly() => _writer.CompleteFlushes();
 
         public Task ArmReadPark() => _readingStream.ArmReadPark();
 
@@ -711,6 +831,23 @@ public class RacingDisposeInMemoryTests
             {
             }
         }
+    }
+
+    sealed class CompletingPipeWriter(PipeWriter inner) : PipeWriter
+    {
+        int _completeFlushes;
+
+        public void CompleteFlushes() => Volatile.Write(ref _completeFlushes, 1);
+        public override void Advance(int bytes) => inner.Advance(bytes);
+        public override void CancelPendingFlush() => inner.CancelPendingFlush();
+        public override void Complete(Exception? exception = null) => inner.Complete(exception);
+        public override ValueTask<FlushResult> FlushAsync(CancellationToken cancellationToken = default)
+            => Volatile.Read(ref _completeFlushes) is not 0
+                ? new(new FlushResult(isCanceled: false, isCompleted: true))
+                : inner.FlushAsync(cancellationToken);
+        public override long UnflushedBytes => inner.UnflushedBytes;
+        public override Memory<byte> GetMemory(int sizeHint = 0) => inner.GetMemory(sizeHint);
+        public override Span<byte> GetSpan(int sizeHint = 0) => inner.GetSpan(sizeHint);
     }
 
     sealed class ReadParkSignalingStream(Stream inner) : Stream

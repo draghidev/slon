@@ -177,7 +177,7 @@ sealed class ResyncRecoveryFlow : PgClientFlow
             {
                 var message = await decoder.GetNextAsync().ConfigureAwait(false);
                 if (FailedFlow is ExclusiveAccessFlow && remaining == 1 && message.TryCreateError(out var error))
-                    resetError ??= error;
+                    resetError ??= error.Preserve();
                 // HandleMessageAutoCore decrements _rfqCount internally; the local counter drives
                 // the loop exit independently of the auto-handler's count semantics.
                 if (message.Header.Type is BackendType.ReadyForQuery)

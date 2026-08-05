@@ -39,13 +39,15 @@ sealed class PipeOutputWriter(PipeWriter pipeWriter) : IOutputWriter
         if (!flushTask.IsCompletedSuccessfully)
             return Core(flushTask);
 
-        _ = flushTask.Result;
+        EnsureFlushed(flushTask.Result);
         return new();
 
         [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
         static async ValueTask Core(ValueTask<FlushResult> flushTask)
+            => EnsureFlushed(await flushTask.ConfigureAwait(false));
+
+        static void EnsureFlushed(FlushResult result)
         {
-            var result = await flushTask.ConfigureAwait(false);
             if (result.IsCompleted)
                 throw new InvalidOperationException("Other pipe end was already completed.");
             if (result.IsCanceled)

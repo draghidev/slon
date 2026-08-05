@@ -57,11 +57,12 @@ sealed class BackpressureWriteTransport : TransportConnection
             if (!_toServer.Reader.TryRead(out var result))
                 result = await _toServer.Reader.ReadAsync().ConfigureAwait(false);
 
-            var take = Math.Min(count - drained, result.Buffer.Length);
+            var bufferLength = result.Buffer.Length;
+            var take = Math.Min(count - drained, bufferLength);
             drained += take;
             _toServer.Reader.AdvanceTo(result.Buffer.Slice(0, take).End);
 
-            if (result.IsCompleted && result.Buffer.Length == take)
+            if (result.IsCompleted && bufferLength == take)
                 break;
         }
         return drained;

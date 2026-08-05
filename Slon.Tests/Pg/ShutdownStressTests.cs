@@ -93,7 +93,7 @@ public class ShutdownStressTests
     // ----- Scenario B: graceful->abort, handshake-only (parked read) -----
 
     [TestMethod]
-    public async Task Stress_GracefulEscalatesToAbort_NoNre()
+    public async Task Stress_GracefulTimeout_AbortsTransportAndConverges()
     {
         var options = PgTestPool.NewOptions();
         var handshake = Handshake();
@@ -102,7 +102,8 @@ public class ShutdownStressTests
         {
             var protocolOptions = new PgClientProtocolOptions(options) { CompletionTimeout = TimeSpan.FromMilliseconds(2), HeartbeatInterval = TimeSpan.FromMilliseconds(5) };
             var protocol = PgClientProtocol.Create(protocolOptions);
-            await protocol.StartAsync(options, new ReplayTransport(handshake));
+            var transport = new ReplayTransport(handshake);
+            await protocol.StartAsync(options, transport);
             await RunIterationAsync(i, async () =>
             {
                 var flow = new CommandFlow(async: true, Command.Create("select 1"));
@@ -112,6 +113,7 @@ public class ShutdownStressTests
                 var moveNextTask = e.MoveNextAsync().AsTask();
                 var completeTask = protocol.CompleteAsync();
 
+                await transport.Aborted.WaitAsync(Cap);
                 await moveNextTask.WaitAsync(Cap);
                 await e.DisposeAsync();
                 await completeTask.WaitAsync(Cap);
@@ -238,9 +240,17 @@ public class ShutdownStressTests
     {
         readonly Pipe _toClient = new();
         readonly Pipe _toServer = new(new PipeOptions(pauseWriterThreshold: 1 << 30, resumeWriterThreshold: 1 << 29));
+        readonly TaskCompletionSource _aborted = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public override PipeReader Reader => _toClient.Reader;
         public override PipeWriter Writer => _toServer.Writer;
+        public Task Aborted => _aborted.Task;
         public override void WaitWritable() { }
+        public override void Abort()
+        {
+            _aborted.TrySetResult();
+            try { _toClient.Writer.Complete(new IOException("The in-memory transport was aborted.")); }
+            catch (InvalidOperationException) { }
+        }
         public ReplayTransport(byte[] canned)
         {
             _toClient.Writer.WriteAsync(canned).AsTask().GetAwaiter().GetResult();

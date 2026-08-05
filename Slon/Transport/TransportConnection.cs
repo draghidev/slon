@@ -24,6 +24,8 @@ abstract class TransportConnection
     [ThreadStatic]
     public static Deadline? SyncNonBlockingDeadline;
 
+    // The protocol owns read-result tenure and completes these endpoints only after every borrowed
+    // buffer has been retired. Abort must make outstanding physical I/O settle so that join can finish.
     public abstract PipeReader Reader { get; }
     public abstract PipeWriter Writer { get; }
 

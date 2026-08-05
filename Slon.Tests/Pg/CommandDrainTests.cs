@@ -362,9 +362,9 @@ public class CommandDrainTests
     }
 
     // Graceful-then-abort escalation: a body parked on an advisory lock can't observe StoppingToken
-    // through the per-result check. CompleteAsync's graceful path schedules AbortToken via
-    // CancelAfter(CompletionTimeout); when the timeout fires the decoder's CTS-linked CT
-    // throws, the body's catch routes the closed exception out, and the consumer's pending
+    // through the per-result check. CompleteAsync's graceful path schedules forceful protocol
+    // escalation after CompletionTimeout; the abort token cancels the decoder before the transport
+    // is aborted, the body's catch routes the closed exception out, and the consumer's pending
     // MoveNextAsync surfaces PgClientClosedException.
     [TestMethod]
     public async Task StoppingToken_GracefulEscalatesToAbort_AsyncFlowFaultsWithClosedException()

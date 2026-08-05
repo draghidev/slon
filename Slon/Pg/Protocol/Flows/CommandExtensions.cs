@@ -182,7 +182,7 @@ static class CommandExtensions
             if (!decoder.TryGetNext(out var message))
             {
                 if (!await decoder.MoveNextAsync().ConfigureAwait(false))
-                    ThrowHelper.ThrowInvalidOperation("No more messages");
+                    throw PgProtocolException.UnexpectedEof();
                 message = decoder.Current;
             }
             if (message.EnsureExpectedOrError(PgTypes.BackendType.RowDescription, PgTypes.BackendType.NoData)
@@ -209,7 +209,7 @@ static class CommandExtensions
             if (!decoder.TryGetNext(out message))
             {
                 if (!await decoder.MoveNextAsync().ConfigureAwait(false))
-                    ThrowHelper.ThrowInvalidOperation("No more messages");
+                    throw PgProtocolException.UnexpectedEof();
                 message = decoder.Current;
             }
             message.DebugEnsureExpected(PgTypes.BackendType.DataRow, PgTypes.BackendType.CommandComplete);
@@ -225,7 +225,7 @@ static class CommandExtensions
                 if (!decoder.TryGetNext(out message))
                 {
                     if (!await decoder.MoveNextAsync().ConfigureAwait(false))
-                        ThrowHelper.ThrowInvalidOperation("No more messages");
+                        throw PgProtocolException.UnexpectedEof();
                     message = decoder.Current;
                 }
                 if (message.EnsureExpectedOrError(PgTypes.BackendType.ParseComplete) is { } parseError)
@@ -238,7 +238,7 @@ static class CommandExtensions
             if (!decoder.TryGetNext(out message))
             {
                 if (!await decoder.MoveNextAsync().ConfigureAwait(false))
-                    ThrowHelper.ThrowInvalidOperation("No more messages");
+                    throw PgProtocolException.UnexpectedEof();
                 message = decoder.Current;
             }
             if (message.EnsureExpectedOrError(PgTypes.BackendType.BindComplete) is { } bindError)
@@ -253,7 +253,7 @@ static class CommandExtensions
                 if (!decoder.TryGetNext(out message))
                 {
                     if (!await decoder.MoveNextAsync().ConfigureAwait(false))
-                        ThrowHelper.ThrowInvalidOperation("No more messages");
+                        throw PgProtocolException.UnexpectedEof();
                     message = decoder.Current;
                 }
                 if (message.EnsureExpectedOrError(PgTypes.BackendType.RowDescription, PgTypes.BackendType.NoData)
@@ -282,7 +282,7 @@ static class CommandExtensions
                 if (!decoder.TryGetNext(out message))
                 {
                     if (!await decoder.MoveNextAsync().ConfigureAwait(false))
-                        ThrowHelper.ThrowInvalidOperation("No more messages");
+                        throw PgProtocolException.UnexpectedEof();
                     message = decoder.Current;
                 }
                 message.DebugEnsureExpected(PgTypes.BackendType.DataRow, PgTypes.BackendType.CommandComplete);
@@ -406,6 +406,8 @@ static class CommandExtensions
         if (!command.WithSync)
             return errorMessage is not null ? (errorMessage, TransactionStatus.Unknown) : null;
 
+        // Reading the following RFQ may retire the batch which owns the ErrorResponse body.
+        errorMessage = errorMessage?.Preserve();
         var message = decoder.GetNext();
         // When an error is returned while we expect an RFQ it's going to be some unexpected server issue, just throw it.
         if (message.TryCreateError(out var syncError))
@@ -436,6 +438,8 @@ static class CommandExtensions
         if (!command.WithSync)
             return errorMessage is not null ? new((errorMessage, TransactionStatus.Unknown)) : new(result: null);
 
+        // Reading the following RFQ may retire the batch which owns the ErrorResponse body.
+        errorMessage = errorMessage?.Preserve();
         if (!decoder.TryGetNext(out var message))
             return Core(decoder, errorMessage);
 

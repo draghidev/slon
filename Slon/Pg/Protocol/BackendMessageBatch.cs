@@ -50,6 +50,7 @@ struct BackendMessageBatch(ReadOnlySequence<byte> buffer)
     internal struct Segmenter : IPipeSegmenter<BackendMessageBatch>
     {
         public const int DefaultDataRowStreamingThreshold = 16 * 1024;
+        const uint MaxMessageLength = 0x3FFF_FFFF;
 
         readonly int _dataRowStreamingThreshold;
         int _minimumSize;
@@ -74,9 +75,15 @@ struct BackendMessageBatch(ReadOnlySequence<byte> buffer)
             // Try span first before accessing the sequence.
             while (Header.TryParse(reader.UnreadSpan, out var header) || Header.TryParseMultiSegment(reader.UnreadSequence, out header))
             {
+                var backendType = (BackendType)header.Tag;
+                if (!backendType.IsDefined())
+                    throw new PgFramingException($"Unknown PostgreSQL backend message type: {header.Tag}.");
+                if (header.MessageLength > MaxMessageLength)
+                    throw new PgFramingException($"PostgreSQL backend message length {header.MessageLength} exceeds the maximum supported length.");
+
                 if (reader.Remaining < header.MessageLength)
                 {
-                    var required = RequiredBufferedLength((BackendType)header.Tag, header.MessageLength);
+                    var required = RequiredBufferedLength(backendType, header.MessageLength);
                     if (reader.Remaining < required)
                     {
                         // MinimumSize is relative to the entire unconsumed pipe buffer, including messages

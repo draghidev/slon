@@ -123,12 +123,17 @@ public class FlowSourceTests
                 index[flows[k]] = k;
             }
             var consume = new int[N];
+            var executorConsume = new int[N];
+            var drainConsume = new int[N];
             int nullSeen = 0, unknownSeen = 0;
 
-            void Record(PgClientFlow? f)
+            void Record(PgClientFlow? f, bool drain)
             {
                 if (f is not null && index.TryGetValue(f, out var k))
+                {
                     Interlocked.Increment(ref consume[k]);
+                    Interlocked.Increment(ref (drain ? ref drainConsume[k] : ref executorConsume[k]));
+                }
                 else if (f is null)
                     Interlocked.Increment(ref nullSeen);
                 else
@@ -142,7 +147,7 @@ public class FlowSourceTests
                 {
                     if (enumerator.TryGetNext(out var item))
                     {
-                        Record(item);
+                        Record(item, drain: false);
                         continue;
                     }
                     if (!await enumerator.WaitForNextAsync())
@@ -159,21 +164,25 @@ public class FlowSourceTests
             source.SetDrainSignal(executorStopped);
             enumerator.Complete();
             await Task.WhenAny(executorStopped.Task, executor);
-            source.DrainInertItems(Record);
+            source.DrainInertItems(flow => Record(flow, drain: true));
             await executor.WaitAsync(TimeSpan.FromSeconds(10));
             await enumerator.DisposeAsync();
 
+            List<string>? anomalies = null;
             if (nullSeen != 0)
-                Assert.Fail($"iter {i}: DrainInertItems saw {nullSeen} null flow(s) - torn SPSC dequeue.");
+                (anomalies ??= []).Add($"DrainInertItems saw {nullSeen} null flow(s)");
             if (unknownSeen != 0)
-                Assert.Fail($"iter {i}: saw {unknownSeen} unrecognized flow(s) - corrupted dequeue.");
+                (anomalies ??= []).Add($"saw {unknownSeen} unrecognized flow(s)");
             for (int k = 0; k < N; k++)
             {
                 if (consume[k] == 0)
-                    Assert.Fail($"iter {i}: flow {k} consumed 0 times - lost (would hang a real caller).");
-                if (consume[k] > 1)
-                    Assert.Fail($"iter {i}: flow {k} consumed {consume[k]} times - double dequeue (torn/corrupt).");
+                    (anomalies ??= []).Add($"flow {k} consumed 0 times");
+                else if (consume[k] > 1)
+                    (anomalies ??= []).Add($"flow {k} consumed {consume[k]} times " +
+                        $"(executor={executorConsume[k]}, drain={drainConsume[k]})");
             }
+            if (anomalies is not null)
+                Assert.Fail($"iter {i}: {string.Join("; ", anomalies)}");
         }
     }
 

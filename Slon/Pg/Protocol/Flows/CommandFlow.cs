@@ -482,7 +482,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                     if (!_decoder.TryGetNext(out var message))
                     {
                         if (!await _decoder.MoveNextAsync().ConfigureAwait(false))
-                            ThrowHelper.ThrowInvalidOperation("No more messages");
+                            throw PgProtocolException.UnexpectedEof();
                         message = _decoder.Current;
                     }
 
@@ -496,7 +496,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                         if (!_decoder.TryGetNext(out message))
                         {
                             if (!await _decoder.MoveNextAsync().ConfigureAwait(false))
-                                ThrowHelper.ThrowInvalidOperation("No more messages");
+                                throw PgProtocolException.UnexpectedEof();
                             message = _decoder.Current;
                         }
                         message.DebugEnsureExpected(PgTypes.BackendType.DataRow, PgTypes.BackendType.CommandComplete);
@@ -1602,7 +1602,8 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                 try
                 {
                     var decoder = _decoder;
-                    if (decoder.Current.Header.Type is PgTypes.BackendType.DataRow)
+                    if (!decoder.TryGetCurrent(out var current)
+                        || current.Header.Type is PgTypes.BackendType.DataRow)
                     {
                         while (decoder.GetNext().Header.Type is PgTypes.BackendType.DataRow) {}
                     }
@@ -1630,7 +1631,8 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                 try
                 {
                     var decoder = _decoder;
-                    if (decoder.Current.Header.Type is not PgTypes.BackendType.DataRow)
+                    if (decoder.TryGetCurrent(out var current)
+                        && current.Header.Type is not PgTypes.BackendType.DataRow)
                     {
                         var completion = Command.CompleteAsync(decoder);
                         if (completion.IsCompletedSuccessfully)

@@ -105,6 +105,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
     ExclusiveScopeState? _exclusiveScope;
     readonly Lock _syncRoot = new();
     ProtocolStatus _status = ProtocolStatus.Created;
+    int _queryProtocolEstablished;
     // Track draining count so overlapping recovery starts/ends don't signal ready too early.
     // Any concurrent CompleteAsync (which also transitions to draining) is respected the same way.
     int _drainingCount;
@@ -113,7 +114,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
     {
         _options = options;
         _scopeReset = options.ScopeReset.Snapshot();
-        _close = CloseSignal.CreateRoot(options.TimeProvider);
+        _close = CloseSignal.CreateRoot();
         FlowControl = new Control(this, poolFacing: true);
     }
 
@@ -288,8 +289,9 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         if (read.Buffer.IsEmpty)
             throw new EndOfStreamException("PostgreSQL closed the connection before answering the SSL request.");
         var response = read.Buffer.FirstSpan[0];
+        var responseLength = read.Buffer.Length;
         connection.Reader.AdvanceTo(read.Buffer.GetPosition(1));
-        EnsureNoAdditionalSslResponseData(read.Buffer);
+        EnsureNoAdditionalSslResponseData(responseLength);
         return ShouldUpgradeTransport(response, mode);
     }
 
@@ -321,8 +323,9 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         if (read.Buffer.IsEmpty)
             throw new EndOfStreamException("PostgreSQL closed the connection before answering the SSL request.");
         var response = read.Buffer.FirstSpan[0];
+        var responseLength = read.Buffer.Length;
         connection.Reader.AdvanceTo(read.Buffer.GetPosition(1));
-        EnsureNoAdditionalSslResponseData(read.Buffer);
+        EnsureNoAdditionalSslResponseData(responseLength);
         return ShouldUpgradeTransport(response, mode);
     }
 
@@ -341,9 +344,9 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
             $"PostgreSQL returned an invalid SSL response byte: 0x{response:X2}."));
     }
 
-    static void EnsureNoAdditionalSslResponseData(ReadOnlySequence<byte> buffer)
+    static void EnsureNoAdditionalSslResponseData(long responseLength)
     {
-        if (buffer.Length != 1)
+        if (responseLength != 1)
             throw new PgClientException(new PgProtocolException(
                 "PostgreSQL sent additional unencrypted data with the SSL response."));
     }
@@ -383,6 +386,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
             // fields are effectively readonly.
             _backendProcessId = flow.BackendProcessId;
             _backendSecretKey = flow.BackendSecretKey;
+            Volatile.Write(ref _queryProtocolEstablished, 1);
             SignalReady();
         }
         catch (Exception ex)
@@ -691,6 +695,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
     // callers await Completion. Separate from the completion TCS because that task must be observable
     // before shutdown begins.
     bool _shutdownStarted;
+    TaskCompletionSource? _executorStopped;
     bool _closeReleaseStarted;
     int _closeUsers;
     TaskCompletionSource? _closeUsersDrained;
@@ -712,6 +717,8 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
                 // sets it once; losers read the same instance. Wraps closeReason as inner. CloseSignal also
                 // re-materializes on every trip, so the invariant is structural, not just this ordering.
                 _close.MaterializeReason(closeReason);
+                _executorStopped = new(TaskCreationOptions.RunContinuationsAsynchronously);
+                _source.SetDrainSignal(_executorStopped);
                 _shutdownStarted = true;
                 if (_status is not ProtocolStatus.Completed)
                     SetStatus(ProtocolStatus.Draining);
@@ -797,42 +804,34 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
     {
         // Set by the Shutdown gate under _syncRoot before any cancellation fired.
         var closedException = _close.Reason!;
+        ITimer? abortTimer = null;
 
-        // Graceful: bound the drain with CompletionTimeout (AbortToken escalates on expiry) and fire
-        // StoppingToken so the body drains to a clean RFQ. Forceful already fired AbortToken + the
-        // abortive Abort in the Shutdown gate, so it goes straight to the drain. Parked-flow propagation
-        // is heartbeat-driven either way (ExecutionControl.OnHeartbeat fails the activation source within
-        // HeartbeatInterval; forceful disposal accepts that latency too).
+        // Graceful: bound the drain with CompletionTimeout and fire StoppingToken so the body drains
+        // to a clean RFQ. Timeout expiry must perform the same physical escalation as a forceful caller:
+        // AbortToken alone cannot break synchronous socket I/O. Route the timer back through Shutdown so
+        // cancellation delivery finishes before the transport is aborted, exactly as for an external
+        // forceful caller. Parked-flow propagation is heartbeat-driven either way
+        // (ExecutionControl.OnHeartbeat fails the activation source within HeartbeatInterval; forceful
+        // disposal accepts that latency too).
         if (!forceful)
         {
-            _close.ArmAbortTimeout(_options.CompletionTimeout);
+            abortTimer = _options.TimeProvider.CreateTimer(
+                static state => _ = ((PgClientProtocol)state!).Shutdown(closeReason: null, forceful: true),
+                this, _options.CompletionTimeout, Timeout.InfiniteTimeSpan);
             await _close.StopAsync().ConfigureAwait(false);
         }
 
-        // Coordinate the residual drain with the executor. The source fires DrainSignal once its pull
-        // resolves completed (WaitForNextAsync delivers false), i.e. the executor stopped dequeuing.
-        // Draining earlier would contend with the executor (concurrent SPSC dequeue = torn read).
-        // RunContinuationsAsynchronously so the signal never resumes us inline under the wake lock.
-        var executorStopped = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        _source.SetDrainSignal(executorStopped);
+        // The shutdown winner armed this before firing either close token. It resolves when the
+        // executor's source pull returns completed, allowing inert items to migrate without waiting
+        // for already-dispatched flows to drain.
+        var executorStopped = _executorStopped!;
 
-        // AsTask once: consumed by both the drain gate below and the final await.
+        // AsTask once: consumed by both the source-drain gate and the final await.
         var completeTask = _pipeline.CompleteAsync(closedException).AsTask();
         try
         {
-            // Drain the inert head the moment the executor stops pulling, rather than make the
-            // residual's parked consumers wait out the dispatched flows' drain. The executor stops by
-            // resolving completed (executorStopped) or by exiting outright (completeTask); both mean
-            // it is no longer dequeuing, so the drain is the sole consumer. Items still in the SPSC
-            // queue were never dispatched, so faulting each unblocks its consumer's MoveNextAsync.
             await Task.WhenAny(executorStopped.Task, completeTask).ConfigureAwait(false);
-            // Never-ran backlog flows the heartbeat never enumerated: deliver the close to each caller gate
-            // and complete with the reason. FailUnstarted carries the never-ran fault that used to live in
-            // OnComplete (one hook suffices - an unstarted flow has no graceful/forceful distinction).
             _source.DrainInertItems(flow => flow.GetExecutionControl(FlowControl).FailUnstarted(closedException));
-
-            // Drain remaining (dispatched) items. closedException is delivered to each via
-            // policy.CompleteItem.
             await completeTask.ConfigureAwait(false);
         }
         catch (PgClientClosedException)
@@ -849,8 +848,9 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         }
         finally
         {
-            // Disarm the CTS scheduled by the graceful path.
-            _close.DisarmAbortTimeout();
+            // Disarm and join the graceful escalation callback before releasing its close-signal lease.
+            if (abortTimer is not null)
+                await abortTimer.DisposeAsync().ConfigureAwait(false);
             try
             {
                 // Release the transport once the drain has completed. Single-winner gating runs this body
@@ -865,10 +865,11 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
                     // no teardown. Error-complete the writer (DISCARDS any buffered write rather than
                     // flushing it: graceful reached a clean RFQ, forceful already Abort'd the socket; the
                     // error completion writes nothing and never starts the flush promise), then complete
-                    // the reader via the enumerator that owns it. Both dispose the shared stream
-                    // (idempotent), closing the socket.
+                    // the reader via the enumerator that owns it. The completed pipeline has already joined
+                    // every read owner and retired its borrowed buffer before reader completion can return
+                    // pooled segments. Both endpoints dispose the shared stream idempotently.
                     await _connection.Writer.CompleteAsync(closedException).ConfigureAwait(false);
-                    await _pipeSegmentEnumerator.DisposeAsync().ConfigureAwait(false);
+                    await ((IAsyncDisposable)_pgDecoder).DisposeAsync().ConfigureAwait(false);
                 }
             }
             finally
@@ -975,6 +976,8 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
             }
 
             _control.OnCompleted(item, remainingDepth);
+            if (exception is PgProtocolException)
+                exception = new PgClientException(exception);
             item.GetExecutionControl(_control).Complete(exception);
             // No recovery in play here (recovered flows take the branch above), so the wire state is final:
             // an outer flow that left a transaction open is unscoped poison. Inner-scope / failed flows are
@@ -1126,6 +1129,26 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
             Debug.Assert(failedItem is not ResyncRecoveryFlow,
                 "Recovery item routed back into TryRecoverItemFailure - recovery-on-recovery must not exist.");
 
+            // Startup has not established a reusable query-protocol wire. Authentication may still own
+            // the server state machine, where injecting Sync is neither a valid nor useful recovery.
+            if (!_control.QueryProtocolEstablished)
+            {
+                recoveryItem = null;
+                return false;
+            }
+
+            // Recovery assumes the decoder still owns a trustworthy message boundary. A framing
+            // failure says precisely that it may not: reading toward an RFQ can reinterpret body
+            // bytes and condemn successors with misleading secondary failures. Publish the cause and
+            // abort the connection instead; the failed flow keeps its specific exception while queued
+            // successors receive the canonical close verdict.
+            if (context.Exception is PgFramingException)
+            {
+                _control.FailProtocol(context.Exception);
+                recoveryItem = null;
+                return false;
+            }
+
             // Pipeline is ABORTING: skip recovery and let the framework propagate the failure. Gate on the
             // ABORT token specifically, NOT ClosedException - which a GRACEFUL close also sets. A forceful
             // abort is teardown over a torn wire: recovering it drives a resync drain over a dead/RST'd
@@ -1174,7 +1197,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
             //     wrong message and its late fault re-enters nonexistent recovery-of-recovery.
             var outstandingIsRead = context.Kind is PipelineItemFailureKind.TrailingExecutionTask;
             var outstandingPhase =
-                outstandingIsRead || (canWriteSync && context.Kind is PipelineItemFailureKind.ExecutionPipelineTask)
+                outstandingIsRead || context.Kind is PipelineItemFailureKind.ExecutionPipelineTask
                     ? context.OutstandingPhaseTask
                     : default;
 
@@ -1309,6 +1332,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         // The wire's last-seen transaction status. Connection-wide (single field on the protocol); the
         // inner-scope Control reads the same one. Idle / Transaction / Error, or Unknown pre-first-RFQ.
         public TransactionStatus TransactionStatus => protocol._transactionStatus;
+        public bool QueryProtocolEstablished => Volatile.Read(ref protocol._queryProtocolEstablished) is not 0;
 
         // Tokens come from the scope signal for an inner Control (so the scope cascade reaches inner
         // flows), else the protocol's _close. Both are stable across a flow's tenure. Surfaced through

@@ -126,6 +126,14 @@ sealed class PgAdvisoryLock : IAsyncDisposable
             end $$
             """);
 
+    public async Task<bool> IsContendedAsync(int backendProcessId)
+        => (await ReadSingleValueAsync(_owner, $$"""
+            select case when exists (
+                select 1 from pg_stat_activity
+                where pid = {{backendProcessId}} and wait_event = 'advisory')
+                then 'yes' else 'no' end
+            """)) is "yes";
+
     public Task WaitUntilContendedAsync()
         => PgTestPool.RunAsync(_owner, $$"""
             do $$

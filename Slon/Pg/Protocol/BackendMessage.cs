@@ -33,20 +33,6 @@ readonly struct BackendMessage
     public BackendMessage(BackendHeader header, ReadOnlySequence<byte> buffer, BackendMessageContext context, short token)
         : this(header, buffer, context, token, buffer.Length >= header.MessageLength) {}
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static bool TryCreateFromBatch(ref BackendMessageBatch batch, BackendMessageContext context, short token, out BackendMessage message)
-    {
-        if (!batch.TryReadNextInPlace(out var header, out var buffer, out var bufferLength))
-        {
-            message = default;
-            return false;
-        }
-
-        Unsafe.SkipInit(out message);
-        Initialize(ref message, header, buffer, context, token, bufferLength >= header.MessageLength);
-        return true;
-    }
-
     internal static void Initialize(ref BackendMessage destination, BackendHeader header, ReadOnlySequence<byte> buffer,
         BackendMessageContext context, short token, bool buffered)
     {
@@ -93,6 +79,7 @@ readonly struct BackendMessage
         => WriteGranularly(ref destination, in value);
 
     BackendType Type => _type;
+    internal bool IsDefault => _type == default;
 
     public BackendHeader Header
     {
@@ -184,7 +171,8 @@ readonly struct BackendMessage
         return default;
 
         static void Throw(BackendType actual, ReadOnlySpan<BackendType> expected)
-            => throw new InvalidOperationException($"Unexpected backend message: {actual}, expected: {string.Join(" or ", expected.ToArray())}.");
+            => throw new InvalidOperationException(
+                $"Unexpected backend message: {actual}, expected: {string.Join(" or ", expected.ToArray())}.");
     }
 
     public Accessor GetAccessor() => new(_context, _token);
@@ -280,7 +268,8 @@ readonly struct BackendMessage
         return default;
 
         static void Throw(BackendType actual, ReadOnlySpan<BackendType> expected)
-            => throw new PgProtocolException($"Unexpected backend message: {actual}, expected: {string.Join(" or ", expected.ToArray())}.");
+            => throw new PgProtocolException(
+                $"Unexpected backend message: {actual}, expected: {string.Join(" or ", expected.ToArray())}.");
     }
 
     public void EnsureBuffered()

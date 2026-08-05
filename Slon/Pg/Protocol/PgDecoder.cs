@@ -147,6 +147,10 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
             {
                 throw TranslateReadCancellation(ex, cancellationToken);
             }
+            catch (EndOfStreamException ex)
+            {
+                throw TranslateEof(ex);
+            }
             finally
             {
                 LeaveCancellationReadFrontier(frontierFlow);
@@ -170,6 +174,10 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
         catch (Exception) when (_abortToken.IsCancellationRequested && _control.ClosedException is { } closed)
         {
             throw closed;
+        }
+        catch (EndOfStreamException ex)
+        {
+            throw TranslateEof(ex);
         }
         finally
         {
@@ -207,6 +215,10 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
             {
                 throw TranslateReadCancellation(ex, cancellationToken);
             }
+            catch (EndOfStreamException ex)
+            {
+                throw TranslateEof(ex);
+            }
             finally
             {
                 LeaveCancellationReadFrontier(frontierFlow);
@@ -229,6 +241,10 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
         catch (Exception) when (_abortToken.IsCancellationRequested && _control.ClosedException is { } closed)
         {
             throw closed;
+        }
+        catch (EndOfStreamException ex)
+        {
+            throw TranslateEof(ex);
         }
         finally
         {
@@ -355,12 +371,13 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
             if (pipe.TryMoveNextBatch(out var completed))
                 continue;
             if (completed)
-                return new(false);
+                return new(ReadCompleted());
 
             var readToken = _cancellationTokenSource.Token;
             var frontierFlow = EnterCancellationReadFrontier();
             try
             {
+                retryRead:
                 if (pipe.TryBeginDirectRead(readToken, out var directReadTask))
                 {
                     try
@@ -376,19 +393,16 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
                             if (directReadCompleted)
                             {
                                 LeaveCancellationReadFrontier(frontierFlow);
-                                return new(false);
+                                return new(ReadCompleted());
                             }
-                            goto nextRead;
+                            goto retryRead;
                         }
                         LeaveCancellationReadFrontier(frontierFlow);
                         continue;
                     }
-                    catch (Exception ex)
+                    catch
                     {
                         pipe.AbortDirectRead();
-                        LeaveCancellationReadFrontier(frontierFlow);
-                        if (_cancellationTokenSource.IsCancellationRequested)
-                            throw TranslateReadCancellation(ex, cancellationToken);
                         throw;
                     }
                 }
@@ -400,19 +414,23 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
                 if (pipe.TryMoveNextBatch(readTask.Result, _cancellationTokenSource.Token, out var readCompleted))
                     continue;
                 if (readCompleted)
-                    return new(false);
+                    return new(ReadCompleted());
             }
             catch (Exception ex) when (_cancellationTokenSource.IsCancellationRequested)
             {
                 LeaveCancellationReadFrontier(frontierFlow);
                 throw TranslateReadCancellation(ex, cancellationToken);
             }
+            catch (EndOfStreamException ex)
+            {
+                LeaveCancellationReadFrontier(frontierFlow);
+                throw TranslateEof(ex);
+            }
             catch
             {
                 LeaveCancellationReadFrontier(frontierFlow);
                 throw;
             }
-            nextRead:;
         }
 
 
@@ -449,11 +467,15 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
                             if (_pipe.TryMoveNextBatch(result, _cancellationTokenSource.Token, out var readCompleted))
                                 continue;
                             if (readCompleted)
-                                return false;
+                                return ReadCompleted();
                         }
                         catch (Exception ex) when (_cancellationTokenSource.IsCancellationRequested)
                         {
                             throw TranslateReadCancellation(ex, cancellationToken);
+                        }
+                        catch (EndOfStreamException ex)
+                        {
+                            throw TranslateEof(ex);
                         }
                     }
 
@@ -483,7 +505,7 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
                             LeaveCancellationReadFrontier(frontierFlow!);
                             frontierFlow = null;
                             if (readCompleted)
-                                return false;
+                                return ReadCompleted();
                         }
                         catch (Exception ex)
                         {
@@ -495,6 +517,8 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
                             }
                             if (_cancellationTokenSource.IsCancellationRequested)
                                 throw TranslateReadCancellation(ex, cancellationToken);
+                            if (ex is EndOfStreamException eof)
+                                throw TranslateEof(eof);
                             throw;
                         }
                     }
@@ -516,7 +540,7 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
                     if (_pipe.TryMoveNextBatch(out var completed))
                         continue;
                     if (completed)
-                        return false;
+                        return ReadCompleted();
 
                     try
                     {
@@ -542,11 +566,34 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
         }
     }
 
+    bool ReadCompleted()
+    {
+        // Closing a socket may settle a pending read as EOF instead of an exception. Once shutdown has
+        // published its reason, EOF is the same terminal event and must use the canonical close surface.
+        if (_control.ClosedException is { } closed)
+            throw closed;
+        return false;
+    }
+
+    Exception TranslateEof(EndOfStreamException exception)
+        => _control.ClosedException is { } closed
+            ? closed
+            : PgProtocolException.UnexpectedEof(exception);
+
 
     public BackendMessage Current
     {
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         get => EnrichError(_pipe.Current);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public bool TryGetCurrent(out BackendMessage message)
+    {
+        if (!_pipe.TryGetCurrent(out message))
+            return false;
+        message = EnrichError(message);
+        return true;
     }
 
     BackendMessage EnrichError(BackendMessage message)
@@ -617,8 +664,7 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
         if (task.Result)
             return new(Current);
 
-        ThrowHelper.ThrowInvalidOperation("No more messages");
-        return default;
+        throw PgProtocolException.UnexpectedEof();
     }
 
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
@@ -627,8 +673,7 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
         if (await task.ConfigureAwait(false))
             return Current;
 
-        ThrowHelper.ThrowInvalidOperation("No more messages");
-        return default;
+        throw PgProtocolException.UnexpectedEof();
     }
 
     public bool MoveNext()
@@ -661,13 +706,17 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
                         // exception, mirroring the async path's TranslateReadCancellation.
                         throw closed;
                     }
+                    catch (EndOfStreamException ex)
+                    {
+                        throw TranslateEof(ex);
+                    }
                     finally
                     {
                         LeaveCancellationReadFrontier(frontierFlow);
                     }
                     pipe.CommitBatch();
                     if (!success)
-                        return false;
+                        return ReadCompleted();
 
                     if (!pipe.TryMoveNext())
                         ThrowHelper.ThrowInvalidOperation("No message in a new batch");
@@ -691,7 +740,7 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
     public BackendMessage GetNext()
     {
         if (!MoveNext())
-            ThrowHelper.ThrowInvalidOperation("No more messages");
+            throw PgProtocolException.UnexpectedEof();
         return Current;
     }
 

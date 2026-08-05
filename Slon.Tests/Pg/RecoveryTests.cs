@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Threading.Tasks.Sources;
 using Slon.Pg;
 using Slon.Pg.Protocol;
 using Slon.Pg.Protocol.Flows;
@@ -96,6 +97,25 @@ public class RecoveryTests
         PipelinedParseBindExecuteNoSync
     }
 
+    sealed class AwaitObservedValueTaskSource : IValueTaskSource
+    {
+        ManualResetValueTaskSourceCore<bool> _core = new() { RunContinuationsAsynchronously = true };
+        readonly TaskCompletionSource _awaitObserved = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public ValueTask Task => new(this, _core.Version);
+        public Task AwaitObserved => _awaitObserved.Task;
+        public void SetResult() => _core.SetResult(true);
+
+        void IValueTaskSource.GetResult(short token) => _core.GetResult(token);
+        ValueTaskSourceStatus IValueTaskSource.GetStatus(short token) => _core.GetStatus(token);
+        void IValueTaskSource.OnCompleted(Action<object?> continuation, object? state, short token,
+            ValueTaskSourceOnCompletedFlags flags)
+        {
+            _awaitObserved.TrySetResult();
+            _core.OnCompleted(continuation, state, token, flags);
+        }
+    }
+
     // Test flow that lets each test pick its failure phase and write shape. Recovery's input
     // signal is the failed flow's recorded write state (rfqCount, lastMessageInducesRfq,
     // protocol's unflushed bytes), so faithful reproduction of those wire states is the
@@ -120,6 +140,7 @@ public class RecoveryTests
         /// trailing completes, exercising the recovery's substitution-substrate contract
         /// of capturing-and-awaiting `OutstandingPhaseTask` (move-to-trailing path).
         public TaskCompletionSource? ControllableTrailing { get; init; }
+        public ValueTask? ControllableTrailingTask { get; init; }
 
         /// When set, the flow's PIPELINE task acquires the decoder (the read turn) and holds it
         /// until this completes - a real read still in flight on the single-consumer wire. Pair
@@ -148,6 +169,8 @@ public class RecoveryTests
         public TaskCompletionSource? HeldReadConsumedFirst { get; init; }
 
         public bool RequestCancellation { get; init; }
+
+        public Exception Failure { get; init; } = new InvalidOperationException("FaultingFlow synthetic failure.");
 
         /// SQL for the QueryNoFlush / ParseBindExecuteNoSync shapes (defaults to a trivial select).
         /// Lets a test run a side-effecting statement (e.g. BEGIN + CREATE TEMP TABLE) to observe
@@ -207,7 +230,7 @@ public class RecoveryTests
                 RequestBackendCancellation();
 
             if (_phase is FaultPhase.PreReturn)
-                throw new InvalidOperationException("FaultingFlow pre-return synthetic failure.");
+                throw Failure;
 
             ValueTask pipelineTask;
             if (ControllablePipeline is { } controllablePipeline)
@@ -215,9 +238,13 @@ public class RecoveryTests
             else if (ControllablePipelineRead is { } readGate)
                 pipelineTask = HoldReadTurn(context, readGate, PipelineReadAcquired, HeldReadConsumedFirst, HeldReadConsumeCount);
             else
-                pipelineTask = _phase is FaultPhase.PipelineTask ? FailedTask() : ValueTask.CompletedTask;
+                pipelineTask = _phase is FaultPhase.PipelineTask ? FailedTask(Failure) : ValueTask.CompletedTask;
             ValueTask trailingTask;
-            if (ControllableTrailing is { } controllable)
+            if (ControllableTrailingTask is { } controllableTrailingTask)
+            {
+                trailingTask = controllableTrailingTask;
+            }
+            else if (ControllableTrailing is { } controllable)
             {
                 // Controllable trailing: the framework captures this as OutstandingPhaseTask
                 // when PipelineTask sync-faults. The recovery's TrailingPhase awaits it before
@@ -226,7 +253,7 @@ public class RecoveryTests
             }
             else if (_phase is FaultPhase.TrailingTask)
             {
-                trailingTask = FailedTask();
+                trailingTask = FailedTask(Failure);
             }
             else
             {
@@ -235,8 +262,8 @@ public class RecoveryTests
 
             return new(new FlowTasks(trailingExecutionTask: trailingTask, pipelineTask: pipelineTask));
 
-            static ValueTask FailedTask()
-                => new(Task.FromException(new InvalidOperationException("FaultingFlow synthetic failure.")));
+            static ValueTask FailedTask(Exception exception)
+                => new(Task.FromException(exception));
 
             // Acquire the decoder (the single-consumer read turn), signal it, wait on the test's
             // release gate, then do a real read. This is the unfinished pipelineTask: when recovery activates and robs the
@@ -275,6 +302,57 @@ public class RecoveryTests
     }
 
     [TestMethod]
+    public async Task FramingViolation_DoesNotRecover_QueuedSuccessorReceivesClose()
+    {
+        await using var protocol = await ConnectAsync();
+        var failureGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var violation = new PgFramingException("synthetic framing violation");
+        var faulting = new FaultingFlow(async: true, FaultPhase.PipelineTask, WriteShape.None)
+        {
+            ControllablePipeline = failureGate,
+        };
+        var successor = new CommandFlow(async: true, Command.Create("select 1"));
+
+        Assert.IsTrue(protocol.TryQueue(faulting));
+        Assert.IsTrue(protocol.TryQueue(successor));
+        failureGate.SetException(violation);
+
+        var failed = await Assert.ThrowsExactlyAsync<PgClientException>(
+            () => faulting.WaitForComplete().AsTask().WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.AreSame(violation, failed.InnerException);
+
+        var e = successor.GetAsyncEnumerator();
+        var closed = await Assert.ThrowsExactlyAsync<PgClientClosedException>(
+            () => e.MoveNextAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.AreSame(violation, closed.InnerException);
+    }
+
+    [TestMethod]
+    public async Task ProtocolExpectationViolation_Recovers_QueuedSuccessorSucceeds()
+    {
+        await using var protocol = await ConnectAsync();
+        var failureGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var violation = new PgProtocolException("synthetic expectation violation");
+        var faulting = new FaultingFlow(async: true, FaultPhase.PipelineTask, WriteShape.None)
+        {
+            ControllablePipeline = failureGate,
+        };
+        var successor = new CommandFlow(async: true, Command.Create("select 1"));
+
+        Assert.IsTrue(protocol.TryQueue(faulting));
+        Assert.IsTrue(protocol.TryQueue(successor));
+        failureGate.SetException(violation);
+
+        var failed = await Assert.ThrowsExactlyAsync<PgClientException>(
+            () => faulting.WaitForComplete().AsTask().WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.AreSame(violation, failed.InnerException);
+
+        var e = successor.GetAsyncEnumerator();
+        while (await e.MoveNextAsync()) { }
+        await e.DisposeAsync();
+    }
+
+    [TestMethod]
     public async Task InFlightReadOnlyRecovery_BlocksNewAdmissionUntilRecovered()
     {
         await using var protocol = await ConnectAsync();
@@ -308,6 +386,48 @@ public class RecoveryTests
             () => faulting.WaitForComplete().AsTask().WaitAsync(TimeSpan.FromSeconds(5)));
         Assert.IsTrue(protocol.IsSchedulable);
         await RunAsync(protocol, "select 1");
+    }
+
+    [TestMethod]
+    public async Task PipelineFailure_DuringGracefulShutdown_StillRecoversWire()
+    {
+        var protocol = await ConnectAsync();
+        await using var blocker = await PgAdvisoryLock.AcquireAsync();
+        var writesLanded = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var pipeline = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var failure = new InvalidOperationException("synthetic pipeline failure during graceful shutdown");
+        var faulting = new FaultingFlow(async: true, FaultPhase.PipelineTask, WriteShape.QueryNoFlush)
+        {
+            QueryText = $"select pg_advisory_xact_lock({blocker.Key})",
+            ControllablePipeline = pipeline,
+            AfterWrites = writesLanded.SetResult,
+            Failure = failure,
+        };
+        Assert.IsTrue(protocol.TryQueue(faulting));
+        await writesLanded.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        // CompleteAsync changes Ready to Draining before the flow fails. Recovery eligibility is
+        // based on the sticky fact that startup established the query protocol, not on whether the
+        // protocol still admits new work. Recovery must therefore flush the inherited Query and
+        // park on its advisory lock before graceful shutdown can complete.
+        var complete = protocol.CompleteAsync();
+        var failedCompletion = faulting.WaitForComplete().AsTask();
+        pipeline.SetException(failure);
+
+        var contended = false;
+        while (!failedCompletion.IsCompleted && !contended)
+            contended = await blocker.IsContendedAsync(protocol.FlowControl.BackendProcessId);
+        Assert.IsFalse(failedCompletion.IsCompleted,
+            "the failed flow completed before recovery drained its inherited RFQ");
+        Assert.IsFalse(complete.IsCompleted,
+            "graceful shutdown completed without recovering the failed flow's pending query");
+        Assert.IsTrue(contended);
+
+        await blocker.ReleaseAsync();
+        var failed = await Assert.ThrowsExactlyAsync<InvalidOperationException>(
+            () => failedCompletion.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.AreSame(failure, failed);
+        await complete.WaitAsync(TimeSpan.FromSeconds(5));
     }
 
     [TestMethod]
@@ -668,6 +788,27 @@ public class RecoveryTests
         await sibling;
 
         await protocol.CompleteAsync();
+    }
+
+    [TestMethod]
+    public async Task PipelineTask_QueryPendingTrailing_WaitsBeforeRecoveryWrites()
+    {
+        await using var protocol = await ConnectAsync();
+        var trailing = new AwaitObservedValueTaskSource();
+        var faulting = new FaultingFlow(async: true, FaultPhase.PipelineTask, WriteShape.QueryNoFlush)
+        {
+            ControllableTrailingTask = trailing.Task,
+        };
+        Assert.IsTrue(protocol.TryQueue(faulting));
+
+        var sibling = RunAsync(protocol, "select 1");
+        var first = await Task.WhenAny(trailing.AwaitObserved, sibling)
+            .WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.AreSame(trailing.AwaitObserved, first,
+            "recovery wrote ROLLBACK before the failed flow's pending trailing write settled");
+
+        trailing.SetResult();
+        await sibling.WaitAsync(TimeSpan.FromSeconds(10));
     }
 
     // Sync-flow variant of the pending-trailing move-to-trailing path (the "sync in trailing"
