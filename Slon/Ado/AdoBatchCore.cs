@@ -589,6 +589,14 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
     public int ExecuteNonQuery(DbParameterCollection? parameters)
     {
         ThrowIfDisposed();
+        if (SlonTracing.ShouldStart)
+            return TraceSync(static (ref AdoBatchCore<TCommand> core, DbParameterCollection? state) =>
+                core.ExecuteNonQueryCore(state), parameters);
+        return ExecuteNonQueryCore(parameters);
+    }
+
+    int ExecuteNonQueryCore(DbParameterCollection? parameters)
+    {
         var recordsAffected = 0L;
         foreach (var result in Enqueue(parameters, CommandBehavior.Default))
         {
@@ -612,11 +620,24 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
     }
 
     public ValueTask<int> ExecuteNonQueryAsync(DbParameterCollection? parameters, CancellationToken cancellationToken = default)
-        => ExecuteNonQueryAsyncCore(_fieldRef, parameters, cancellationToken);
+    {
+        var fieldRef = _fieldRef;
+        return SlonTracing.ShouldStart
+            ? TraceAsync(() => ExecuteNonQueryAsyncCore(fieldRef, parameters, cancellationToken))
+            : ExecuteNonQueryAsyncCore(fieldRef, parameters, cancellationToken);
+    }
 
     public object? ExecuteScalar(DbParameterCollection? parameters)
     {
         ThrowIfDisposed();
+        if (SlonTracing.ShouldStart)
+            return TraceSync(static (ref AdoBatchCore<TCommand> core, DbParameterCollection? state) =>
+                core.ExecuteScalarCore(state), parameters);
+        return ExecuteScalarCore(parameters);
+    }
+
+    object? ExecuteScalarCore(DbParameterCollection? parameters)
+    {
         foreach (var result in Enqueue(parameters, CommandBehavior.Default))
         {
             using var rowEnumerator = result.GetAsyncEnumerator();
@@ -665,13 +686,25 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
     }
 
     public ValueTask<object?> ExecuteScalarAsync(DbParameterCollection? parameters, CancellationToken cancellationToken = default)
-        => ExecuteScalarAsyncCore(_fieldRef, parameters, cancellationToken);
+    {
+        var fieldRef = _fieldRef;
+        return SlonTracing.ShouldStart
+            ? TraceAsync(() => ExecuteScalarAsyncCore(fieldRef, parameters, cancellationToken))
+            : ExecuteScalarAsyncCore(fieldRef, parameters, cancellationToken);
+    }
 
     public SlonDataReader ExecuteReader(DbParameterCollection? parameters, CommandBehavior behavior)
     {
         ThrowIfDisposed();
-        return SlonDataReader.Create(behavior, Enqueue(parameters, behavior));
+        if (SlonTracing.ShouldStart)
+            return TraceSync(static (ref AdoBatchCore<TCommand> core,
+                    (DbParameterCollection? Parameters, CommandBehavior Behavior) state) =>
+                core.ExecuteReaderCore(state.Parameters, state.Behavior), (parameters, behavior));
+        return ExecuteReaderCore(parameters, behavior);
     }
+
+    SlonDataReader ExecuteReaderCore(DbParameterCollection? parameters, CommandBehavior behavior)
+        => SlonDataReader.Create(behavior, Enqueue(parameters, behavior));
 
     public ValueTask<DbDataReader> ExecuteDbReaderAsync(DbParameterCollection? parameters, CommandBehavior behavior, CancellationToken cancellationToken = default)
     {
@@ -680,7 +713,12 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
         if (cancellationToken.IsCancellationRequested)
             return ValueTask.FromCanceled<DbDataReader>(cancellationToken);
 
-        return SlonDataReader.CreateAsync<DbDataReader>(behavior, EnqueueAsync(parameters, behavior, cancellationToken), cancellationToken);
+        var fieldRef = _fieldRef;
+        return SlonTracing.ShouldStart
+            ? TraceAsync(() => SlonDataReader.CreateAsync<DbDataReader>(behavior,
+                fieldRef.Invoke().EnqueueAsync(parameters, behavior, cancellationToken), cancellationToken))
+            : SlonDataReader.CreateAsync<DbDataReader>(behavior,
+                EnqueueAsync(parameters, behavior, cancellationToken), cancellationToken);
     }
 
     public ValueTask<SlonDataReader> ExecuteReaderAsync(DbParameterCollection? parameters, CommandBehavior behavior, CancellationToken cancellationToken = default)
@@ -690,7 +728,48 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
         if (cancellationToken.IsCancellationRequested)
             return ValueTask.FromCanceled<SlonDataReader>(cancellationToken);
 
-        return SlonDataReader.CreateAsync<SlonDataReader>(behavior, EnqueueAsync(parameters, behavior, cancellationToken), cancellationToken);
+        var fieldRef = _fieldRef;
+        return SlonTracing.ShouldStart
+            ? TraceAsync(() => SlonDataReader.CreateAsync<SlonDataReader>(behavior,
+                fieldRef.Invoke().EnqueueAsync(parameters, behavior, cancellationToken), cancellationToken))
+            : SlonDataReader.CreateAsync<SlonDataReader>(behavior,
+                EnqueueAsync(parameters, behavior, cancellationToken), cancellationToken);
+    }
+
+    delegate TResult SyncOperation<TState, TResult>(ref AdoBatchCore<TCommand> core, TState state);
+
+    TResult TraceSync<TState, TResult>(SyncOperation<TState, TResult> operation, TState state)
+    {
+        using var activity = StartActivity();
+        try
+        {
+            return operation(ref this, state);
+        }
+        catch (Exception ex)
+        {
+            SlonTracing.RecordException(activity, ex);
+            throw;
+        }
+    }
+
+    async ValueTask<TResult> TraceAsync<TResult>(Func<ValueTask<TResult>> operation)
+    {
+        using var activity = StartActivity();
+        try
+        {
+            return await operation().ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            SlonTracing.RecordException(activity, ex);
+            throw;
+        }
+    }
+
+    Activity? StartActivity()
+    {
+        TryGetDataSource(out var dataSource, out var connection);
+        return SlonTracing.Start(dataSource ?? connection!.DbDataSource, _commands.Count);
     }
 
     public void Add(TCommand command)

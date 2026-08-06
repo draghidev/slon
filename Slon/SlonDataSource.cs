@@ -217,6 +217,7 @@ public sealed class SlonDataSource : DbDataSource
     internal void ReportTransactionDisposeRollbackFailure(Exception exception)
         => SlonLogMessages.TransactionDisposeRollbackFailed(_adoLogger, exception);
     internal string Database => _options.Database ?? _options.Username;
+    internal EndPoint EndPoint => _options.EndPoint;
     public string Name { get; }
     internal string DisplayEndpoint { get; }
 
