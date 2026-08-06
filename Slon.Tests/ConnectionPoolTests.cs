@@ -1106,11 +1106,25 @@ public class ConnectionPoolTests
     }
 
     [TestMethod]
+    public void ConnectionInitializers_MustBeConfiguredAsPair()
+    {
+        var inner = new AdmissionConnectionFactory();
+
+        Assert.ThrowsExactly<ArgumentException>(() =>
+            new InitializingConnectionFactory<AdmissionConnection>(
+                inner, initializer: static (_, _) => { }));
+        Assert.ThrowsExactly<ArgumentException>(() =>
+            new InitializingConnectionFactory<AdmissionConnection>(
+                inner, asyncInitializer: static (_, _) => ValueTask.CompletedTask));
+    }
+
+    [TestMethod]
     public async Task AsyncInitializerFailure_ClosesCreatedConnection()
     {
         var inner = new AdmissionConnectionFactory();
         var factory = new InitializingConnectionFactory<AdmissionConnection>(
             inner,
+            initializer: static (_, _) => { },
             asyncInitializer: static (_, _) =>
                 ValueTask.FromException(new InvalidOperationException("initializer failed")));
         await using var pool = new ConnectionPool<AdmissionConnection>(
@@ -1130,7 +1144,8 @@ public class ConnectionPoolTests
         var inner = new AdmissionConnectionFactory();
         var factory = new InitializingConnectionFactory<AdmissionConnection>(
             inner,
-            initializer: static (_, _) => throw new InvalidOperationException("initializer failed"));
+            initializer: static (_, _) => throw new InvalidOperationException("initializer failed"),
+            asyncInitializer: static (_, _) => ValueTask.CompletedTask);
         await using var pool = new ConnectionPool<AdmissionConnection>(
             factory,
             new() { MaxConnections = 1 });

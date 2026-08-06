@@ -8,10 +8,21 @@ sealed class InitializingConnectionFactory<T>(
     Func<T, CancellationToken, ValueTask>? asyncInitializer = null)
     : IPoolConnectionFactory<T> where T : class, IPoolConnection<T>
 {
+    readonly IPoolConnectionFactory<T> _factory = Validate(factory, initializer, asyncInitializer);
+
+    static IPoolConnectionFactory<T> Validate(IPoolConnectionFactory<T> factory,
+        Action<T, TimeSpan>? initializer, Func<T, CancellationToken, ValueTask>? asyncInitializer)
+    {
+        ArgumentNullException.ThrowIfNull(factory);
+        if ((initializer is null) != (asyncInitializer is null))
+            throw new ArgumentException("Synchronous and asynchronous connection initializers must be configured together.");
+        return factory;
+    }
+
     public T Create(ConnectionPoolContext<T> poolContext, TimeSpan timeout = default)
     {
         var deadline = new Deadline(timeout);
-        var connection = factory.Create(poolContext, deadline.GetRemaining());
+        var connection = _factory.Create(poolContext, deadline.GetRemaining());
         try
         {
             initializer?.Invoke(connection, deadline.GetRemaining());
@@ -26,7 +37,7 @@ sealed class InitializingConnectionFactory<T>(
 
     public async ValueTask<T> CreateAsync(ConnectionPoolContext<T> poolContext, CancellationToken cancellationToken = default)
     {
-        var connection = await factory.CreateAsync(poolContext, cancellationToken).ConfigureAwait(false);
+        var connection = await _factory.CreateAsync(poolContext, cancellationToken).ConfigureAwait(false);
         try
         {
             if (asyncInitializer is not null)
