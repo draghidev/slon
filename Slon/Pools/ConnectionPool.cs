@@ -24,9 +24,10 @@ sealed class ConnectionPoolOptions
     public TimeProvider TimeProvider { get; set; } = TimeProvider.System;
     public TimeSpan HeartbeatInterval { get; set; } = TimeSpan.FromSeconds(1);
     public ILoggerFactory LoggerFactory { get; set; } = NullLoggerFactory.Instance;
+    public string? MetricsName { get; set; }
 }
 
-internal sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
+sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSource
     where T : class, IPoolConnection<T>
 {
     bool _disposed;
@@ -61,8 +62,30 @@ internal sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
     readonly ConnectionWaitQueue _waitQueue = new();
     internal int WaiterCount => _waitQueue.Count;
 
+    PoolMetricsSnapshot IPoolMetricsSource.GetMetricsSnapshot()
+    {
+        var open = 0;
+        var idle = 0;
+        for (var i = 0; i < _connections.Length; i++)
+        {
+            var connection = Volatile.Read(ref _connections[i]) switch
+            {
+                T value => value,
+                ConnectionFuture { IsCompleted: true } future => future.Result,
+                _ => null
+            };
+            if (connection is null || connection.Completion.IsCompleted)
+                continue;
+            open++;
+            if (connection.IsIdle)
+                idle++;
+        }
+        return new(open, idle, _connections.Length, _waitQueue.Count);
+    }
+
     readonly Heartbeat _heartbeat;
     readonly ILogger _logger;
+    readonly PoolMetricsReporter? _metrics;
     readonly TimeProvider _timeProvider;
     readonly int _minConnections;
     readonly TimeSpan _pruningInterval;
@@ -129,6 +152,8 @@ internal sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
             },
             (conn, action)  => _heartbeat.Register(interval => action(conn, interval))
         );
+        if (options.MetricsName is { } metricsName)
+            _metrics = SlonMetrics.Register(this, metricsName);
     }
 
     ValueTask OnPoolHeartbeat(TimeSpan interval)
@@ -524,7 +549,17 @@ internal sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
         bool scheduled;
         try
         {
-            conn = _factory.Create(_context, timeout);
+            var started = _metrics?.StartConnectionCreate() ?? 0;
+            try
+            {
+                conn = _factory.Create(_context, timeout);
+                _metrics?.ReportConnectionCreated(started);
+            }
+            catch
+            {
+                _metrics?.ReportConnectionCreateFailed();
+                throw;
+            }
 
             // The claimed future makes disposal wait for this opener. Check disposal before admission;
             // visibility alone does not make the connection rentable.
@@ -577,7 +612,17 @@ internal sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
         {
             timeoutSource = RentTimeoutSource(timeout, _timeProvider, cancellationToken);
 
-            conn = await _factory.CreateAsync(_context, cancellationToken: timeoutSource?.Token ?? cancellationToken).ConfigureAwait(false);
+            var started = _metrics?.StartConnectionCreate() ?? 0;
+            try
+            {
+                conn = await _factory.CreateAsync(_context, cancellationToken: timeoutSource?.Token ?? cancellationToken).ConfigureAwait(false);
+                _metrics?.ReportConnectionCreated(started);
+            }
+            catch
+            {
+                _metrics?.ReportConnectionCreateFailed();
+                throw;
+            }
 
             // Clear ownership before returning the source to its thread-local cache.
             if (timeoutSource is { } source)
@@ -640,6 +685,11 @@ internal sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
 
     T GetCore<TState>(Func<ConnectionCandidate<T>, TState, bool>? schedule, TState state, TimeSpan timeout)
     {
+        var reportAdmissions = _metrics?.AdmissionsEnabled is true;
+        var reportTimeouts = _metrics?.AdmissionTimeoutsEnabled is true;
+        if (reportAdmissions || reportTimeouts)
+            return Observed(schedule, state, timeout, reportAdmissions, reportTimeouts);
+
         ThrowIfDisposed();
 
         if (!_waitQueue.HasDemand)
@@ -652,6 +702,31 @@ internal sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
         }
 
         return WaitForAvailability(schedule, state, timeout);
+
+        T Observed(Func<ConnectionCandidate<T>, TState, bool>? schedule, TState state, TimeSpan timeout,
+            bool reportAdmissions, bool reportTimeouts)
+        {
+            try
+            {
+                ThrowIfDisposed();
+
+                if (!_waitQueue.HasDemand)
+                {
+                    if (TrySchedule(schedule, state, CancellationToken.None, out var future, out var conn))
+                        return ReportAdmission(conn, waited: false, reportAdmissions);
+
+                    if (future is not null)
+                        return ReportAdmission(OpenConnection(future, schedule, state, timeout), waited: false, reportAdmissions);
+                }
+
+                return ReportAdmission(WaitForAvailability(schedule, state, timeout), waited: true, reportAdmissions);
+            }
+            catch (TimeoutException) when (reportTimeouts)
+            {
+                _metrics!.ReportAdmissionTimeout();
+                throw;
+            }
+        }
     }
 
     public T Get(TimeSpan timeout)
@@ -664,16 +739,62 @@ internal sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
     {
         ThrowIfDisposed();
 
+        var reportAdmissions = _metrics?.AdmissionsEnabled is true;
+        var reportTimeouts = _metrics?.AdmissionTimeoutsEnabled is true;
         if (!_waitQueue.HasDemand)
         {
             if (TrySchedule(schedule, state, cancellationToken, out var future, out var conn))
-                return new(conn);
+                return new(ReportAdmission(conn, waited: false, reportAdmissions));
 
             if (future is not null)
-                return OpenConnectionAsync(future, schedule, state, timeout, cancellationToken);
+            {
+                var task = OpenConnectionAsync(future, schedule, state, timeout, cancellationToken);
+                return reportAdmissions || reportTimeouts
+                    ? ObserveAdmissionAsync(task, waited: false, reportAdmissions, reportTimeouts, _metrics!)
+                    : task;
+            }
         }
 
-        return WaitForAvailabilityAsync(schedule, state, timeout, cancellationToken);
+        var waitTask = WaitForAvailabilityAsync(schedule, state, timeout, cancellationToken);
+        return reportAdmissions || reportTimeouts
+            ? ObserveAdmissionAsync(waitTask, waited: true, reportAdmissions, reportTimeouts, _metrics!)
+            : waitTask;
+    }
+
+    T ReportAdmission(T connection, bool waited, bool enabled)
+    {
+        if (enabled)
+            _metrics!.ReportAdmission(waited);
+        return connection;
+    }
+
+    static ValueTask<T> ObserveAdmissionAsync(ValueTask<T> task, bool waited,
+        bool reportAdmissions, bool reportTimeouts, PoolMetricsReporter metrics)
+    {
+        if (task.IsCompletedSuccessfully)
+        {
+            if (reportAdmissions)
+                metrics.ReportAdmission(waited);
+            return new(task.Result);
+        }
+        return Awaited(task, waited, reportAdmissions, reportTimeouts, metrics);
+
+        static async ValueTask<T> Awaited(ValueTask<T> task, bool waited,
+            bool reportAdmissions, bool reportTimeouts, PoolMetricsReporter metrics)
+        {
+            try
+            {
+                var connection = await task.ConfigureAwait(false);
+                if (reportAdmissions)
+                    metrics.ReportAdmission(waited);
+                return connection;
+            }
+            catch (TimeoutException) when (reportTimeouts)
+            {
+                metrics.ReportAdmissionTimeout();
+                throw;
+            }
+        }
     }
 
     public ValueTask<T> GetAsync(TimeSpan timeout, CancellationToken cancellationToken = default)
@@ -781,6 +902,8 @@ internal sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
                 }
             }
         }
+
+        _metrics?.Dispose();
 
         // Never invoke connection code while holding SyncObj: terminal continuations may settle an
         // opener through the same lock. Initiating directly here avoids a thread-pool hop without

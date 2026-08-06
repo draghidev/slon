@@ -18,6 +18,8 @@ public sealed record SlonDataSourceOptions
 
     public required EndPoint EndPoint { get; init; }
     public required string Username { get; init; }
+    /// <summary>Identifies this datasource in metrics. Defaults to endpoint/database.</summary>
+    public string? Name { get; init; }
     public string? Password { get; init; }
     public string? Database { get; init; }
     /// <summary>Configures PostgreSQL TLS negotiation and server authentication.</summary>
@@ -108,6 +110,8 @@ public sealed record SlonDataSourceOptions
         ArgumentNullException.ThrowIfNull(Ssl);
         ArgumentNullException.ThrowIfNull(Authentication);
         ArgumentNullException.ThrowIfNull(LoggerFactory);
+        if (Name is not null && string.IsNullOrWhiteSpace(Name))
+            throw new ArgumentException("Cannot be empty or whitespace.", nameof(Name));
         if ((ConnectionInitializer is null) != (AsyncConnectionInitializer is null))
             throw new ArgumentException(
                 "Synchronous and asynchronous connection initializers must be configured together.");
@@ -176,6 +180,7 @@ public sealed class SlonDataSource : DbDataSource
         _loggerFactory = new SlonLoggerFactory(_options.LoggerFactory);
         _adoLogger = _loggerFactory.CreateLogger("Slon");
         DisplayEndpoint = _options.EndPoint.AddressFamily is AddressFamily.InterNetwork or AddressFamily.InterNetworkV6 ? $"tcp://{_options.EndPoint}" : _options.EndPoint.ToString()!;
+        Name = _options.Name ?? $"{DisplayEndpoint}/{Database}";
         _backendProvider = _options.BackendProvider
             ?? throw new ArgumentNullException(nameof(_options.BackendProvider));
         _userTypeCatalogPlugins = [.. (_options.TypeCatalogPlugins
@@ -212,6 +217,7 @@ public sealed class SlonDataSource : DbDataSource
     internal void ReportTransactionDisposeRollbackFailure(Exception exception)
         => SlonLogMessages.TransactionDisposeRollbackFailed(_adoLogger, exception);
     internal string Database => _options.Database ?? _options.Username;
+    public string Name { get; }
     internal string DisplayEndpoint { get; }
 
     internal string ServerVersion => GetDbDependencies().BackendInfo.ServerVersionString;
@@ -299,6 +305,7 @@ public sealed class SlonDataSource : DbDataSource
                             ConnectionPruningInterval = _options.ConnectionPruningInterval,
                             HeartbeatInterval = _options.HeartbeatInterval,
                             LoggerFactory = _loggerFactory,
+                            MetricsName = Name,
                         });
 
                     var bootstrapResult = await CreateDbDeps(
