@@ -4,6 +4,7 @@ using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
 using System.Text;
 using Slon.Buffers;
+using Slon.Text;
 using Slon.Transport;
 using static Slon.Pg.Protocol.PgTypes;
 

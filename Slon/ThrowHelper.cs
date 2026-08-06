@@ -3,7 +3,7 @@ using System.Diagnostics.CodeAnalysis;
 
 namespace Slon;
 
-public class ThrowHelper
+static class ThrowHelper
 {
     [DoesNotReturn]
     [StackTraceHidden]

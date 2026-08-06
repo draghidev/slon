@@ -1,6 +1,7 @@
 using Slon.Pg;
 using Slon.Pg.Protocol;
 using Slon.Pg.Protocol.Flows;
+using Slon.Threading;
 
 namespace Slon.Tests.Pg;
 

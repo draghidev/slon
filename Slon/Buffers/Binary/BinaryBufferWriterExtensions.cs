@@ -4,7 +4,7 @@ using System.Runtime.CompilerServices;
 
 namespace Slon.Buffers.Binary;
 
-public static class BinaryBufferWriterExtensions
+static class BinaryBufferWriterExtensions
 {
     public static void WriteByte<TWriter>(this ref TWriter writer, byte value) where TWriter : struct, IBufferWriter<byte>, allows ref struct
     {

@@ -1,6 +1,6 @@
-namespace Slon.Pg.Protocol;
+namespace Slon.Threading;
 
-public sealed class Heartbeat : IDisposable
+sealed class Heartbeat : IDisposable
 {
     // Threshold for flagging a tick as drifted. 1.5x the requested interval matches the
     // ecosystem norm (PeriodicTimer / Tokio's Delay MissedTickBehavior) - small drift below

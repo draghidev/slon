@@ -3,6 +3,7 @@ using System.IO.Pipelines;
 using System.Runtime.CompilerServices;
 using Slon.Buffers;
 using Slon.Runtime.CompilerServices;
+using Slon.Runtime;
 
 namespace Slon.Pipelines;
 

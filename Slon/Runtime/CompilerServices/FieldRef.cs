@@ -1,6 +1,6 @@
 using System.Runtime.CompilerServices;
 
-namespace Slon;
+namespace Slon.Runtime.CompilerServices;
 
 // This is safe against unloading as long as instance is the same type as the getter function is defined on.
 // There is unfortunately no static type safety to guarantee a user creates one correctly.

@@ -1,5 +1,6 @@
 using System.Runtime.CompilerServices;
 using System.Threading.Tasks.Sources;
+using Slon.Runtime.CompilerServices;
 
 namespace Slon.Pg.Protocol.Flows;
 
@@ -26,7 +27,7 @@ struct FlowCallerInteractionCore<TResult>
     // Cancellation may have to take ownership from a sync caller that will not return. Once set,
     // a claimed handoff runs on a dedicated driver instead of occupying a pool worker.
     bool _dedicatedWakeRequested;
-    // The sticky close-latch: the canonical close exception for this flow's tenure, set out-of-band by
+    // The sticky close-latch: the flow-termination exception for this tenure, set out-of-band by
     // the protocol abort/stopping (CancelPendingWait) AND by the body's terminal close paths. The
     // consumer reads it on every Reset rearm to self-deliver the close to its just-armed generation,
     // so the live generation always has a completer regardless of which writer set the latch. Two

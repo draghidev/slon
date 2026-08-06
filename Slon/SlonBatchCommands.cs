@@ -1,4 +1,5 @@
 using System.Data.Common;
+using Slon.Runtime.CompilerServices;
 
 namespace Slon;
 

@@ -1,6 +1,7 @@
 using System.Data;
 using System.Data.Common;
 using Slon.Pg;
+using Slon.Runtime.CompilerServices;
 using Slon.Pg.Protocol.Flows;
 
 namespace Slon;

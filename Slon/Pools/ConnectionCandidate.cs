@@ -1,6 +1,6 @@
 namespace Slon.Pools;
 
-public readonly struct ConnectionCandidate<T>(T connection, CancellationToken cancellationToken, bool isIdleCandidate = true)
+readonly struct ConnectionCandidate<T>(T connection, CancellationToken cancellationToken, bool isIdleCandidate = true)
 {
     public T Connection { get; } = connection;
 

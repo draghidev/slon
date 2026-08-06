@@ -1,6 +1,6 @@
 namespace Slon.Pools;
 
-public sealed class ConnectionPoolContext<T>(Action<T, bool> signalAvailability,
+sealed class ConnectionPoolContext<T>(Action<T, bool> signalAvailability,
     Func<T, Func<T, TimeSpan, ValueTask>, IDisposable> onHeartbeat)
     where T : class, IPoolConnection<T>
 {

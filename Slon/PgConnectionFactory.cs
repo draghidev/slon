@@ -3,6 +3,7 @@ using System.Net.Sockets;
 using Slon.Pg;
 using Slon.Pg.Protocol;
 using Slon.Pools;
+using Slon.Runtime;
 using Slon.Transport;
 
 namespace Slon;

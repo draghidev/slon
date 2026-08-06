@@ -1,7 +1,9 @@
 using Slon.Pg;
 using Slon.Pg.Protocol;
+using Slon.Threading;
 using Slon.Pools;
 using Slon.Transport;
+using Slon.Text;
 
 namespace Slon;
 

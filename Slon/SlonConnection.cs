@@ -6,6 +6,7 @@ using System.Runtime.CompilerServices;
 using Slon.Pg;
 using Slon.Pg.Protocol;
 using Slon.Pg.Protocol.Flows;
+using Slon.Text;
 using IsolationLevel = System.Data.IsolationLevel;
 #pragma warning disable CS0197 // Using a field of a marshal-by-reference class as a ref or out value or taking its address may cause a runtime exception
 

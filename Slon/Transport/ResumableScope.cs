@@ -1,3 +1,5 @@
+using Slon.Runtime;
+
 namespace Slon.Transport;
 
 // Installs a write-resumption signal and optional deadline for one resumable call. Dispose restores

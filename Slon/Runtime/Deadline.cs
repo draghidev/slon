@@ -1,10 +1,12 @@
-namespace Slon;
+namespace Slon.Runtime;
 
 readonly struct Deadline
 {
     readonly TimeSpan _timespan;
     readonly long _startTicksMs;
 
+    // Default(TimeSpan) is the API sentinel for no deadline; an explicit negative value other
+    // than Timeout.InfiniteTimeSpan remains invalid.
     public Deadline(TimeSpan value)
     {
         if (value < Timeout.InfiniteTimeSpan)

@@ -4,5 +4,8 @@ root = false
 
 [*.cs]
 
+# Omit accessibility modifiers where the language default already expresses the intent.
+dotnet_style_require_accessibility_modifiers = omit_if_default:suggestion
+
 # Consider calling ConfigureAwait on the awaited task
 dotnet_diagnostic.CA2007.severity = error;

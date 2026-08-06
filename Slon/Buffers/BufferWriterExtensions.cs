@@ -3,7 +3,7 @@ using System.Runtime.CompilerServices;
 
 namespace Slon.Buffers;
 
-public static class BufferWriterExtensions
+static class BufferWriterExtensions
 {
     /// <summary>
     /// Copies the caller's buffer into this writer and calls <see cref="Advance(int)"/> with the length of the source buffer.

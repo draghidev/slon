@@ -1,4 +1,5 @@
-using Slon.Pg.Protocol;
+using Slon.Runtime;
+using Slon.Threading;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
@@ -7,7 +8,7 @@ using static Slon.Pools.ConnectionPool;
 
 namespace Slon.Pools;
 
-public class ConnectionPoolOptions
+sealed class ConnectionPoolOptions
 {
     /// Minimum number of connections preserved by statistical idle pruning.
     public int MinConnections { get; set; }
@@ -22,7 +23,7 @@ public class ConnectionPoolOptions
     public TimeSpan HeartbeatInterval { get; set; } = TimeSpan.FromSeconds(1);
 }
 
-public sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
+internal sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
     where T : class, IPoolConnection<T>
 {
     bool _disposed;

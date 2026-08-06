@@ -1,7 +1,11 @@
+using Slon.Runtime;
+
 namespace Slon.Pools;
 
 sealed class InitializingConnectionFactory<T>(
-    IPoolConnectionFactory<T> factory, Action<T, TimeSpan>? initializer = null, Func<T, CancellationToken, ValueTask>? asyncInitializer = null)
+    IPoolConnectionFactory<T> factory,
+    Action<T, TimeSpan>? initializer = null,
+    Func<T, CancellationToken, ValueTask>? asyncInitializer = null)
     : IPoolConnectionFactory<T> where T : class, IPoolConnection<T>
 {
     public T Create(ConnectionPoolContext<T> poolContext, TimeSpan timeout = default)

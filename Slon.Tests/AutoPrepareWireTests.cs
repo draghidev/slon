@@ -1,5 +1,6 @@
 using Slon.Pg;
 using Slon.Pg.Protocol;
+using Slon.Text;
 
 namespace Slon.Tests;
 

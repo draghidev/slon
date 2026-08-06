@@ -10,7 +10,7 @@ using System.Runtime.InteropServices;
 namespace Slon.Buffers;
 
 // Peeking (non advancing variants), cheaper than rewinding afterwards.
-public static class SequenceReaderExtensions
+static class SequenceReaderExtensions
 {
     /// <summary>
     /// Try to peek the given type out of the buffer if possible. Warning: this is dangerous to use with arbitrary

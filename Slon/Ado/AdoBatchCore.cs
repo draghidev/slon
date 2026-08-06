@@ -7,6 +7,7 @@ using System.Runtime.CompilerServices;
 using Slon.Pg;
 using Slon.Pg.Protocol;
 using Slon.Pg.Protocol.Flows;
+using Slon.Runtime.CompilerServices;
 
 namespace Slon;
 

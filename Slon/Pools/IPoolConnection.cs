@@ -1,7 +1,7 @@
 namespace Slon.Pools;
 
 /// Used for pools to determine whether a protocol is idle or to determine which protocol is the most idle.
-public interface IPoolConnection<TSelf>
+interface IPoolConnection<TSelf>
     where TSelf : class, IPoolConnection<TSelf>
 {
     /// Initiates terminal completion and completes only after the connection is fully quiet.

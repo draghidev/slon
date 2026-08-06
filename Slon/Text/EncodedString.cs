@@ -3,7 +3,7 @@ using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
 using System.Text;
 
-namespace Slon;
+namespace Slon.Text;
 
 // Defined as a struct wrapping a class so we can always pull some usable span out, without needing explicit null checks in consuming code.
 [DebuggerDisplay("{_core,nq}")]

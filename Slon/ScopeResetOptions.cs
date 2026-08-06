@@ -1,6 +1,5 @@
 using System.Text;
-
-namespace Slon.Pg.Protocol;
+namespace Slon;
 
 /// <summary>
 /// Configures which connection state is reset when an exclusive scope is released.

@@ -3,6 +3,7 @@ using System.Data.Common;
 using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
 using Slon.Pg;
+using Slon.Runtime.CompilerServices;
 using Slon.Pg.Protocol.Flows;
 
 namespace Slon;

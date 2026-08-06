@@ -5,7 +5,7 @@ using System.Text;
 
 namespace Slon.Buffers.Binary;
 
-public static class BinarySpanWriterExtensions
+static class BinarySpanWriterExtensions
 {
     public static void WriteStringWithNullTerminator<TWriter>(this ref TWriter writer, string value, Encoding encoding, int? encodedLength = null)
         where TWriter : struct, IBufferWriter<byte>, allows ref struct
