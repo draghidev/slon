@@ -29,7 +29,7 @@ readonly struct EncodedString(string value) : IEquatable<EncodedString>
     }
 
     public override bool Equals(object? obj) => obj is EncodedString other && Equals(other);
-    public override int GetHashCode() => _core.Value.GetHashCode();
+    public override int GetHashCode() => _core?.Value.GetHashCode() ?? 0;
 
     public static implicit operator EncodedString(string value) => new(value);
     public static bool operator ==(EncodedString left, EncodedString right) => left.Equals(right);
@@ -41,29 +41,36 @@ readonly struct EncodedString(string value) : IEquatable<EncodedString>
     {
         readonly string _value = value;
         public string Value => _value;
-        Encoding? _encoding;
-        byte[]? _encoded;
+        EncodedValue? _encoded;
 
         public ReadOnlySpan<byte> AsSpan(Encoding encoding) => AsNullTerminatedSpan(encoding)[..^1];
         public ReadOnlySpan<byte> AsNullTerminatedSpan(Encoding encoding)
         {
-            return ReferenceEquals(encoding, _encoding) ? (ReadOnlySpan<byte>)_encoded! : Core();
+            var encoded = Volatile.Read(ref _encoded);
+            return encoded is not null && ReferenceEquals(encoding, encoded.Encoding)
+                ? encoded.Bytes
+                : Core();
 
             [MethodImpl(MethodImplOptions.NoInlining)]
             ReadOnlySpan<byte> Core()
             {
-                lock (_value)
+                lock (this)
                 {
-                    if (ReferenceEquals(encoding, _encoding))
-                    {
-                        Debug.Assert(_encoded is not null);
-                        return _encoded;
-                    }
+                    var encoded = _encoded;
+                    if (encoded is not null && ReferenceEquals(encoding, encoded.Encoding))
+                        return encoded.Bytes;
 
-                    _encoding = encoding;
-                    return _encoded = [..encoding.GetBytes(_value), 0];
+                    encoded = new(encoding, [..encoding.GetBytes(_value), 0]);
+                    Volatile.Write(ref _encoded, encoded);
+                    return encoded.Bytes;
                 }
             }
+        }
+
+        sealed class EncodedValue(Encoding encoding, byte[] bytes)
+        {
+            public Encoding Encoding { get; } = encoding;
+            public byte[] Bytes { get; } = bytes;
         }
     }
 }
