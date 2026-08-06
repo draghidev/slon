@@ -26,7 +26,6 @@ sealed class PgClientOptions
 
     public TimeSpan ConnectionTimeout { get; init; } = Timeout.InfiniteTimeSpan;
 
-    public int PoolSize { get; init; }
     internal ScopeResetOptions ScopeReset { get; init; } = new();
     internal int DataRowStreamingThreshold { get; init; } = BackendMessageBatch.Segmenter.DefaultDataRowStreamingThreshold;
 
