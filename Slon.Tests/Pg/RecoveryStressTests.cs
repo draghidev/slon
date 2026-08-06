@@ -13,7 +13,7 @@ namespace Slon.Tests.Pg;
 // Each test runs isolated against its own protocol so a failure inside the loop doesn't poison
 // sibling tests.
 [TestClass]
-public class RecoveryStressTests
+public class RecoveryStressTests : ConnectionCreatingTest
 {
     // Real recovery (and connection) per iteration. Capped at the documented heavy-soak value; set
     // SLON_UNCAPPED=1 to drive the raw SLON_STRESS_ITERATIONS for a deeper soak.

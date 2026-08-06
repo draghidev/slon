@@ -9,7 +9,7 @@ namespace Slon.Tests;
 // test pool would starve it / let one lease's failure poison the others. Stateless command tests use the
 // shared multiplexed path (AdoTestPool.ExecuteNonQueryAsync) instead.
 [TestClass]
-public class ExclusiveScopeAdoTests
+public class ExclusiveScopeAdoTests : ConnectionCreatingTest
 {
     static async Task<int> ExecNonQuery(SlonConnection conn, string sql)
     {

@@ -18,7 +18,7 @@ namespace Slon.Tests.Pg;
 // asserted the same thing with a stricter, untoleranced bound on a global oracle, so it flaked
 // on the documented SocketAsyncEngine BCL noise (a TP thread injected during the window).
 [TestClass]
-public class SyncFlowHandoffTests
+public class SyncFlowHandoffTests : ConnectionCreatingTest
 {
     static int StressIterations => StressEnv.Iterations(fallback: 64, cap: 8_000);
 

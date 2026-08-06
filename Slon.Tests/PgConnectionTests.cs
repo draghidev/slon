@@ -15,7 +15,7 @@ namespace Slon.Tests;
 // (e.g., shared heartbeat thread). Each test owns its connection end-to-end because
 // PgConnection isn't pool-managed without an actual pool above it.
 [TestClass]
-public class PgConnectionTests
+public class PgConnectionTests : ConnectionCreatingTest
 {
     sealed class AsyncOnlyTransport : TransportConnection
     {

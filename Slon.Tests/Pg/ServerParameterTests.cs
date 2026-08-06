@@ -6,7 +6,7 @@ using Slon.Pg.Types;
 namespace Slon.Tests.Pg;
 
 [TestClass]
-public class ServerParameterTests
+public class ServerParameterTests : ConnectionCreatingTest
 {
     [TestMethod]
     public void BackendInfo_SharesTheOwnedStartupSnapshot()

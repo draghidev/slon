@@ -12,7 +12,7 @@ namespace Slon.Tests.Pg;
 // and the heartbeat-based parked-flow propagation that fails activation sources when AbortToken
 // fires on a flow that's enqueued but not yet activated.
 [TestClass]
-public class ProtocolCompletionTests
+public class ProtocolCompletionTests : ConnectionCreatingTest
 {
     static int RaceIterations => StressEnv.Iterations(fallback: 3, cap: 100);
 

@@ -24,7 +24,7 @@ namespace Slon.Tests.Pg;
 // the failed flow's own completion carries its original exception, plus the recovery's fault
 // when the recovery itself died (see RecoveryItselfFails_FailedFlowCompletes_WithBothFaults).
 [TestClass]
-public class RecoveryTests
+public class RecoveryTests : ConnectionCreatingTest
 {
     // Isolated per test by design: every recovery test faults a flow or kills the transport.
     // Cannot share via PgTestPool. The fault-injection tests further down

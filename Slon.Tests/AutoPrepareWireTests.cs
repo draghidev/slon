@@ -10,7 +10,7 @@ namespace Slon.Tests;
 //
 // Assumes a local PostgreSQL accessible at 127.0.0.1:5432 with user "postgres" password "postgres123".
 [TestClass]
-public class AutoPrepareWireTests
+public class AutoPrepareWireTests : ConnectionCreatingTest
 {
     // Each test customizes auto-prepare thresholds and inspects CommandTracker state, so the
     // data source must be isolated per test (sharing would cross-pollute prepared-statement

@@ -12,7 +12,7 @@ namespace Slon.Tests;
 // blocking appears at this layer, the proxy itself (or its tracker integration) is the
 // coupling.
 [TestClass]
-public class AdoConnectionProxyTests
+public class AdoConnectionProxyTests : ConnectionCreatingTest
 {
     static PgClientOptions NewOptions() => new()
     {

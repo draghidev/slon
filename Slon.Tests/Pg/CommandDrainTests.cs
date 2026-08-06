@@ -11,7 +11,7 @@ namespace Slon.Tests.Pg;
 // shutdown), the body skips the user-handoff for remaining commands and drains the wire
 // to RFQ on its own. Parameterized over (flowAsync, useAsyncDispose).
 [TestClass]
-public class CommandDrainTests
+public class CommandDrainTests : ConnectionCreatingTest
 {
     const BindingFlags NonPublicInstance = BindingFlags.Instance | BindingFlags.NonPublic;
 

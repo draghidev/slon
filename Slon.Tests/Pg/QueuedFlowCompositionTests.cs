@@ -4,7 +4,7 @@ using Slon.Pg.Protocol.Flows;
 namespace Slon.Tests.Pg;
 
 [TestClass]
-public class QueuedFlowCompositionTests
+public class QueuedFlowCompositionTests : ConnectionCreatingTest
 {
     static async Task DrainAsync(CommandFlow flow)
     {

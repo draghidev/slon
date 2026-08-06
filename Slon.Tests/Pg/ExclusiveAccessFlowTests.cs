@@ -17,7 +17,7 @@ namespace Slon.Tests.Pg;
 // real execution - the acceptance test that the exclusive flow actually owns the wire and runs user
 // subflows on its inner pipeline.
 [TestClass]
-public class ExclusiveAccessFlowTests
+public class ExclusiveAccessFlowTests : ConnectionCreatingTest
 {
     static async Task DrainAsync(CommandFlow flow)
     {

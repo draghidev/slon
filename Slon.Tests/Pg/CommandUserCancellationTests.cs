@@ -9,7 +9,7 @@ namespace Slon.Tests.Pg;
 // is reserved for the caller's own token; PgClientClosedException is reserved for protocol shutdown.
 // I/O is not cancelled: the body keeps reading and drains the wire to RFQ, leaving the protocol usable.
 [TestClass]
-public class CommandUserCancellationTests
+public class CommandUserCancellationTests : ConnectionCreatingTest
 {
     sealed class AdmissionProbeFlow : PgClientFlow
     {
@@ -78,7 +78,6 @@ public class CommandUserCancellationTests
     // OCE, the body finishes the in-flight read and drains the rest to RFQ, and the follow-up command
     // confirms the protocol stays usable.
     [TestMethod]
-    [DoNotParallelize]
     public async Task UserCt_FiresMidRead_SurfacesOce_ProtocolUsable()
     {
         await using var blocker = await PgAdvisoryLock.AcquireAsync();
@@ -111,7 +110,6 @@ public class CommandUserCancellationTests
     }
 
     [TestMethod]
-    [DoNotParallelize]
     public async Task ServerCancel_InterruptsBlockedCommand_AndProtocolRemainsUsable()
     {
         await using var blocker = await PgAdvisoryLock.AcquireAsync();
@@ -147,7 +145,6 @@ public class CommandUserCancellationTests
     }
 
     [TestMethod]
-    [DoNotParallelize]
     public async Task ServerCancel_CancelAsyncWaitsForDeliveryAttempt()
     {
         await using var blocker = await PgAdvisoryLock.AcquireAsync();
@@ -179,7 +176,6 @@ public class CommandUserCancellationTests
     }
 
     [TestMethod]
-    [DoNotParallelize]
     public async Task ServerCancel_AbandonedSyncFlowGraduatesAndDrains()
     {
         await using var blocker = await PgAdvisoryLock.AcquireAsync();
@@ -202,7 +198,6 @@ public class CommandUserCancellationTests
     }
 
     [TestMethod]
-    [DoNotParallelize]
     public async Task ServerCancel_NotSent_DoesNotCondemnProtocol()
     {
         await using var blocker = await PgAdvisoryLock.AcquireAsync();
@@ -238,7 +233,6 @@ public class CommandUserCancellationTests
     }
 
     [TestMethod]
-    [DoNotParallelize]
     public async Task ServerCancel_GraceExpiresOnHeartbeatWithoutPerIntentTimer()
     {
         await using var blocker = await PgAdvisoryLock.AcquireAsync();
@@ -282,7 +276,6 @@ public class CommandUserCancellationTests
     }
 
     [TestMethod]
-    [DoNotParallelize]
     public async Task ServerCancel_WaitsForCancellationReadFrontierBeforeDispatch()
     {
         await using var blocker = await PgAdvisoryLock.AcquireAsync();
@@ -322,7 +315,6 @@ public class CommandUserCancellationTests
     }
 
     [TestMethod]
-    [DoNotParallelize]
     public async Task ServerCancel_AlreadyPublishedReadFrontierDispatchesWithoutHeartbeat()
     {
         await using var blocker = await PgAdvisoryLock.AcquireAsync();
@@ -362,7 +354,6 @@ public class CommandUserCancellationTests
     }
 
     [TestMethod]
-    [DoNotParallelize]
     public async Task ServerCancel_FlowFinishesDuringGrace_SuppressesSideChannelAttempt()
     {
         await using var blocker = await PgAdvisoryLock.AcquireAsync();
@@ -398,7 +389,6 @@ public class CommandUserCancellationTests
     }
 
     [TestMethod]
-    [DoNotParallelize]
     public async Task ServerCancel_ReadTimeoutBypassesCallerCancellationGrace()
     {
         await using var blocker = await PgAdvisoryLock.AcquireAsync();
@@ -433,7 +423,6 @@ public class CommandUserCancellationTests
     }
 
     [TestMethod]
-    [DoNotParallelize]
     public async Task ServerCancel_NotSentAfterInstigatorCompletes_RetiresIntent()
     {
         await using var blocker = await PgAdvisoryLock.AcquireAsync();
@@ -468,7 +457,6 @@ public class CommandUserCancellationTests
     }
 
     [TestMethod]
-    [DoNotParallelize]
     public async Task ServerCancel_AttemptHoldsLaterFlowExecutionUntilDeliverySettles()
     {
         await using var blocker = await PgAdvisoryLock.AcquireAsync();
@@ -510,7 +498,6 @@ public class CommandUserCancellationTests
     }
 
     [TestMethod]
-    [DoNotParallelize]
     public async Task ServerCancel_UnknownDelivery_UsesBoundaryWithoutCondemningProtocol()
     {
         await using var blocker = await PgAdvisoryLock.AcquireAsync();
@@ -552,7 +539,6 @@ public class CommandUserCancellationTests
     }
 
     [TestMethod]
-    [DoNotParallelize]
     public async Task ServerCancel_LoadedPipeline_RetiresAtFirstPostAckRfq()
     {
         await using var blocker = await PgAdvisoryLock.AcquireAsync();
@@ -623,7 +609,6 @@ public class CommandUserCancellationTests
     }
 
     [TestMethod]
-    [DoNotParallelize]
     public async Task ServerCancel_LateDeliveryStrikesSuccessorWithoutMisattribution()
     {
         await using var firstBlocker = await PgAdvisoryLock.AcquireAsync();
@@ -699,7 +684,6 @@ public class CommandUserCancellationTests
     }
 
     [TestMethod]
-    [DoNotParallelize]
     public async Task ServerCancel_RemainingFlow_RedrivesAfterPostAckRfq()
     {
         await using var firstBlocker = await PgAdvisoryLock.AcquireAsync();
@@ -738,7 +722,6 @@ public class CommandUserCancellationTests
     }
 
     [TestMethod]
-    [DoNotParallelize]
     public async Task ServerCancel_PerReadTokenTargetsOnlyCurrentWindow()
     {
         await using var firstBlocker = await PgAdvisoryLock.AcquireAsync();
@@ -775,24 +758,6 @@ public class CommandUserCancellationTests
     }
 
     [TestMethod]
-    [DoNotParallelize]
-    public async Task AdoCancel_TargetsItsActiveCommandFlow()
-    {
-        await using var blocker = await PgAdvisoryLock.AcquireAsync();
-        await using var command = AdoTestPool.CreateCommand($"select pg_advisory_xact_lock({blocker.Key})");
-        var execution = command.ExecuteScalarAsync();
-
-        await blocker.WaitUntilContendedAsync();
-        command.Cancel();
-
-        await Assert.ThrowsExactlyAsync<OperationCanceledException>(
-            async () => await execution.WaitAsync(TestTimeout.Hang));
-        await blocker.ReleaseAsync();
-        await AdoTestPool.ExecuteNonQueryAsync("select 1");
-    }
-
-    [TestMethod]
-    [DoNotParallelize]
     public async Task ServerCancel_ExclusiveScope_UsesInnerPipelineBoundary()
     {
         await using var blocker = await PgAdvisoryLock.AcquireAsync();

@@ -10,7 +10,7 @@ namespace Slon.Tests.Pg;
 // consumer-detach (canceled WaitForHandoffAsync), done-before-executed fast retire, and the pre-turn cascade
 // path (a waiter torn down by a protocol stop before it ever won its turn).
 [TestClass]
-public class ExclusiveScopeMultiWaiterTests
+public class ExclusiveScopeMultiWaiterTests : ConnectionCreatingTest
 {
     static Task<PgClientProtocol> ConnectAsync() => PgTestPool.NewIsolatedAsync();
 

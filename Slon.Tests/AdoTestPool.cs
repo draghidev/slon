@@ -49,6 +49,14 @@ static class AdoTestPool
         return cmd.ExecuteNonQuery();
     }
 
+    internal static async ValueTask ExecuteBatchNonQueryAsync(params string[] commands)
+    {
+        await using var batch = _shared.CreateBatch();
+        foreach (var command in commands)
+            batch.BatchCommands.Add(batch.CreateBatchCommand(command));
+        _ = await batch.ExecuteNonQueryAsync(CancellationToken.None);
+    }
+
     // A data-source-bound (MULTIPLEXED) command, for tests that need to drive a specific execute method
     // themselves (e.g. assert ExecuteScalar throws). Runs on a pool-picked wire - no connection lease.
     internal static SlonCommand CreateCommand(string sql) => new(_shared, sql);
