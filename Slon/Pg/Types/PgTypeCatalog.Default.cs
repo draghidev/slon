@@ -6,7 +6,8 @@ partial class PgTypeCatalog
 {
     // A default set of non-portable postgres types which are commonly supported, to be used in offline scenarios (no type loading) or testing.
     [field: MaybeNull]
-    public static PgTypeCatalog Default => field ??= new PgTypeCatalog(CreateDefaultTypes(withMultiranges: true));
+    public static PgTypeCatalog Default => field ??= new PgTypeCatalogBuilder(
+        CreateDefaultTypes(withMultiranges: true)).Build();
 
     static IEnumerable<PgType> CreateDefaultTypes(bool withMultiranges)
     {

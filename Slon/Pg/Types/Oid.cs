@@ -1,4 +1,4 @@
-namespace Slon.Pg;
+namespace Slon.Pg.Types;
 
 readonly struct Oid(uint value) : IEquatable<Oid>
 {

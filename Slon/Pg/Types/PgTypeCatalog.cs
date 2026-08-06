@@ -1,73 +1,57 @@
-using System.Collections.Concurrent;
 using System.Collections.Frozen;
 
 namespace Slon.Pg.Types;
 
 sealed partial class PgTypeCatalog
 {
-    // Important keys are represented by their underlying primitives for slightly faster lookups.
+    // An OID-backed catalog may be shared across physical endpoints only when their relevant
+    // catalog OIDs and type shapes are exactly aligned. Physical cluster membership is neither
+    // required nor sufficient: replicated or fleet-managed databases may assert that invariant,
+    // while portable catalogs defer backend-specific OID materialization.
     readonly FrozenDictionary<string, PgType> _typesByDataTypeName;
-    readonly FrozenDictionary<uint, PgType> _typesByOid;
-    // This one and future additions for range/multirange serve purely as a lookup cache for inverse relations like element type -> array type etc.
-    ConcurrentDictionary<PgTypeId, PgType>? _arrayTypesByElementId;
+    readonly FrozenDictionary<string, PgType?> _typesByUnqualifiedName;
+    readonly FrozenDictionary<uint, PgType>? _typesByOid;
+    readonly FrozenDictionary<PgTypeId, PgType> _arrayTypesByElementId;
+    readonly FrozenDictionary<PgTypeId, PgType> _multirangeTypesByRangeId;
 
-    public PgTypeCatalog(IEnumerable<PgType> types)
+    internal PgTypeCatalog(
+        Dictionary<string, PgType> typesByDataTypeName,
+        Dictionary<string, PgType?> typesByUnqualifiedName,
+        Dictionary<uint, PgType>? typesByOid,
+        Dictionary<PgTypeId, PgType> arrayTypesByElementId,
+        Dictionary<PgTypeId, PgType> multirangeTypesByRangeId)
     {
-        var typesByOid = new Dictionary<uint, PgType>();
-        var typesByDataTypeName = new Dictionary<string, PgType>();
-        foreach (var type in types)
-        {
-            if (type.Oid is not { } oid)
-            {
-                ThrowHelper.ThrowInvalidOperation("All types passed to a catalog must have an oid.");
-                return;
-            }
-
-            typesByDataTypeName.Add(type.DataTypeName, type);
-            typesByOid.Add((uint)oid, type);
-        }
-        _typesByDataTypeName = typesByDataTypeName.ToFrozenDictionary();
-        _typesByOid = typesByOid.ToFrozenDictionary();
+        _typesByDataTypeName = typesByDataTypeName.ToFrozenDictionary(StringComparer.Ordinal);
+        _typesByUnqualifiedName = typesByUnqualifiedName.ToFrozenDictionary(StringComparer.Ordinal);
+        _typesByOid = typesByOid?.ToFrozenDictionary();
+        _arrayTypesByElementId = arrayTypesByElementId.ToFrozenDictionary();
+        _multirangeTypesByRangeId = multirangeTypesByRangeId.ToFrozenDictionary();
     }
 
     public IReadOnlyCollection<PgType> Types => _typesByDataTypeName.Values;
+    public bool IsPortable => _typesByOid is null;
 
     public PgType GetPgType(PgTypeId pgTypeId)
-    {
-        if (pgTypeId.IsOid)
-            return _typesByOid[(uint)pgTypeId.Oid];
+        => pgTypeId.IsOid
+            ? GetOidCatalog()[unchecked((uint)pgTypeId.Oid)]
+            : _typesByDataTypeName[pgTypeId.DataTypeName];
 
-        return _typesByDataTypeName[pgTypeId.DataTypeName];
-    }
-
-    Oid GetOidCore(PgTypeId pgTypeId, bool validateIfOid = true)
+    public Oid GetOid(PgTypeId pgTypeId)
     {
         if (pgTypeId.IsOid)
         {
-            if (validateIfOid)
-                _ = _typesByOid[(uint)pgTypeId.Oid];
+            _ = GetOidCatalog()[unchecked((uint)pgTypeId.Oid)];
             return pgTypeId.Oid;
         }
 
-        return _typesByDataTypeName[pgTypeId.DataTypeName].Oid.GetValueOrDefault();
+        return _typesByDataTypeName[pgTypeId.DataTypeName].Oid
+            ?? throw new InvalidOperationException("A portable type catalog cannot resolve PostgreSQL OIDs.");
     }
 
-    DataTypeName GetDataTypeNameCore(PgTypeId pgTypeId, bool validateIfDataTypeName = true)
-    {
-        if (pgTypeId.IsDataTypeName)
-        {
-            if (validateIfDataTypeName)
-                _ = _typesByDataTypeName[pgTypeId.DataTypeName];
-            return pgTypeId.DataTypeName;
-        }
-
-        return _typesByOid[(uint)pgTypeId.Oid].DataTypeName;
-    }
-
-    /// Returns whether this type catalog can be used to lookup by oid and whether any returned types are portable by default.
-    public bool IsPortable => _typesByOid is null;
-
-    public Oid GetOid(PgTypeId pgTypeId) => GetOidCore(pgTypeId, validateIfOid: true);
+    public DataTypeName GetDataTypeName(PgTypeId pgTypeId)
+        => pgTypeId.IsDataTypeName
+            ? _typesByDataTypeName[pgTypeId.DataTypeName].DataTypeName
+            : GetOidCatalog()[unchecked((uint)pgTypeId.Oid)].DataTypeName;
 
     public Oid GetElementOid(PgTypeId arrayTypeId)
     {
@@ -75,86 +59,119 @@ sealed partial class PgTypeCatalog
         if (type.Kind is not PgTypeKind.Array)
             throw new InvalidOperationException("Type is not of kind Array.");
 
-        return GetOid(type.ElementType.Oid.GetValueOrDefault());
+        return type.ElementType.Oid
+            ?? throw new InvalidOperationException("A portable type catalog cannot resolve PostgreSQL OIDs.");
     }
 
     public Oid GetArrayOid(PgTypeId elementTypeId)
-    {
-        if ((_arrayTypesByElementId ??= new()).TryGetValue(elementTypeId, out var cached))
-            return GetOidCore(cached.Oid.GetValueOrDefault(), validateIfOid: false);
-
-        // Map it to oid as we have stored non-portable types which must be compared against.
-        var elementOid = GetOidCore(elementTypeId, validateIfOid: false);
-        foreach (var type in Types)
-            if (type.Kind is PgTypeKind.Array && type.ElementType.Oid == elementOid)
-            {
-                // We need to be able to store both the portable and oid version for the cache to work.
-                _arrayTypesByElementId[elementTypeId] = type;
-                return elementOid;
-            }
-
-        throw new KeyNotFoundException();
-    }
+        => GetInverse(_arrayTypesByElementId, Canonicalize(elementTypeId), "array").Oid
+           ?? throw new InvalidOperationException("A portable type catalog cannot resolve PostgreSQL OIDs.");
 
     public DataTypeName GetDataTypeName(string name)
     {
         if (!TryGetIdentifiers(name, out _, out var dataTypeName))
-            throw new KeyNotFoundException();
+        {
+            if (!DataTypeName.IsFullyQualified(name))
+            {
+                var normalizedName = DataTypeName.NormalizeName(name);
+                var candidates = Types
+                    .Where(type => type.DataTypeName.UnqualifiedName == normalizedName)
+                    .Select(type => type.DataTypeName.Value)
+                    .Order(StringComparer.Ordinal)
+                    .ToArray();
+                if (candidates.Length > 1)
+                    throw new KeyNotFoundException(
+                        $"PostgreSQL type name '{name}' is ambiguous; qualify one of: " +
+                        string.Join(", ", candidates) + ".");
+            }
+
+            throw new KeyNotFoundException($"PostgreSQL type '{name}' was not found in the catalog.");
+        }
 
         return dataTypeName;
     }
 
-    public DataTypeName GetDataTypeName(PgTypeId pgTypeId) => GetDataTypeNameCore(pgTypeId, validateIfDataTypeName: true);
-
     public DataTypeName GetElementDataTypeName(PgTypeId arrayTypeId)
     {
         var type = GetPgType(arrayTypeId);
-        if (type.Kind is PgTypeKind.Array)
-            throw new InvalidOperationException("Type is not a kind of Array.");
+        if (type.Kind is not PgTypeKind.Array)
+            throw new InvalidOperationException("Type is not of kind Array.");
 
-        return GetDataTypeName(new PgTypeId(type.ElementType.DataTypeName));
+        return type.ElementType.DataTypeName;
     }
 
     public DataTypeName GetArrayDataTypeName(PgTypeId elementTypeId)
-    {
-        if ((_arrayTypesByElementId ??= new()).TryGetValue(elementTypeId, out var cached))
-            return cached.DataTypeName;
+        => GetInverse(_arrayTypesByElementId, Canonicalize(elementTypeId), "array").DataTypeName;
 
-        var oid = GetOidCore(elementTypeId);
-        foreach (var type in Types)
-        {
-            if (type is { Kind: PgTypeKind.Array, ElementType: { Oid: { } elementOid } elementType } && elementOid == oid)
-            {
-                _arrayTypesByElementId.TryAdd(elementTypeId, type);
-                return elementType.DataTypeName;
-            }
-        }
+    public bool TryGetMultiRangeIdentifiers(string rangeDataTypeName, out PgTypeId canonicalTypeId,
+        out DataTypeName dataTypeName)
+        => TryGetRelatedIdentifiers(rangeDataTypeName, _multirangeTypesByRangeId,
+            out canonicalTypeId, out dataTypeName);
 
-        throw new KeyNotFoundException();
-    }
-
-    public bool TryGetMultiRangeIdentifiers(string rangeDataTypeName, out PgTypeId canonicalTypeId, out DataTypeName dataTypeName)
-    {
-        // TODO
-        throw new NotImplementedException();
-    }
-
-    public bool TryGetArrayIdentifiers(string elementDataTypeName, out PgTypeId canonicalTypeId, out DataTypeName dataTypeName)
-    {
-        // TODO
-        throw new NotImplementedException();
-    }
+    public bool TryGetArrayIdentifiers(string elementDataTypeName, out PgTypeId canonicalTypeId,
+        out DataTypeName dataTypeName)
+        => TryGetRelatedIdentifiers(elementDataTypeName, _arrayTypesByElementId,
+            out canonicalTypeId, out dataTypeName);
 
     public bool TryGetIdentifiers(string name, out PgTypeId canonicalTypeId, out DataTypeName dataTypeName)
     {
-        var hasSchema = name.IndexOf('.') != -1;
-        if (hasSchema && _typesByDataTypeName.TryGetValue(name, out var type))
+        var normalizedName = DataTypeName.NormalizeName(name);
+        PgType? type;
+        if (DataTypeName.IsFullyQualified(name))
         {
-            canonicalTypeId = type.Oid is { } oid ? new PgTypeId(oid) : type.DataTypeName;
-            dataTypeName = new DataTypeName(name);
-            return true;
+            type = _typesByDataTypeName.TryGetValue(normalizedName, out var qualified)
+                ? qualified
+                : null;
         }
-        // TODO
-        throw new NotImplementedException();
+        else if (_typesByUnqualifiedName.TryGetValue(normalizedName, out var unqualified))
+        {
+            type = unqualified;
+        }
+        else
+        {
+            type = null;
+        }
+
+        if (type is not { } resolved)
+        {
+            canonicalTypeId = default;
+            dataTypeName = default;
+            return false;
+        }
+
+        canonicalTypeId = resolved.Oid is { } oid ? new PgTypeId(oid) : resolved.DataTypeName;
+        dataTypeName = resolved.DataTypeName;
+        return true;
     }
+
+    bool TryGetRelatedIdentifiers(string sourceName, FrozenDictionary<PgTypeId, PgType> inverse,
+        out PgTypeId canonicalTypeId, out DataTypeName dataTypeName)
+    {
+        if (!TryGetIdentifiers(sourceName, out var sourceId, out _)
+            || !inverse.TryGetValue(sourceId, out var related))
+        {
+            canonicalTypeId = default;
+            dataTypeName = default;
+            return false;
+        }
+
+        canonicalTypeId = related.Oid is { } oid ? new PgTypeId(oid) : related.DataTypeName;
+        dataTypeName = related.DataTypeName;
+        return true;
+    }
+
+    PgTypeId Canonicalize(PgTypeId typeId)
+    {
+        var type = GetPgType(typeId);
+        return type.Oid is { } oid ? new PgTypeId(oid) : type.DataTypeName;
+    }
+
+    static PgType GetInverse(FrozenDictionary<PgTypeId, PgType> inverse, PgTypeId source, string kind)
+        => inverse.TryGetValue(source, out var related)
+            ? related
+            : throw new KeyNotFoundException($"The catalog contains no {kind} type for {source}.");
+
+    FrozenDictionary<uint, PgType> GetOidCatalog()
+        => _typesByOid
+           ?? throw new InvalidOperationException("A portable type catalog cannot resolve PostgreSQL OIDs.");
 }

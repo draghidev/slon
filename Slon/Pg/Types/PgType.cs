@@ -33,6 +33,26 @@ readonly record struct PgType
             var v => throw new ArgumentOutOfRangeException(nameof(Data), v, null)
         };
 
+    public PgType RangeType => Kind is PgTypeKind.Multirange
+        ? ((PgTypeData.Multirange)Data!).RangeType
+        : throw new InvalidOperationException("Type is not of kind Multirange.");
+
+    public PgType UnderlyingType => Kind is PgTypeKind.Domain
+        ? ((PgTypeData.Domain)Data!).UnderlyingType
+        : throw new InvalidOperationException("Type is not of kind Domain.");
+
+    public bool IsDomainNotNull => Kind is PgTypeKind.Domain
+        ? ((PgTypeData.Domain)Data!).IsNotNull
+        : throw new InvalidOperationException("Type is not of kind Domain.");
+
+    public ImmutableArray<PgCompositeFieldType> CompositeFields => Kind is PgTypeKind.Composite
+        ? ((PgTypeData.Composite)Data!).Fields
+        : throw new InvalidOperationException("Type is not of kind Composite.");
+
+    public ImmutableArray<string> EnumVariants => Kind is PgTypeKind.Enum
+        ? ((PgTypeData.Enum)Data!).Variants
+        : throw new InvalidOperationException("Type is not of kind Enum.");
+
     public PgTypeKind Kind => Data?.Kind ?? PgTypeKind.Base;
     PgTypeData? Data { get; init; }
     public DataTypeName DataTypeName { get; init; }
@@ -50,17 +70,21 @@ readonly record struct PgType
     public static PgType CreateArray(PgType elementType, Oid? oid = null)
         => new(new PgTypeData.Array(elementType), elementType.DataTypeName.ToArrayName(), oid);
 
+    internal static PgType CreateArray(PgType elementType, DataTypeName dataTypeName, Oid? oid = null)
+        => new(new PgTypeData.Array(elementType), dataTypeName, oid);
+
     public static PgType CreateRange(PgType elementType, DataTypeName dataTypeName, Oid? oid = null)
         => new(new PgTypeData.Range(elementType), dataTypeName, oid);
 
     public static PgType CreateMultirange(PgType rangeType, DataTypeName dataTypeName, Oid? oid = null)
         => new(new PgTypeData.Multirange(rangeType), dataTypeName, oid);
 
-    public static PgType CreateDomain(PgType underlyingType, DataTypeName dataTypeName, Oid? oid = null)
-        => new(new PgTypeData.Domain(underlyingType), dataTypeName, oid);
+    public static PgType CreateDomain(PgType underlyingType, DataTypeName dataTypeName, Oid? oid = null,
+        bool isNotNull = false)
+        => new(new PgTypeData.Domain(underlyingType, isNotNull), dataTypeName, oid);
 
-    public static PgType CreateComposite(ImmutableArray<PgCompositeFieldType> fieldTypes, DataTypeName dataTypeName, Oid? oid = null)
-        => new(new PgTypeData.Composite(fieldTypes), dataTypeName, oid);
+    public static PgType CreateComposite(ImmutableArray<PgCompositeFieldType> fields, DataTypeName dataTypeName, Oid? oid = null)
+        => new(new PgTypeData.Composite(fields), dataTypeName, oid);
 }
 
 enum PgTypeKind

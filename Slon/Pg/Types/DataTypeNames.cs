@@ -7,6 +7,22 @@ namespace Slon.Pg.Types;
 /// </summary>
 static class DataTypeNames
 {
+    public static bool IsWellKnownUnqualifiedName(ReadOnlySpan<char> name) => name switch
+    {
+        "aclitem" or "bit" or "bool" or "box" or "bpchar" or "bytea" or "char" or "cid" or
+        "cidr" or "circle" or "date" or "float4" or "float8" or "gtsvector" or "inet" or
+        "int2" or "int4" or "int8" or "interval" or "json" or "jsonb" or "jsonpath" or
+        "line" or "lseg" or "macaddr" or "macaddr8" or "money" or "name" or "numeric" or
+        "oid" or "path" or "pg_brin_bloom_summary" or "pg_brin_minmax_multi_summary" or
+        "pg_dependencies" or "pg_lsn" or "pg_mcv_list" or "pg_ndistinct" or "pg_node_tree" or
+        "pg_snapshot" or "point" or "polygon" or "refcursor" or "regclass" or "regcollation" or
+        "regconfig" or "regdictionary" or "regnamespace" or "regoper" or "regoperator" or
+        "regproc" or "regprocedure" or "regrole" or "regtype" or "text" or "tid" or "time" or
+        "timestamp" or "timestamptz" or "timetz" or "tsquery" or "tsvector" or "txid_snapshot" or
+        "uuid" or "varbit" or "varchar" or "xid" or "xid8" or "xml" => true,
+        _ => false
+    };
+
     // Note: The names are fully qualified in source so the strings are constants and instances will be interned after the first call.
     // Uses an internal constructor bypassing the public DataTypeName constructor validation, as we don't want to store all these names on
     // fields either.
