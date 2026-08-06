@@ -29,7 +29,7 @@ public class ExclusiveAccessFlowTests
     public async Task Scope_RoundTrip_RunsCommandOnInnerPipeline()
     {
         var protocol = await PgTestPool.GetProtocolAsync();
-        var scope = protocol.BeginExclusiveScope(async: true);
+        var scope = protocol.QueueExclusiveScope(async: true);
         await scope.HandoffReady;   // acquired exclusive access; the flow owns the wire
 
         var cmd = scope.Queue(new CommandFlow(async: true, Command.Create("select 1")));
@@ -42,7 +42,7 @@ public class ExclusiveAccessFlowTests
     public async Task Scope_MultipleCommands_RunSequentially()
     {
         var protocol = await PgTestPool.GetProtocolAsync();
-        var scope = protocol.BeginExclusiveScope(async: true);
+        var scope = protocol.QueueExclusiveScope(async: true);
         await scope.HandoffReady;
 
         for (int i = 0; i < 5; i++)
@@ -57,7 +57,7 @@ public class ExclusiveAccessFlowTests
         var protocol = await PgTestPool.GetProtocolAsync();
         for (int i = 0; i < 3; i++)
         {
-            var scope = protocol.BeginExclusiveScope(async: true);
+            var scope = protocol.QueueExclusiveScope(async: true);
             await scope.HandoffReady;
             await DrainAsync(scope.Queue(new CommandFlow(async: true, Command.Create("select 1"))));
             await scope.CompleteScopeAsync();
@@ -72,7 +72,7 @@ public class ExclusiveAccessFlowTests
         var tempTable = "slon_reset_" + suffix;
         var channel = "slon_reset_" + suffix;
 
-        var first = protocol.BeginExclusiveScope(async: true);
+        var first = protocol.QueueExclusiveScope(async: true);
         await first.HandoffReady;
         try
         {
@@ -85,7 +85,7 @@ public class ExclusiveAccessFlowTests
             await first.CompleteScopeAsync();
         }
 
-        var second = protocol.BeginExclusiveScope(async: true);
+        var second = protocol.QueueExclusiveScope(async: true);
         await second.HandoffReady;
         try
         {
@@ -124,13 +124,13 @@ public class ExclusiveAccessFlowTests
         var table = "slon_preserved_" + Guid.NewGuid().ToString("N");
         try
         {
-            var first = protocol.BeginExclusiveScope(async: true);
+            var first = protocol.QueueExclusiveScope(async: true);
             await first.HandoffReady;
             await DrainAsync(first.Queue(new CommandFlow(async: true, Command.Create(
                 $"CREATE TEMP TABLE {table}(value integer)"))));
             await first.CompleteScopeAsync();
 
-            var second = protocol.BeginExclusiveScope(async: true);
+            var second = protocol.QueueExclusiveScope(async: true);
             await second.HandoffReady;
             await DrainAsync(second.Queue(new CommandFlow(async: true, Command.Create(
                 $"INSERT INTO {table} VALUES (1)"))));
@@ -148,7 +148,7 @@ public class ExclusiveAccessFlowTests
     public async Task Scope_Release_WithOpenTransaction_FailsAndRecoversWire()
     {
         var protocol = await PgTestPool.GetProtocolAsync();
-        var scope = protocol.BeginExclusiveScope(async: true);
+        var scope = protocol.QueueExclusiveScope(async: true);
         await scope.HandoffReady;
 
         await DrainAsync(scope.Queue(new CommandFlow(async: true, Command.Create("BEGIN"))));
@@ -158,7 +158,7 @@ public class ExclusiveAccessFlowTests
         StringAssert.Contains(exception.Message, "must be committed or rolled back");
         Assert.AreEqual(TransactionStatus.Idle, protocol.TransactionStatus);
 
-        var next = protocol.BeginExclusiveScope(async: true);
+        var next = protocol.QueueExclusiveScope(async: true);
         await next.HandoffReady;
         await DrainAsync(next.Queue(new CommandFlow(async: true, Command.Create("select 1"))));
         await next.CompleteScopeAsync();
@@ -179,13 +179,13 @@ public class ExclusiveAccessFlowTests
         });
         try
         {
-            var scope = protocol.BeginExclusiveScope(async: true);
+            var scope = protocol.QueueExclusiveScope(async: true);
             await scope.HandoffReady.WaitAsync(TimeSpan.FromSeconds(5));
             await DrainAsync(scope.Queue(new CommandFlow(async: true, Command.Create("BEGIN"))));
             await Assert.ThrowsExactlyAsync<InvalidOperationException>(
                 async () => await scope.CompleteScopeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(5)));
 
-            var next = protocol.BeginExclusiveScope(async: true);
+            var next = protocol.QueueExclusiveScope(async: true);
             await next.HandoffReady.WaitAsync(TimeSpan.FromSeconds(5));
             await DrainAsync(next.Queue(new CommandFlow(async: true, Command.Create("select 1"))));
             await next.CompleteScopeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(5));
@@ -209,7 +209,7 @@ public class ExclusiveAccessFlowTests
         var protocol = await PgTestPool.NewIsolatedAsync(o => o.HeartbeatInterval = TimeSpan.FromMilliseconds(50));
         try
         {
-            var scope = protocol.BeginExclusiveScope(async: true);
+            var scope = protocol.QueueExclusiveScope(async: true);
             await scope.HandoffReady;
 
             await DrainAsync(scope.Queue(new CommandFlow(async: true, Command.Create("select 1"))));
@@ -277,7 +277,7 @@ public class ExclusiveAccessFlowTests
         // Input-caused SQL error, scope stays usable (resyncs to RFQ), so use the shared pool.
         var protocol = await PgTestPool.GetProtocolAsync();
         {
-            var scope = protocol.BeginExclusiveScope(async: true);
+            var scope = protocol.QueueExclusiveScope(async: true);
             await scope.HandoffReady;
 
             // A subflow producing a backend SQL error (its own command, its own Sync/RFQ - a separate
@@ -313,7 +313,7 @@ public class ExclusiveAccessFlowTests
     public async Task PipelinedSubflows_InScope_InnerSourceEscalatesAndPipelines()
     {
         var protocol = await PgTestPool.GetProtocolAsync();
-        var scope = protocol.BeginExclusiveScope(async: true);
+        var scope = protocol.QueueExclusiveScope(async: true);
         await scope.HandoffReady;
 
         const int batch = 8;
@@ -343,7 +343,7 @@ public class ExclusiveAccessFlowTests
 
         async Task Cycle()
         {
-            var scope = protocol.BeginExclusiveScope(async: true);
+            var scope = protocol.QueueExclusiveScope(async: true);
             await scope.HandoffReady;
             await DrainAsync(scope.Queue(new CommandFlow(async: true, Command.Create("select 1"))));
             await scope.CompleteScopeAsync();
@@ -392,7 +392,7 @@ public class ExclusiveAccessFlowTests
         var protocol = PgClientProtocol.Create(protocolOptions);
         await protocol.StartAsync(options, transport);
 
-        var scope = protocol.BeginExclusiveScope(async: true);
+        var scope = protocol.QueueExclusiveScope(async: true);
         try
         {
             await scope.HandoffReady.WaitAsync(TimeSpan.FromSeconds(10));
@@ -525,7 +525,7 @@ public class ExclusiveAccessFlowTests
         try
         {
             await using var blocker = await PgAdvisoryLock.AcquireAsync();
-            var scope = protocol.BeginExclusiveScope(async: true);
+            var scope = protocol.QueueExclusiveScope(async: true);
             await scope.HandoffReady;
             var sub = scope.Queue(new CommandFlow(async: true, blocker.WaitCommand));
 

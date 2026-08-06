@@ -521,7 +521,9 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
     // shared read/write pipes carry the scope's token, so a scope-only abort breaks a subflow parked on
     // a wire read/write while the pooled protocol survives. The shells are created once here alongside the
     // flyweight and reused across scopes.
-    internal ExclusiveAccessFlow BeginExclusiveScope(bool async)
+    // Low-level queue half used by handoff/race tests. Ordinary callers use the acquired-scope
+    // methods below so the queue/ownership split does not leak through their control flow.
+    internal ExclusiveAccessFlow QueueExclusiveScope(bool async)
     {
         ExclusiveAccessFlow flow;
         PgClientFlowSource.EnqueueResult enqueue = default;
@@ -554,6 +556,21 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         if (_scoringEnabled && control.StallsPipeline)
             Interlocked.Increment(ref _pipelineStalls);
         return flow;
+    }
+
+    internal ExclusiveAccessFlow BeginExclusiveScope()
+    {
+        var scope = QueueExclusiveScope(async: false);
+        scope.WaitForHandoffAsync(CancellationToken.None).GetAwaiter().GetResult();
+        return scope;
+    }
+
+    internal async ValueTask<ExclusiveAccessFlow> BeginExclusiveScopeAsync(
+        CancellationToken cancellationToken = default)
+    {
+        var scope = QueueExclusiveScope(async: true);
+        await scope.WaitForHandoffAsync(cancellationToken).ConfigureAwait(false);
+        return scope;
     }
 
     // Scope-only abort: trips the active scope's CloseSignal, breaking any subflow parked on a wire

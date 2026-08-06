@@ -175,14 +175,12 @@ sealed class AdoConnectionProxy : IDisposable, IAsyncDisposable
     // thread; an async acquire is executor-driven. From here every command on this proxy routes as a subflow.
     public void AcquireExclusiveScope()
     {
-        _exclusiveFlow = _pgConnection.Protocol.BeginExclusiveScope(async: false);
-        _exclusiveFlow.BeginScopeAsync(CancellationToken.None).GetAwaiter().GetResult();
+        _exclusiveFlow = _pgConnection.Protocol.BeginExclusiveScope();
     }
 
     public async ValueTask AcquireExclusiveScopeAsync(CancellationToken cancellationToken = default)
     {
-        _exclusiveFlow = _pgConnection.Protocol.BeginExclusiveScope(async: true);
-        await _exclusiveFlow.BeginScopeAsync(cancellationToken).ConfigureAwait(false);
+        _exclusiveFlow = await _pgConnection.Protocol.BeginExclusiveScopeAsync(cancellationToken).ConfigureAwait(false);
     }
 
     public void EndExclusiveScope()

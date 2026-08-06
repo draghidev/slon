@@ -34,7 +34,7 @@ public class ExclusiveAccessFlowStressTests
 
     static async Task RunScopeAsync(PgClientProtocol protocol)
     {
-        var scope = protocol.BeginExclusiveScope(async: true);
+        var scope = protocol.QueueExclusiveScope(async: true);
         await scope.HandoffReady;
         await DrainAsync(scope.Queue(new CommandFlow(async: true, Command.Create("select 1"))));
         await scope.CompleteScopeAsync();
@@ -42,7 +42,7 @@ public class ExclusiveAccessFlowStressTests
 
     static async Task RunManyCommandsScopeAsync(PgClientProtocol protocol)
     {
-        var scope = protocol.BeginExclusiveScope(async: true);
+        var scope = protocol.QueueExclusiveScope(async: true);
         await scope.HandoffReady;
         for (int k = 0; k < 8; k++)
             await DrainAsync(scope.Queue(new CommandFlow(async: true, Command.Create("select 1"))));
@@ -51,7 +51,7 @@ public class ExclusiveAccessFlowStressTests
 
     static async Task RunSyncSubflowScopeAsync(PgClientProtocol protocol)
     {
-        var scope = protocol.BeginExclusiveScope(async: true);
+        var scope = protocol.QueueExclusiveScope(async: true);
         await scope.HandoffReady;
         var cmd = scope.Queue(new CommandFlow(async: false, Command.Create("select 1")));
         var e = cmd.GetEnumerator();

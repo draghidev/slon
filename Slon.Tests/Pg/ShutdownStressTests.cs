@@ -150,7 +150,7 @@ public class ShutdownStressTests
             await protocol.StartAsync(options, new ReplayTransport(handshake));
             await RunIterationAsync(i, async () =>
             {
-                var a = protocol.BeginExclusiveScope(async: true);
+                var a = protocol.QueueExclusiveScope(async: true);
                 try
                 {
                     await a.HandoffReady.WaitAsync(Cap);
@@ -164,7 +164,7 @@ public class ShutdownStressTests
                         $"protocol: draining={protocol.IsDraining} completed={protocol.IsCompleted}]\n" +
                         $"{ProtocolDiag.Gauges(protocol)}\nsource: {ProtocolDiag.SourceState(protocol)}");
                 }
-                var b = protocol.BeginExclusiveScope(async: true);
+                var b = protocol.QueueExclusiveScope(async: true);
                 var bWait = b.HandoffReady;
 
                 if (i % 7 != 0)

@@ -132,6 +132,44 @@ public class FlushBatchingTests
     }
 
     [TestMethod]
+    public async Task ExclusiveScopeBurst_CoalescesOnNestedPipeline()
+    {
+        var (p, t, scheduler) = await CreateAsync();
+        try
+        {
+            var scope = p.QueueExclusiveScope(async: true);
+            await scope.HandoffReady;
+
+            // Establish the exact encoded size on this same nested pipeline. The command remains
+            // parked on its response, which also proves successors are being pipelined behind it.
+            var beforeWarm = t.Counter.FlushedBytes;
+            _ = scope.Queue(Cmd());
+            await WaitForBytes(t, beforeWarm + 1);
+            var perCmd = t.Counter.FlushedBytes - beforeWarm;
+
+            var baseBytes = t.Counter.FlushedBytes;
+            var baseFlush = t.Counter.FlushCount;
+            await scheduler.PauseAsync();
+            try
+            {
+                for (var i = 0; i < N; i++)
+                    _ = scope.Queue(Cmd());
+            }
+            finally { scheduler.Resume(); }
+
+            await WaitForBytes(t, baseBytes + N * perCmd);
+            var flushes = t.Counter.FlushCount - baseFlush;
+            Assert.AreEqual(1, flushes,
+                $"a deterministically co-queued nested burst of {N} sub-threshold commands produced {flushes} wire segments");
+        }
+        finally
+        {
+            scheduler.Resume();
+            await p.DisposeAsync();
+        }
+    }
+
+    [TestMethod]
     public async Task NonPipelinedSuccessor_FlushesPipelinedPredecessor()
     {
         var (p, t, scheduler) = await CreateAsync();
@@ -140,7 +178,7 @@ public class FlushBatchingTests
             var baseFlush = t.Counter.FlushCount;
             await scheduler.PauseAsync();
             Assert.IsTrue(p.TryQueue(Cmd()));
-            _ = p.BeginExclusiveScope(async: true);
+            _ = p.QueueExclusiveScope(async: true);
 
             scheduler.Resume();
             await WaitForBytes(t, 1);

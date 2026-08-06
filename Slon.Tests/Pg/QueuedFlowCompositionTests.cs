@@ -53,7 +53,7 @@ public class QueuedFlowCompositionTests
     public async Task ExclusiveScope_QueueThenDrain()
     {
         var protocol = await PgTestPool.GetProtocolAsync();
-        var scope = protocol.BeginExclusiveScope(async: true);
+        var scope = protocol.QueueExclusiveScope(async: true);
         await scope.HandoffReady;
         var flows = new CommandFlow[8];
         for (var i = 0; i < flows.Length; i++)
@@ -69,7 +69,7 @@ public class QueuedFlowCompositionTests
         await using var protocol = await PgTestPool.NewIsolatedAsync();
 
         var predecessor = protocol.Queue(new CommandFlow(async: false, Command.Create("select 1")));
-        var scope = protocol.BeginExclusiveScope(async: true);
+        var scope = protocol.QueueExclusiveScope(async: true);
         var successor = protocol.Queue(new CommandFlow(async: false, Command.Create("select 2")));
 
         await DrainExpecting(predecessor, async: false, expectedResults: 1);

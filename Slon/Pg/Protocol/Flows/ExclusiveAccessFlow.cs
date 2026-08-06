@@ -80,7 +80,7 @@ sealed class ExclusiveAccessFlow : PgClientFlow
 
     /// Acquires exclusive access. Cancellation before handoff detaches the caller; the issued flow still
     /// takes its turn and retires. Cancellation after handoff does not revoke ownership.
-    public async Task BeginScopeAsync(CancellationToken cancellationToken)
+    internal async Task WaitForHandoffAsync(CancellationToken cancellationToken)
     {
         if (!cancellationToken.CanBeCanceled)
         {

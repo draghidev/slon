@@ -117,7 +117,7 @@ public class ProtocolCompletionTests
         await protocol.CompleteAsync();
 
         Assert.ThrowsExactly<InvalidOperationException>(
-            () => protocol.BeginExclusiveScope(async: true));
+            () => protocol.QueueExclusiveScope(async: true));
     }
 
     // Forceful DisposeAsync after a normal flow finishes. Same final state as CompleteAsync

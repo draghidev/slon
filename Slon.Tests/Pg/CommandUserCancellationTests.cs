@@ -796,7 +796,7 @@ public class CommandUserCancellationTests
         var options = PgTestPool.NewOptions();
         var sender = PgTestPool.CreateCancelSender(options);
         await using var protocol = await PgTestPool.NewIsolatedAsync(o => o.CancelSender = sender);
-        var scope = protocol.BeginExclusiveScope(async: true);
+        var scope = protocol.QueueExclusiveScope(async: true);
         await scope.HandoffReady;
 
         using var cts = new CancellationTokenSource();

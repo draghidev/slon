@@ -6,7 +6,7 @@ namespace Slon.Tests.Pg;
 
 // Multi-waiter exclusive scopes: N BeginExclusiveScope waiters share one ExclusiveScopeState, serialized
 // by the outer pipeline's ordering (the fair hand-out). Covers concurrent begins, fair FIFO turn order,
-// consumer-detach (canceled BeginScopeAsync), done-before-executed fast retire, and the pre-turn cascade
+// consumer-detach (canceled WaitForHandoffAsync), done-before-executed fast retire, and the pre-turn cascade
 // path (a waiter torn down by a protocol stop before it ever won its turn).
 [TestClass]
 public class ExclusiveScopeMultiWaiterTests
@@ -30,11 +30,11 @@ public class ExclusiveScopeMultiWaiterTests
         var protocol = await ConnectAsync();
         try
         {
-            var a = protocol.BeginExclusiveScope(async: true);
+            var a = protocol.QueueExclusiveScope(async: true);
             await a.HandoffReady;
 
             // B begins while A still holds the wire - a second waiter on the outer pipeline.
-            var b = protocol.BeginExclusiveScope(async: true);
+            var b = protocol.QueueExclusiveScope(async: true);
             Assert.IsFalse(b.HandoffReady.IsCompleted, "B must not acquire while A holds the scope");
 
             await DrainAsync(a.Queue(new CommandFlow(async: true, Command.Create("select 1"))));
@@ -51,7 +51,7 @@ public class ExclusiveScopeMultiWaiterTests
         }
     }
 
-    // Canceling a waiter's BeginScopeAsync before its turn DETACHES the consumer: the flow still takes its
+    // Canceling a waiter's WaitForHandoffAsync before its turn DETACHES the consumer: the flow still takes its
     // turn (it is issued) and retires fast without holding the wire, so a later waiter runs cleanly and the
     // protocol survives.
     [TestMethod]
@@ -60,18 +60,18 @@ public class ExclusiveScopeMultiWaiterTests
         var protocol = await ConnectAsync();
         try
         {
-            var a = protocol.BeginExclusiveScope(async: true);
+            var a = protocol.QueueExclusiveScope(async: true);
             await a.HandoffReady;
 
             // B waits behind A; cancel B before A releases, so B never wins its turn with a consumer.
-            var b = protocol.BeginExclusiveScope(async: true);
+            var b = protocol.QueueExclusiveScope(async: true);
             using var cts = new CancellationTokenSource();
-            var bWait = b.BeginScopeAsync(cts.Token);
+            var bWait = b.WaitForHandoffAsync(cts.Token);
             cts.Cancel();
             await Assert.ThrowsExactlyAsync<OperationCanceledException>(async () => await bWait);
 
             // C waits behind B. Releasing A lets B retire fast (consumer-gone) and C acquire.
-            var c = protocol.BeginExclusiveScope(async: true);
+            var c = protocol.QueueExclusiveScope(async: true);
             await DrainAsync(a.Queue(new CommandFlow(async: true, Command.Create("select 1"))));
             await a.CompleteScopeAsync();
 
@@ -87,7 +87,7 @@ public class ExclusiveScopeMultiWaiterTests
         }
     }
 
-    // Canceling a waiter's BeginScopeAsync AFTER it won the handoff is too late: it resolves normally and
+    // Canceling a waiter's WaitForHandoffAsync AFTER it won the handoff is too late: it resolves normally and
     // the caller owns the scope.
     [TestMethod]
     public async Task CancelBeginScope_AfterHandoff_IsTooLate()
@@ -95,9 +95,9 @@ public class ExclusiveScopeMultiWaiterTests
         var protocol = await ConnectAsync();
         try
         {
-            var a = protocol.BeginExclusiveScope(async: true);
+            var a = protocol.QueueExclusiveScope(async: true);
             using var cts = new CancellationTokenSource();
-            await a.BeginScopeAsync(cts.Token); // wins immediately (no contention)
+            await a.WaitForHandoffAsync(cts.Token); // wins immediately (no contention)
             cts.Cancel(); // too late
             await DrainAsync(a.Queue(new CommandFlow(async: true, Command.Create("select 1"))));
             await a.CompleteScopeAsync();
@@ -117,10 +117,10 @@ public class ExclusiveScopeMultiWaiterTests
     public async Task ProtocolStop_WhileWaiterPreTurn_ReleasesCleanly()
     {
         var protocol = await ConnectAsync();
-        var a = protocol.BeginExclusiveScope(async: true);
+        var a = protocol.QueueExclusiveScope(async: true);
         await a.HandoffReady;
         // B waits behind A, never activated.
-        var b = protocol.BeginExclusiveScope(async: true);
+        var b = protocol.QueueExclusiveScope(async: true);
         var bWait = b.HandoffReady;
 
         // Run A to a parked-idle state, then stop the protocol without ending either scope.

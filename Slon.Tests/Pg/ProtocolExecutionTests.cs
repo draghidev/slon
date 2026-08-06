@@ -43,7 +43,7 @@ public class ProtocolExecutionTests
         Assert.AreEqual(TransactionStatus.Idle, p.TransactionStatus, "after autocommit select (outer Control)");
 
         // Inner Control: a transaction held exclusively, BEGIN/COMMIT as subflows on the inner pipeline.
-        var scope = p.BeginExclusiveScope(async: true);
+        var scope = p.QueueExclusiveScope(async: true);
         await scope.HandoffReady;
         try
         {
