@@ -3,23 +3,25 @@ namespace Slon.Runtime;
 readonly struct Deadline
 {
     readonly TimeSpan _timespan;
-    readonly long _startTicksMs;
+    readonly TimeProvider _timeProvider;
+    readonly long _startTimestamp;
 
     // Default(TimeSpan) is the API sentinel for no deadline; an explicit negative value other
     // than Timeout.InfiniteTimeSpan remains invalid.
-    public Deadline(TimeSpan value)
+    public Deadline(TimeSpan value, TimeProvider? timeProvider = null)
     {
         if (value < Timeout.InfiniteTimeSpan)
             throw new ArgumentOutOfRangeException(nameof(value), "Value must be -1 or non-negative.");
 
         _timespan = value == default ? Timeout.InfiniteTimeSpan : value;
-        _startTicksMs = _timespan == Timeout.InfiniteTimeSpan ? 0 : Environment.TickCount64;
+        _timeProvider = timeProvider ?? TimeProvider.System;
+        _startTimestamp = _timespan == Timeout.InfiniteTimeSpan ? 0 : _timeProvider.GetTimestamp();
     }
 
     public TimeSpan TotalDuration => _timespan;
 
     public bool IsElapsed
-        => _timespan != Timeout.InfiniteTimeSpan && Environment.TickCount64 - _startTicksMs >= _timespan.TotalMilliseconds;
+        => _timespan != Timeout.InfiniteTimeSpan && _timeProvider.GetElapsedTime(_startTimestamp) >= _timespan;
 
     public TimeSpan GetRemaining()
     {
@@ -32,14 +34,13 @@ readonly struct Deadline
     {
         if (_timespan != Timeout.InfiniteTimeSpan)
         {
-            var elapsed = Environment.TickCount64 - _startTicksMs;
-            var totalMilliseconds = _timespan.TotalMilliseconds;
-            if (elapsed >= totalMilliseconds)
+            var elapsed = _timeProvider.GetElapsedTime(_startTimestamp);
+            if (elapsed >= _timespan)
             {
                 remaining = TimeSpan.Zero;
                 return false;
             }
-            remaining = TimeSpan.FromMilliseconds(totalMilliseconds - elapsed);
+            remaining = _timespan - elapsed;
         }
         else
         {

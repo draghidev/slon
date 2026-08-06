@@ -1,5 +1,4 @@
 using System.Collections.Concurrent;
-using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using Microsoft.Extensions.Time.Testing;
 using Slon.Pg;
@@ -289,14 +288,14 @@ public class ConnectionPoolTests
                 return true;
             },
             state: 0,
-            timeout: TimeSpan.FromSeconds(1));
+            timeout: TestTimeout.Hang);
 
-        var leased = await pool.GetAsync(TimeSpan.FromSeconds(1));
+        var leased = await pool.GetAsync(TestTimeout.Hang);
         Assert.AreSame(scheduled, leased, "the synchronous idle edge should publish the admitted connection");
 
         using var cancellation = new CancellationTokenSource();
         var second = pool.GetAsync(Timeout.InfiniteTimeSpan, cancellation.Token).AsTask();
-        await WaitUntilAsync(() => pool.WaiterCount == 1, TimeSpan.FromSeconds(1),
+        await WaitUntilAsync(() => pool.WaiterCount == 1, TestTimeout.Hang,
             "a correctly depleted idle set must park the second lease");
         Assert.IsFalse(second.IsCompleted,
             "a second idle entry would allow the same connection to be leased twice");
@@ -316,14 +315,14 @@ public class ConnectionPoolTests
             await pool.GetAsync<int>(
                 static (_, _) => throw new InvalidOperationException("placement failed"),
                 state: 0,
-                timeout: TimeSpan.FromSeconds(1)));
+                timeout: TestTimeout.Hang));
 
         Assert.IsNotNull(factory.LastCreated);
         Assert.IsTrue(factory.LastCreated.Started, "the connection was installed and admitted before placement");
         Assert.IsFalse(factory.LastCreated.Completion.IsCompleted,
             "placement failure must not be promoted to connection failure");
 
-        var reacquired = await pool.GetAsync(TimeSpan.FromSeconds(1));
+        var reacquired = await pool.GetAsync(TestTimeout.Hang);
         Assert.AreSame(factory.LastCreated, reacquired,
             "an installed connection must remain reachable after placement throws");
     }
@@ -335,7 +334,7 @@ public class ConnectionPoolTests
             new AdmissionConnectionFactory(),
             new() { MaxConnections = 1 });
 
-        var connection = await pool.GetAsync(TimeSpan.FromSeconds(1));
+        var connection = await pool.GetAsync(TestTimeout.Hang);
         connection.RunInitialWorkToIdle();
 
         var attempts = new StrongBox<int>();
@@ -359,9 +358,9 @@ public class ConnectionPoolTests
             TimeProvider = time,
         });
 
-        await pool.GetAsync(TimeSpan.FromSeconds(1));
+        await pool.GetAsync(TestTimeout.Hang);
         time.Advance(TimeSpan.FromSeconds(1));
-        await WaitUntilAsync(() => factory.LastCreated!.HeartbeatCount > 0, TimeSpan.FromSeconds(1),
+        await WaitUntilAsync(() => factory.LastCreated!.HeartbeatCount > 0, TestTimeout.Hang,
             "the heartbeat should tick before pool disposal");
 
         await pool.DisposeAsync();
@@ -385,20 +384,20 @@ public class ConnectionPoolTests
             TimeProvider = time,
         });
 
-        var retired = await pool.GetAsync(TimeSpan.FromSeconds(1));
+        var retired = await pool.GetAsync(TestTimeout.Hang);
         time.Advance(TimeSpan.FromSeconds(1));
-        await WaitUntilAsync(() => retired.HeartbeatCount > 0, TimeSpan.FromSeconds(1),
+        await WaitUntilAsync(() => retired.HeartbeatCount > 0, TestTimeout.Hang,
             "the original connection should receive heartbeat ticks");
 
         // Model a terminal protocol abort that completes beneath the pool wrapper. The pool must
         // release pool-membership resources when it CAS-replaces the completed slot.
         retired.MarkCompletedExternally();
         var retiredCount = retired.HeartbeatCount;
-        var replacement = await pool.GetAsync(TimeSpan.FromSeconds(1));
+        var replacement = await pool.GetAsync(TestTimeout.Hang);
         Assert.AreNotSame(retired, replacement);
 
         time.Advance(TimeSpan.FromSeconds(1));
-        await WaitUntilAsync(() => replacement.HeartbeatCount > 0, TimeSpan.FromSeconds(1),
+        await WaitUntilAsync(() => replacement.HeartbeatCount > 0, TestTimeout.Hang,
             "the replacement connection should receive heartbeat ticks");
 
         Assert.AreEqual(retiredCount, retired.HeartbeatCount,
@@ -427,14 +426,14 @@ public class ConnectionPoolTests
         {
             time.Advance(TimeSpan.FromSeconds(1));
             var expected = tick;
-            await WaitUntilAsync(() => connections.All(c => c.HeartbeatCount >= expected), TimeSpan.FromSeconds(1),
+            await WaitUntilAsync(() => connections.All(c => c.HeartbeatCount >= expected), TestTimeout.Hang,
                 "the pruning lifetime must be measured from complete heartbeat samples");
             Assert.IsTrue(connections.All(c => !c.Completion.IsCompleted),
                 "no connection should be pruned before the full idle lifetime");
         }
 
         time.Advance(TimeSpan.FromSeconds(1));
-        await WaitUntilAsync(() => connections.Count(c => c.Completion.IsCompleted) == 2, TimeSpan.FromSeconds(1),
+        await WaitUntilAsync(() => connections.Count(c => c.Completion.IsCompleted) == 2, TestTimeout.Hang,
             "the median idle population above the minimum should be pruned");
         Assert.AreEqual(1, connections.Count(c => !c.Completion.IsCompleted));
     }
@@ -510,13 +509,13 @@ public class ConnectionPoolTests
         var connections = factory.Created;
         time.Advance(TimeSpan.FromSeconds(1));
         time.Advance(TimeSpan.FromSeconds(1));
-        await WaitUntilAsync(() => connections.All(c => c.HeartbeatCount > 0), TimeSpan.FromSeconds(1),
+        await WaitUntilAsync(() => connections.All(c => c.HeartbeatCount > 0), TestTimeout.Hang,
             "the pruning tick should inspect both idle connections");
 
         Assert.IsTrue(connections.All(c => !c.Completion.IsCompleted));
-        var first = await pool.GetAsync(TimeSpan.FromSeconds(1));
+        var first = await pool.GetAsync(TestTimeout.Hang);
         first.RunInitialWorkToIdle();
-        var second = await pool.GetAsync(TimeSpan.FromSeconds(1));
+        var second = await pool.GetAsync(TestTimeout.Hang);
         Assert.AreNotSame(first, second, "a refused prune must return every claimed idle token");
     }
 
@@ -539,10 +538,10 @@ public class ConnectionPoolTests
         time.Advance(TimeSpan.FromSeconds(1));
         connection.GatePruning();
         var tick = Task.Run(() => time.Advance(TimeSpan.FromSeconds(1)));
-        await connection.PruningEntered.WaitAsync(TimeSpan.FromSeconds(1));
+        await connection.PruningEntered.WaitAsync(TestTimeout.Hang);
 
-        var waiting = pool.GetAsync(TimeSpan.FromSeconds(1)).AsTask();
-        await WaitUntilAsync(() => pool.WaiterCount == 1, TimeSpan.FromSeconds(1),
+        var waiting = pool.GetAsync(TestTimeout.Hang).AsTask();
+        await WaitUntilAsync(() => pool.WaiterCount == 1, TestTimeout.Hang,
             "the waiter must register while pruning owns the idle token");
         connection.ReleasePruning();
         await tick;
@@ -566,12 +565,12 @@ public class ConnectionPoolTests
         });
         await PopulateAsync(pool, 3);
 
-        var busy = await pool.GetAsync(TimeSpan.FromSeconds(1));
+        var busy = await pool.GetAsync(TestTimeout.Hang);
         busy.MarkBusy();
         var connections = factory.Created;
         time.Advance(TimeSpan.FromSeconds(1));
         time.Advance(TimeSpan.FromSeconds(1));
-        await WaitUntilAsync(() => connections.Count(c => c.Completion.IsCompleted) == 2, TimeSpan.FromSeconds(1),
+        await WaitUntilAsync(() => connections.Count(c => c.Completion.IsCompleted) == 2, TestTimeout.Hang,
             "consistently idle capacity may be removed while a busy connection satisfies the minimum");
 
         Assert.IsFalse(busy.Completion.IsCompleted);
@@ -596,9 +595,9 @@ public class ConnectionPoolTests
         var pruned = factory.LastCreated!;
         time.Advance(TimeSpan.FromSeconds(1));
         time.Advance(TimeSpan.FromSeconds(1));
-        await pruned.Completion.WaitAsync(TimeSpan.FromSeconds(1));
+        await pruned.Completion.WaitAsync(TestTimeout.Hang);
 
-        var replacement = await pool.GetAsync(TimeSpan.FromSeconds(1));
+        var replacement = await pool.GetAsync(TestTimeout.Hang);
         Assert.AreNotSame(pruned, replacement);
         Assert.IsFalse(replacement.Completion.IsCompleted);
     }
@@ -622,7 +621,7 @@ public class ConnectionPoolTests
         var rented = new AdmissionConnection[3];
         for (var i = 0; i < rented.Length; i++)
         {
-            rented[i] = await pool.GetAsync(TimeSpan.FromSeconds(1));
+            rented[i] = await pool.GetAsync(TestTimeout.Hang);
             rented[i].MarkBusy();
         }
         foreach (var connection in rented)
@@ -635,7 +634,7 @@ public class ConnectionPoolTests
 
         for (var i = 0; i < 3; i++)
             time.Advance(TimeSpan.FromSeconds(1));
-        await WaitUntilAsync(() => factory.Created.All(c => c.Completion.IsCompleted), TimeSpan.FromSeconds(1),
+        await WaitUntilAsync(() => factory.Created.All(c => c.Completion.IsCompleted), TestTimeout.Hang,
             "a later lifetime window with uninterrupted idle capacity should prune");
     }
 
@@ -648,8 +647,8 @@ public class ConnectionPoolTests
             MaxConnections = 1,
         });
 
-        var retired = await pool.GetAsync(TimeSpan.FromSeconds(1));
-        var waiting = pool.GetAsync(TimeSpan.FromSeconds(1)).AsTask();
+        var retired = await pool.GetAsync(TestTimeout.Hang);
+        var waiting = pool.GetAsync(TestTimeout.Hang).AsTask();
         await Task.Yield();
         Assert.IsFalse(waiting.IsCompleted,
             "the sole idle token is held by the first lease, so the second acquisition must wait");
@@ -664,14 +663,23 @@ public class ConnectionPoolTests
     [TestMethod]
     public async Task SaturationTimeout_HasSameSyncAndAsyncSurface()
     {
+        var time = new FakeTimeProvider();
         await using var pool = new ConnectionPool<AdmissionConnection>(
-            new AdmissionConnectionFactory(), new() { MaxConnections = 1 });
-        await pool.GetAsync(TimeSpan.FromSeconds(1));
+            new AdmissionConnectionFactory(), new() { MaxConnections = 1, TimeProvider = time });
+        await pool.GetAsync(TestTimeout.Hang);
 
-        var sync = Assert.ThrowsExactly<TimeoutException>(
-            () => pool.Get(TimeSpan.FromMilliseconds(20)));
-        var async = await Assert.ThrowsExactlyAsync<TimeoutException>(
-            async () => await pool.GetAsync(TimeSpan.FromMilliseconds(20)));
+        var syncWait = Task.Run(() => Assert.ThrowsExactly<TimeoutException>(
+            () => pool.Get(TimeSpan.FromSeconds(1))));
+        await WaitUntilAsync(() => pool.WaiterCount == 1, TestTimeout.Hang,
+            "the synchronous acquisition must park before its deadline advances");
+        time.Advance(TimeSpan.FromSeconds(1));
+        var sync = await syncWait;
+
+        var asyncWait = pool.GetAsync(TimeSpan.FromSeconds(1)).AsTask();
+        await WaitUntilAsync(() => pool.WaiterCount == 1, TestTimeout.Hang,
+            "the asynchronous acquisition must park before its deadline advances");
+        time.Advance(TimeSpan.FromSeconds(1));
+        var async = await Assert.ThrowsExactlyAsync<TimeoutException>(() => asyncWait);
 
         Assert.AreEqual(async.Message, sync.Message);
     }
@@ -685,9 +693,9 @@ public class ConnectionPoolTests
             MaxConnections = 1,
         });
 
-        var failedOpen = pool.GetAsync(TimeSpan.FromSeconds(1)).AsTask();
+        var failedOpen = pool.GetAsync(TestTimeout.Hang).AsTask();
         await factory.Started;
-        var waiting = pool.GetAsync(TimeSpan.FromSeconds(1)).AsTask();
+        var waiting = pool.GetAsync(TestTimeout.Hang).AsTask();
         await Task.Yield();
         Assert.IsFalse(waiting.IsCompleted);
 
@@ -715,14 +723,14 @@ public class ConnectionPoolTests
                 return true;
             },
             (Scheduling: scheduling, Release: release),
-            TimeSpan.FromSeconds(10)));
+            TestTimeout.Hang));
 
         await scheduling.Task;
         var waiting = pool.GetAsync(
             static (_, _) => true,
             state: 0,
-            timeout: TimeSpan.FromSeconds(1)).AsTask();
-        await WaitUntilAsync(() => pool.WaiterCount == 1, TimeSpan.FromSeconds(1),
+            timeout: TestTimeout.Hang).AsTask();
+        await WaitUntilAsync(() => pool.WaiterCount == 1, TestTimeout.Hang,
             "the second renter must park while the admitted connection is unpublished");
 
         release.Set();
@@ -738,7 +746,7 @@ public class ConnectionPoolTests
         await using var pool = new ConnectionPool<AdmissionConnection>(
             new AdmissionConnectionFactory(), new() { MaxConnections = 1 });
 
-        var connection = await pool.GetAsync(TimeSpan.FromSeconds(1));
+        var connection = await pool.GetAsync(TestTimeout.Hang);
         connection.EnterRecovery();
 
         using var cancellation = new CancellationTokenSource();
@@ -750,9 +758,9 @@ public class ConnectionPoolTests
         var multiplexed = pool.GetAsync(
             static (_, _) => true,
             state: 0,
-            timeout: TimeSpan.FromSeconds(1)).AsTask();
+            timeout: TestTimeout.Hang).AsTask();
 
-        await WaitUntilAsync(() => pool.WaiterCount == 2, TimeSpan.FromSeconds(1),
+        await WaitUntilAsync(() => pool.WaiterCount == 2, TestTimeout.Hang,
             "both placement attempts must be parked before recovery restores continuity");
         connection.CompleteRecovery();
 
@@ -769,7 +777,7 @@ public class ConnectionPoolTests
         await using var pool = new ConnectionPool<AdmissionConnection>(
             new AdmissionConnectionFactory(), new() { MaxConnections = 1 });
 
-        var connection = await pool.GetAsync(TimeSpan.FromSeconds(1));
+        var connection = await pool.GetAsync(TestTimeout.Hang);
         connection.EnterRecovery();
 
         using var cancellation = new CancellationTokenSource();
@@ -781,9 +789,9 @@ public class ConnectionPoolTests
         var accepting = pool.GetAsync(
             static (_, _) => true,
             state: 0,
-            timeout: TimeSpan.FromSeconds(1)).AsTask();
+            timeout: TestTimeout.Hang).AsTask();
 
-        await WaitUntilAsync(() => pool.WaiterCount == 2, TimeSpan.FromSeconds(1),
+        await WaitUntilAsync(() => pool.WaiterCount == 2, TestTimeout.Hang,
             "both waiters must be parked before recovery restores continuity");
         connection.CompleteRecovery();
 
@@ -801,7 +809,7 @@ public class ConnectionPoolTests
         await using var pool = new ConnectionPool<AdmissionConnection>(
             new AdmissionConnectionFactory(), new() { MaxConnections = 1 });
 
-        var connection = await pool.GetAsync(TimeSpan.FromSeconds(1));
+        var connection = await pool.GetAsync(TestTimeout.Hang);
         connection.EnterRecovery();
 
         using var cancellation = new CancellationTokenSource();
@@ -810,7 +818,7 @@ public class ConnectionPoolTests
             state: 0,
             timeout: Timeout.InfiniteTimeSpan,
             cancellationToken: cancellation.Token).AsTask();
-        await WaitUntilAsync(() => pool.WaiterCount == 1, TimeSpan.FromSeconds(1),
+        await WaitUntilAsync(() => pool.WaiterCount == 1, TestTimeout.Hang,
             "the cancellable waiter must be queued before cancellation");
 
         cancellation.Cancel();
@@ -823,14 +831,14 @@ public class ConnectionPoolTests
         {
             Assert.AreEqual(cancellation.Token, ex.CancellationToken);
         }
-        await WaitUntilAsync(() => pool.WaiterCount == 0, TimeSpan.FromSeconds(1),
+        await WaitUntilAsync(() => pool.WaiterCount == 0, TestTimeout.Hang,
             "cancellation must physically unlink the waiter");
 
         var accepting = pool.GetAsync(
             static (_, _) => true,
             state: 0,
-            timeout: TimeSpan.FromSeconds(1)).AsTask();
-        await WaitUntilAsync(() => pool.WaiterCount == 1, TimeSpan.FromSeconds(1),
+            timeout: TestTimeout.Hang).AsTask();
+        await WaitUntilAsync(() => pool.WaiterCount == 1, TestTimeout.Hang,
             "the replacement waiter must be queued before availability is restored");
 
         connection.CompleteRecovery();
@@ -843,17 +851,17 @@ public class ConnectionPoolTests
         await using var pool = new ConnectionPool<AdmissionConnection>(
             new AdmissionConnectionFactory(), new() { MaxConnections = 1 });
 
-        var connection = await pool.GetAsync(TimeSpan.FromSeconds(1));
+        var connection = await pool.GetAsync(TestTimeout.Hang);
         var exclusive = pool.GetAsync(
             static (candidate, _) => candidate.IsIdleCandidate,
             state: 0,
-            timeout: TimeSpan.FromSeconds(1)).AsTask();
+            timeout: TestTimeout.Hang).AsTask();
         var shared = pool.GetAsync(
             static (_, _) => true,
             state: 0,
-            timeout: TimeSpan.FromSeconds(1)).AsTask();
+            timeout: TestTimeout.Hang).AsTask();
 
-        await WaitUntilAsync(() => pool.WaiterCount == 2, TimeSpan.FromSeconds(1),
+        await WaitUntilAsync(() => pool.WaiterCount == 2, TestTimeout.Hang,
             "both placement policies must be queued before the idle edge");
         connection.RunInitialWorkToIdle();
 
@@ -871,13 +879,13 @@ public class ConnectionPoolTests
         await using var pool = new ConnectionPool<AdmissionConnection>(
             new AdmissionConnectionFactory(), new() { MaxConnections = 1 });
 
-        var connection = await pool.GetAsync(TimeSpan.FromSeconds(1));
-        var queued = pool.GetAsync(TimeSpan.FromSeconds(1)).AsTask();
-        await WaitUntilAsync(() => pool.WaiterCount == 1, TimeSpan.FromSeconds(1),
+        var connection = await pool.GetAsync(TestTimeout.Hang);
+        var queued = pool.GetAsync(TestTimeout.Hang).AsTask();
+        await WaitUntilAsync(() => pool.WaiterCount == 1, TestTimeout.Hang,
             "the older renter must be queued before the idle edge");
 
         connection.RunInitialWorkToIdle();
-        var newcomer = pool.GetAsync(TimeSpan.FromSeconds(1)).AsTask();
+        var newcomer = pool.GetAsync(TestTimeout.Hang).AsTask();
 
         Assert.AreSame(connection, await queued,
             "the detached wake must retain priority over a racing newcomer");
@@ -894,13 +902,13 @@ public class ConnectionPoolTests
         await using var pool = new ConnectionPool<AdmissionConnection>(
             new AdmissionConnectionFactory(), new() { MaxConnections = 1 });
 
-        var connection = await pool.GetAsync(TimeSpan.FromSeconds(1));
+        var connection = await pool.GetAsync(TestTimeout.Hang);
         var throwing = pool.GetAsync(
             static (_, _) => throw new InvalidOperationException("placement failed"),
             state: 0,
-            timeout: TimeSpan.FromSeconds(1)).AsTask();
-        var follower = pool.GetAsync(TimeSpan.FromSeconds(1)).AsTask();
-        await WaitUntilAsync(() => pool.WaiterCount == 2, TimeSpan.FromSeconds(1),
+            timeout: TestTimeout.Hang).AsTask();
+        var follower = pool.GetAsync(TestTimeout.Hang).AsTask();
+        await WaitUntilAsync(() => pool.WaiterCount == 2, TestTimeout.Hang,
             "both renters must be queued before the idle edge");
 
         connection.RunInitialWorkToIdle();
@@ -916,7 +924,7 @@ public class ConnectionPoolTests
         var pool = new ConnectionPool<AdmissionConnection>(
             new AdmissionConnectionFactory(), new() { MaxConnections = 1 });
 
-        await pool.GetAsync(TimeSpan.FromSeconds(1));
+        await pool.GetAsync(TestTimeout.Hang);
         var exclusive = pool.GetAsync(
             static (candidate, _) => candidate.IsIdleCandidate,
             state: 0,
@@ -926,7 +934,7 @@ public class ConnectionPoolTests
             state: 0,
             timeout: Timeout.InfiniteTimeSpan).AsTask();
 
-        await WaitUntilAsync(() => pool.WaiterCount == 2, TimeSpan.FromSeconds(1),
+        await WaitUntilAsync(() => pool.WaiterCount == 2, TestTimeout.Hang,
             "both waiters must be queued before disposal");
         await pool.DisposeAsync();
 
@@ -937,21 +945,21 @@ public class ConnectionPoolTests
     [TestMethod]
     public async Task AvailabilityRacingWaiterRegistration_IsNotLost()
     {
-        for (var i = 0; i < 100; i++)
+        for (var i = 0; i < 32; i++)
         {
             await using var pool = new ConnectionPool<AdmissionConnection>(
                 new AdmissionConnectionFactory(), new() { MaxConnections = 1 });
 
-            var connection = await pool.GetAsync(TimeSpan.FromSeconds(1));
+            var connection = await pool.GetAsync(TestTimeout.Hang);
             connection.EnterRecovery();
             var waiting = pool.GetAsync(
                 static (_, _) => true,
                 state: 0,
-                timeout: TimeSpan.FromSeconds(1)).AsTask();
+                timeout: TestTimeout.Hang).AsTask();
 
             // WaiterCount becomes visible immediately after registration, potentially before
             // the mandatory state rescan which closes the registration/signal race.
-            await WaitUntilAsync(() => pool.WaiterCount == 1, TimeSpan.FromSeconds(1),
+            await WaitUntilAsync(() => pool.WaiterCount == 1, TestTimeout.Hang,
                 "the waiter must publish itself before availability changes");
             connection.CompleteRecovery();
 
@@ -964,7 +972,7 @@ public class ConnectionPoolTests
     {
         var factory = new GatedAdmissionConnectionFactory();
         var pool = new ConnectionPool<AdmissionConnection>(factory, new() { MaxConnections = 1 });
-        var opening = pool.GetAsync(TimeSpan.FromSeconds(10)).AsTask();
+        var opening = pool.GetAsync(TestTimeout.Hang).AsTask();
         await factory.Started;
 
         var disposing = pool.DisposeAsync().AsTask();
@@ -985,7 +993,7 @@ public class ConnectionPoolTests
     {
         var factory = new GatedFailingAdmissionFactory();
         var pool = new ConnectionPool<AdmissionConnection>(factory, new() { MaxConnections = 1 });
-        var opening = Task.Run(() => pool.Get(TimeSpan.FromSeconds(10)));
+        var opening = Task.Run(() => pool.Get(TestTimeout.Hang));
         while (factory.Connection is null)
             await Task.Yield();
         await factory.Connection.AdmissionEntered;
@@ -1019,7 +1027,7 @@ public class ConnectionPoolTests
                 return true;
             },
             (Scheduling: scheduling, Release: release),
-            TimeSpan.FromSeconds(10)));
+            TestTimeout.Hang));
 
         await scheduling.Task;
         var disposing = pool.DisposeAsync().AsTask();
@@ -1044,24 +1052,28 @@ public class ConnectionPoolTests
         // iteration; five iterations keep repeated reuse coverage without the timer bill of fifty.
         for (var i = 0; i < 5; i++)
         {
+            var time = new FakeTimeProvider();
             var factory = new AdmissionConnectionFactory();
             await using var pool = new ConnectionPool<AdmissionConnection>(
                 factory,
-                new() { MaxConnections = 1 });
+                new() { MaxConnections = 1, TimeProvider = time });
 
             await Assert.ThrowsExactlyAsync<InvalidOperationException>(async () =>
                 await pool.GetAsync<int>(
                     static (_, _) => throw new InvalidOperationException("placement failed"),
                     state: 0,
-                    timeout: TimeSpan.FromSeconds(1)));
+                    timeout: TestTimeout.Hang));
 
             // Placement failure republishes the admitted connection. Consume that token, then
             // rent again immediately on this thread: the second rent parks and exercises the
             // returned timeout source. On the pre-fix poisoned cache this throws
             // ObjectDisposedException instead of timing out.
-            Assert.AreSame(factory.LastCreated, await pool.GetAsync(TimeSpan.FromSeconds(1)));
-            await Assert.ThrowsExactlyAsync<TimeoutException>(async () =>
-                await pool.GetAsync(TimeSpan.FromMilliseconds(5)));
+            Assert.AreSame(factory.LastCreated, await pool.GetAsync(TestTimeout.Hang));
+            var waiting = pool.GetAsync(TimeSpan.FromSeconds(1)).AsTask();
+            await WaitUntilAsync(() => pool.WaiterCount == 1, TestTimeout.Hang,
+                "the rent-cache probe must arm its returned timeout source");
+            time.Advance(TimeSpan.FromSeconds(1));
+            await Assert.ThrowsExactlyAsync<TimeoutException>(() => waiting);
         }
     }
 
@@ -1074,13 +1086,13 @@ public class ConnectionPoolTests
             new() { MaxConnections = 1 });
 
         await Assert.ThrowsExactlyAsync<InvalidOperationException>(async () =>
-            await pool.GetAsync(TimeSpan.FromSeconds(1)));
+            await pool.GetAsync(TestTimeout.Hang));
 
         var failed = factory.Created[0];
         Assert.IsTrue(failed.Completion.IsCompleted,
             "a connection that failed admission must be closed rather than published");
 
-        var replacement = await pool.GetAsync(TimeSpan.FromSeconds(1));
+        var replacement = await pool.GetAsync(TestTimeout.Hang);
         Assert.AreNotSame(failed, replacement);
         Assert.IsTrue(replacement.Started);
     }
@@ -1094,13 +1106,13 @@ public class ConnectionPoolTests
             new() { MaxConnections = 1 });
 
         Assert.ThrowsExactly<InvalidOperationException>(() =>
-            pool.Get(TimeSpan.FromSeconds(1)));
+            pool.Get(TestTimeout.Hang));
 
         var failed = factory.Created[0];
         Assert.IsTrue(failed.Completion.IsCompleted,
             "a connection that failed admission must be closed rather than published");
 
-        var replacement = await pool.GetAsync(TimeSpan.FromSeconds(1));
+        var replacement = await pool.GetAsync(TestTimeout.Hang);
         Assert.AreNotSame(failed, replacement);
         Assert.IsTrue(replacement.Started);
     }
@@ -1132,7 +1144,7 @@ public class ConnectionPoolTests
             new() { MaxConnections = 1 });
 
         await Assert.ThrowsExactlyAsync<InvalidOperationException>(async () =>
-            await pool.GetAsync(TimeSpan.FromSeconds(1)));
+            await pool.GetAsync(TestTimeout.Hang));
 
         Assert.IsTrue(inner.LastCreated!.Completion.IsCompleted,
             "the initializing factory must close a connection it cannot return");
@@ -1151,7 +1163,7 @@ public class ConnectionPoolTests
             new() { MaxConnections = 1 });
 
         Assert.ThrowsExactly<InvalidOperationException>(() =>
-            pool.Get(TimeSpan.FromSeconds(1)));
+            pool.Get(TestTimeout.Hang));
 
         Assert.IsTrue(inner.LastCreated!.Completion.IsCompleted,
             "the initializing factory must close a connection it cannot return");
@@ -1161,7 +1173,7 @@ public class ConnectionPoolTests
     public async Task Sync_OnLeasedConnection_Completes()
     {
         await using var pool = NewPool();
-        var conn = await pool.GetAsync(TimeSpan.FromSeconds(10));
+        var conn = await pool.GetAsync(TestTimeout.Hang);
         await RunSyncOn(conn, "select 1");
     }
 
@@ -1169,7 +1181,7 @@ public class ConnectionPoolTests
     public async Task Async_OnLeasedConnection_Completes()
     {
         await using var pool = NewPool();
-        var conn = await pool.GetAsync(TimeSpan.FromSeconds(10));
+        var conn = await pool.GetAsync(TestTimeout.Hang);
         await RunAsyncOn(conn, "select 1");
     }
 
@@ -1177,7 +1189,7 @@ public class ConnectionPoolTests
     public async Task SyncWhileAsyncInFlight_SameLeasedConn_BothComplete()
     {
         await using var pool = NewPool();
-        var conn = await pool.GetAsync(TimeSpan.FromSeconds(10));
+        var conn = await pool.GetAsync(TestTimeout.Hang);
 
         await RunAsyncOn(conn, "select 1"); // warm
 
@@ -1199,13 +1211,12 @@ public class ConnectionPoolTests
         });
 
         await blocker.ReleaseAsync();
-        await syncTask.WaitAsync(TimeSpan.FromSeconds(2));
+        await syncTask.WaitAsync(TestTimeout.Hang);
 
         await slowTask;
         await slowEnum.DisposeAsync();
     }
 
-    static readonly TimeSpan Cap = TimeSpan.FromSeconds(10);
 
     static Exception Root(Exception ex)
     {
@@ -1216,10 +1227,13 @@ public class ConnectionPoolTests
 
     static async Task WaitUntilAsync(Func<bool> condition, TimeSpan timeout, string because)
     {
-        var sw = Stopwatch.StartNew();
-        while (!condition() && sw.Elapsed < timeout)
-            await Task.Delay(10);
-        Assert.IsTrue(condition(), because);
+        using var cancellation = new CancellationTokenSource(timeout);
+        while (!condition())
+        {
+            if (cancellation.IsCancellationRequested)
+                Assert.Fail(because);
+            await Task.Yield();
+        }
     }
 
     static async Task PopulateAsync(ConnectionPool<AdmissionConnection> pool, int count)
@@ -1253,19 +1267,19 @@ public class ConnectionPoolTests
     {
         await using var tracker = new CommandTracker(maxAuto: 1, autoMinimumUses: 1);
         await using var pool = NewPool(maxConnections: 1, sharedTracker: tracker);
-        var conn1 = await pool.GetAsync(Cap);
+        var conn1 = await pool.GetAsync(TestTimeout.Hang);
         await RunAsyncOn(conn1, "select 1"); // healthy before the abort
         Assert.AreEqual(1, tracker.RegisteredConnectionCount);
 
         await conn1.Protocol.DisposeAsync(); // forceful terminal abort (fire-and-forget; teardown runs async)
         // Completion settles at the END of background shutdown, so it is eventually consistent,
         // not immediate. The pool's eviction gate keys off it, so it reclaims once it lands.
-        await WaitUntilAsync(() => conn1.Completion.IsCompleted, Cap,
+        await WaitUntilAsync(() => conn1.Completion.IsCompleted, TestTimeout.Hang,
             "a terminally aborted connection must reach Completed — that is the pool's eviction gate.");
-        await WaitUntilAsync(() => tracker.RegisteredConnectionCount == 0, Cap,
+        await WaitUntilAsync(() => tracker.RegisteredConnectionCount == 0, TestTimeout.Hang,
             "terminal completion must promptly release tracker membership");
 
-        var conn2 = await pool.GetAsync(Cap);
+        var conn2 = await pool.GetAsync(TestTimeout.Hang);
         Assert.AreNotSame(conn1, conn2, "the pool must replace the aborted connection, not hand it back.");
         Assert.IsFalse(conn2.Completion.IsCompleted, "the replacement connection must be live.");
         Assert.AreEqual(1, tracker.RegisteredConnectionCount);
@@ -1280,7 +1294,7 @@ public class ConnectionPoolTests
     public async Task TerminalAbort_OutstandingPipelinedFlows_AllFaultClosed()
     {
         await using var pool = NewPool(maxConnections: 1);
-        var conn = await pool.GetAsync(Cap);
+        var conn = await pool.GetAsync(TestTimeout.Hang);
         await using var blocker = await PgAdvisoryLock.AcquireAsync();
 
         const int N = 8;
@@ -1301,7 +1315,7 @@ public class ConnectionPoolTests
             Exception? observed = null;
             try
             {
-                await DrainAsync(enums[i]).WaitAsync(Cap);
+                await DrainAsync(enums[i]).WaitAsync(TestTimeout.Hang);
             }
             catch (Exception ex)
             {

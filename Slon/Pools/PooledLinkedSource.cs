@@ -1,8 +1,17 @@
 namespace Slon.Pools;
 
-sealed class PooledLinkedSource(Action<PooledLinkedSource> returnAction) : CancellationTokenSource, IDisposable, IAsyncDisposable
+sealed class PooledLinkedSource : CancellationTokenSource, IDisposable, IAsyncDisposable
 {
+    readonly Action<PooledLinkedSource>? _returnAction;
     CancellationTokenRegistration _registration;
+
+    internal PooledLinkedSource(Action<PooledLinkedSource> returnAction)
+        => _returnAction = returnAction;
+
+    internal PooledLinkedSource(TimeSpan timeout, TimeProvider timeProvider)
+        : base(timeout, timeProvider)
+    {
+    }
 
     public CancellationToken LinkedToken => _registration.Token;
 
@@ -25,7 +34,7 @@ sealed class PooledLinkedSource(Action<PooledLinkedSource> returnAction) : Cance
     public new void Dispose()
     {
         _registration.Dispose();
-        returnAction(this);
+        ReturnOrDispose();
     }
 
     public ValueTask DisposeAsync()
@@ -34,7 +43,7 @@ sealed class PooledLinkedSource(Action<PooledLinkedSource> returnAction) : Cance
         if (task.IsCompleted)
         {
             task.GetAwaiter().GetResult();
-            returnAction(this);
+            ReturnOrDispose();
             return new();
         }
 
@@ -43,7 +52,15 @@ sealed class PooledLinkedSource(Action<PooledLinkedSource> returnAction) : Cance
         async ValueTask Core(ValueTask task)
         {
             await task.ConfigureAwait(false);
-            returnAction(this);
+            ReturnOrDispose();
         }
+    }
+
+    void ReturnOrDispose()
+    {
+        if (_returnAction is { } returnAction)
+            returnAction(this);
+        else
+            base.Dispose();
     }
 }

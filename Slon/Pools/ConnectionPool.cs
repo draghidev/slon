@@ -59,6 +59,7 @@ internal sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
     internal int WaiterCount => _waitQueue.Count;
 
     readonly Heartbeat _heartbeat;
+    readonly TimeProvider _timeProvider;
     readonly int _minConnections;
     readonly TimeSpan _pruningInterval;
     readonly int[]? _idleSamples;
@@ -108,7 +109,8 @@ internal sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
                     "The lifetime requires too many pruning samples.");
             _idleSamples = new int[(int)sampleCount];
         }
-        _heartbeat = new(options.HeartbeatInterval, options.TimeProvider);
+        _timeProvider = options.TimeProvider;
+        _heartbeat = new(options.HeartbeatInterval, _timeProvider);
         if (_idleSamples is not null)
             _heartbeat.Register(OnPoolHeartbeat);
         _context = new ConnectionPoolContext<T>(
@@ -251,8 +253,8 @@ internal sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
     async ValueTask<T> WaitForAvailabilityAsync<TState>(Func<ConnectionCandidate<T>, TState, bool>? schedule, TState state,
         TimeSpan timeout, CancellationToken cancellationToken)
     {
-        var deadline = new Deadline(timeout);
-        var timeoutSource = RentTimeoutSource(deadline.GetRemaining(), cancellationToken);
+        var deadline = new Deadline(timeout, _timeProvider);
+        var timeoutSource = RentTimeoutSource(deadline.GetRemaining(), _timeProvider, cancellationToken);
         ConnectionWaitQueue.Waiter? waiter = null;
         ConnectionWaitQueue.Wake wake = default;
         try
@@ -318,7 +320,8 @@ internal sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
 
     T WaitForAvailability<TState>(Func<ConnectionCandidate<T>, TState, bool>? schedule, TState state, TimeSpan timeout)
     {
-        var deadline = new Deadline(timeout);
+        var deadline = new Deadline(timeout, _timeProvider);
+        var timeoutSource = RentTimeoutSource(deadline.GetRemaining(), _timeProvider);
         ConnectionWaitQueue.Waiter? waiter = null;
         ConnectionWaitQueue.Wake wake = default;
         try
@@ -339,12 +342,13 @@ internal sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
                 waiter = null;
                 try
                 {
-                    wake = _waitQueue.Wait(settling, deadline.GetRemaining());
+                    wake = _waitQueue.Wait(settling, timeoutSource?.Token ?? CancellationToken.None);
                 }
-                catch (TimeoutException ex)
+                catch (OperationCanceledException ex) when (timeoutSource is not null &&
+                    IsCancellationTokenException(ex, timeoutSource.Token))
                 {
                     ThrowSourceExhausted(ex);
-                    throw;
+                    return default!;
                 }
 
                 if (TryAcquire(null, ref wake, schedule, state, CancellationToken.None,
@@ -366,6 +370,10 @@ internal sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
             if (wake.Remaining != 0)
                 _waitQueue.Pass(wake);
             throw;
+        }
+        finally
+        {
+            timeoutSource?.Dispose();
         }
     }
 
@@ -549,7 +557,7 @@ internal sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
         bool scheduled;
         try
         {
-            timeoutSource = RentTimeoutSource(timeout, cancellationToken);
+            timeoutSource = RentTimeoutSource(timeout, _timeProvider, cancellationToken);
 
             conn = await _factory.CreateAsync(_context, cancellationToken: timeoutSource?.Token ?? cancellationToken).ConfigureAwait(false);
 
@@ -989,23 +997,27 @@ internal sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
             }
         }
 
-        public Wake Wait(Waiter waiter, TimeSpan timeout)
+        public Wake Wait(Waiter waiter, CancellationToken cancellationToken)
         {
             try
             {
-                if (waiter.Wait(timeout))
+                try
                 {
+                    waiter.Wait(cancellationToken);
                     waiter.ThrowIfFailed();
                     return waiter.Wake;
+                }
+                catch (OperationCanceledException)
+                {
                 }
                 if (!TryRemove(waiter, out var wake))
                 {
                     waiter.ThrowIfFailed();
-                    throw new TimeoutException("The operation has timed out.");
+                    cancellationToken.ThrowIfCancellationRequested();
                 }
 
-                // Signaling detached the waiter just as its timed wait expired.
-                waiter.Wait(Timeout.InfiniteTimeSpan);
+                // Signaling detached the waiter just as cancellation fired.
+                waiter.Wait(CancellationToken.None);
                 waiter.ThrowIfFailed();
                 return wake;
             }
@@ -1075,7 +1087,7 @@ internal sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
             internal Wake Wake;
 
             public Task<Wake> Task => _completion!.Task;
-            internal bool Wait(TimeSpan timeout) => _signal!.Wait(timeout);
+            internal void Wait(CancellationToken cancellationToken) => _signal!.Wait(cancellationToken);
             internal void WaitForDetachedSignal() => _signal?.Wait();
             public void Dispose() => _signal?.Dispose();
             internal void ThrowIfFailed()
@@ -1119,22 +1131,29 @@ static class ConnectionPool
     internal static void ThrowSourceExhausted(Exception? inner = null)
         => throw new TimeoutException($"{nameof(ConnectionPool)} is exhausted, there are no empty spots or connections idle enough to take new work in time.", inner);
 
-    internal static PooledLinkedSource? RentTimeoutSource(TimeSpan timeout, CancellationToken cancellationToken = default)
+    internal static PooledLinkedSource? RentTimeoutSource(TimeSpan timeout, TimeProvider timeProvider,
+        CancellationToken cancellationToken = default)
     {
         if (timeout == default || timeout == Timeout.InfiniteTimeSpan)
             return null;
 
-        return Core(timeout, cancellationToken);
+        return Core(timeout, timeProvider, cancellationToken);
 
-        static PooledLinkedSource Core(TimeSpan timeout, CancellationToken cancellationToken)
+        static PooledLinkedSource Core(TimeSpan timeout, TimeProvider timeProvider,
+            CancellationToken cancellationToken)
         {
             if (timeout < TimeSpan.Zero)
                 throw new TimeoutException("The operation has timed out.");
 
-            var timeoutSource = TimeoutSource;
-            TimeoutSource = null;
-            timeoutSource ??= new PooledLinkedSource(ReturnTimeoutSource);
-            timeoutSource.CancelAfter(timeout);
+            PooledLinkedSource timeoutSource;
+            if (ReferenceEquals(timeProvider, TimeProvider.System))
+            {
+                timeoutSource = TimeoutSource ?? new PooledLinkedSource(ReturnTimeoutSource);
+                TimeoutSource = null;
+                timeoutSource.CancelAfter(timeout);
+            }
+            else
+                timeoutSource = new PooledLinkedSource(timeout, timeProvider);
             timeoutSource.Initialize(cancellationToken.UnsafeRegister(static state => ((CancellationTokenSource)state!).Cancel(), timeoutSource));
             return timeoutSource;
         }
