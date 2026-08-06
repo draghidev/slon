@@ -103,7 +103,7 @@ public class CommandUserCancellationTests
         await blocker.ReleaseAsync();
 
         var oce = await Assert.ThrowsExactlyAsync<OperationCanceledException>(
-            async () => await moveNextTask.WaitAsync(TimeSpan.FromSeconds(10)));
+            async () => await moveNextTask);
         Assert.AreEqual(cts.Token, oce.CancellationToken);
         await DisposeBoundedAsync(e);
 
@@ -135,10 +135,10 @@ public class CommandUserCancellationTests
         await blocker.WaitUntilContendedAsync(protocol.FlowControl.BackendProcessId);
         Assert.AreSame(flow, protocol.FlowControl.ActivatedFlow);
         cts.Cancel();
-        await cancelDelivered.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        await cancelDelivered.Task;
 
         var exception = await Assert.ThrowsExactlyAsync<OperationCanceledException>(
-            async () => await moveNext.WaitAsync(TimeSpan.FromSeconds(10)));
+            async () => await moveNext);
         Assert.AreEqual(cts.Token, exception.CancellationToken);
         await enumerator.DisposeAsync();
 
@@ -166,14 +166,14 @@ public class CommandUserCancellationTests
 
         await blocker.WaitUntilContendedAsync(protocol.FlowControl.BackendProcessId);
         var cancellation = flow.CancelAsync();
-        await senderEntered.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        await senderEntered.Task;
         Assert.IsFalse(cancellation.IsCompleted);
 
         delivery.SetResult(CancelRequestState.Sent);
-        await cancellation.WaitAsync(TimeSpan.FromSeconds(10));
+        await cancellation;
         await blocker.ReleaseAsync();
         await Assert.ThrowsExactlyAsync<OperationCanceledException>(
-            async () => await moveNext.WaitAsync(TimeSpan.FromSeconds(10)));
+            async () => await moveNext);
         await enumerator.DisposeAsync();
         await WaitUntilAsync(() => !protocol.HasPendingCancellation);
     }
@@ -191,12 +191,12 @@ public class CommandUserCancellationTests
         Assert.IsTrue(protocol.TryQueue(flow));
         var enumerator = flow.GetEnumerator();
 
-        Assert.IsTrue(await Task.Run(enumerator.MoveNext).WaitAsync(TimeSpan.FromSeconds(10)));
+        Assert.IsTrue(await Task.Run(enumerator.MoveNext));
         await blocker.WaitUntilContendedAsync(protocol.FlowControl.BackendProcessId);
 
-        await flow.CancelAsync().WaitAsync(TimeSpan.FromSeconds(10));
+        await flow.CancelAsync();
         await blocker.ReleaseAsync();
-        await flow.WaitForComplete().AsTask().WaitAsync(TimeSpan.FromSeconds(10));
+        await flow.WaitForComplete().AsTask();
         await WaitUntilAsync(() => !protocol.HasPendingCancellation);
         await PgTestPool.RunAsync(protocol, "select 1");
     }
@@ -223,13 +223,13 @@ public class CommandUserCancellationTests
 
         await blocker.WaitUntilContendedAsync(protocol.FlowControl.BackendProcessId);
         cts.Cancel();
-        await attemptsExhausted.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        await attemptsExhausted.Task;
         Assert.IsFalse(protocol.Completion.IsCompleted);
         Assert.IsTrue(protocol.HasPendingCancellation);
 
         await blocker.ReleaseAsync();
         var exception = await Assert.ThrowsExactlyAsync<OperationCanceledException>(
-            async () => await moveNext.WaitAsync(TimeSpan.FromSeconds(10)));
+            async () => await moveNext);
         Assert.AreEqual(cts.Token, exception.CancellationToken);
         await enumerator.DisposeAsync();
 
@@ -270,12 +270,12 @@ public class CommandUserCancellationTests
         await protocol.Heartbeat(TimeSpan.FromSeconds(40));
         Assert.AreEqual(0, Volatile.Read(ref attempts));
         await protocol.Heartbeat(TimeSpan.FromSeconds(60));
-        await attempted.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        await attempted.Task;
         Assert.AreEqual(1, Volatile.Read(ref attempts));
 
         await blocker.ReleaseAsync();
         await Assert.ThrowsExactlyAsync<OperationCanceledException>(
-            async () => await moveNext.WaitAsync(TimeSpan.FromSeconds(10)));
+            async () => await moveNext);
         await enumerator.DisposeAsync();
         await WaitUntilAsync(() => !protocol.HasPendingCancellation);
         await PgTestPool.RunAsync(protocol, "select 1");
@@ -310,12 +310,12 @@ public class CommandUserCancellationTests
         Assert.AreEqual(0, Volatile.Read(ref attempts));
 
         protocol.FlowControl.EnterCancellationReadFrontier(flow, flow.CancellationWindow);
-        await attempted.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        await attempted.Task;
         Assert.AreEqual(1, Volatile.Read(ref attempts));
 
         await blocker.ReleaseAsync();
         await Assert.ThrowsExactlyAsync<OperationCanceledException>(
-            async () => await moveNext.WaitAsync(TimeSpan.FromSeconds(10)));
+            async () => await moveNext);
         await enumerator.DisposeAsync();
         await WaitUntilAsync(() => !protocol.HasPendingCancellation);
         await PgTestPool.RunAsync(protocol, "select 1");
@@ -350,12 +350,12 @@ public class CommandUserCancellationTests
         Assert.IsTrue(protocol.FlowControl.IsAtCancellationReadFrontier(flow, flow.CancellationWindow));
 
         cts.Cancel();
-        await attempted.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        await attempted.Task;
         Assert.AreEqual(1, Volatile.Read(ref attempts));
 
         await blocker.ReleaseAsync();
         await Assert.ThrowsExactlyAsync<OperationCanceledException>(
-            async () => await moveNext.WaitAsync(TimeSpan.FromSeconds(10)));
+            async () => await moveNext);
         await enumerator.DisposeAsync();
         await WaitUntilAsync(() => !protocol.HasPendingCancellation);
         await PgTestPool.RunAsync(protocol, "select 1");
@@ -388,7 +388,7 @@ public class CommandUserCancellationTests
         cts.Cancel();
         await blocker.ReleaseAsync();
         await Assert.ThrowsExactlyAsync<OperationCanceledException>(
-            async () => await moveNext.WaitAsync(TimeSpan.FromSeconds(10)));
+            async () => await moveNext);
         await enumerator.DisposeAsync();
         await WaitUntilAsync(() => !protocol.HasPendingCancellation);
 
@@ -422,11 +422,11 @@ public class CommandUserCancellationTests
 
         await blocker.WaitUntilContendedAsync(protocol.FlowControl.BackendProcessId);
         await protocol.Heartbeat(TimeSpan.FromSeconds(100));
-        await attempted.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        await attempted.Task;
         await blocker.ReleaseAsync();
 
         await Assert.ThrowsExactlyAsync<TimeoutException>(
-            async () => await moveNext.WaitAsync(TimeSpan.FromSeconds(10)));
+            async () => await moveNext);
         await Assert.ThrowsExactlyAsync<TimeoutException>(async () => await enumerator.DisposeAsync());
         await WaitUntilAsync(() => !protocol.HasPendingCancellation);
         await PgTestPool.RunAsync(protocol, "select 1");
@@ -453,11 +453,11 @@ public class CommandUserCancellationTests
 
         await blocker.WaitUntilContendedAsync(protocol.FlowControl.BackendProcessId);
         cts.Cancel();
-        await senderEntered.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        await senderEntered.Task;
         await blocker.ReleaseAsync();
 
         await Assert.ThrowsExactlyAsync<OperationCanceledException>(
-            async () => await moveNext.WaitAsync(TimeSpan.FromSeconds(10)));
+            async () => await moveNext);
         await enumerator.DisposeAsync();
         Assert.IsTrue(protocol.HasPendingCancellation);
 
@@ -488,7 +488,7 @@ public class CommandUserCancellationTests
 
         await blocker.WaitUntilContendedAsync(protocol.FlowControl.BackendProcessId);
         cts.Cancel();
-        await senderEntered.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        await senderEntered.Task;
 
         var successorExecuted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var successor = new AdmissionProbeFlow(successorExecuted.SetResult);
@@ -498,13 +498,13 @@ public class CommandUserCancellationTests
             "A later flow executed while cancellation delivery was still unknown.");
 
         delivery.SetResult(CancelRequestState.Sent);
-        await successorExecuted.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        await successorExecuted.Task;
         await blocker.ReleaseAsync();
 
         await Assert.ThrowsExactlyAsync<OperationCanceledException>(
-            async () => await canceledMove.WaitAsync(TimeSpan.FromSeconds(10)));
+            async () => await canceledMove);
         await canceled.DisposeAsync();
-        await successor.WaitForComplete().AsTask().WaitAsync(TimeSpan.FromSeconds(10));
+        await successor.WaitForComplete().AsTask();
         await WaitUntilAsync(() => !protocol.HasPendingCancellation);
         await PgTestPool.RunAsync(protocol, "select 1");
     }
@@ -529,7 +529,7 @@ public class CommandUserCancellationTests
 
         await blocker.WaitUntilContendedAsync(protocol.FlowControl.BackendProcessId);
         cts.Cancel();
-        await attempted.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        await attempted.Task;
         Assert.IsTrue(protocol.HasPendingCancellation);
         Assert.IsFalse(protocol.Completion.IsCompleted);
 
@@ -540,11 +540,11 @@ public class CommandUserCancellationTests
 
         await blocker.ReleaseAsync();
         var exception = await Assert.ThrowsExactlyAsync<OperationCanceledException>(
-            async () => await canceledMove.WaitAsync(TimeSpan.FromSeconds(10)));
+            async () => await canceledMove);
         Assert.AreEqual(cts.Token, exception.CancellationToken);
         await canceled.DisposeAsync();
 
-        Assert.IsTrue(await boundaryMove.WaitAsync(TimeSpan.FromSeconds(10)));
+        Assert.IsTrue(await boundaryMove);
         Assert.IsFalse(await boundary.MoveNextAsync());
         await boundary.DisposeAsync();
         Assert.IsFalse(protocol.HasPendingCancellation);
@@ -589,10 +589,10 @@ public class CommandUserCancellationTests
             // Observe pending while the sender is provably in flight: deterministic (the intent is
             // alive and the reach is pre-registered). Post-delivery pending is a legal transient,
             // the strike can complete the instigator's window and retire the reach at any time.
-            await senderEntered.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            await senderEntered.Task;
             Assert.IsTrue(protocol.HasPendingCancellation);
             deliver.TrySetResult();
-            await cancelDelivered.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            await cancelDelivered.Task;
 
             var boundaryFlow = new CommandFlow(async: true, Command.Create("select 1"));
             Assert.IsTrue(protocol.TryQueue(boundaryFlow));
@@ -600,16 +600,16 @@ public class CommandUserCancellationTests
             var boundaryMove = boundary.MoveNextAsync().AsTask();
 
             var exception = await Assert.ThrowsExactlyAsync<OperationCanceledException>(
-                async () => await canceledMove.WaitAsync(TimeSpan.FromSeconds(10)));
+                async () => await canceledMove);
             Assert.AreEqual(cts.Token, exception.CancellationToken);
             await canceled.DisposeAsync();
 
             await blocker.ReleaseAsync();
-            Assert.IsTrue(await successorMove.WaitAsync(TimeSpan.FromSeconds(10)));
+            Assert.IsTrue(await successorMove);
             Assert.IsFalse(await successor.MoveNextAsync());
             await successor.DisposeAsync();
 
-            Assert.IsTrue(await boundaryMove.WaitAsync(TimeSpan.FromSeconds(10)));
+            Assert.IsTrue(await boundaryMove);
             Assert.IsFalse(await boundary.MoveNextAsync());
             await boundary.DisposeAsync();
             Assert.IsFalse(protocol.HasPendingCancellation);
@@ -658,21 +658,21 @@ public class CommandUserCancellationTests
             await firstBlocker.WaitUntilContendedAsync(protocol.FlowControl.BackendProcessId);
             await WaitUntilAsync(() => successorFlow.IsStarted);
             cts.Cancel();
-            await senderEntered.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            await senderEntered.Task;
 
             // Let the intended command finish before delivering the already-started side request.
             // PostgreSQL then applies it to the pipelined successor that is now running.
             await firstBlocker.ReleaseAsync();
             var cancellation = await Assert.ThrowsExactlyAsync<OperationCanceledException>(
-                async () => await canceledMove.WaitAsync(TimeSpan.FromSeconds(10)));
+                async () => await canceledMove);
             Assert.AreEqual(cts.Token, cancellation.CancellationToken);
             await canceled.DisposeAsync();
 
             await successorBlocker.WaitUntilContendedAsync(protocol.FlowControl.BackendProcessId);
             deliver.TrySetResult();
-            await delivered.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            await delivered.Task;
 
-            Assert.IsTrue(await successorMove.WaitAsync(TimeSpan.FromSeconds(10)));
+            Assert.IsTrue(await successorMove);
             var result = successor.Current;
             var rows = result.GetAsyncEnumerator();
             while (await rows.MoveNextAsync()) { }
@@ -723,15 +723,15 @@ public class CommandUserCancellationTests
         await firstBlocker.WaitUntilContendedAsync(protocol.FlowControl.BackendProcessId);
         var cancellation = flow.CancelAsync();
         await WaitUntilAsync(() => Volatile.Read(ref attempts) == 1);
-        await cancellation.WaitAsync(TimeSpan.FromSeconds(10));
+        await cancellation;
         await firstBlocker.ReleaseAsync();
 
         await secondBlocker.WaitUntilContendedAsync(protocol.FlowControl.BackendProcessId);
-        await secondAttempt.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        await secondAttempt.Task;
         await secondBlocker.ReleaseAsync();
 
         await Assert.ThrowsExactlyAsync<OperationCanceledException>(
-            async () => await moveNext.WaitAsync(TimeSpan.FromSeconds(10)));
+            async () => await moveNext);
         await enumerator.DisposeAsync();
         await WaitUntilAsync(() => !protocol.HasPendingCancellation);
         await PgTestPool.RunAsync(protocol, "select 1");
@@ -768,7 +768,7 @@ public class CommandUserCancellationTests
         await secondBlocker.ReleaseAsync();
 
         await Assert.ThrowsExactlyAsync<OperationCanceledException>(
-            async () => await moveNext.WaitAsync(TimeSpan.FromSeconds(10)));
+            async () => await moveNext);
         await enumerator.DisposeAsync();
         Assert.AreEqual(1, Volatile.Read(ref attempts));
         await PgTestPool.RunAsync(protocol, "select 1");
@@ -786,7 +786,7 @@ public class CommandUserCancellationTests
         command.Cancel();
 
         await Assert.ThrowsExactlyAsync<OperationCanceledException>(
-            async () => await execution.WaitAsync(TimeSpan.FromSeconds(10)));
+            async () => await execution.WaitAsync(TestTimeout.Hang));
         await blocker.ReleaseAsync();
         await AdoTestPool.ExecuteNonQueryAsync("select 1");
     }
@@ -810,7 +810,7 @@ public class CommandUserCancellationTests
         await blocker.WaitUntilContendedAsync(protocol.FlowControl.BackendProcessId);
         cts.Cancel();
         var exception = await Assert.ThrowsExactlyAsync<OperationCanceledException>(
-            async () => await moveNext.WaitAsync(TimeSpan.FromSeconds(10)));
+            async () => await moveNext);
         Assert.AreEqual(cts.Token, exception.CancellationToken);
         await enumerator.DisposeAsync();
 
@@ -821,11 +821,10 @@ public class CommandUserCancellationTests
 
     static async Task WaitUntilAsync(Func<bool> predicate)
     {
-        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
         while (!predicate())
-            await Task.Delay(1, timeout.Token);
+            await Task.Yield();
     }
 
     static Task DisposeBoundedAsync(IAsyncDisposable enumerator)
-        => enumerator.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(10));
+        => enumerator.DisposeAsync().AsTask();
 }

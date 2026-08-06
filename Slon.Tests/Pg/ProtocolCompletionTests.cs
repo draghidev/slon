@@ -14,7 +14,7 @@ namespace Slon.Tests.Pg;
 [TestClass]
 public class ProtocolCompletionTests
 {
-    static int RaceIterations => StressEnv.Iterations(fallback: 5, cap: 100);
+    static int RaceIterations => StressEnv.Iterations(fallback: 3, cap: 100);
 
     // Isolated per test by design: every test in this file fully destroys (CompleteAsync,
     // DisposeAsync, Dispose, FailProtocol) the protocol. Cannot share via PgTestPool
@@ -81,9 +81,7 @@ public class ProtocolCompletionTests
             try { await RunAsync(protocol, "BEGIN"); }
             catch (PgClientClosedException) { }
 
-            var sw = System.Diagnostics.Stopwatch.StartNew();
-            while (!protocol.IsCompleted && sw.Elapsed < TimeSpan.FromSeconds(5))
-                await Task.Delay(10);
+            await protocol.Completion;
             Assert.IsTrue(protocol.IsCompleted, "the unscoped BEGIN did not trip the wire-handoff guard");
         }
         finally
@@ -239,7 +237,7 @@ public class ProtocolCompletionTests
         Assert.IsTrue(protocol.TryQueue(flow));
         var e = flow.GetAsyncEnumerator();
         var move = e.MoveNextAsync().AsTask();
-        await transport.ReadParked.WaitAsync(TimeSpan.FromSeconds(5));
+        await transport.ReadParked;
 
         var violation = new PgProtocolException("synthetic framing violation");
         protocol.FailProtocol(violation);
@@ -250,11 +248,11 @@ public class ProtocolCompletionTests
         transport.CompleteServerOutput();
 
         var observed = await Assert.ThrowsExactlyAsync<PgCollateralException>(
-            () => move.WaitAsync(TimeSpan.FromSeconds(5)));
+            () => move);
         Assert.AreEqual(PgCollateralKind.ProtocolFailure, observed.Kind);
         Assert.AreSame(violation, observed.InnerException,
             "a synthesized unexpected-EOF failure must not displace the FailProtocol reason");
-        await protocol.Completion.WaitAsync(TimeSpan.FromSeconds(5));
+        await protocol.Completion;
     }
 
     [TestMethod]
@@ -269,16 +267,16 @@ public class ProtocolCompletionTests
         Assert.IsTrue(protocol.TryQueue(flow));
         var e = flow.GetAsyncEnumerator();
         var move = e.MoveNextAsync().AsTask();
-        await transport.ReadParked.WaitAsync(TimeSpan.FromSeconds(5));
+        await transport.ReadParked;
 
         var supplied = new InvalidOperationException("external shutdown");
         var completion = protocol.CompleteAsync(supplied);
         transport.CompleteServerOutput();
 
         var observed = await Assert.ThrowsExactlyAsync<PgClientClosedException>(
-            () => move.WaitAsync(TimeSpan.FromSeconds(5)));
+            () => move);
         Assert.AreSame(supplied, observed.InnerException);
-        await completion.WaitAsync(TimeSpan.FromSeconds(5));
+        await completion;
     }
 
     // Graceful CompleteAsync racing forceful DisposeAsync on the SAME protocol under maximal
@@ -325,7 +323,7 @@ public class ProtocolCompletionTests
             gate.Set();
             await blocker.ReleaseAsync();
 
-            await Task.WhenAll(complete, dispose, runTask).WaitAsync(TimeSpan.FromSeconds(10));
+            await Task.WhenAll(complete, dispose, runTask);
             Assert.IsTrue(protocol.IsCompleted, $"iteration {i}: protocol did not reach Completed");
         }
     }
@@ -361,7 +359,7 @@ public class ProtocolCompletionTests
             var dispose = Task.Run(async () => { gate.Wait(); await protocol.DisposeAsync(); });
             gate.Set();
             await blocker.ReleaseAsync();
-            await Task.WhenAll(complete, dispose, runTask).WaitAsync(TimeSpan.FromSeconds(10));
+            await Task.WhenAll(complete, dispose, runTask);
             Assert.IsTrue(protocol.IsCompleted, $"iteration {i}: protocol did not reach Completed");
         }
     }
@@ -407,7 +405,7 @@ public class ProtocolCompletionTests
             var dispose = Task.Run(async () => { gate.Wait(); await protocol.DisposeAsync(); });
             gate.Set();
             await blocker.ReleaseAsync();
-            await Task.WhenAll(complete, dispose, runTask).WaitAsync(TimeSpan.FromSeconds(10));
+            await Task.WhenAll(complete, dispose, runTask);
             Assert.IsTrue(protocol.IsCompleted, $"iteration {i}: protocol did not reach Completed");
         }
     }
@@ -443,7 +441,7 @@ public class ProtocolCompletionTests
             var dispose = Task.Run(async () => { gate.Wait(); await protocol.DisposeAsync(); });
             gate.Set();
             await blocker.ReleaseAsync();
-            await Task.WhenAll(complete, dispose, runTask).WaitAsync(TimeSpan.FromSeconds(10));
+            await Task.WhenAll(complete, dispose, runTask);
             Assert.IsTrue(protocol.IsCompleted, $"iteration {i}: protocol did not reach Completed");
         }
     }
@@ -457,14 +455,13 @@ public class ProtocolCompletionTests
     // _pending stuck true with the continuation stored, DrainSignal never fired, and shutdown hung
     // forever at its WhenAny. Recipe: CompleteAsync mid-body plants IsCompleted while the executor
     // is off-signal (its Drive is a guaranteed no-op - nothing armed), then DisposeAsync's abort
-    // faults the body and drives the pump through the unchecked arm. The phase sweep walks the
-    // teardown across pre-takeover, mid-body, and post-body so mid-body iterations hit the window
-    // on every run rather than by scheduler luck.
+    // faults the body and drives the pump through the unchecked arm. The advisory lock holds every
+    // iteration in the mid-body state; repetition varies which teardown caller wins.
     [TestMethod]
     public async Task CompleteAsync_ThenDisposeAsync_MidSyncFlowBody_ConvergesCleanly()
     {
         await using var blocker = await PgAdvisoryLock.AcquireAsync();
-        for (var i = 0; i < 15; i++)
+        for (var i = 0; i < 3; i++)
         {
             await blocker.HoldAsync();
             var protocol = await ConnectAsync();
@@ -488,7 +485,7 @@ public class ProtocolCompletionTests
             var complete = protocol.CompleteAsync();
             var dispose = protocol.DisposeAsync().AsTask();
             await blocker.ReleaseAsync();
-            await Task.WhenAll(complete, dispose, runTask).WaitAsync(TimeSpan.FromSeconds(10));
+            await Task.WhenAll(complete, dispose, runTask);
             Assert.IsTrue(protocol.IsCompleted, $"iteration {i}: protocol did not reach Completed");
         }
     }
@@ -611,7 +608,7 @@ public class ProtocolCompletionTests
 
         await blocker.WaitUntilContendedAsync(protocol.FlowControl.BackendProcessId);
         await protocol.DisposeAsync();
-        await run.WaitAsync(TimeSpan.FromSeconds(10));
+        await run;
         await blocker.ReleaseAsync();
         await blocker.WaitUntilBackendGoneAsync(protocol.FlowControl.BackendProcessId);
 

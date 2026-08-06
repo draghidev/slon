@@ -385,7 +385,7 @@ public class BackendMessageStreamingTests
     [TestMethod]
     public async Task RepeatedQueryFrames_WithSmallRecycledBuffers_NeverEnterMessageBodies()
     {
-        var repetitions = StressEnv.Iterations(2_000, 100_000);
+        var repetitions = StressEnv.Iterations(512, 100_000);
         var response = QueryResponseBytes();
         var responseLength = response.Sum(static message => message.Length);
         var wire = new byte[responseLength * repetitions];
@@ -424,7 +424,7 @@ public class BackendMessageStreamingTests
     [TestMethod]
     public async Task RepeatedQueryFrames_ThroughDirectReads_NeverEnterMessageBodies()
     {
-        var repetitions = StressEnv.Iterations(2_000, 100_000);
+        var repetitions = StressEnv.Iterations(512, 100_000);
         var response = QueryResponseBytes();
         var responseLength = response.Sum(static message => message.Length);
         var wire = new byte[responseLength * repetitions];

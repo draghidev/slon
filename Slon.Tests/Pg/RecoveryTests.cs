@@ -318,12 +318,12 @@ public class RecoveryTests
         failureGate.SetException(violation);
 
         var failed = await Assert.ThrowsExactlyAsync<PgClientException>(
-            () => faulting.WaitForComplete().AsTask().WaitAsync(TimeSpan.FromSeconds(5)));
+            () => faulting.WaitForComplete().AsTask().WaitAsync(TestTimeout.Hang));
         Assert.AreSame(violation, failed.InnerException);
 
         var e = successor.GetAsyncEnumerator();
         var collateral = await Assert.ThrowsExactlyAsync<PgCollateralException>(
-            () => e.MoveNextAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(5)));
+            () => e.MoveNextAsync().AsTask().WaitAsync(TestTimeout.Hang));
         Assert.AreEqual(PgCollateralKind.ProtocolFailure, collateral.Kind);
         Assert.AreSame(violation, collateral.InnerException);
     }
@@ -345,7 +345,7 @@ public class RecoveryTests
         failureGate.SetException(violation);
 
         var failed = await Assert.ThrowsExactlyAsync<PgClientException>(
-            () => faulting.WaitForComplete().AsTask().WaitAsync(TimeSpan.FromSeconds(5)));
+            () => faulting.WaitForComplete().AsTask());
         Assert.AreSame(violation, failed.InnerException);
 
         var e = successor.GetAsyncEnumerator();
@@ -384,7 +384,7 @@ public class RecoveryTests
         // Unblock the in-flight query; its RFQ arrives and recovery's drain completes.
         await blocker.ReleaseAsync();
         await Assert.ThrowsExactlyAsync<InvalidOperationException>(
-            () => faulting.WaitForComplete().AsTask().WaitAsync(TimeSpan.FromSeconds(5)));
+            () => faulting.WaitForComplete().AsTask());
         Assert.IsTrue(protocol.IsSchedulable);
         await RunAsync(protocol, "select 1");
     }
@@ -405,7 +405,7 @@ public class RecoveryTests
             Failure = failure,
         };
         Assert.IsTrue(protocol.TryQueue(faulting));
-        await writesLanded.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await writesLanded.Task;
 
         // CompleteAsync changes Ready to Draining before the flow fails. Recovery eligibility is
         // based on the sticky fact that startup established the query protocol, not on whether the
@@ -426,9 +426,9 @@ public class RecoveryTests
 
         await blocker.ReleaseAsync();
         var failed = await Assert.ThrowsExactlyAsync<InvalidOperationException>(
-            () => failedCompletion.WaitAsync(TimeSpan.FromSeconds(5)));
+            () => failedCompletion);
         Assert.AreSame(failure, failed);
-        await complete.WaitAsync(TimeSpan.FromSeconds(5));
+        await complete;
     }
 
     [TestMethod]
@@ -696,7 +696,7 @@ public class RecoveryTests
         Exception? completion = null;
         try
         {
-            await faulting.WaitForComplete().AsTask().WaitAsync(TimeSpan.FromSeconds(10));
+            await faulting.WaitForComplete().AsTask();
         }
         catch (Exception ex)
         {
@@ -740,7 +740,7 @@ public class RecoveryTests
         Exception? completion = null;
         try
         {
-            await faulting.WaitForComplete().AsTask().WaitAsync(TimeSpan.FromSeconds(10));
+            await faulting.WaitForComplete().AsTask();
         }
         catch (Exception ex)
         {
@@ -804,12 +804,12 @@ public class RecoveryTests
 
         var sibling = RunAsync(protocol, "select 1");
         var first = await Task.WhenAny(trailing.AwaitObserved, sibling)
-            .WaitAsync(TimeSpan.FromSeconds(10));
+            ;
         Assert.AreSame(trailing.AwaitObserved, first,
             "recovery wrote ROLLBACK before the failed flow's pending trailing write settled");
 
         trailing.SetResult();
-        await sibling.WaitAsync(TimeSpan.FromSeconds(10));
+        await sibling;
     }
 
     // Sync-flow variant of the pending-trailing move-to-trailing path (the "sync in trailing"
@@ -837,13 +837,13 @@ public class RecoveryTests
             // moved trailing and the sibling queues behind recovery.
             var sibling = Task.Run(() => RunSync(protocol, "select 1"));
             trailingTcs.TrySetResult();
-            await sibling.WaitAsync(TimeSpan.FromSeconds(10));
+            await sibling;
         }
         finally
         {
             // A wedged protocol's completion may also hang; guard it so a deadlock result stays a
             // clean TimeoutException from the body, not a hung cleanup.
-            try { await protocol.CompleteAsync().WaitAsync(TimeSpan.FromSeconds(5)); }
+            try { await protocol.CompleteAsync(); }
             catch { }
         }
     }
@@ -878,20 +878,21 @@ public class RecoveryTests
             Assert.IsTrue(protocol.TryQueue(faulting));
 
             // The read genuinely owns the decoder before the trailing failure is published.
-            await acquired.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            await acquired.Task;
             trailing.TrySetException(new InvalidOperationException("synthetic trailing fault while read held"));
 
             var sibling = RunAsync(protocol, "select 1");
-            await Task.Delay(50);
+            for (var i = 0; i < 8; i++)
+                await Task.Yield();
             Assert.IsFalse(sibling.IsCompleted,
                 "recovery must not revoke a still-running pipeline phase's decoder ownership");
 
             releaseGate.TrySetResult();
-            await sibling.WaitAsync(TimeSpan.FromSeconds(15));
+            await sibling;
         }
         finally
         {
-            try { await protocol.CompleteAsync().WaitAsync(TimeSpan.FromSeconds(5)); }
+            try { await protocol.CompleteAsync(); }
             catch { }
         }
     }
@@ -946,7 +947,7 @@ public class RecoveryTests
         // recovery completes). Its exception is the original synthetic fault, NOT the
         // recovery's behavior.
         Exception? failedCompletion = null;
-        try { await faulting.WaitForComplete().AsTask().WaitAsync(TimeSpan.FromSeconds(10)); }
+        try { await faulting.WaitForComplete().AsTask(); }
         catch (Exception ex) { failedCompletion = ex; }
         Assert.IsInstanceOfType<InvalidOperationException>(failedCompletion);
         StringAssert.Contains(failedCompletion!.Message, "synthetic");
@@ -987,17 +988,17 @@ public class RecoveryTests
 
         try
         {
-            await acquired.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            await acquired.Task;
             releaseGate.TrySetResult();
 
             transport.ReleaseSegment(CommandComplete());
-            await consumedFirst.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            await consumedFirst.Task;
 
             trailing.TrySetException(new InvalidOperationException("synthetic trailing fault while read held"));
             // Recovery's resync ROLLBACK is written inline in its ExecuteAuto (read-outstanding
             // shape), strictly after Create snapshots RfqCount - observing it proves the snapshot
             // exists before RFQ#1 is released below, so the crossing stays post-snapshot.
-            await transport.WaitForWrittenAsync("ROLLBACK").WaitAsync(TimeSpan.FromSeconds(10));
+            await transport.WaitForWrittenAsync("ROLLBACK");
 
             transport.ReleaseSegment(ReadyForQuery());
             transport.ReleaseSegment(CommandComplete());
@@ -1007,12 +1008,12 @@ public class RecoveryTests
             transport.ReleaseSegment(CommandComplete());
             transport.ReleaseSegment(ReadyForQuery());
 
-            try { await completed.WaitAsync(TimeSpan.FromSeconds(8)); return null; }
+            try { await completed; return null; }
             catch (Exception ex) { return ex; }
         }
         finally
         {
-            try { await protocol.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(5)); }
+            try { await protocol.DisposeAsync().AsTask(); }
             catch { }
         }
     }

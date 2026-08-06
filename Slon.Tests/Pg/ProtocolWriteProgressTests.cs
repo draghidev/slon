@@ -55,7 +55,7 @@ public class ProtocolWriteProgressTests
             {
                 drained += transport.DrainAvailable();
                 if (drained < RequestPadding)
-                    await Task.Delay(5).ConfigureAwait(false);
+                    await Task.Yield();
             }
         });
 
@@ -65,17 +65,17 @@ public class ProtocolWriteProgressTests
 
             // The discriminating wait: completes only if the read drained the wire while the write was still
             // parked on the send window. A deadlock surfaces here as a TimeoutException, not a hung runner.
-            var first = await e.MoveNextAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(10));
+            var first = await e.MoveNextAsync().AsTask();
             readMadeProgress.TrySetResult();
             Assert.IsTrue(first, "first result must be delivered from the concurrently-drained read");
 
-            while (await e.MoveNextAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(10))) { }
-            await e.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(10));
+            while (await e.MoveNextAsync().AsTask()) { }
+            await e.DisposeAsync().AsTask();
         }
         finally
         {
             readMadeProgress.TrySetResult();
-            try { await protocol.CompleteAsync().WaitAsync(TimeSpan.FromSeconds(5)); }
+            try { await protocol.CompleteAsync(); }
             catch { }
         }
     }

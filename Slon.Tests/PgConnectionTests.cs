@@ -141,7 +141,7 @@ public class PgConnectionTests
             });
 
             await blocker.ReleaseAsync();
-            await syncTask.WaitAsync(TimeSpan.FromSeconds(2));
+            await syncTask;
 
             await slowTask;
             await slowEnum.DisposeAsync();

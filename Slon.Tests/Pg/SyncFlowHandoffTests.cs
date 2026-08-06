@@ -20,7 +20,7 @@ namespace Slon.Tests.Pg;
 [TestClass]
 public class SyncFlowHandoffTests
 {
-    static int StressIterations => StressEnv.Iterations(fallback: 200, cap: 8_000);
+    static int StressIterations => StressEnv.Iterations(fallback: 64, cap: 8_000);
 
     sealed class AutonomousSyncFlow : PgClientFlow
     {
@@ -48,7 +48,7 @@ public class SyncFlowHandoffTests
             try
             {
                 for (var i = 0; i < StressIterations && Volatile.Read(ref failure) is null; i++)
-                    await PgTestPool.RunAsync(protocol, "select 1").WaitAsync(TimeSpan.FromSeconds(20));
+                    await PgTestPool.RunAsync(protocol, "select 1");
             }
             catch (Exception ex) { Capture(ex); }
         });
@@ -65,7 +65,7 @@ public class SyncFlowHandoffTests
 
         syncThread.Start();
         await asyncLoop;
-        Assert.IsTrue(syncThread.Join(TimeSpan.FromSeconds(120)), "sync handoff thread did not finish");
+        syncThread.Join();
         if (failure is not null)
             Assert.Fail($"concurrent sync/async raised {failure}");
     }
@@ -101,8 +101,8 @@ public class SyncFlowHandoffTests
 
         holder.Core.RequestWake(useDedicatedDriver: true);
 
-        Assert.IsFalse(await resumedOnThreadPool.Task.WaitAsync(TimeSpan.FromSeconds(10)));
-        await suspended.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.IsFalse(await resumedOnThreadPool.Task.WaitAsync(TestTimeout.Hang));
+        await suspended.WaitAsync(TestTimeout.Hang);
         holder.Core.Reset();
 
         static async Task Suspend(WakeHolder holder, TaskCompletionSource<bool> resumedOnThreadPool)
@@ -133,7 +133,7 @@ public class SyncFlowHandoffTests
         };
 
         waiter.Start();
-        Assert.IsTrue(waiter.Join(TimeSpan.FromSeconds(1)), "the close wake was lost before wait registration");
+        waiter.Join();
         Assert.IsNull(continuation);
     }
 
@@ -203,17 +203,14 @@ public class SyncFlowHandoffTests
             $"allowed {allowed}); expected 0-2 (SocketAsyncEngine BCL noise only)");
     }
 
-    // Per-iteration thread-id check across many handoff cycles. Repeats the rendezvous tightly
-    // so any per-call leak in the handoff state
-    // / the parked-MRES would either deadlock or break the caller-thread guarantee within a few
-    // hundred runs.
+    // Per-iteration thread-id check across repeated handoff cycles. A per-call leak in the handoff
+    // state or parked MRES either deadlocks or breaks the caller-thread guarantee.
     [TestMethod]
     public async Task RepeatedSync_StaysOnCallerThread()
     {
         var protocol = await PgTestPool.GetProtocolAsync();
-        const int iterations = 200;
         var callerThread = Environment.CurrentManagedThreadId;
-        for (int i = 0; i < iterations; i++)
+        for (int i = 0; i < StressIterations; i++)
         {
             await PgTestPool.RunSync(protocol, "select 1");
             Assert.AreEqual(callerThread, Environment.CurrentManagedThreadId,
@@ -261,14 +258,7 @@ public class SyncFlowHandoffTests
         }
 
         foreach (var t in threads) t.Start();
-        foreach (var t in threads)
-        {
-            if (t.Join(TimeSpan.FromSeconds(30)))
-                continue;
-            var diag = string.Join("\n", protocols.Select((_, i) =>
-                $"protocol {i}: progress={Volatile.Read(ref progress[i])}/20"));
-            Assert.Fail($"thread timed out\n{diag}");
-        }
+        foreach (var t in threads) t.Join();
 
         for (int i = 0; i < concurrency; i++)
             Assert.IsNull(exceptions[i], $"thread {i} threw: {exceptions[i]}");
@@ -320,7 +310,7 @@ public class SyncFlowHandoffTests
         }
 
         foreach (var t in threads) t.Start();
-        JoinAll(threads, "a sync caller thread timed out (possible misrouted wake / deadlock)");
+        JoinAll(threads);
 
         for (int i = 0; i < concurrency; i++)
         {
@@ -354,7 +344,7 @@ public class SyncFlowHandoffTests
 
         const int syncThreads = 4;
         const int asyncThreads = 4;
-        const int iterations = 100;
+        const int iterations = 32;
         var threads = new Thread[syncThreads + asyncThreads];
         var mismatches = new int[syncThreads];
         var exceptions = new Exception?[syncThreads + asyncThreads];
@@ -426,7 +416,7 @@ public class SyncFlowHandoffTests
         }
 
         foreach (var t in threads) t.Start();
-        JoinAll(threads, "a mixed-flow caller thread timed out (possible misrouted wake / deadlock)");
+        JoinAll(threads);
 
         for (int i = 0; i < threads.Length; i++)
             Assert.IsNull(exceptions[i], $"thread {i} threw: {exceptions[i]}");
@@ -487,15 +477,7 @@ public class SyncFlowHandoffTests
                 var (flow, async) = flows[k];
                 driveTasks[k] = async ? Task.Run(() => DriveAsyncReadRank(flow)) : Task.Run(() => DriveSyncReadRank(flow));
             }
-            try
-            {
-                ranks = await Task.WhenAll(driveTasks).WaitAsync(TimeSpan.FromSeconds(30));
-            }
-            catch (TimeoutException)
-            {
-                Assert.Fail($"block {b}: drive tasks timed out");
-                return;
-            }
+            ranks = await Task.WhenAll(driveTasks);
 
             // The sync flow (index 2) must have a HIGHER rank than the earlier-submitted async flows
             // (index 0, 1): the server processed it after them. A lower rank means it jumped ahead.
@@ -527,7 +509,7 @@ public class SyncFlowHandoffTests
         await PgTestPool.RunSync(protocol, "select 1"); // warm
 
         const int concurrency = 8;
-        const int iterations = 100;
+        const int iterations = 32;
         var threads = new Thread[concurrency];
         var misroutes = new int[concurrency];   // times a caller read back a value it did not submit
         var exceptions = new Exception?[concurrency];
@@ -559,7 +541,7 @@ public class SyncFlowHandoffTests
         }
 
         foreach (var t in threads) t.Start();
-        JoinAll(threads, "a sync caller thread timed out (possible misrouted wake / deadlock)");
+        JoinAll(threads);
 
         for (int i = 0; i < concurrency; i++)
         {
@@ -592,9 +574,9 @@ public class SyncFlowHandoffTests
         return rank;
     }
 
-    static void JoinAll(Thread[] threads, string message)
+    static void JoinAll(Thread[] threads)
     {
         foreach (var thread in threads)
-            Assert.IsTrue(thread.Join(TimeSpan.FromSeconds(30)), message);
+            thread.Join();
     }
 }

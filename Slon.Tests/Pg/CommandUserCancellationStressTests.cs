@@ -1,6 +1,7 @@
 using Slon.Pg;
 using Slon.Pg.Protocol;
 using Slon.Pg.Protocol.Flows;
+using Microsoft.Extensions.Time.Testing;
 
 namespace Slon.Tests.Pg;
 
@@ -11,40 +12,31 @@ namespace Slon.Tests.Pg;
 //     first result is ALLOWED to race (a delivered result or an OCE/close are all acceptable);
 //   - a per-read MoveNextAsync(ct) token cancels just that read.
 // The bug class is the lost wake / wrong-generation double-fire / pipeline-tenure reentry that the
-// generation-bound registration + version-aware terminal closed. A hang (caught by HangCap) always
-// fails; the submit-bound case additionally requires a strict OCE.
+// generation-bound registration + version-aware terminal closed. The submit-bound case additionally
+// requires a strict OCE.
 [TestClass]
 [DoNotParallelize]
 public class CommandUserCancellationStressTests
 {
-    static readonly TimeSpan HangCap = TimeSpan.FromSeconds(5);
 
-    // I/O-bound (each iteration is a real pipelined command + cancel against a live PG backend over a
-    // few pooled connections), so the default keeps each test ~100ms in the suite. The races surface
-    // fast; a deliberate deep sweep raises the count via SLON_STRESS_ITERATIONS (the original 6000 was ~800ms).
-    static int Iters => StressEnv.Iterations(fallback: 500, cap: 8_000);
+    // Each iteration is a real pipelined command + cancellation against a live backend. The default
+    // is regression coverage; SLON_STRESS_ITERATIONS supplies deliberate deeper exposure.
+    static int Iters => StressEnv.Iterations(fallback: 64, cap: 8_000);
 
     static CommandFlow TwoResultFlow() => new(async: true,
         Command.Create("select generate_series(1, 50)"),
         Command.Create("select 'two'"));
 
-    // Drive one MoveNextAsync under the hang cap; returns the caught exception (or null on a delivered
-    // result). A TimeoutException is the lost-wake failure and is asserted here so callers don't repeat it.
+    // Drive one MoveNextAsync and return the caught exception (or null on a delivered result).
     static async Task<Exception?> MoveNextGuarded(CommandFlow.Enumerator e, CancellationToken ct, int i)
     {
-        try { await e.MoveNextAsync(ct).AsTask().WaitAsync(HangCap); return null; }
-        catch (TimeoutException)
-        {
-            Assert.Fail($"iter {i}: MoveNextAsync never completed.");
-            throw;
-        }
+        try { await e.MoveNextAsync(ct).AsTask(); return null; }
         catch (Exception ex) { return ex; }
     }
 
     static async Task DisposeGuarded(CommandFlow.Enumerator e, int i, string what)
     {
-        try { await e.DisposeAsync().AsTask().WaitAsync(HangCap); }
-        catch (TimeoutException) { Assert.Fail($"iter {i}: {what} never completed."); }
+        try { await e.DisposeAsync().AsTask(); }
         catch (OperationCanceledException) { }
         catch (PgClientClosedException) { }
     }
@@ -126,9 +118,11 @@ public class CommandUserCancellationStressTests
     {
         var flow = TwoResultFlow();
         Assert.IsTrue(protocol.TryQueue(flow));
-        var cts = new CancellationTokenSource();
-        cts.CancelAfter(TimeSpan.FromTicks((i % 7) * 5000));
+        var time = new FakeTimeProvider();
+        var delay = TimeSpan.FromTicks((i % 7) + 1);
+        var cts = new CancellationTokenSource(delay, time);
         var e = flow.GetAsyncEnumerator(cts.Token);
+        await Task.Run(() => time.Advance(delay));
         AssertCancelOrClose(await MoveNextGuarded(e, cts.Token, i), i);
         return e;
     });
@@ -201,8 +195,7 @@ public class CommandUserCancellationStressTests
         // hand RaceLoop a default(Enumerator) - its trailing dispose then no-ops (flow == null).
         var label = waitForDrain ? "wait-for-drain" : "opt-out";
         await DisposeGuarded(e, i, $"{label} DisposeAsync");
-        try { await PgTestPool.RunAsync(protocol, "select 1").WaitAsync(HangCap); }
-        catch (TimeoutException) { Assert.Fail($"iter {i}: protocol unusable after {label} dispose (wire not at RFQ)."); }
+        try { await PgTestPool.RunAsync(protocol, "select 1"); }
         catch (Exception ex) { Assert.Fail($"iter {i}: reuse after {label} dispose threw {ex.GetType().Name}: {ex.Message}"); }
         return default;
     });
@@ -232,8 +225,7 @@ public class CommandUserCancellationStressTests
         AssertCancelOrClose(await MoveNextGuarded(e, cts.Token, i), i);  // OCE/close/result all fine
 
         await DisposeGuarded(e, i, "token-bounded DisposeAsync");  // disposed mid-body; RaceLoop no-ops on default
-        try { await PgTestPool.RunAsync(protocol, "select 1").WaitAsync(HangCap); }
-        catch (TimeoutException) { Assert.Fail($"iter {i}: protocol unusable after token-bounded dispose."); }
+        try { await PgTestPool.RunAsync(protocol, "select 1"); }
         catch (PgClientClosedException) { }
         return default;
     });

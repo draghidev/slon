@@ -1,6 +1,7 @@
 using Slon.Pg;
 using Slon.Pg.Protocol;
 using Slon.Pg.Protocol.Flows;
+using Microsoft.Extensions.Time.Testing;
 
 namespace Slon.Tests.Pg;
 
@@ -11,10 +12,7 @@ namespace Slon.Tests.Pg;
 [TestClass]
 public class ExclusiveScopeMultiWaiterTests
 {
-    static Task<PgClientProtocol> ConnectAsync() => PgTestPool.NewIsolatedAsync(o =>
-    {
-        o.HeartbeatInterval = TimeSpan.FromMilliseconds(50);
-    });
+    static Task<PgClientProtocol> ConnectAsync() => PgTestPool.NewIsolatedAsync();
 
     static async Task DrainAsync(CommandFlow flow)
     {
@@ -41,7 +39,7 @@ public class ExclusiveScopeMultiWaiterTests
             await a.CompleteScopeAsync();
 
             // Now B's turn lands.
-            await b.HandoffReady.WaitAsync(TimeSpan.FromSeconds(10));
+            await b.HandoffReady;
             await DrainAsync(b.Queue(new CommandFlow(async: true, Command.Create("select 2"))));
             await b.CompleteScopeAsync();
         }
@@ -75,7 +73,7 @@ public class ExclusiveScopeMultiWaiterTests
             await DrainAsync(a.Queue(new CommandFlow(async: true, Command.Create("select 1"))));
             await a.CompleteScopeAsync();
 
-            await c.HandoffReady.WaitAsync(TimeSpan.FromSeconds(10));
+            await c.HandoffReady;
             await DrainAsync(c.Queue(new CommandFlow(async: true, Command.Create("select 3"))));
             await c.CompleteScopeAsync();
 
@@ -116,7 +114,12 @@ public class ExclusiveScopeMultiWaiterTests
     [TestMethod]
     public async Task ProtocolStop_WhileWaiterPreTurn_ReleasesCleanly()
     {
-        var protocol = await ConnectAsync();
+        var time = new FakeTimeProvider();
+        var protocol = await PgTestPool.NewIsolatedAsync(o =>
+        {
+            o.HeartbeatInterval = TimeSpan.FromSeconds(1);
+            o.TimeProvider = time;
+        });
         var a = protocol.QueueExclusiveScope(async: true);
         await a.HandoffReady;
         // B waits behind A, never activated.
@@ -127,9 +130,10 @@ public class ExclusiveScopeMultiWaiterTests
         await DrainAsync(a.Queue(new CommandFlow(async: true, Command.Create("select 1"))));
 
         await protocol.DisposeAsync();
+        time.Advance(TimeSpan.FromSeconds(1));
 
         // B's pre-turn waiter must have been torn down (faulted), not left hanging.
-        await Assert.ThrowsExactlyAsync<PgClientClosedException>(async () => await bWait.WaitAsync(TimeSpan.FromSeconds(10)));
+        await Assert.ThrowsExactlyAsync<PgClientClosedException>(async () => await bWait);
         // DisposeAsync is fire-and-forget; Completed is only guaranteed once the drain is joined
         // (a post-dispose CompleteAsync returns the same drain task).
         await protocol.CompleteAsync();

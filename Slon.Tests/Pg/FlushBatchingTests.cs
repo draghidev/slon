@@ -23,7 +23,6 @@ public class FlushBatchingTests
     // 8 tiny "select 1" command frames stay under the 1000-byte flush threshold, so a coalesced run is one
     // wire segment.
     const int N = 8;
-    static readonly TimeSpan SettleTimeout = TimeSpan.FromSeconds(5);
 
     // ~28-byte trust-auth handshake: AuthenticationOk, BackendKeyData, ReadyForQuery. Lets StartAsync finish.
     static byte[] Handshake()
@@ -58,13 +57,8 @@ public class FlushBatchingTests
 
     static async Task WaitForBytes(FlushCountingTransport t, long target)
     {
-        var sw = System.Diagnostics.Stopwatch.StartNew();
         while (Volatile.Read(ref t.Counter.FlushedBytes) < target)
-        {
-            if (sw.Elapsed > SettleTimeout)
-                Assert.Fail($"timed out waiting for {target} flushed bytes, saw {t.Counter.FlushedBytes} in {t.Counter.FlushCount} flushes");
-            await Task.Delay(5);
-        }
+            await t.Counter.WaitForFlushAsync(Volatile.Read(ref t.Counter.FlushedBytes));
     }
 
     // Queue one flow, wait for its write to reach the wire (the executor flushes on park), return its size.
@@ -209,7 +203,7 @@ public class FlushBatchingTests
             t.Counter.RunBeforeNextNonEmptyFlush(
                 () => racedEnqueue.TrySetResult(p.TryQueue(Cmd(), mustPipeline: true)));
             Assert.IsTrue(p.TryQueue(Cmd(), mustPipeline: true));
-            Assert.IsTrue(await racedEnqueue.Task.WaitAsync(SettleTimeout));
+            Assert.IsTrue(await racedEnqueue.Task);
             await WaitForBytes(t, baseBytes + 2 * perCmd);
             Assert.AreEqual(2, t.Counter.FlushCount - baseFlush);
         }
@@ -314,9 +308,15 @@ public class FlushBatchingTests
         {
             long _unflushed;
             Action? _beforeNextNonEmptyFlush;
+            TaskCompletionSource _flushed = NewSignal();
             public int FlushCount;
             public long FlushedBytes;
             public void RunBeforeNextNonEmptyFlush(Action action) => Volatile.Write(ref _beforeNextNonEmptyFlush, action);
+            public Task WaitForFlushAsync(long observedBytes)
+            {
+                var signal = Volatile.Read(ref _flushed);
+                return Volatile.Read(ref FlushedBytes) != observedBytes ? Task.CompletedTask : signal.Task;
+            }
             // The protocol reads UnflushedBytes for the flush-threshold gate; the base PipeWriter throws
             // unless these delegate to the real (unflushed-tracking) pipe writer.
             public override bool CanGetUnflushedBytes => inner.CanGetUnflushedBytes;
@@ -335,9 +335,13 @@ public class FlushBatchingTests
                     FlushCount++;
                     Volatile.Write(ref FlushedBytes, FlushedBytes + _unflushed);
                     _unflushed = 0;
+                    Interlocked.Exchange(ref _flushed, NewSignal()).TrySetResult();
                 }
                 return inner.FlushAsync(cancellationToken);
             }
+
+            static TaskCompletionSource NewSignal()
+                => new(TaskCreationOptions.RunContinuationsAsynchronously);
         }
     }
 }

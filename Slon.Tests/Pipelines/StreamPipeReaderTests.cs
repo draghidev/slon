@@ -85,18 +85,18 @@ public class StreamPipeReaderTests
             supportCancelPending: false);
 
         var read = reader.ReadAsync().AsTask();
-        await stream.ReadStarted.WaitAsync(TimeSpan.FromSeconds(5));
+        await stream.ReadStarted;
 
         Assert.ThrowsExactly<InvalidOperationException>(() => { _ = reader.CompleteAsync(); });
         Assert.IsFalse(pool.OwnerDisposed.IsCompleted,
             "the receive destination was returned while its stream read was still outstanding");
 
         stream.CompleteRead();
-        var result = await read.WaitAsync(TimeSpan.FromSeconds(5));
+        var result = await read;
         Assert.IsTrue(result.IsCompleted);
         await reader.CompleteAsync();
-        await stream.Disposed.WaitAsync(TimeSpan.FromSeconds(5));
-        await pool.OwnerDisposed.WaitAsync(TimeSpan.FromSeconds(5));
+        await stream.Disposed;
+        await pool.OwnerDisposed;
     }
 
     [TestMethod]
@@ -112,16 +112,16 @@ public class StreamPipeReaderTests
         var destination = new HeldWriteStream();
 
         var copy = reader.CopyToAsync(destination);
-        await destination.WriteStarted.WaitAsync(TimeSpan.FromSeconds(5));
+        await destination.WriteStarted;
 
         Assert.ThrowsExactly<InvalidOperationException>(() => { _ = reader.CompleteAsync(); });
         Assert.IsFalse(pool.OwnerDisposed.IsCompleted,
             "the copied buffer was returned while the destination still owned its write");
 
         destination.CompleteWrite();
-        await copy.WaitAsync(TimeSpan.FromSeconds(5));
+        await copy;
         await reader.CompleteAsync();
-        await pool.OwnerDisposed.WaitAsync(TimeSpan.FromSeconds(5));
+        await pool.OwnerDisposed;
     }
 
     [TestMethod]
@@ -134,7 +134,7 @@ public class StreamPipeReaderTests
             supportCancelPending: false);
 
         var read = reader.ReadAsync().AsTask();
-        await stream.ZeroByteReadStarted.WaitAsync(TimeSpan.FromSeconds(5));
+        await stream.ZeroByteReadStarted;
         Assert.ThrowsExactly<InvalidOperationException>(() => { _ = reader.CompleteAsync(); });
 
         stream.CompleteZeroByteRead();

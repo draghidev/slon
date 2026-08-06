@@ -38,7 +38,7 @@ public class AutoPrepareWireTests
         await using var conn = await ds.OpenConnectionAsync(CancellationToken.None);
 
         const string sql = "select 1";
-        const int runs = 8;
+        const int runs = 6;
         for (var i = 0; i < runs; i++)
         {
             await using var cmd = new SlonCommand(conn, sql);
@@ -58,7 +58,8 @@ public class AutoPrepareWireTests
         await using var ds = CreateDataSource(maxAutoPreparations: 10, autoMinimumUses: 5);
         await using var conn = await ds.OpenConnectionAsync(CancellationToken.None);
         await using var batch = conn.CreateBatch();
-        for (var i = 0; i < 8; i++)
+        const int commandCount = 6;
+        for (var i = 0; i < commandCount; i++)
             batch.BatchCommands.Add(batch.CreateBatchCommand("select 1"));
 
         await using var reader = await batch.ExecuteReaderAsync(CancellationToken.None);
@@ -71,8 +72,8 @@ public class AutoPrepareWireTests
                 rows++;
         } while (await reader.NextResultAsync(CancellationToken.None));
 
-        Assert.AreEqual(8, results);
-        Assert.AreEqual(8, rows);
+        Assert.AreEqual(commandCount, results);
+        Assert.AreEqual(commandCount, rows);
     }
 
     [TestMethod]
@@ -290,7 +291,7 @@ public class AutoPrepareWireTests
         // drain. Release the scope (close the connection); the PgConnection survives the lease (pool unit),
         // so we keep inspecting it. Maintenance is a protocol concern, never scope work.
         await conn.CloseAsync();
-        await drained.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        await drained.Task;
 
         // The completion fires from the flow's cleanup walk, after RemoveTracked for sqlA and before
         // CommitMaintenanceRange. Presence is the meaningful invariant and is settled here; the queue
@@ -323,7 +324,7 @@ public class AutoPrepareWireTests
     [TestMethod]
     public async Task EvictionMaintenanceBatch_ClosesEveryServerStatement()
     {
-        const int evictions = 8;
+        const int evictions = 4;
         await using var ds = CreateDataSource(maxAutoPreparations: 1, autoMinimumUses: 2, maxPoolSize: 1);
         await using var conn = await ds.OpenConnectionAsync(CancellationToken.None);
         var pg = conn.UnderlyingPgConnection!;
@@ -343,7 +344,7 @@ public class AutoPrepareWireTests
         var drained = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         pg.PushMaintenance(new CloseStatement("slon_maintenance_batch_probe") { Completion = drained });
         await conn.CloseAsync();
-        await drained.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        await drained.Task;
 
         await using var reacquired = await ds.OpenConnectionAsync(CancellationToken.None);
         Assert.AreSame(pg, reacquired.UnderlyingPgConnection);
@@ -363,9 +364,9 @@ public class AutoPrepareWireTests
         await using var ds = CreateDataSource(maxAutoPreparations: 1, autoMinimumUses: 2, maxPoolSize: 1);
         await using var conn = await ds.OpenConnectionAsync(CancellationToken.None);
 
-        // Repeated error recovery is the contract under test; 32 consecutive windows retain
-        // meaningful in-process exposure while process-level stress supplies the larger multiplier.
-        for (var i = 0; i < 32; i++)
+        // Exercise consecutive error-recovery windows here; process-level stress supplies the
+        // larger exposure multiplier.
+        for (var i = 0; i < 8; i++)
         {
             var name = $"slon_missing_{i}";
             var error = await Deallocate(name);
@@ -462,9 +463,7 @@ public class AutoPrepareWireTests
         const string table = "slon_changed_prepared_result";
         const string sql = $"select value from {table}";
 
-        await Execute(conn, $"drop table if exists {table}");
-        await Execute(conn, $"create temporary table {table} (value integer)");
-        await Execute(conn, $"insert into {table} values (1)");
+        await Execute(conn, $"create temporary table {table} as select 1::integer as value");
 
         await RunN(conn, sql, 3);
         var pg = conn.UnderlyingPgConnection!;

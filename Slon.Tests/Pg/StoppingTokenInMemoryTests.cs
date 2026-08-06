@@ -23,7 +23,6 @@ namespace Slon.Tests.Pg;
 [TestClass]
 public class StoppingTokenInMemoryTests
 {
-    static readonly TimeSpan Cap = TimeSpan.FromSeconds(10);
 
     static readonly object _logLock = new();
     // Off by default; set SLON_INMEM_LOG to capture the phase timeline for this timing-sensitive race.
@@ -121,11 +120,9 @@ public class StoppingTokenInMemoryTests
 
         // Pin the interleaving deterministically: wait until A has actually parked mid-read BEFORE
         // completing, rather than racing A's dispatch against source-completion (the race that let A
-        // drain inert ~0.6% of reps, which the old byte-poll masked as 5s of silent green). A timeout
-        // here is a real "scenario never set up" failure, not slowness.
+        // drain inert ~0.6% of reps, which the old byte-poll masked as silent green).
         Log($"{variant} rep{rep} awaiting A read-park");
-        try { await aParkedOnRead.WaitAsync(Cap); }
-        catch (TimeoutException) { return $"flowA never parked on its read within {Cap} - scenario not set up (dispatch raced completion)"; }
+        await aParkedOnRead;
 
         // StoppingToken + flush. A is parked mid-read; completion can no longer drain it inert.
         var completeTask = protocol.CompleteAsync();
@@ -164,7 +161,7 @@ public class StoppingTokenInMemoryTests
         }
 
         Log($"{variant} rep{rep} switch done, awaiting aFirst");
-        try { await aFirstTask.WaitAsync(Cap); } catch (Exception ex) { Catch("aFirst", ex); }
+        try { await aFirstTask; } catch (Exception ex) { Catch("aFirst", ex); }
         Log($"{variant} rep{rep} aFirst settled");
 
         // Release the remaining segments and escalate the abort so the protocol drains to a clean
@@ -174,12 +171,12 @@ public class StoppingTokenInMemoryTests
         fake.Advance(TimeSpan.FromSeconds(31));
         Log($"{variant} rep{rep} abort escalated");
 
-        try { await eB.MoveNextAsync().AsTask().WaitAsync(Cap); } catch (Exception ex) { Catch("eB", ex); }
+        try { await eB.MoveNextAsync().AsTask(); } catch (Exception ex) { Catch("eB", ex); }
         Log($"{variant} rep{rep} eB settled");
         try { await eA.DisposeAsync(); } catch (Exception ex) { Catch("eA dispose", ex); }
         try { await eB.DisposeAsync(); } catch (Exception ex) { Catch("eB dispose", ex); }
         Log($"{variant} rep{rep} disposed");
-        try { await completeTask.WaitAsync(Cap); } catch (Exception ex) { Catch("complete", ex); }
+        try { await completeTask; } catch (Exception ex) { Catch("complete", ex); }
         Log($"{variant} rep{rep} complete settled -> {(captured is null ? "clean" : "FAILURE")}");
 
         return captured;
@@ -188,9 +185,8 @@ public class StoppingTokenInMemoryTests
         {
             // Let the heartbeat's OnStopping actions (scheduled off the PeriodicTimer continuation)
             // run to completion before the next controlled step.
-            for (var i = 0; i < 5; i++)
+            for (var i = 0; i < 16; i++)
                 await Task.Yield();
-            await Task.Delay(2);
         }
     }
 
@@ -219,18 +215,18 @@ public class StoppingTokenInMemoryTests
             Command.Create("select generate_series(1, 20)"),
             Command.Create("select 'a-two'"));
         Assert.IsTrue(protocol.TryQueue(flowA));
-        await Drain(flowA).WaitAsync(Cap);
+        await Drain(flowA);
         var afterA = recStream.RecordedLength;
         Log($"capture: flowA drained, recorded={afterA}");
 
         var flowB = new CommandFlow(async: true, Command.Create("select 'b'"));
         Assert.IsTrue(protocol.TryQueue(flowB));
-        await Drain(flowB).WaitAsync(Cap);
+        await Drain(flowB);
         var afterB = recStream.RecordedLength;
         Log($"capture: flowB drained, recorded={afterB}");
 
         var full = recStream.Snapshot();
-        await protocol.CompleteAsync().WaitAsync(Cap);
+        await protocol.CompleteAsync();
         Log($"capture: complete, total={full.Length}");
 
         var handshake = StartupTranscript.MakeReplayable(full.AsSpan(0, handshakeLen));

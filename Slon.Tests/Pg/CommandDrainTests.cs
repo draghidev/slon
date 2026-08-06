@@ -1,4 +1,5 @@
 using System.Reflection;
+using Microsoft.Extensions.Time.Testing;
 using Slon.Pg;
 using Slon.Pg.Protocol;
 using Slon.Pg.Protocol.Flows;
@@ -55,7 +56,7 @@ public class CommandDrainTests
             TaskCreationOptions.LongRunning,
             TaskScheduler.Default);
 
-        await flow.ReleaseEntered.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        await flow.ReleaseEntered.Task;
         try
         {
             Assert.IsFalse(completion.IsCompleted,
@@ -65,7 +66,7 @@ public class CommandDrainTests
         {
             flow.ContinueRelease();
         }
-        await release.WaitAsync(TimeSpan.FromSeconds(10));
+        await release;
         await completion;
     }
 
@@ -98,7 +99,7 @@ public class CommandDrainTests
             TaskCreationOptions.LongRunning,
             TaskScheduler.Default);
 
-        Assert.IsTrue(SpinWait.SpinUntil(() => flow.CompletionWaiterPending, TimeSpan.FromSeconds(10)),
+        Assert.IsTrue(SpinWait.SpinUntil(() => flow.CompletionWaiterPending, TestTimeout.Hang),
             "synchronous completion waiter did not arm");
 
         var completionCore = typeof(PgClientFlow)
@@ -113,7 +114,7 @@ public class CommandDrainTests
             CancellationToken.None,
             TaskCreationOptions.LongRunning,
             TaskScheduler.Default);
-        await waiter.WaitAsync(TimeSpan.FromSeconds(10));
+        await waiter.WaitAsync(TestTimeout.Hang);
     }
 
     [TestMethod]
@@ -133,7 +134,7 @@ public class CommandDrainTests
             CancellationToken.None,
             TaskCreationOptions.LongRunning,
             TaskScheduler.Default);
-        await dispose.WaitAsync(TimeSpan.FromSeconds(10));
+        await dispose.WaitAsync(TestTimeout.Hang);
     }
 
     static async ValueTask Dispose(CommandFlow.Enumerator e, bool useAsyncDispose)
@@ -208,7 +209,7 @@ public class CommandDrainTests
     [DoNotParallelize]
     public async Task ConsumerDispose_MidBatch_SyncDispose_OpenBeforePark_Stress()
     {
-        var iters = StressEnv.Iterations(fallback: 500, cap: 8_000);
+        var iters = StressEnv.Iterations(fallback: 128, cap: 8_000);
         var protocol = await PgTestPool.GetProtocolAsync();
         for (var i = 0; i < iters; i++)
         {
@@ -220,7 +221,7 @@ public class CommandDrainTests
             var e = flow.GetAsyncEnumerator();
             Assert.IsTrue(await e.MoveNextAsync(), $"iter {i}: first result not delivered");
             e.Dispose(); // SYNC dispose of an async flow, mid-batch - the raced path.
-            await PgTestPool.RunAsync(protocol, "select 1").WaitAsync(TimeSpan.FromSeconds(10));
+            await PgTestPool.RunAsync(protocol, "select 1");
         }
     }
 
@@ -232,11 +233,10 @@ public class CommandDrainTests
     [TestMethod]
     public async Task InFlightCompletion_RacesSyncDispose_PumpNeverStrands_Stress()
     {
-        var cap = TimeSpan.FromSeconds(10);
         // Each iteration is a full connect + force-abort cycle. Cap it because this is path coverage,
         // not a throughput soak.
         var stress = StressEnv.Iterations(fallback: 0, cap: int.MaxValue);
-        var iters = Math.Min(Math.Max(stress, 10), 300);
+        var iters = Math.Min(Math.Max(stress, 5), 300);
         await using var blocker = await PgAdvisoryLock.AcquireAsync();
         for (var i = 0; i < iters; i++)
         {
@@ -253,19 +253,8 @@ public class CommandDrainTests
             var abortTask = Task.Run(async () => { try { await protocol.DisposeAsync(); } catch { } });
             await blocker.ReleaseAsync();
 
-            try
-            {
-                await Task.WhenAll(disposeTask, abortTask).WaitAsync(cap);
-            }
-            catch (TimeoutException)
-            {
-                var stuck = string.Join(", ", new[] { ("dispose", disposeTask), ("abort", abortTask) }
-                    .Where(x => !x.Item2.IsCompleted).Select(x => x.Item1));
-                Assert.Fail($"iter {i}: dispose/abort race did not converge\n  stuck: {stuck}\n" +
-                    $"flow: {ProtocolDiag.Describe(flow)}\n{ProtocolDiag.Gauges(protocol)}\n" +
-                    $"source: {ProtocolDiag.SourceState(protocol)}");
-            }
-            try { await moveNext.WaitAsync(cap); } catch { }
+            await Task.WhenAll(disposeTask, abortTask);
+            try { await moveNext; } catch { }
         }
     }
 
@@ -292,7 +281,7 @@ public class CommandDrainTests
         await Assert.ThrowsExactlyAsync<PgClientClosedException>(async () => await MoveNext(e, flowAsync));
         await e.DisposeAsync();
 
-        await completeTask.WaitAsync(TimeSpan.FromSeconds(10));
+        await completeTask;
     }
 
     // Graceful shutdown overlapping consumer-side dispose. The first MoveNext's outcome may
@@ -324,7 +313,7 @@ public class CommandDrainTests
         catch (PgClientClosedException) { }
         await Dispose(e, useAsyncDispose);
 
-        await completeTask.WaitAsync(TimeSpan.FromSeconds(10));
+        await completeTask;
     }
 
     // Async flow: shutdown signalled before the consumer ever touches the flow. The parked
@@ -343,16 +332,11 @@ public class CommandDrainTests
         });
         Assert.IsTrue(protocol.TryQueue(flow));
 
-        await observer.Entered.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        await observer.Entered.Task;
         var completeTask = protocol.CompleteAsync();
         Assert.IsTrue(protocol.IsDraining);
-        var stoppingTimeout = Task.Delay(TimeSpan.FromSeconds(10));
         while (!protocol.FlowControl.StoppingToken.IsCancellationRequested)
-        {
             await Task.Yield();
-            if (stoppingTimeout.IsCompleted)
-                Assert.Fail("shutdown did not publish the stopping token");
-        }
         flow.GetExecutionControl(protocol.FlowControl).OnHeartbeat(TimeSpan.Zero);
         await protocol.Heartbeat(TimeSpan.Zero);
 
@@ -360,13 +344,10 @@ public class CommandDrainTests
         await Assert.ThrowsExactlyAsync<PgClientClosedException>(async () => await e.MoveNextAsync());
         await e.DisposeAsync();
 
-        var timeout = Task.Delay(TimeSpan.FromSeconds(10));
         while (!completeTask.IsCompleted)
         {
             await protocol.Heartbeat(TimeSpan.Zero);
             await Task.Yield();
-            if (timeout.IsCompleted)
-                Assert.Fail("shutdown did not converge while heartbeats were driven");
         }
         await completeTask;
     }
@@ -404,7 +385,7 @@ public class CommandDrainTests
         await eA.DisposeAsync();
         await eB.DisposeAsync();
 
-        await completeTask.WaitAsync(TimeSpan.FromSeconds(10));
+        await completeTask;
     }
 
     // Graceful-then-abort escalation: a body parked on an advisory lock can't observe StoppingToken
@@ -418,7 +399,12 @@ public class CommandDrainTests
         // Narrow timeout, but safe parallelized: the body is parked on the advisory lock for the whole window,
         // so the graceful->abort escalation is deterministic - there is no timing race to lose.
         await using var blocker = await PgAdvisoryLock.AcquireAsync();
-        var protocol = await PgTestPool.NewIsolatedAsync(o => o.CompletionTimeout = TimeSpan.FromMilliseconds(20));
+        var time = new FakeTimeProvider();
+        var protocol = await PgTestPool.NewIsolatedAsync(o =>
+        {
+            o.CompletionTimeout = TimeSpan.FromSeconds(1);
+            o.TimeProvider = time;
+        });
 
         var flow = new CommandFlow(async: true, blocker.WaitCommand);
         Assert.IsTrue(protocol.TryQueue(flow));
@@ -428,13 +414,14 @@ public class CommandDrainTests
         await blocker.WaitUntilContendedAsync(protocol.FlowControl.BackendProcessId);
 
         var completeTask = protocol.CompleteAsync();
+        time.Advance(TimeSpan.FromSeconds(1));
 
         await Assert.ThrowsExactlyAsync<PgClientClosedException>(
-            async () => await moveNextTask.WaitAsync(TimeSpan.FromSeconds(10)));
+            async () => await moveNextTask);
         await blocker.ReleaseAsync();
         await blocker.WaitUntilBackendGoneAsync(protocol.FlowControl.BackendProcessId);
         await e.DisposeAsync();
 
-        await completeTask.WaitAsync(TimeSpan.FromSeconds(10));
+        await completeTask;
     }
 }

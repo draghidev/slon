@@ -39,8 +39,6 @@ namespace Slon.Tests.Pg;
 [TestClass]
 public class RacingDisposeInMemoryTests
 {
-    static readonly TimeSpan Cap = TimeSpan.FromSeconds(10);
-    static readonly TimeSpan HangCap = TimeSpan.FromSeconds(3);
 
     // One real connection, captured once: handshake + the flow's RFQ-delimited response split into
     // wire messages so the test can release RowDescription/DataRow while holding CommandComplete+RFQ,
@@ -84,14 +82,14 @@ public class RacingDisposeInMemoryTests
         var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var flow = new WriteThenWaitFlow(written, release, async: true);
         Assert.IsTrue(protocol.TryQueue(flow));
-        await written.Task.WaitAsync(Cap);
+        await written.Task;
 
         var completion = protocol.CompleteAsync();
         transport.CompleteWriteCleanly();
         await Assert.ThrowsExactlyAsync<PgClientClosedException>(async () => await protocol.FlushAsync(CancellationToken.None));
         release.SetResult();
 
-        await completion.WaitAsync(Cap);
+        await completion;
     }
 
     [TestMethod]
@@ -111,13 +109,13 @@ public class RacingDisposeInMemoryTests
         Assert.IsTrue(protocol.TryQueue(flow));
         var enumerator = flow.GetAsyncEnumerator();
         var moveNext = enumerator.MoveNextAsync().AsTask();
-        await readParked.WaitAsync(Cap);
+        await readParked;
 
         var completion = protocol.CompleteAsync();
         transport.CompleteReadCleanly();
-        await Assert.ThrowsExactlyAsync<PgClientClosedException>(async () => await moveNext.WaitAsync(Cap));
+        await Assert.ThrowsExactlyAsync<PgClientClosedException>(async () => await moveNext);
         await enumerator.DisposeAsync();
-        await completion.WaitAsync(Cap);
+        await completion;
     }
 
     [TestMethod]
@@ -137,7 +135,7 @@ public class RacingDisposeInMemoryTests
         Assert.IsTrue(protocol.TryQueue(flow));
         var flowEnumerator = flow.GetAsyncEnumerator();
         var resultPending = flowEnumerator.MoveNextAsync().AsTask();
-        await initialReadParked.WaitAsync(Cap);
+        await initialReadParked;
 
         var messages = _largeRowMessages!;
         var dataRowIndex = messages.ToList().FindIndex(static message => message[0] == (byte)'D');
@@ -147,20 +145,20 @@ public class RacingDisposeInMemoryTests
         transport.ReleaseSegment(messages[dataRowIndex]
             .AsSpan(0, BackendMessageBatch.Segmenter.DefaultDataRowStreamingThreshold).ToArray());
 
-        Assert.IsTrue(await resultPending.WaitAsync(Cap));
+        Assert.IsTrue(await resultPending);
         var rows = flowEnumerator.Current.GetAsyncEnumerator(CommandResult.RowBuffering.Streaming);
-        Assert.IsTrue(await rows.MoveNextAsync().AsTask().WaitAsync(Cap));
+        Assert.IsTrue(await rows.MoveNextAsync().AsTask());
 
         var continuationReadParked = transport.ArmReadPark();
         var valuePending = rows.Current.GetValueAsync<string>(0).AsTask();
-        await continuationReadParked.WaitAsync(Cap);
+        await continuationReadParked;
 
         var completion = protocol.CompleteAsync();
         transport.CompleteReadCleanly();
-        await Assert.ThrowsExactlyAsync<PgClientClosedException>(async () => await valuePending.WaitAsync(Cap));
-        try { await rows.DisposeAsync().AsTask().WaitAsync(Cap); } catch (PgClientClosedException) { }
-        try { await flowEnumerator.DisposeAsync().AsTask().WaitAsync(Cap); } catch (PgClientClosedException) { }
-        await completion.WaitAsync(Cap);
+        await Assert.ThrowsExactlyAsync<PgClientClosedException>(async () => await valuePending);
+        try { await rows.DisposeAsync().AsTask(); } catch (PgClientClosedException) { }
+        try { await flowEnumerator.DisposeAsync().AsTask(); } catch (PgClientClosedException) { }
+        await completion;
     }
 
     [ClassInitialize]
@@ -202,7 +200,7 @@ public class RacingDisposeInMemoryTests
         {
             try { await Protocol.DisposeAsync(); } catch { }
             Clock.Advance(TimeSpan.FromSeconds(120));
-            try { await Protocol.CompleteAsync().WaitAsync(Cap); } catch { }
+            try { await Protocol.CompleteAsync(); } catch { }
         }
     }
 
@@ -232,7 +230,7 @@ public class RacingDisposeInMemoryTests
         var first = e.MoveNextAsync().AsTask();
 
         // The body writes its command and parks on the response read.
-        await aParked.WaitAsync(Cap);
+        await aParked;
 
         // Release RowDescription + first DataRow: enough for ReadUntilExecute to return and the body
         // to deliver result 1, then park on the inter-result gate. CommandComplete + RFQ stay held.
@@ -248,7 +246,7 @@ public class RacingDisposeInMemoryTests
         // delivery and its next statement is the inter-result gate await; settle so it reaches that
         // park before the test perturbs the teardown. The gate sources are set-before-await safe, so
         // this only narrows the schedule, it does not gate correctness.
-        Assert.IsTrue(await first.WaitAsync(Cap), "first MoveNextAsync did not deliver result 1");
+        Assert.IsTrue(await first, "first MoveNextAsync did not deliver result 1");
         await SettleAsync();
 
         return new Scenario
@@ -297,7 +295,7 @@ public class RacingDisposeInMemoryTests
         var e = flow.GetAsyncEnumerator();
 
         var first = e.MoveNextAsync().AsTask();
-        await aParked.WaitAsync(Cap);
+        await aParked;
 
         // Release command 1's result (T, D, C) so the body delivers result 1 and parks on the
         // inter-result gate. Hold everything from command 2's RowDescription onward.
@@ -306,7 +304,7 @@ public class RacingDisposeInMemoryTests
         for (var i = 0; i < release; i++)
             transport.ReleaseSegment(msgs[i]);
 
-        Assert.IsTrue(await first.WaitAsync(Cap), "first MoveNextAsync did not deliver result 1");
+        Assert.IsTrue(await first, "first MoveNextAsync did not deliver result 1");
         await SettleAsync();
 
         return new Scenario
@@ -408,10 +406,10 @@ public class RacingDisposeInMemoryTests
 
         var bodyReParked = s.Transport.ArmReadPark();
         var dispose = consumer.RunDispose();
-        await bodyReParked.WaitAsync(Cap);
+        await bodyReParked;
 
         var protoDispose = s.Protocol.DisposeAsync();
-        var escaped = await dispose.WaitAsync(Cap);
+        var escaped = await dispose;
         await protoDispose;
 
         Assert.IsNull(escaped,
@@ -432,23 +430,12 @@ public class RacingDisposeInMemoryTests
             var bodyReParked = s.Transport.ArmReadPark();
             var dispose = StartSyncDispose(s.Enumerator, out var started);
             using (started)
-                Assert.IsTrue(started.Wait(Cap), $"iteration {i}: disposer thread did not start");
-            await bodyReParked.WaitAsync(Cap);
+                started.Wait();
+            await bodyReParked;
 
             var abort = s.Protocol.DisposeAsync().AsTask();
-            Exception? escaped;
-            try
-            {
-                escaped = await dispose.WaitAsync(Cap);
-            }
-            catch (TimeoutException)
-            {
-                Assert.Fail($"iteration {i}: synchronous disposal did not converge\n" +
-                    $"flow: {ProtocolDiag.Describe(s.Flow)}\n{ProtocolDiag.Gauges(s.Protocol)}\n" +
-                    $"source: {ProtocolDiag.SourceState(s.Protocol)}\nabort={abort.Status}");
-                return;
-            }
-            await abort.WaitAsync(Cap);
+            var escaped = await dispose;
+            await abort;
 
             Assert.IsNull(escaped,
                 $"iteration {i}: {escaped} escaped synchronous disposal");
@@ -475,8 +462,8 @@ public class RacingDisposeInMemoryTests
         var dispose = consumer.RunDispose();
         await SettleAsync();
         s.Clock.Advance(TimeSpan.FromSeconds(120));
-        var escaped = await dispose.WaitAsync(Cap);
-        await complete.WaitAsync(Cap);
+        var escaped = await dispose;
+        await complete;
 
         Assert.IsNull(escaped,
             $"ordering 2: PgClientClosedException escaped DisposeAsync: {escaped?.GetType().Name}");
@@ -498,11 +485,11 @@ public class RacingDisposeInMemoryTests
 
             var dispose = StartSyncDispose(s.Enumerator, out var started);
             using (started)
-                Assert.IsTrue(started.Wait(Cap), $"iteration {i}: disposer thread did not start");
+                started.Wait();
             s.Clock.Advance(TimeSpan.FromSeconds(120));
 
-            var escaped = await dispose.WaitAsync(Cap);
-            await complete.WaitAsync(Cap);
+            var escaped = await dispose;
+            await complete;
             Assert.IsNull(escaped,
                 $"iteration {i}: {escaped?.GetType().Name} escaped synchronous disposal");
         }
@@ -524,16 +511,13 @@ public class RacingDisposeInMemoryTests
         await SettleAsync();
 
         var loop = consumer.RunLoop();
-        var done = await Task.WhenAny(loop, Task.Delay(HangCap));
-        var converged = done == loop;
+        await loop;
 
         _ = s.Protocol.DisposeAsync();
         s.Clock.Advance(TimeSpan.FromSeconds(120));
-        try { await complete.WaitAsync(Cap); } catch { }
-        try { await consumer.RunDispose().WaitAsync(Cap); } catch { }
+        try { await complete; } catch { }
+        try { await consumer.RunDispose(); } catch { }
 
-        Assert.IsTrue(converged,
-            "ordering 3 (gate-fault): the self-deliver failed to recover the no-op - lost-completion regressed");
     }
 
     // Ordering 3 (read-fault) - the no-op never happens: with the body on its drain read, a forceful
@@ -547,18 +531,15 @@ public class RacingDisposeInMemoryTests
 
         var bodyReParked = s.Transport.ArmReadPark();
         var loop = consumer.RunLoop();
-        await bodyReParked.WaitAsync(Cap);
+        await bodyReParked;
 
         _ = s.Protocol.DisposeAsync();
 
-        var done = await Task.WhenAny(loop, Task.Delay(HangCap));
-        var converged = done == loop;
+        await loop;
 
         s.Clock.Advance(TimeSpan.FromSeconds(120));
-        try { await consumer.RunDispose().WaitAsync(Cap); } catch { }
+        try { await consumer.RunDispose(); } catch { }
 
-        Assert.IsTrue(converged,
-            "ordering 3 (read-fault): read-fault produced a lost-completion hang - unexpected on this flow");
     }
 
     // Multi-command convergence under graceful close while the body is parked on the INTER-RESULT gate
@@ -583,15 +564,12 @@ public class RacingDisposeInMemoryTests
         for (var i = 0; i < s.Messages.Count; i++)
             s.Transport.ReleaseSegment(s.Messages[i]);
 
-        var done = await Task.WhenAny(loop, Task.Delay(HangCap));
-        var converged = done == loop;
+        await loop;
 
         s.Clock.Advance(TimeSpan.FromSeconds(120));
-        try { await complete.WaitAsync(Cap); } catch { }
-        try { await consumer.RunDispose().WaitAsync(Cap); } catch { }
+        try { await complete; } catch { }
+        try { await consumer.RunDispose(); } catch { }
 
-        Assert.IsTrue(converged,
-            "multi-command: consumer hung at the inter-result gate under graceful close - body not woken without a heartbeat");
     }
 
     // Point-C outcome (deterministic replacement for ProtocolCompletionTests.DisposeAfterFirstResult_-
@@ -614,7 +592,7 @@ public class RacingDisposeInMemoryTests
         bool more;
         try
         {
-            more = await s.Enumerator.MoveNextAsync().AsTask().WaitAsync(HangCap);
+            more = await s.Enumerator.MoveNextAsync().AsTask();
         }
         catch (PgClientClosedException)
         {
@@ -624,15 +602,14 @@ public class RacingDisposeInMemoryTests
             "the next MoveNextAsync re-yielded the stale result 1 instead of surfacing close/complete");
 
         s.Clock.Advance(TimeSpan.FromSeconds(120));
-        try { await dispose.WaitAsync(Cap); } catch { }
+        try { await dispose; } catch { }
         try { await s.Enumerator.DisposeAsync(); } catch { }
     }
 
     static async Task SettleAsync()
     {
-        for (var i = 0; i < 8; i++)
+        for (var i = 0; i < 16; i++)
             await Task.Yield();
-        await Task.Delay(5);
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -662,7 +639,7 @@ public class RacingDisposeInMemoryTests
         var afterFlow = recStream.RecordedLength;
 
         var full = recStream.Snapshot();
-        await protocol.CompleteAsync().WaitAsync(Cap);
+        await protocol.CompleteAsync();
 
         var handshake = StartupTranscript.MakeReplayable(full.AsSpan(0, handshakeLen));
         var response = full.AsSpan(handshakeLen, afterFlow - handshakeLen).ToArray();

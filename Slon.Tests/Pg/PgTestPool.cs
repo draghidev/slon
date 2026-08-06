@@ -33,7 +33,6 @@ static class PgTestPool
         int.TryParse(Environment.GetEnvironmentVariable("PG_TEST_POOL_MAX"), out var m) && m > 0
             ? m
             : Environment.ProcessorCount);
-    static readonly TimeSpan LeaseTimeout = TimeSpan.FromSeconds(30);
 
     static readonly ConnectionPool<PooledProtocol> _pool =
         new(new Factory(), new ConnectionPoolOptions { MaxConnections = MaxConnections, HeartbeatInterval = TimeSpan.FromSeconds(1) });
@@ -53,7 +52,7 @@ static class PgTestPool
     {
         try
         {
-            return (await _pool.GetAsync(LeaseTimeout).ConfigureAwait(false)).Protocol;
+            return (await _pool.GetAsync(default).ConfigureAwait(false)).Protocol;
         }
         catch (TimeoutException ex)
         {

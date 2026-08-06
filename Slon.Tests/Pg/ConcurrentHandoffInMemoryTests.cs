@@ -80,22 +80,13 @@ public class ConcurrentHandoffInMemoryTests
             var aDrain = DrainAsync(a);
             // Trigger sync S concurrently - now A and S are both in flight on one wire.
             runSync.Release();
-            try
-            {
-                await aDrain.WaitAsync(TimeSpan.FromSeconds(15));
-                if (!await Task.Run(() => syncDone.Wait(TimeSpan.FromSeconds(15))))
-                    throw new TimeoutException("sync flow");
-            }
-            catch (Exception ex) when (ex is TimeoutException)
-            {
-                Capture(new Exception($"FORCED-OVERLAP HUNG at iter {i} ({ex.Message})."));
-                break;
-            }
+            await aDrain;
+            await Task.Run(syncDone.Wait);
         }
 
         Volatile.Write(ref stop, true);
         runSync.Release();
-        try { await protocol.CompleteAsync().WaitAsync(TimeSpan.FromSeconds(10)); } catch { }
+        try { await protocol.CompleteAsync(); } catch { }
         if (failure[0] is { } f)
             Assert.Fail($"forced-overlap (in-memory) raised {f.GetType().Name}: {f.Message}\n{f}");
 
@@ -134,12 +125,7 @@ public class ConcurrentHandoffInMemoryTests
             {
                 for (int i = 0; i < iters && Volatile.Read(ref failure[0]) is null; i++)
                 {
-                    try { await PgTestPool.RunAsync(protocol, "select 1").WaitAsync(TimeSpan.FromSeconds(15)); }
-                    catch (TimeoutException)
-                    {
-                        Capture(new Exception($"async RunAsync HUNG at iter {i}."));
-                        break;
-                    }
+                    await PgTestPool.RunAsync(protocol, "select 1");
                 }
             }
             catch (Exception ex) { Capture(ex); }
@@ -165,8 +151,8 @@ public class ConcurrentHandoffInMemoryTests
         syncThread.Start();
 
         await asyncLoop;
-        syncThread.Join(TimeSpan.FromSeconds(30));
-        try { await protocol.CompleteAsync().WaitAsync(TimeSpan.FromSeconds(10)); } catch { }
+        syncThread.Join();
+        try { await protocol.CompleteAsync(); } catch { }
 
         if (failure[0] is { } ex2)
             Assert.Fail($"concurrent sync/async (in-memory) raised {ex2.GetType().Name}: {ex2.Message}\n{ex2}");
@@ -198,7 +184,7 @@ public class ConcurrentHandoffInMemoryTests
         await e.DisposeAsync();
         var total = rec.RecordedLength;
         var full = rec.Snapshot();
-        await protocol.CompleteAsync().WaitAsync(TimeSpan.FromSeconds(10));
+        await protocol.CompleteAsync();
 
         var handshake = StartupTranscript.MakeReplayable(full.AsSpan(0, handshakeLen));
         var response = full.AsSpan(handshakeLen, total - handshakeLen).ToArray();

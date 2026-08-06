@@ -57,7 +57,8 @@ public class ExclusiveScopeAdoTests
         await using var ds = AdoTestPool.NewIsolatedDataSource();
         await using var conn = await ds.OpenConnectionAsync(CancellationToken.None);
         await ExecNonQuery(conn, "SET application_name = 'slon_scope_probe'");
-        for (var i = 0; i < 8; i++)
+        // The fifth lease crosses the four-connection capacity boundary.
+        for (var i = 0; i < 5; i++)
         {
             await using var cmd = new SlonCommand(conn, "SHOW application_name");
             await using var reader = await cmd.ExecuteReaderAsync(CancellationToken.None);

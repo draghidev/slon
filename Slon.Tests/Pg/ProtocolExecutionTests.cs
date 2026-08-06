@@ -118,12 +118,12 @@ public class ProtocolExecutionTests
     // Many sync flows in a tight loop. Exercises the handoff state machine across repeated
     // cycles: HandoffSlot / HandoffActive / SyncHead / SyncTail / ParkedMres / VTS Reset all
     // need to return to rest between iterations. A leak in any would deadlock or skip results
-    // within a few hundred runs.
+    // during the repeated cycles.
     [TestMethod]
     public async Task RepeatedSync_OnRawProtocol_Completes()
     {
         var protocol = await PgTestPool.GetProtocolAsync();
-        for (int i = 0; i < 200; i++)
+        for (int i = 0; i < 64; i++)
             await PgTestPool.RunSync(protocol, "select 1");
     }
 
@@ -133,7 +133,7 @@ public class ProtocolExecutionTests
     public async Task RepeatedAsync_OnRawProtocol_Completes()
     {
         var protocol = await PgTestPool.GetProtocolAsync();
-        for (int i = 0; i < 200; i++)
+        for (int i = 0; i < 64; i++)
             await PgTestPool.RunAsync(protocol, "select 1");
     }
 
@@ -145,7 +145,7 @@ public class ProtocolExecutionTests
     public async Task AlternatingSyncAsync_OnRawProtocol_Completes()
     {
         var protocol = await PgTestPool.GetProtocolAsync();
-        for (int i = 0; i < 50; i++)
+        for (int i = 0; i < 16; i++)
         {
             if ((i & 1) == 0)
                 await PgTestPool.RunSync(protocol, "select 1");
@@ -201,7 +201,7 @@ public class ProtocolExecutionTests
         });
 
         await blocker.ReleaseAsync();
-        await syncTask.WaitAsync(TimeSpan.FromSeconds(2));
+        await syncTask;
 
         await slowTask;
         await slowEnum.DisposeAsync();

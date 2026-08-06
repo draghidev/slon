@@ -1,6 +1,7 @@
 using System.Buffers.Binary;
 using System.IO.Pipelines;
 using System.Text;
+using Microsoft.Extensions.Time.Testing;
 using Slon.Buffers;
 using Slon.Pg;
 using Slon.Tests;
@@ -180,15 +181,15 @@ public class ExclusiveAccessFlowTests
         try
         {
             var scope = protocol.QueueExclusiveScope(async: true);
-            await scope.HandoffReady.WaitAsync(TimeSpan.FromSeconds(5));
+            await scope.HandoffReady;
             await DrainAsync(scope.Queue(new CommandFlow(async: true, Command.Create("BEGIN"))));
             await Assert.ThrowsExactlyAsync<InvalidOperationException>(
-                async () => await scope.CompleteScopeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(5)));
+                async () => await scope.CompleteScopeAsync().AsTask());
 
             var next = protocol.QueueExclusiveScope(async: true);
-            await next.HandoffReady.WaitAsync(TimeSpan.FromSeconds(5));
+            await next.HandoffReady;
             await DrainAsync(next.Queue(new CommandFlow(async: true, Command.Create("select 1"))));
-            await next.CompleteScopeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(5));
+            await next.CompleteScopeAsync().AsTask();
         }
         finally
         {
@@ -206,7 +207,12 @@ public class ExclusiveAccessFlowTests
 
     static async Task ProtocolShutdownWhileScopeOpenCascadesToInnerTeardown(Exception? cause)
     {
-        var protocol = await PgTestPool.NewIsolatedAsync(o => o.HeartbeatInterval = TimeSpan.FromMilliseconds(50));
+        var time = new FakeTimeProvider();
+        var protocol = await PgTestPool.NewIsolatedAsync(o =>
+        {
+            o.HeartbeatInterval = TimeSpan.FromSeconds(1);
+            o.TimeProvider = time;
+        });
         try
         {
             var scope = protocol.QueueExclusiveScope(async: true);
@@ -214,19 +220,9 @@ public class ExclusiveAccessFlowTests
 
             await DrainAsync(scope.Queue(new CommandFlow(async: true, Command.Create("select 1"))));
 
-            try
-            {
-                await protocol.CompleteAsync(cause).WaitAsync(TimeSpan.FromSeconds(10));
-            }
-            catch (TimeoutException)
-            {
-                // A hang here is a distinct face from the collision below - dump the slot/pump state
-                // so it self-classifies (the shutdown x recovery bailout face was pinned by exactly
-                // this readout in the racing-teardown family).
-                Assert.Fail("cascade CompleteAsync did not converge: " +
-                    $"[unflushed={protocol.UnflushedBytes} scope: pending={scope.IsPending} started={scope.IsStarted} completed={scope.IsCompleted}]\n" +
-                    $"{ProtocolDiag.Gauges(protocol)}\nsource: {ProtocolDiag.SourceState(protocol)}");
-            }
+            var completion = protocol.CompleteAsync(cause);
+            time.Advance(TimeSpan.FromSeconds(1));
+            try { await completion; }
             catch (InvalidOperationException ex) when (!ReferenceEquals(ex, cause))
             {
                 // Pump collision capture: record the premise the deterministic-repro attempts keep
@@ -383,10 +379,11 @@ public class ExclusiveAccessFlowTests
             ScopeReset = new ScopeResetOptions { ClearListeners = true },
         };
 
+        var time = new FakeTimeProvider();
         var protocolOptions = new PgClientProtocolOptions(options)
         {
-            CompletionTimeout = TimeSpan.FromMilliseconds(2),
-            HeartbeatInterval = TimeSpan.FromMilliseconds(5),
+            HeartbeatInterval = TimeSpan.FromSeconds(1),
+            TimeProvider = time,
             BackendProvider = TestBackendProvider.Instance,
         };
         var transport = new GatedWriteTransport(StartupHandshake());
@@ -394,28 +391,15 @@ public class ExclusiveAccessFlowTests
         await protocol.StartAsync(options, transport);
 
         var scope = protocol.QueueExclusiveScope(async: true);
-        try
-        {
-            await scope.HandoffReady.WaitAsync(TimeSpan.FromSeconds(10));
-        }
-        catch (TimeoutException)
-        {
-            Assert.Fail($"scope handoff stranded pre-arm\n{ProtocolDiag.Gauges(protocol)}\nsource: {ProtocolDiag.SourceState(protocol)}");
-        }
+        await scope.HandoffReady;
 
         transport.ArmWriteFaults();
         var completion = protocol.CompleteAsync(new Exception("test shutdown"));
+        time.Advance(TimeSpan.FromSeconds(1));
         try
         {
-            await transport.HeldWriteEntered.WaitAsync(TimeSpan.FromSeconds(10));
+            await transport.HeldWriteEntered;
             Assert.IsFalse(completion.IsCompleted, "Outer teardown advanced while the inner flush was held.");
-        }
-        catch (TimeoutException)
-        {
-            // The premise itself failed: teardown never reached the held write. Distinct from both the
-            // collision (IOE below) and a held-write hang; dump so it self-classifies.
-            Assert.Fail($"teardown never entered the held write (amplifier premise not reached)\n" +
-                $"{ProtocolDiag.Gauges(protocol)}\nsource: {ProtocolDiag.SourceState(protocol)}");
         }
         finally
         {
@@ -423,14 +407,10 @@ public class ExclusiveAccessFlowTests
         }
         try
         {
-            await completion.WaitAsync(TimeSpan.FromSeconds(10));
+            await completion;
         }
         catch (PgClientClosedException)
         {
-        }
-        catch (TimeoutException)
-        {
-            Assert.Fail($"teardown did not converge after held-write release\n{ProtocolDiag.Gauges(protocol)}\nsource: {ProtocolDiag.SourceState(protocol)}");
         }
         catch (InvalidOperationException ex)
         {
@@ -521,8 +501,12 @@ public class ExclusiveAccessFlowTests
     [TestMethod]
     public async Task ScopeAbort_BreaksSubflowParkedOnRead_ProtocolSurvives()
     {
+        var time = new FakeTimeProvider();
         var protocol = await PgTestPool.NewIsolatedAsync(o =>
-            o.HeartbeatInterval = TimeSpan.FromMilliseconds(50));
+        {
+            o.HeartbeatInterval = TimeSpan.FromSeconds(1);
+            o.TimeProvider = time;
+        });
         try
         {
             await using var blocker = await PgAdvisoryLock.AcquireAsync();
@@ -546,9 +530,10 @@ public class ExclusiveAccessFlowTests
             });
 
             protocol.AbortActiveScope();
+            time.Advance(TimeSpan.FromSeconds(1));
             await blocker.ReleaseAsync();
 
-            var observed = await run.WaitAsync(TimeSpan.FromSeconds(10));
+            var observed = await run;
             Assert.IsNotNull(observed);
             while (observed is not PgClientClosedException && observed.InnerException is not null)
                 observed = observed.InnerException;

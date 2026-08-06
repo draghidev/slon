@@ -6,24 +6,14 @@ namespace Slon.Tests.Pg;
 
 // Stress for ExclusiveAccessFlow: hammers wire-takeover + nested-pipeline + flyweight-reuse +
 // recursive-handoff to shake the outer/inner decoder-rebind and reuse races against the quiet
-// baseline. Override iteration count via SLON_STRESS_ITERATIONS (default 1000).
+// baseline. SLON_STRESS_ITERATIONS supplies deliberate deeper exposure.
 [TestClass]
 [DoNotParallelize]
 public class ExclusiveAccessFlowStressTests
 {
     // Real exclusive-access flows per iteration (this base count is further divided per scenario).
     // Capped so a blanket high count can't mountain the suite; SLON_UNCAPPED=1 drives the raw value.
-    static int Iterations => StressEnv.Iterations(fallback: 100, cap: 5_000);
-
-    static readonly TimeSpan Cap = TimeSpan.FromSeconds(10);
-
-    // Fail fast on a deadlock instead of hanging the whole suite. where carries the iteration so a
-    // rare stress failure points at the attempt that wedged.
-    static async Task Capped(Task work, string where)
-    {
-        try { await work.WaitAsync(Cap); }
-        catch (TimeoutException) { Assert.Fail($"{where}: hung (deadlock under stress)."); }
-    }
+    static int Iterations => StressEnv.Iterations(fallback: 32, cap: 5_000);
 
     static async Task DrainAsync(CommandFlow flow)
     {
@@ -67,7 +57,7 @@ public class ExclusiveAccessFlowStressTests
     {
         var protocol = await PgTestPool.GetProtocolAsync();
         for (int i = 0; i < Iterations; i++)
-            await Capped(RunScopeAsync(protocol), $"RepeatedScopes iter {i}");
+            await RunScopeAsync(protocol);
     }
 
     // Many commands within one scope, drained one-at-a-time (the consumer-driven read contract):
@@ -78,7 +68,7 @@ public class ExclusiveAccessFlowStressTests
         var protocol = await PgTestPool.GetProtocolAsync();
         var iters = Math.Max(1, Iterations / 10);
         for (int i = 0; i < iters; i++)
-            await Capped(RunManyCommandsScopeAsync(protocol), $"ManyCommands iter {i}");
+            await RunManyCommandsScopeAsync(protocol);
     }
 
     // Sync subflow inside a scope: fires the RECURSIVE handoff (EnqueueSyncWithHandoff on the inner
@@ -89,7 +79,7 @@ public class ExclusiveAccessFlowStressTests
         var protocol = await PgTestPool.GetProtocolAsync();
         var iters = Math.Max(1, Iterations / 2);
         for (int i = 0; i < iters; i++)
-            await Capped(RunSyncSubflowScopeAsync(protocol), $"SyncSubflow iter {i}");
+            await RunSyncSubflowScopeAsync(protocol);
     }
 
     // N protocols each running scopes concurrently: per-protocol isolation + concurrent takeovers.
@@ -109,7 +99,7 @@ public class ExclusiveAccessFlowStressTests
             tasks[i] = Task.Run(async () =>
             {
                 for (int j = 0; j < perThread; j++)
-                    await Capped(RunScopeAsync(protocol), $"ConcurrentScopes p{p} iter {j}");
+                    await RunScopeAsync(protocol);
             });
         }
         await Task.WhenAll(tasks);

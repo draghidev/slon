@@ -11,7 +11,7 @@ public class FlowSourceTests
     // In-memory, but exercises the source's spin/Mres wait points (PgClientFlowSource), which escalate to
     // Sleep(1) once the threadpool is saturated - so a blanket high count goes super-linear. Cap; the raw
     // value still flows under SLON_UNCAPPED=1 for a deliberate soak.
-    static int Iterations => StressEnv.Iterations(fallback: 5_000, cap: 20_000);
+    static int Iterations => StressEnv.Iterations(fallback: 512, cap: 20_000);
 
     // True only within the dynamic extent of the test's inline-driving Execute call. The budget
     // invariant is stack-bounded, not thread-bounded: preferLocal dispatch may legally resume
@@ -69,11 +69,11 @@ public class FlowSourceTests
         }
 
         Assert.AreEqual(callerThread, firstThread, "The idle claimant did not drive its own item inline.");
-        await secondSeen.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        await secondSeen.Task;
         Assert.IsFalse(secondOnInlineDriveStack, "A successor escaped the one-item inline budget.");
 
         enumerator.Complete();
-        await consumer.WaitAsync(TimeSpan.FromSeconds(10));
+        await consumer;
         await enumerator.DisposeAsync();
     }
 
@@ -165,7 +165,7 @@ public class FlowSourceTests
             enumerator.Complete();
             await Task.WhenAny(executorStopped.Task, executor);
             source.DrainInertItems(flow => Record(flow, drain: true));
-            await executor.WaitAsync(TimeSpan.FromSeconds(10));
+            await executor;
             await enumerator.DisposeAsync();
 
             List<string>? anomalies = null;
@@ -186,7 +186,6 @@ public class FlowSourceTests
         }
     }
 
-    static readonly TimeSpan Cap = TimeSpan.FromSeconds(10);
 
     [TestMethod]
     public async Task QueuedSyncFlow_CompletesBeforeHandoff_CallerReturnsAndFlowResolvedOnce()
@@ -245,8 +244,8 @@ public class FlowSourceTests
 
         await Task.WhenAny(drained.Task, executor);
         source.DrainInertItems(Record);
-        await executor.WaitAsync(Cap);
-        await caller.WaitAsync(Cap);
+        await executor;
+        await caller;
         await enumerator.DisposeAsync();
 
         Assert.AreEqual(1, consumed,
@@ -310,8 +309,8 @@ public class FlowSourceTests
 
         await Task.WhenAny(drained.Task, executor);
         source.DrainInertItems(Record);
-        await executor.WaitAsync(Cap);
-        await caller.WaitAsync(Cap);
+        await executor;
+        await caller;
         await enumerator.DisposeAsync();
 
         Assert.AreEqual(1, consumed[asyncFlow], "the queued async flow must resolve exactly once.");

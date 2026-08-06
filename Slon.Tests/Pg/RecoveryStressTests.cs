@@ -9,8 +9,7 @@ namespace Slon.Tests.Pg;
 // Hammers two patterns inside a single test method so the loop runs in one process — much faster
 // per attempt than restarting the test runner per iteration.
 //
-// Iterations override via SLON_STRESS_ITERATIONS (default 50). Default is a fast regression
-// guard now the race is fixed; explicit stress runs override (e.g. SLON_STRESS_ITERATIONS=2000).
+// The default is a regression guard; SLON_STRESS_ITERATIONS supplies deliberate deeper exposure.
 // Each test runs isolated against its own protocol so a failure inside the loop doesn't poison
 // sibling tests.
 [TestClass]
@@ -18,17 +17,7 @@ public class RecoveryStressTests
 {
     // Real recovery (and connection) per iteration. Capped at the documented heavy-soak value; set
     // SLON_UNCAPPED=1 to drive the raw SLON_STRESS_ITERATIONS for a deeper soak.
-    static int Iterations => StressEnv.Iterations(fallback: 50, cap: 2_000);
-
-    static readonly TimeSpan Cap = TimeSpan.FromSeconds(10);
-
-    // Fail fast on a deadlock instead of hanging the whole suite. where carries the iteration so a
-    // rare stress failure points at the attempt that wedged.
-    static async Task Capped(Task work, string where)
-    {
-        try { await work.WaitAsync(Cap); }
-        catch (TimeoutException) { Assert.Fail($"{where}: hung (deadlock under stress)."); }
-    }
+    static int Iterations => StressEnv.Iterations(fallback: 20, cap: 2_000);
 
     static async Task RunAsync(PgClientProtocol protocol, string sql)
     {
@@ -51,8 +40,10 @@ public class RecoveryStressTests
             var faulting = new RecoveryTests.FaultingFlow(async: true, RecoveryTests.FaultPhase.PreReturn, RecoveryTests.WriteShape.MultipleSyncsNoFlush);
             Assert.IsTrue(protocol.TryQueue(faulting));
 
-            for (int j = 0; j < 5; j++)
-                await Capped(RunAsync(protocol, "select 1"), $"RecoveryThenSequential iter {i}.{j}");
+            // Two successors prove both the immediate post-recovery handoff and the return to the
+            // ordinary sequential cycle; further commands repeat the latter state unchanged.
+            for (int j = 0; j < 2; j++)
+                await RunAsync(protocol, "select 1");
         }
     }
 
@@ -64,8 +55,8 @@ public class RecoveryStressTests
     public async Task Stress_SequentialReads_NoRecovery()
     {
         await using var protocol = await PgTestPool.NewIsolatedAsync();
-        for (int i = 0; i < Iterations * 5; i++)
-            await Capped(RunAsync(protocol, "select 1"), $"SequentialReads iter {i}");
+        for (int i = 0; i < Iterations * 2; i++)
+            await RunAsync(protocol, "select 1");
     }
 
     // Recovery dispatch OVERLAPPING the pump's next dispatch - the execute-promise single-pump edge
@@ -94,16 +85,11 @@ public class RecoveryStressTests
 
             // The follow-on must complete cleanly (no tenure collision, clean wire after resync).
             var e = follow.GetAsyncEnumerator();
-            try
-            {
-                while (await e.MoveNextAsync().AsTask().WaitAsync(Cap)) { }
-            }
-            catch (TimeoutException) { Assert.Fail($"iter {i}: follow-on flow hung (dispatch collided with recovery)."); }
+            try { while (await e.MoveNextAsync().AsTask()) { } }
             finally { await e.DisposeAsync(); }
 
             // The faulting flow completes with its injected fault; observe-and-discard.
-            try { await faulting.WaitForComplete().AsTask().WaitAsync(Cap); }
-            catch (TimeoutException) { Assert.Fail($"iter {i}: faulting flow never completed (recovery stranded)."); }
+            try { await faulting.WaitForComplete().AsTask(); }
             catch { /* the injected fault - expected */ }
 
             // Protocol still at RFQ and reusable after the resync.

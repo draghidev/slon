@@ -103,7 +103,7 @@ public class PostgreSqlSslTests
         listener.Start();
         var server = ServeAsync(listener, cert, direct: false);
 
-        var connection = CreateFactory(listener, PostgreSqlSslNegotiation.PostgreSql).Create(TimeSpan.FromSeconds(5));
+        var connection = CreateFactory(listener, PostgreSqlSslNegotiation.PostgreSql).Create(default);
         await server;
         await connection.CompleteAsync();
     }
@@ -116,7 +116,7 @@ public class PostgreSqlSslTests
         listener.Start();
         var server = ServeAsync(listener, cert, direct: true);
 
-        var connection = CreateFactory(listener, PostgreSqlSslNegotiation.Direct).Create(TimeSpan.FromSeconds(5));
+        var connection = CreateFactory(listener, PostgreSqlSslNegotiation.Direct).Create(default);
         await server;
         await connection.CompleteAsync();
     }
@@ -355,7 +355,7 @@ public class PostgreSqlSslTests
         var server = ServePreferFallbackAsync(listener, cert);
 
         var connection = CreateFactory(listener, PostgreSqlSslNegotiation.PostgreSql,
-            PostgreSqlSslMode.Prefer).Create(TimeSpan.FromSeconds(5));
+            PostgreSqlSslMode.Prefer).Create(default);
         await server;
         await connection.CompleteAsync();
     }
@@ -383,7 +383,7 @@ public class PostgreSqlSslTests
         var server = ServeAllowFallbackAsync(listener, cert);
 
         var connection = CreateFactory(listener, PostgreSqlSslNegotiation.Automatic,
-            PostgreSqlSslMode.Allow).Create(TimeSpan.FromSeconds(5));
+            PostgreSqlSslMode.Allow).Create(default);
         await server;
         await connection.CompleteAsync();
     }
@@ -451,7 +451,7 @@ public class PostgreSqlSslTests
                 EndpointVersion = endpointVersion,
                 ConfigureClientAuthenticationOptions = options => options.TargetHost = "localhost"
             },
-            ConnectionTimeout = TimeSpan.FromSeconds(5)
+            ConnectionTimeout = default
         };
         return new PgConnectionFactory(options, transportFactory ?? SocketStreamConnection.CreateFactory(endpoint));
     }

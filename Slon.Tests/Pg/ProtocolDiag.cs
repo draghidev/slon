@@ -68,21 +68,4 @@ static class ProtocolDiag
             $"takeoverPending={S("TakeoverPending")} takeoverActive={S("TakeoverActive")}";
     }
 
-    // Await the named tasks bounded by timeout and, on a hang, name WHICH tasks are still unfinished
-    // plus the protocol/source gauges. Turns a bare TimeoutException (which task wedged? unknown)
-    // into a self-classifying capture. A task FAULT (not a hang) still surfaces its exception, same
-    // as a plain await Task.WhenAll(...).WaitAsync(timeout).
-    internal static async Task WhenAllOrDump(PgClientProtocol protocol, string what, TimeSpan timeout,
-        params (string name, Task task)[] named)
-    {
-        try
-        {
-            await Task.WhenAll(named.Select(n => n.task)).WaitAsync(timeout);
-        }
-        catch (TimeoutException)
-        {
-            var stuck = string.Join(", ", named.Where(n => !n.task.IsCompleted).Select(n => n.name));
-            Assert.Fail($"{what}\n  stuck: {stuck}\n{Gauges(protocol)}\nsource: {SourceState(protocol)}");
-        }
-    }
 }
