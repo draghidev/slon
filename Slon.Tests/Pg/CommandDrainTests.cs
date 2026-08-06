@@ -23,6 +23,52 @@ public class CommandDrainTests
         public void OnFlowEnded(CommandFlow flow) { }
     }
 
+    sealed class ReleaseOrderingFlow : PgClientFlow
+    {
+        readonly ManualResetEventSlim _continueRelease = new();
+
+        public ReleaseOrderingFlow() => IsAsync = true;
+
+        public TaskCompletionSource ReleaseEntered { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public void ContinueRelease() => _continueRelease.Set();
+
+        protected override ValueTask<FlowTasks> ExecuteAuto(Context context) => new(new FlowTasks());
+
+        protected override void OnReleasing(Exception? exception)
+        {
+            ReleaseEntered.TrySetResult();
+            _continueRelease.Wait();
+        }
+    }
+
+    [TestMethod]
+    public async Task Release_DoesNotPublishReuseGateBeforeTenureResourcesAreReleased()
+    {
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
+        var flow = new ReleaseOrderingFlow();
+        var completion = flow.WaitForComplete();
+        var release = Task.Factory.StartNew(
+            () => flow.GetExecutionControl(protocol.FlowControl).Release(),
+            CancellationToken.None,
+            TaskCreationOptions.LongRunning,
+            TaskScheduler.Default);
+
+        await flow.ReleaseEntered.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        try
+        {
+            Assert.IsFalse(completion.IsCompleted,
+                "terminal publication would let the flow be reset while its prior tenure is still releasing resources");
+        }
+        finally
+        {
+            flow.ContinueRelease();
+        }
+        await release.WaitAsync(TimeSpan.FromSeconds(10));
+        await completion;
+    }
+
     [TestMethod]
     public void TerminalProgress_IsStickyBeforeSyncDisposerArms()
     {
@@ -63,7 +109,7 @@ public class CommandDrainTests
             "synchronous completion must park on its event rather than register scheduler work");
 
         await Task.Factory.StartNew(
-            () => flow.GetExecutionControl(protocol.FlowControl).Complete(),
+            () => flow.GetExecutionControl(protocol.FlowControl).Release(),
             CancellationToken.None,
             TaskCreationOptions.LongRunning,
             TaskScheduler.Default);
@@ -80,7 +126,7 @@ public class CommandDrainTests
         // Complete before synchronous disposal has created its lazy event. Completion installs the
         // core's sentinel, so GetStatus observes the terminal level and disposal must not park.
         typeof(CommandFlow).GetMethod("WakePumpOnCompletion", NonPublicInstance)!.Invoke(flow, null);
-        flow.GetExecutionControl(protocol.FlowControl).Complete();
+        flow.GetExecutionControl(protocol.FlowControl).Release();
 
         var dispose = Task.Factory.StartNew(
             () => enumerator.Dispose(),

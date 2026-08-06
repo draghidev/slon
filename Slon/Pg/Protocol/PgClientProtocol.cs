@@ -982,10 +982,10 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public void CompleteItem(PgClientFlow item, int remainingDepth, Exception? exception)
         {
-            // OnCompleted (protocol bookkeeping: ActivatedFlow release, read-state recycle) must run
-            // BEFORE Complete (user-visible completion): Complete fires the flow's completion action,
+            // OnReleasing (protocol bookkeeping: ActivatedFlow release, read-state recycle) must run
+            // BEFORE Release (user-visible terminal): Release fires the flow's completion action,
             // which may Reset() and re-enqueue the SAME instance. If that next tenure's Activate lands
-            // before OnCompleted's depth-0 CAS, the comparand matches the new activation (ABA) and
+            // before OnReleasing's depth-0 CAS, the comparand matches the new activation (ABA) and
             // severs a live binding. Ordering the release first closes this by causality. Recovery
             // items take the hardened path (capture + try/finally) out-of-line to keep this inlineable.
             if (item is ResyncRecoveryFlow { FailedFlow: { } failedFlow } recovery)
@@ -994,10 +994,10 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
                 return;
             }
 
-            _control.OnCompleted(item, remainingDepth);
+            _control.OnReleasing(item, remainingDepth);
             if (exception is PgProtocolException)
                 exception = new PgClientException(exception);
-            item.GetExecutionControl(_control).Complete(exception);
+            item.GetExecutionControl(_control).Release(exception);
             // No recovery in play here (recovered flows take the branch above), so the wire state is final:
             // an outer flow that left a transaction open is unscoped poison. Inner-scope / failed flows are
             // exempt (handled in GuardWireIdleOnHandoff).
@@ -1007,22 +1007,22 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         [MethodImpl(MethodImplOptions.NoInlining)]
         void CompleteRecoveryItem(ResyncRecoveryFlow resyncRecovery, PgClientFlow failedFlow, int remainingDepth, Exception? exception)
         {
-            // Capture the binding BEFORE Complete fires the resyncRecovery's completion action:
+            // Capture the binding BEFORE Release fires the resyncRecovery's completion action:
             // completion is the reuse gate, and a Reset on reuse clears the binding (same
-            // causality as the OnCompleted-before-Complete ordering below).
+            // causality as the OnReleasing-before-Release ordering below).
             var failureException = resyncRecovery.FailureException!;
 
-            _control.OnCompleted(resyncRecovery, remainingDepth);
+            _control.OnReleasing(resyncRecovery, remainingDepth);
             try
             {
-                resyncRecovery.GetExecutionControl(_control).Complete(exception);
+                resyncRecovery.GetExecutionControl(_control).Release(exception);
             }
             finally
             {
                 if (exception is not null)
                     _control.FailProtocol(exception);
 
-                // A resyncRecovery's completion ends its supplanted flow's extended lifetime: the wire is
+                // Releasing a resyncRecovery ends its supplanted flow's extended lifetime: the wire is
                 // resynced (or dead) and nothing references the failed tenure. The supplanted flow
                 // completes on EVERY exit (including the resyncRecovery's own fault), or its caller strands.
                 // A resyncRecovery that also died attaches its fault behind the original failure as inner -
@@ -1051,7 +1051,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
                 if (resyncRecovery.BlocksAdmission)
                     _control.RecoveryCompleted();
 
-                failedFlow.GetExecutionControl(_control).Complete(combined);
+                failedFlow.GetExecutionControl(_control).Release(combined);
             }
         }
 
@@ -1527,17 +1527,17 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         internal void Activate(PgClientFlow flow)
             => flow.GetExecutionControl(this).Activate(Decoder);
 
-        // Self-evict route for the flow layer's completion-callback seam (see ExecutionControl.Complete).
+        // Self-evict route for the flow layer's release-callback seam (see ExecutionControl.Release).
         internal void FailProtocol(Exception? reason) => protocol.FailProtocol(reason);
 
         internal void RecoveryStarted() => protocol.SignalDraining();
         internal void RecoveryCompleted() => protocol.SignalReady();
 
-        internal void OnCompleted(PgClientFlow flow, int remainingDepth)
+        internal void OnReleasing(PgClientFlow flow, int remainingDepth)
         {
             if (remainingDepth is 0)
                 Volatile.Write(ref _isIdle, true);
-            protocol.OnFlowCompleted(this, flow, remainingDepth);
+            protocol.OnFlowReleased(this, flow, remainingDepth);
             // Scoring inputs maintained at retirement (the universal completion point, fires for every
             // flow including ones faulted before bind). Throughput: every retirement counts. Stalls: a
             // non-pipelined flow held the wire serialized from queue until its RFQ here (not just until

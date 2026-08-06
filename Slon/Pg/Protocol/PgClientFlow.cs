@@ -281,7 +281,10 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
     /// GateTask) override this to wake it so the body short-circuits instead of waiting for
     /// AbortToken. Idempotent across heartbeat ticks (subclasses use TrySet).
     protected virtual void OnStopping(PgClientClosedException exception) {}
-    protected virtual void OnExecutionCompleted(Exception? exception) {}
+    /// Releases tenure-owned resources before the terminal signal makes this instance reusable.
+    /// No overridable hook may run after that signal: a completion waiter can immediately Reset and
+    /// enqueue the same object for its next tenure.
+    protected virtual void OnReleasing(Exception? exception) {}
     protected virtual void OnCancellationWindowCompleted(int completedWindow, int remainingWindowCount) {}
     protected virtual void OnDiscarded() {}
     protected virtual void OnReset() {}
@@ -727,27 +730,29 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
         /// heartbeat fires OnStopping/OnAbort for the flows the pipeline enumerates (dispatched); it never
         /// reaches the backlog, so the drain delivers here. Because the body never ran, OnStopping and OnAbort
         /// take the IDENTICAL branch - no inner executor to drain, no graceful/forceful distinction to make -
-        /// so one hook faults the caller gate (the flow is a bystander to the wire's death). Complete then
+        /// so one hook faults the caller gate (the flow is a bystander to the wire's death). Release then
         /// signals done (the TCS) and fires the action, whose exception drives e.g. the ADO connection Break.
         public void FailUnstarted(PgClientClosedException exception)
         {
             flow.OnStopping(exception);
-            Complete(exception);
+            Release(exception);
         }
 
         /// Framework lifecycle: marks the flow started. Called from the pipeline policy's
         /// ExecuteItemAsync before the flow body runs.
         public void Start() => flow._started = true;
 
-        /// Framework lifecycle: marks the flow completed, fires the per-flow completion signal,
-        /// disposes any per-await activation-cancellation registration, fires the registered
-        /// completion action. Called from the pipeline policy's CompleteItem.
-        public void Complete(Exception? exception = null)
+        /// Framework lifecycle: releases the flow after execution and trailing work have settled.
+        /// Tenure-owned resources are released before the per-flow terminal signal publishes the
+        /// reuse gate. Called from the pipeline policy's CompleteItem.
+        public void Release(Exception? exception = null)
         {
             if (flow._completed)
                 return;
             flow._completed = true;
             flow._activationCancellationTokenRegistration.Dispose();
+            try { flow.OnReleasing(exception); }
+            catch (Exception ex) { /* TODO log */ control.FailProtocol(ex); }
             // Wire-death fault delivery is NOT done here - it rides the OnStopping/OnAbort hooks (dispatched
             // flows from the heartbeat, backlog flows from the shutdown drain's DeliverClose), so a flow's
             // caller gate is faulted by the close verdict, not by completion. Completion just signals done
@@ -761,8 +766,6 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
             else
                 flow._completionCore.TrySetResult(flow, runContinuationsAsynchronously: true);
             flow._completionEvent?.Set();
-            try { flow.OnExecutionCompleted(exception); }
-            catch (Exception ex) { /* TODO log */ control.FailProtocol(ex); }
             // The completion callback runs from CompleteItem in the advancer/retirement work-item
             // context: a raw throw would crash that thread unobserved. Don't swallow either - a
             // throwing completion callback means the consumer-side integration is broken, so the

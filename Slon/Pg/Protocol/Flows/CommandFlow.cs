@@ -1122,7 +1122,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
             HandleException(exception);
     }
 
-    protected override void OnExecutionCompleted(Exception? exception)
+    protected override void OnReleasing(Exception? exception)
     {
         Volatile.Read(ref _cancelDelivery)?.TrySetResult();
         _options.Observer?.OnFlowEnded(this);

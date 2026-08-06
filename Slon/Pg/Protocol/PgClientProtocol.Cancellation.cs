@@ -398,7 +398,7 @@ sealed partial class PgClientProtocol
         }
     }
 
-    void OnFlowCompleted(Control control, PgClientFlow flow, int remainingDepth)
+    void OnFlowReleased(Control control, PgClientFlow flow, int remainingDepth)
     {
         if (!HasPendingCancellation)
             return;
