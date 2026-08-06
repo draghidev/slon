@@ -3,6 +3,7 @@ using System.Collections;
 using System.Diagnostics;
 using System.IO.Pipelines;
 using System.Runtime.CompilerServices;
+using System.Text;
 using Slon.Runtime.CompilerServices;
 using Slon.Pipelines;
 
@@ -94,6 +95,7 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
     }
 
     internal ProtocolReadPipe Pipe => _pipe;
+    internal Encoding ClientEncoding => _control.ClientEncoding;
 
     // Builds a scope-bound shell over the shared pipe with the scope's abort token.
     internal static PgDecoder CreateScopeShell(PgDecoder baseShell, CancellationToken abortToken, TimeSpan defaultReadTimeout)

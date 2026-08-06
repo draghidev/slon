@@ -26,6 +26,55 @@ public class ProtocolExecutionTests
         await PgTestPool.RunAsync(protocol, "select 1");
     }
 
+    [TestMethod]
+    public async Task ExtendedBind_PerColumnResultFormatsAreHonored()
+    {
+        var protocol = await PgTestPool.GetProtocolAsync();
+        var command = Command.Create("select 42, 43") with
+        {
+            ResultFormats = [PgFormat.Binary, PgFormat.Text]
+        };
+        var flow = protocol.Queue(new CommandFlow(async: true, command));
+        var results = flow.GetAsyncEnumerator();
+        Assert.IsTrue(await results.MoveNextAsync());
+        var description = results.Current.GetMetadata().RowDescription!;
+        Assert.AreEqual(PgFormat.Binary, description[0].Format);
+        Assert.AreEqual(PgFormat.Text, description[1].Format);
+
+        var rows = results.Current.GetAsyncEnumerator();
+        Assert.IsTrue(await rows.MoveNextAsync());
+        Assert.AreEqual(42, rows.Current.GetValue<int>(0));
+        Assert.AreEqual("43", rows.Current.GetValue<string>(1));
+        Assert.IsFalse(await rows.MoveNextAsync());
+        await rows.DisposeAsync();
+        Assert.IsFalse(await results.MoveNextAsync());
+        await results.DisposeAsync();
+    }
+
+    [TestMethod]
+    public async Task WideRowDescription_RemainsValidUntilResultTenureEnds()
+    {
+        var protocol = await PgTestPool.GetProtocolAsync();
+        var sql = "select " + string.Join(",", Enumerable.Range(0, 257).Select(static i => $"{i} as c{i}"));
+        var flow = protocol.Queue(new CommandFlow(async: true, Command.Create(sql)));
+        var results = flow.GetAsyncEnumerator();
+        Assert.IsTrue(await results.MoveNextAsync());
+        var result = results.Current;
+        var description = result.GetMetadata().RowDescription!;
+        Assert.AreEqual(257, result.FieldCount);
+
+        var rows = result.GetAsyncEnumerator();
+        Assert.IsTrue(await rows.MoveNextAsync());
+        Assert.IsFalse(await rows.MoveNextAsync());
+        await rows.DisposeAsync();
+
+        Assert.AreEqual(257, result.FieldCount,
+            "draining the result must not retire metadata still owned by that result");
+        Assert.AreEqual("c256", description[256].Name);
+        Assert.IsFalse(await results.MoveNextAsync());
+        await results.DisposeAsync();
+    }
+
     // OnFlowRfq bookkeeping: the wire's transaction status is tracked on a SINGLE protocol field, routed
     // from every flow's terminating ReadyForQuery - from both the outer protocol Control (the autocommit
     // select) AND the inner-scope Control (the BEGIN/COMMIT subflows), proving no per-Control duplication.

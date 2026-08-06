@@ -5,6 +5,7 @@ using System.Runtime.CompilerServices;
 using System.Text;
 using Slon.Buffers;
 using Slon.Pg.Protocol;
+using Slon.Pg.Serialization;
 using Slon.Runtime.CompilerServices;
 
 namespace Slon.Pg;
@@ -39,72 +40,35 @@ sealed class Row
     }
 
     public T GetValue<T>(int ordinal)
+        => GetValueCore<T>(ordinal, textEncoding: null);
+
+    // Bootstrap consumers have no serializer but must still bind text decoding to one negotiated
+    // encoding snapshot for the lifetime of their operation.
+    internal T GetValue<T>(int ordinal, Encoding textEncoding)
+        => GetValueCore<T>(ordinal, textEncoding);
+
+    T GetValueCore<T>(int ordinal, Encoding? textEncoding)
     {
         EnsureBuffered();
         if (TryGetFieldSpan(ordinal, out var field))
-            return Decode<T>(field);
+            return RawFieldDecoder.Read<T>(field, textEncoding);
 
-        return GetValueSlow<T>(ordinal);
+        return GetValueSlow<T>(ordinal, textEncoding);
     }
 
     [MethodImpl(MethodImplOptions.NoInlining)]
-    T GetValueSlow<T>(int ordinal)
+    T GetValueSlow<T>(int ordinal, Encoding? textEncoding)
     {
         var reader = GetColumnReader(ordinal, out var columnIndex, out var columnOffset);
         _ = TrySeek(ref reader, ref columnIndex, ordinal, ref columnOffset, out var length);
         _column = columnIndex;
         _columnOffset = columnOffset;
-        if (typeof(T) == typeof(int))
-        {
-            if (reader.TryPeekBigEndian(out int value))
-                return (T)(object)value;
-
+        if (length < 0 || reader.Remaining < length)
             ThrowHelper.ThrowInvalidOperation();
-        }
-
-        if (typeof(T) == typeof(byte[]))
-        {
-            if (reader.CurrentSpan.Length - reader.CurrentSpanIndex >= length)
-                return (T)(object)reader.CurrentSpan.Slice(reader.CurrentSpanIndex, length).ToArray();
-
-            Debug.Assert(reader.Remaining >= length);
-            // if (reader.Remaining >= length)
-            return (T)(object)reader.Sequence.Slice(reader.Consumed, length).ToArray();
-        }
-
-        if (typeof(T) == typeof(string))
-        {
-            if (reader.CurrentSpan.Length - reader.CurrentSpanIndex >= length)
-                return (T)(object)Encoding.UTF8.GetString(reader.CurrentSpan.Slice(reader.CurrentSpanIndex, length));
-
-            Debug.Assert(reader.Remaining >= length);
-            // if (reader.Remaining >= length)
-            return (T)(object)Encoding.UTF8.GetString(reader.Sequence.Slice(reader.Consumed, length));
-        }
-
-        ThrowHelper.ThrowInvalidOperation();
-        return default;
-    }
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    static T Decode<T>(ReadOnlySpan<byte> field)
-    {
-        if (typeof(T) == typeof(int))
-        {
-            if (field.Length >= sizeof(int))
-                return (T)(object)BinaryPrimitives.ReadInt32BigEndian(field);
-
-            ThrowHelper.ThrowInvalidOperation();
-        }
-
-        if (typeof(T) == typeof(byte[]))
-            return (T)(object)field.ToArray();
-
-        if (typeof(T) == typeof(string))
-            return (T)(object)Encoding.UTF8.GetString(field);
-
-        ThrowHelper.ThrowInvalidOperation();
-        return default;
+        if (reader.CurrentSpan.Length - reader.CurrentSpanIndex >= length)
+            return RawFieldDecoder.Read<T>(reader.CurrentSpan.Slice(reader.CurrentSpanIndex, length), textEncoding);
+        var sequence = reader.Sequence.Slice(reader.Consumed, length);
+        return RawFieldDecoder.Read<T>(sequence, textEncoding);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -213,7 +177,7 @@ sealed class Row
 
             var field = _remaining.Slice(sizeof(int), length);
             _remaining = _remaining.Slice(sizeof(int) + length);
-            return Decode<T>(field);
+            return RawFieldDecoder.Read<T>(field);
         }
     }
 

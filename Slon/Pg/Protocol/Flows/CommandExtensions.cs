@@ -21,7 +21,8 @@ static class CommandExtensions
         {
             var command = commands[i];
             var descriptor = command.Descriptor;
-            if (!descriptor.IsPrepared || command.Parameters.Length is not 0 || descriptor.ParameterTypes.Count is not 0)
+            if (!descriptor.IsPrepared || command.Parameters.Length is not 0
+                || descriptor.ParameterTypes.Count is not 0 || command.ResultFormats.Length is not 0)
                 return WriteCommandsAsyncCore(commands, encoder, appendSync, cancellationToken, i);
 
             encoder.WriteBind(descriptor.CommandName);
@@ -48,7 +49,8 @@ static class CommandExtensions
                         parameters = descriptor.ParameterTypes.ToDbNullParameterList();
                     }
 
-                    await encoder.WriteBindAsync(descriptor.CommandName, parameters: parameters, cancellationToken: cancellationToken).ConfigureAwait(false);
+                    await encoder.WriteBindAsync(descriptor.CommandName, parameters: parameters,
+                        resultFormats: command.ResultFormats, cancellationToken: cancellationToken).ConfigureAwait(false);
                     CompletePreparedWrite(command, descriptor, encoder);
                 }
                 else if (command.IsSimple())
@@ -68,7 +70,8 @@ static class CommandExtensions
 
                     // Extended unprepared.
                     await encoder.WriteParseAsync(descriptor.UnpreparedCommandText, descriptor.CommandName, descriptor.ParameterTypes, cancellationToken: cancellationToken).ConfigureAwait(false);
-                    await encoder.WriteBindAsync(descriptor.CommandName, parameters: parameters, cancellationToken: cancellationToken).ConfigureAwait(false);
+                    await encoder.WriteBindAsync(descriptor.CommandName, parameters: parameters,
+                        resultFormats: command.ResultFormats, cancellationToken: cancellationToken).ConfigureAwait(false);
                     encoder.WriteDescribe();
                     if (!command.DescribeOnly)
                         encoder.WriteExecute();
@@ -119,7 +122,8 @@ static class CommandExtensions
                     parameters = descriptor.ParameterTypes.ToDbNullParameterList();
                 }
 
-                await encoder.WriteBindResumable(descriptor.CommandName, parameters: parameters).ConfigureAwait(false);
+                await encoder.WriteBindResumable(descriptor.CommandName, parameters: parameters,
+                    resultFormats: command.ResultFormats).ConfigureAwait(false);
 
                 if (command.DescribeOnly)
                     encoder.WriteDescribe();
@@ -150,7 +154,8 @@ static class CommandExtensions
                 }
 
                 await encoder.WriteParseResumable(descriptor.UnpreparedCommandText, descriptor.CommandName, descriptor.ParameterTypes).ConfigureAwait(false);
-                await encoder.WriteBindResumable(descriptor.CommandName, parameters: parameters).ConfigureAwait(false);
+                await encoder.WriteBindResumable(descriptor.CommandName, parameters: parameters,
+                    resultFormats: command.ResultFormats).ConfigureAwait(false);
                 encoder.WriteDescribe();
                 if (!command.DescribeOnly)
                     encoder.WriteExecute();
@@ -166,18 +171,20 @@ static class CommandExtensions
     /// Reads the response messages up to (but not including) the actual row stream / CommandComplete.
     /// Async variant. Yields on missing bytes. Caller picks this vs <see cref="ReadUntilExecute"/>
     /// based on per-call <c>IsAsync</c>. No wrapper method, dispatch inlined at the call site.
-    public static ValueTask<(PgError?, RowDescription?)> ReadUntilExecuteAsync(this in Command command, PgDecoder decoder)
+    public static ValueTask<(PgError?, RowDescription?)> ReadUntilExecuteAsync(
+        this in Command command, PgDecoder decoder, RowDescription rowDescription)
     {
         if (command.IsSimple())
-            return ReadSimpleAsync(decoder);
+            return ReadSimpleAsync(decoder, rowDescription);
 
-        return ReadExtendedAsync(decoder,
+        return ReadExtendedAsync(decoder, rowDescription,
             readParse: !command.Descriptor.IsPrepared,
             readDescribe: command.DescribeOnly || !command.Descriptor.IsPrepared || command.Descriptor.PreparedRowDescription is null,
             readExecute: !command.DescribeOnly);
 
         [AsyncMethodBuilder(typeof(NonContextRestoringPoolingValueTaskMethodBuilder<>))]
-        static async ValueTask<(PgError?, RowDescription?)> ReadSimpleAsync(PgDecoder decoder)
+        static async ValueTask<(PgError?, RowDescription?)> ReadSimpleAsync(
+            PgDecoder decoder, RowDescription rowDescription)
         {
             if (!decoder.TryGetNext(out var message))
             {
@@ -193,8 +200,8 @@ static class CommandExtensions
             switch (result.Type)
             {
                 case PgTypes.BackendType.RowDescription:
-                    requestedRowDescription = new RowDescription();
-                    requestedRowDescription.Initialize(message.BodyReader);
+                    requestedRowDescription = rowDescription;
+                    requestedRowDescription.Initialize(message.BodyReader, decoder.ClientEncoding);
                     break;
                 case PgTypes.BackendType.NoData:
                     // Nothing to do for NoData.
@@ -217,7 +224,8 @@ static class CommandExtensions
         }
 
         [AsyncMethodBuilder(typeof(NonContextRestoringPoolingValueTaskMethodBuilder<>))]
-        static async ValueTask<(PgError?, RowDescription?)> ReadExtendedAsync(PgDecoder decoder, bool readParse, bool readDescribe, bool readExecute)
+        static async ValueTask<(PgError?, RowDescription?)> ReadExtendedAsync(
+            PgDecoder decoder, RowDescription rowDescription, bool readParse, bool readDescribe, bool readExecute)
         {
             BackendMessage message;
             if (readParse)
@@ -263,8 +271,8 @@ static class CommandExtensions
                 switch (result.Type)
                 {
                     case PgTypes.BackendType.RowDescription:
-                        requestedRowDescription = new RowDescription();
-                        requestedRowDescription.Initialize(message.BodyReader);
+                        requestedRowDescription = rowDescription;
+                        requestedRowDescription.Initialize(message.BodyReader, decoder.ClientEncoding);
                         break;
                     case PgTypes.BackendType.NoData:
                         // Nothing to do for NoData.
@@ -296,17 +304,18 @@ static class CommandExtensions
     /// Sync counterpart to <see cref="ReadUntilExecuteAsync"/>. Blocks via <see cref="PgDecoder.GetNext"/>
     /// when bytes aren't already buffered. Safe on the executor's thread when that thread is dedicated
     /// to this flow's processing (handoff mode sync, or dedicated mode + <c>MoveNext()</c> per-call).
-    public static (PgError?, RowDescription?) ReadUntilExecute(this in Command command, PgDecoder decoder)
+    public static (PgError?, RowDescription?) ReadUntilExecute(
+        this in Command command, PgDecoder decoder, RowDescription rowDescription)
     {
         if (command.IsSimple())
-            return ReadSimpleSync(decoder);
+            return ReadSimpleSync(decoder, rowDescription);
 
-        return ReadExtendedSync(decoder,
+        return ReadExtendedSync(decoder, rowDescription,
             readParse: !command.Descriptor.IsPrepared,
             readDescribe: command.DescribeOnly || !command.Descriptor.IsPrepared || command.Descriptor.PreparedRowDescription is null,
             readExecute: !command.DescribeOnly);
 
-        static (PgError?, RowDescription?) ReadSimpleSync(PgDecoder decoder)
+        static (PgError?, RowDescription?) ReadSimpleSync(PgDecoder decoder, RowDescription rowDescription)
         {
             var message = decoder.TryGetNext(out var m) ? m : decoder.GetNext();
             if (message.EnsureExpectedOrError(PgTypes.BackendType.RowDescription, PgTypes.BackendType.NoData)
@@ -317,8 +326,8 @@ static class CommandExtensions
             switch (result.Type)
             {
                 case PgTypes.BackendType.RowDescription:
-                    requestedRowDescription = new RowDescription();
-                    requestedRowDescription.Initialize(message.BodyReader);
+                    requestedRowDescription = rowDescription;
+                    requestedRowDescription.Initialize(message.BodyReader, decoder.ClientEncoding);
                     break;
                 case PgTypes.BackendType.NoData:
                     Debug.Assert(message.Header.BodyLength is 0);
@@ -334,7 +343,8 @@ static class CommandExtensions
             return (null, requestedRowDescription);
         }
 
-        static (PgError?, RowDescription?) ReadExtendedSync(PgDecoder decoder, bool readParse, bool readDescribe, bool readExecute)
+        static (PgError?, RowDescription?) ReadExtendedSync(
+            PgDecoder decoder, RowDescription rowDescription, bool readParse, bool readDescribe, bool readExecute)
         {
             BackendMessage message;
             if (readParse)
@@ -363,8 +373,8 @@ static class CommandExtensions
                 switch (result.Type)
                 {
                     case PgTypes.BackendType.RowDescription:
-                        requestedRowDescription = new RowDescription();
-                        requestedRowDescription.Initialize(message.BodyReader);
+                        requestedRowDescription = rowDescription;
+                        requestedRowDescription.Initialize(message.BodyReader, decoder.ClientEncoding);
                         break;
                     case PgTypes.BackendType.NoData:
                         Debug.Assert(message.Header.BodyLength is 0);

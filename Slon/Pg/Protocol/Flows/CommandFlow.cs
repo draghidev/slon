@@ -506,11 +506,16 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                 }
                 else if (IsAsync)
                 {
-                    var read = _options.Commands.ItemRef(_commandIndex).ReadUntilExecuteAsync(_decoder);
+                    var rowDescription = context.GetProtocolStatic<ReadState>().RowDescription;
+                    var read = _options.Commands.ItemRef(_commandIndex).ReadUntilExecuteAsync(_decoder, rowDescription);
                     (_pgError, _requestedRowDescription) = await read.ConfigureAwait(false);
                 }
                 else
-                    (_pgError, _requestedRowDescription) = _options.Commands.ItemRef(_commandIndex).ReadUntilExecute(_decoder);
+                {
+                    var rowDescription = context.GetProtocolStatic<ReadState>().RowDescription;
+                    (_pgError, _requestedRowDescription) = _options.Commands.ItemRef(_commandIndex)
+                        .ReadUntilExecute(_decoder, rowDescription);
+                }
 
                 // A draining consumer cannot observe CommandResult, so retain read errors for disposal.
                 var capturedThisCommand = false;
@@ -548,9 +553,11 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                     if (!descriptor.IsPrepared && !descriptor.CommandName.IsDefault
                         && (_pgError is not { } err || !err.Expected.Contains(PgTypes.BackendType.ParseComplete)))
                     {
-                        descriptor = CommandDescriptor.CreatePrepared(descriptor.CommandName, descriptor.ParameterTypes, _requestedRowDescription);
+                        descriptor = CommandDescriptor.CreatePrepared(
+                            descriptor.CommandName, descriptor.ParameterTypes, _requestedRowDescription?.Preserve());
                     }
-                    result.Initialize(_commandIndex, descriptor, _requestedRowDescription, !resultCommand.DescribeOnly, resultCommand.IsSimple());
+                    result.Initialize(_commandIndex, descriptor, _requestedRowDescription,
+                        !resultCommand.DescribeOnly, resultCommand.IsSimple());
                 }
                 try
                 {
@@ -763,6 +770,13 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
         {
             HandleException(ex);
             throw;
+        }
+        finally
+        {
+            // The body is the sole owner of protocol-static row metadata. Recovery consumes only
+            // decoder/wire state, so a faulted body can release oversized storage while recovery
+            // retains the failed flow's framework tenure.
+            context.GetProtocolStatic<ReadState>().RowDescription.PrepareForReuse();
         }
         void SetResult(CommandResult<ResultMessageEnumerator>? next)
         {
@@ -1454,12 +1468,14 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
         public ResultMessageEnumerator ResultMessageEnumerator { get; }
         public CommandResult<ResultMessageEnumerator> CommandResult { get; }
         public ValueTaskSourcePromise<bool> ReadPromise { get; }
+        public RowDescription RowDescription { get; }
 
         public ReadState()
         {
             ResultMessageEnumerator = new();
             CommandResult = new(ResultMessageEnumerator);
             ReadPromise = new();
+            RowDescription = new();
         }
     }
 

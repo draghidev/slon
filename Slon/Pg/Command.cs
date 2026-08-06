@@ -17,12 +17,21 @@ readonly struct Command()
     public CommandDescriptor Descriptor { get; init; } = default;
     public TimeSpan Timeout { get; init; } = default;
     public ImmutableArray<Parameter> Parameters { get; init; } = [];
+    // Empty means Slon's default (all binary). A single entry applies to every result column;
+    // otherwise the count must match the returned RowDescription.
+    public ImmutableArray<PgFormat> ResultFormats { get; init; } = [];
 
     public static Command Create(string commandText, ParameterTypeList parameterTypes = default, EncodedString commandName = default)
         => new() { Descriptor = CommandDescriptor.Create(commandText, parameterTypes, commandName) };
 
     public static Command Create(CommandDescriptor descriptor)
         => new() { Descriptor = descriptor };
+}
+
+enum PgFormat : short
+{
+    Text = 0,
+    Binary = 1
 }
 
 readonly struct CommandList

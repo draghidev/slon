@@ -170,7 +170,8 @@ readonly struct PgEncoder
     public ValueTask WriteBindAuto(EncodedString commandName = default, EncodedString portalName = default, ImmutableArray<Parameter> parameters = default, CancellationToken cancellationToken = default)
     {
         if (_executionControl.IsAsync)
-            return WriteBindAsync(commandName, portalName, parameters, cancellationToken);
+            return WriteBindAsync(commandName, portalName, parameters,
+                cancellationToken: cancellationToken);
         WriteBind(commandName, portalName, parameters);
         return new();
     }
@@ -179,15 +180,18 @@ readonly struct PgEncoder
     // parameter writes are just buffer fills with no flush points. Once the serializer is in
     // and large parameter payloads need to flush mid-write, this method takes the async-flush
     // path (FlushAsync) while WriteBind takes the sync-flush path (Flush).
-    public ValueTask WriteBindAsync(EncodedString commandName = default, EncodedString portalName = default, ImmutableArray<Parameter> parameters = default, CancellationToken cancellationToken = default)
+    public ValueTask WriteBindAsync(EncodedString commandName = default, EncodedString portalName = default,
+        ImmutableArray<Parameter> parameters = default, ImmutableArray<PgFormat> resultFormats = default,
+        CancellationToken cancellationToken = default)
     {
-        WriteBind(commandName, portalName, parameters);
+        WriteBind(commandName, portalName, parameters, resultFormats);
         return new();
     }
 
     // See WriteQueryResumable for the contract.
-    public ValueTask WriteBindResumable(EncodedString commandName = default, EncodedString portalName = default, ImmutableArray<Parameter> parameters = default)
-        => WriteBindAsync(commandName, portalName, parameters);
+    public ValueTask WriteBindResumable(EncodedString commandName = default, EncodedString portalName = default,
+        ImmutableArray<Parameter> parameters = default, ImmutableArray<PgFormat> resultFormats = default)
+        => WriteBindAsync(commandName, portalName, parameters, resultFormats);
 
     public void WriteBind(EncodedString commandName)
     {
@@ -201,12 +205,23 @@ readonly struct PgEncoder
         _writer.WriteUShort(1); // all binary
     }
 
-    public void WriteBind(EncodedString commandName = default, EncodedString portalName = default, ImmutableArray<Parameter> parameters = default)
+    public void WriteBind(EncodedString commandName = default, EncodedString portalName = default,
+        ImmutableArray<Parameter> parameters = default, ImmutableArray<PgFormat> resultFormats = default)
     {
         // The signature invites `default` for the no-parameters case; a default ImmutableArray
         // NREs on every member, so normalize before first use.
         if (parameters.IsDefault)
             parameters = ImmutableArray<Parameter>.Empty;
+        if (resultFormats.IsDefault)
+            resultFormats = ImmutableArray<PgFormat>.Empty;
+        if (resultFormats.Length > ushort.MaxValue)
+            throw new ArgumentException("Too many result format codes.", nameof(resultFormats));
+        foreach (var format in resultFormats)
+        {
+            if (format is not PgFormat.Text and not PgFormat.Binary)
+                throw new ArgumentOutOfRangeException(
+                    nameof(resultFormats), format, "Unknown PostgreSQL result format code.");
+        }
 
         var encoding = ClientEncoding;
         var portalNameBytes = portalName.AsNullTerminatedSpan(encoding);
@@ -231,7 +246,7 @@ readonly struct PgEncoder
             totalFormatCodeSize +
             totalParameterSize +
             sizeof(ushort) + // Number of result format codes
-            sizeof(ushort) // Result format codes
+            Math.Max(1, resultFormats.Length) * sizeof(ushort)
         );
 
         _writer.WriteRaw(portalNameBytes);
@@ -269,8 +284,17 @@ readonly struct PgEncoder
             }
         }
 
-        _writer.WriteUShort(1); // result format codes
-        _writer.WriteUShort(1); // all binary for now
+        if (resultFormats.Length is 0)
+        {
+            _writer.WriteUShort(1);
+            _writer.WriteUShort((ushort)PgFormat.Binary);
+        }
+        else
+        {
+            _writer.WriteUShort((ushort)resultFormats.Length);
+            foreach (var format in resultFormats)
+                _writer.WriteUShort((ushort)format);
+        }
     }
 
     public void WriteDescribe(EncodedString name = default, bool portalName = true)

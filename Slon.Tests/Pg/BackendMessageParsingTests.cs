@@ -8,6 +8,8 @@ using Microsoft.VisualStudio.TestTools.UnitTesting;
 using Slon.Pg;
 using Slon.Pg.Protocol;
 using Slon.Pg.Protocol.Flows;
+using Slon.Pg.Serialization;
+using Slon.Pg.Types;
 
 namespace Slon.Tests.Pg;
 
@@ -16,6 +18,16 @@ namespace Slon.Tests.Pg;
 [TestClass]
 public class BackendMessageParsingTests
 {
+    [TestMethod]
+    public void RawFieldDecoder_UsesTheSuppliedExecutionEncoding()
+    {
+        ReadOnlySpan<byte> latin1 = [0x63, 0x61, 0x66, 0xE9];
+
+        Assert.AreEqual("café", RawFieldDecoder.Read<string>(latin1, Encoding.Latin1));
+        Assert.AreNotEqual("café", RawFieldDecoder.Read<string>(latin1),
+            "the bootstrap decoder must not silently fall back to UTF-8 when an execution snapshot was supplied");
+    }
+
     static BackendMessage Message(PgTypes.BackendType type, ReadOnlySpan<byte> body)
     {
         var length = sizeof(int) + body.Length;
@@ -23,7 +35,33 @@ public class BackendMessageParsingTests
         bytes[0] = (byte)type;
         BinaryPrimitives.WriteInt32BigEndian(bytes.AsSpan(1), length);
         body.CopyTo(bytes.AsSpan(BackendHeader.ByteCount));
-        return new(new BackendHeader(type, length), new ReadOnlySequence<byte>(bytes), new BackendMessageContext(), 0);
+        var context = new BackendMessageContext();
+        context.SetBatch(new BackendMessageBatch(new ReadOnlySequence<byte>(bytes)));
+        Assert.IsTrue(context.TryMoveNext());
+        return context.Current;
+    }
+
+    static byte[] RowDescriptionBody(
+        params (string Name, uint TableOid, short Attribute, uint TypeOid, short Size, int TypeModifier, PgFormat Format)[] fields)
+    {
+        var encodedNames = fields.Select(static field => Encoding.UTF8.GetBytes(field.Name)).ToArray();
+        var body = new byte[sizeof(short) + encodedNames.Sum(static name => name.Length + 1 + 18)];
+        var span = body.AsSpan();
+        BinaryPrimitives.WriteInt16BigEndian(span, checked((short)fields.Length));
+        var offset = sizeof(short);
+        for (var i = 0; i < fields.Length; i++)
+        {
+            var field = fields[i];
+            encodedNames[i].CopyTo(span[offset..]); offset += encodedNames[i].Length;
+            span[offset++] = 0;
+            BinaryPrimitives.WriteUInt32BigEndian(span[offset..], field.TableOid); offset += 4;
+            BinaryPrimitives.WriteInt16BigEndian(span[offset..], field.Attribute); offset += 2;
+            BinaryPrimitives.WriteUInt32BigEndian(span[offset..], field.TypeOid); offset += 4;
+            BinaryPrimitives.WriteInt16BigEndian(span[offset..], field.Size); offset += 2;
+            BinaryPrimitives.WriteInt32BigEndian(span[offset..], field.TypeModifier); offset += 4;
+            BinaryPrimitives.WriteInt16BigEndian(span[offset..], (short)field.Format); offset += 2;
+        }
+        return body;
     }
 
     static byte[] BlockBytes(params (char Type, string Value)[] fields)
@@ -192,25 +230,116 @@ public class BackendMessageParsingTests
             ReadyForQueryMessage.Create(Message(PgTypes.BackendType.ReadyForQuery, "X"u8)));
 
     [TestMethod]
-    public void RowDescription_ParsesFieldCount()
+    public void RowDescription_ParsesCompleteFramedBackendMessage()
     {
-        Span<byte> body = stackalloc byte[sizeof(short)];
-        BinaryPrimitives.WriteInt16BigEndian(body, 3);
+        var message = Message(PgTypes.BackendType.RowDescription, RowDescriptionBody(
+            ("value", 42, 3, 23, 4, -1, PgFormat.Binary),
+            ("display name", 0, 0, 25, -1, 17, PgFormat.Text)));
         var description = new RowDescription();
 
-        description.Initialize(new SequenceReader<byte>(new ReadOnlySequence<byte>(body.ToArray())));
+        Assert.AreEqual(PgTypes.BackendType.RowDescription, message.Header.Type);
+        description.Initialize(message.BodyReader);
 
-        Assert.AreEqual(3, description.FieldCount);
+        Assert.AreEqual(2, description.FieldCount);
+        Assert.AreEqual(new RowDescriptionField("value", (Oid)42, 3, (Oid)23, 4, -1, PgFormat.Binary),
+            description[0]);
+        Assert.AreEqual(new RowDescriptionField("display name", default, 0, (Oid)25, -1, 17, PgFormat.Text),
+            description[1]);
     }
 
     [TestMethod]
     public void RowDescription_RejectsTruncatedFieldCount()
     {
         var description = new RowDescription();
+        var message = Message(PgTypes.BackendType.RowDescription, new byte[1]);
         var exception = Assert.ThrowsExactly<PgProtocolException>(() =>
-            description.Initialize(new SequenceReader<byte>(new ReadOnlySequence<byte>(new byte[1]))));
-        StringAssert.Contains(exception.Message, "enough data");
+            description.Initialize(message.BodyReader));
+        StringAssert.Contains(exception.Message, "enough RowDescription data");
         Assert.IsNull(exception.InnerException);
+    }
+
+    [TestMethod]
+    public void RowDescription_RejectsTruncatedAndTrailingFramedBodies()
+    {
+        var oneField = RowDescriptionBody(("value", 42, 3, 23, 4, -1, PgFormat.Binary));
+        BinaryPrimitives.WriteInt16BigEndian(oneField, 2);
+        var truncated = Message(PgTypes.BackendType.RowDescription, oneField);
+        Assert.ThrowsExactly<PgProtocolException>(() =>
+            new RowDescription().Initialize(truncated.BodyReader));
+
+        var valid = RowDescriptionBody(("value", 42, 3, 23, 4, -1, PgFormat.Binary));
+        var bodyWithTrailingByte = new byte[valid.Length + 1];
+        valid.CopyTo(bodyWithTrailingByte, 0);
+        var trailing = Message(PgTypes.BackendType.RowDescription, bodyWithTrailingByte);
+        var exception = Assert.ThrowsExactly<PgProtocolException>(() =>
+            new RowDescription().Initialize(trailing.BodyReader));
+        StringAssert.Contains(exception.Message, "trailing data");
+    }
+
+    [TestMethod]
+    public void RowDescription_ReusesStorageWhilePreservedCopyRemainsStable()
+    {
+        var description = new RowDescription();
+        description.Initialize(new SequenceReader<byte>(new ReadOnlySequence<byte>(RowDescriptionBody("first", 23))));
+        var preserved = description.Preserve();
+
+        description.Initialize(new SequenceReader<byte>(new ReadOnlySequence<byte>(RowDescriptionBody("second", 25))));
+
+        Assert.AreEqual("second", description[0].Name);
+        Assert.AreEqual((Oid)25, description[0].TypeOid);
+        Assert.AreEqual("first", preserved[0].Name);
+        Assert.AreEqual((Oid)23, preserved[0].TypeOid);
+
+        static byte[] RowDescriptionBody(string name, uint typeOid)
+        {
+            var nameBytes = Encoding.UTF8.GetBytes(name);
+            var body = new byte[2 + nameBytes.Length + 1 + 4 + 2 + 4 + 2 + 4 + 2];
+            var span = body.AsSpan();
+            BinaryPrimitives.WriteInt16BigEndian(span, 1);
+            nameBytes.CopyTo(span[2..]);
+            var offset = 2 + nameBytes.Length + 1;
+            BinaryPrimitives.WriteUInt32BigEndian(span[offset..], 0); offset += 4;
+            BinaryPrimitives.WriteInt16BigEndian(span[offset..], 0); offset += 2;
+            BinaryPrimitives.WriteUInt32BigEndian(span[offset..], typeOid); offset += 4;
+            BinaryPrimitives.WriteInt16BigEndian(span[offset..], -1); offset += 2;
+            BinaryPrimitives.WriteInt32BigEndian(span[offset..], -1); offset += 4;
+            BinaryPrimitives.WriteInt16BigEndian(span[offset..], (short)PgFormat.Binary);
+            return body;
+        }
+    }
+
+    [TestMethod]
+    public void RowDescription_RetirementInvalidatesMetadataAndTrimsOversizedStorage()
+    {
+        var description = new RowDescription();
+        description.Initialize(new SequenceReader<byte>(new ReadOnlySequence<byte>(RowDescriptionBody(256))));
+        description.PrepareForReuse();
+        Assert.AreEqual(0, description.FieldCount);
+        Assert.ThrowsExactly<ArgumentOutOfRangeException>(() => _ = description[0]);
+
+        description.Initialize(new SequenceReader<byte>(new ReadOnlySequence<byte>(RowDescriptionBody(257))));
+        description.PrepareForReuse();
+        Assert.AreEqual(0, description.FieldCount);
+
+        static byte[] RowDescriptionBody(short fieldCount)
+        {
+            const int fieldLength = 1 + 4 + 2 + 4 + 2 + 4 + 2;
+            var body = new byte[2 + fieldCount * fieldLength];
+            var span = body.AsSpan();
+            BinaryPrimitives.WriteInt16BigEndian(span, fieldCount);
+            var offset = 2;
+            for (var i = 0; i < fieldCount; i++)
+            {
+                span[offset++] = 0;
+                BinaryPrimitives.WriteUInt32BigEndian(span[offset..], 0); offset += 4;
+                BinaryPrimitives.WriteInt16BigEndian(span[offset..], 0); offset += 2;
+                BinaryPrimitives.WriteUInt32BigEndian(span[offset..], 23); offset += 4;
+                BinaryPrimitives.WriteInt16BigEndian(span[offset..], 4); offset += 2;
+                BinaryPrimitives.WriteInt32BigEndian(span[offset..], -1); offset += 4;
+                BinaryPrimitives.WriteInt16BigEndian(span[offset..], (short)PgFormat.Binary); offset += 2;
+            }
+            return body;
+        }
     }
 
     [TestMethod]
