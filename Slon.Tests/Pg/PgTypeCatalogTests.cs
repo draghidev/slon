@@ -70,6 +70,13 @@ public class PgTypeCatalogTests
         Assert.AreEqual(hash, first.GetHashCode());
     }
 
+    static readonly PgBackendInfo BackendInfo = new PgBackendInfoBuilder(
+        new Dictionary<string, string>
+        {
+            ["server_version"] = "17.0",
+            ["server_encoding"] = "UTF8"
+        }).Build();
+
     [TestMethod]
     public void Build_PrecomputesArrayAndMultirangeRelationships()
     {
@@ -198,4 +205,99 @@ public class PgTypeCatalogTests
             outerArray.ElementType.ElementType.UnderlyingType.ElementType.DataTypeName);
     }
 
+    [TestMethod]
+    public async Task Factory_PluginsConfigureBeforeLoadingAndLastRegistrationWins()
+    {
+        var original = PgType.CreateBase(new("extension.value"), oid: 8500);
+        var firstReplacement = PgType.CreateBase(new("extension.first"), oid: 8500);
+        var lastReplacement = PgType.CreateBase(new("extension.last"), oid: 8500);
+        var factory = new RecordingFactory(original);
+
+        var catalog = await factory.CreateAsync(Context(),
+        [
+            new TestPlugin("first", firstReplacement, loadTableComposites: true),
+            new TestPlugin("second", lastReplacement)
+        ]);
+
+        CollectionAssert.AreEqual(new[] { "first", "second" }, factory.Options.Schemas.ToArray());
+        Assert.IsTrue(factory.Options.LoadTableComposites);
+        Assert.AreEqual(lastReplacement, catalog.GetPgType((Oid)8500));
+    }
+
+    [TestMethod]
+    public async Task Factory_ReexecutionReconfiguresReloadAndReappliesPlugins()
+    {
+        var factory = new RecordingFactory(PgType.CreateBase(new("public.first"), oid: 8600));
+        var plugin = new CountingPlugin();
+
+        var first = await factory.CreateAsync(Context(), [plugin]);
+        factory.Baseline = PgType.CreateBase(new("public.second"), oid: 8601);
+        var second = await factory.CreateAsync(Context(), [plugin]);
+
+        Assert.AreEqual(2, plugin.ConfigureCount);
+        Assert.AreEqual(2, plugin.ApplyCount);
+        Assert.AreNotSame(first, second);
+        Assert.AreEqual(new DataTypeName("public.second"), second.GetPgType((Oid)8601).DataTypeName);
+    }
+
+    sealed class RecordingFactory(PgType baseline) : PgTypeCatalogFactory
+    {
+        public PgType Baseline { get; set; } = baseline;
+        public PgTypeLoadingOptions Options { get; private set; } = null!;
+
+        protected override void Populate(PgTypeCatalogBuilder builder,
+            PgTypeCatalogFactoryContext context, PgTypeLoadingOptions options)
+        {
+            Options = options;
+            builder.Add(Baseline);
+        }
+
+        protected override ValueTask PopulateAsync(PgTypeCatalogBuilder builder,
+            PgTypeCatalogFactoryContext context, PgTypeLoadingOptions options, CancellationToken cancellationToken)
+        {
+            Populate(builder, context, options);
+            return ValueTask.CompletedTask;
+        }
+    }
+
+    [TestMethod]
+    public void TypeLoadingRequirements_AreMonotonic()
+    {
+        var options = new PgTypeLoadingOptionsBuilder();
+        options.EnableTableCompositesLoading();
+        options.EnableTableCompositesLoading(enable: false);
+
+        Assert.IsTrue(options.Build().LoadTableComposites);
+    }
+
+    sealed class TestPlugin(string schema, PgType replacement, bool loadTableComposites = false)
+        : PgTypeCatalogPlugin
+    {
+        public override void Configure(PgTypeLoadingOptionsBuilder options)
+        {
+            options.AddTypeLoadingSchema(schema);
+            if (loadTableComposites)
+                options.EnableTableCompositesLoading();
+        }
+
+        public override void Apply(PgTypeCatalogBuilder builder)
+            => builder.Add(replacement);
+    }
+
+    sealed class CountingPlugin : PgTypeCatalogPlugin
+    {
+        public int ConfigureCount { get; private set; }
+        public int ApplyCount { get; private set; }
+
+        public override void Configure(PgTypeLoadingOptionsBuilder options)
+        {
+            ConfigureCount++;
+            options.AddTypeLoadingSchema("reload");
+        }
+
+        public override void Apply(PgTypeCatalogBuilder builder)
+            => ApplyCount++;
+    }
+
+    static PgTypeCatalogFactoryContext Context() => new(BackendInfo);
 }

@@ -464,7 +464,6 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                 }
                 if (_flowCancellationToken.CanBeCanceled && !IsDraining)
                 {
-                    Debug.Assert(IsAsync);
                     _flowCancellationTokenRegistration = _flowCancellationToken.UnsafeRegister(static (state, token)
                         => ((CommandFlow)state!).RequestCancel(token, CancellationScope.RemainingFlow), this);
                 }

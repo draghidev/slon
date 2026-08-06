@@ -61,7 +61,7 @@ public class ShutdownStressTests
 
         await RunIterationsAsync(async i =>
         {
-            var protocolOptions = new PgClientProtocolOptions(options) { CompletionTimeout = TimeSpan.FromMilliseconds(2), HeartbeatInterval = TimeSpan.FromMilliseconds(5) };
+            var protocolOptions = new PgClientProtocolOptions(options) { CompletionTimeout = TimeSpan.FromMilliseconds(2), HeartbeatInterval = TimeSpan.FromMilliseconds(5), BackendProvider = TestBackendProvider.Instance };
             var protocol = PgClientProtocol.Create(protocolOptions);
             await protocol.StartAsync(options, new ReplayTransport(handshake));
             await RunIterationAsync(i, async () =>
@@ -100,7 +100,7 @@ public class ShutdownStressTests
 
         await RunIterationsAsync(async i =>
         {
-            var protocolOptions = new PgClientProtocolOptions(options) { CompletionTimeout = TimeSpan.FromMilliseconds(2), HeartbeatInterval = TimeSpan.FromMilliseconds(5) };
+            var protocolOptions = new PgClientProtocolOptions(options) { CompletionTimeout = TimeSpan.FromMilliseconds(2), HeartbeatInterval = TimeSpan.FromMilliseconds(5), BackendProvider = TestBackendProvider.Instance };
             var protocol = PgClientProtocol.Create(protocolOptions);
             var transport = new ReplayTransport(handshake);
             await protocol.StartAsync(options, transport);
@@ -145,7 +145,7 @@ public class ShutdownStressTests
 
         await RunIterationsAsync(async i =>
         {
-            var protocolOptions = new PgClientProtocolOptions(options) { CompletionTimeout = TimeSpan.FromMilliseconds(2), HeartbeatInterval = TimeSpan.FromMilliseconds(5) };
+            var protocolOptions = new PgClientProtocolOptions(options) { CompletionTimeout = TimeSpan.FromMilliseconds(2), HeartbeatInterval = TimeSpan.FromMilliseconds(5), BackendProvider = TestBackendProvider.Instance };
             var protocol = PgClientProtocol.Create(protocolOptions);
             await protocol.StartAsync(options, new ReplayTransport(handshake));
             await RunIterationAsync(i, async () =>

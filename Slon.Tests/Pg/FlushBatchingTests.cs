@@ -46,7 +46,8 @@ public class FlushBatchingTests
         {
             CompletionTimeout = TimeSpan.FromSeconds(30),
             HeartbeatInterval = TimeSpan.FromSeconds(5),
-            ExecutionScheduler = scheduler
+            ExecutionScheduler = scheduler,
+            BackendProvider = TestBackendProvider.Instance
         };
         var protocol = PgClientProtocol.Create(protocolOptions);
         await protocol.StartAsync(options, transport);

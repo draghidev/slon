@@ -387,6 +387,7 @@ public class ExclusiveAccessFlowTests
         {
             CompletionTimeout = TimeSpan.FromMilliseconds(2),
             HeartbeatInterval = TimeSpan.FromMilliseconds(5),
+            BackendProvider = TestBackendProvider.Instance,
         };
         var transport = new GatedWriteTransport(StartupHandshake());
         var protocol = PgClientProtocol.Create(protocolOptions);

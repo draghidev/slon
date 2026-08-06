@@ -64,6 +64,39 @@ public class ServerParameterTests
     }
 
     [TestMethod]
+    public async Task ReportedParameters_KeepStableBaseAndEvolveCurrentSnapshot()
+    {
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
+        var parameters = protocol.FlowControl.StartupParameters;
+
+        Assert.IsTrue(parameters.TryGetValue("server_version", out var serverVersion));
+        Assert.IsFalse(string.IsNullOrWhiteSpace(serverVersion));
+        Assert.AreEqual("on", parameters["integer_datetimes"]);
+        Assert.IsTrue(parameters.TryGetValue("application_name", out var startupApplicationName));
+        Assert.AreSame(parameters, protocol.FlowControl.SessionParameters);
+        var initialRevision = protocol.FlowControl.SessionParametersRevision;
+
+        await PgTestPool.RunAsync(protocol, "set application_name = 'slon-parameter-snapshot-test'");
+
+        Assert.AreEqual(startupApplicationName, parameters["application_name"],
+            "session ParameterStatus updates must not mutate the startup identity snapshot");
+        var changed = protocol.FlowControl.SessionParameters;
+        Assert.AreEqual("slon-parameter-snapshot-test", changed["application_name"]);
+        Assert.AreSame(changed, protocol.FlowControl.SessionParameters,
+            "an unchanged current snapshot should be reused");
+        Assert.IsTrue(protocol.FlowControl.SessionParametersRevision > initialRevision);
+
+        await PgTestPool.RunAsync(protocol,
+            $"set application_name = '{startupApplicationName.Replace("'", "''")}'");
+
+        Assert.AreSame(parameters, protocol.FlowControl.SessionParameters,
+            "returning to the startup state should snap back to the base snapshot");
+        Assert.AreEqual(serverVersion, protocol.FlowControl.BackendInfo.ServerVersionString);
+        Assert.AreEqual(protocol.FlowControl.BackendInfo.Capabilities,
+            protocol.FlowControl.BackendCapabilities);
+    }
+
+    [TestMethod]
     public void ScopeReset_UsesTheBackendCapabilitySnapshot()
     {
         var options = new ScopeResetOptions();

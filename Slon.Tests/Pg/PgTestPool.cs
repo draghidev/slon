@@ -1,6 +1,7 @@
 using Slon.Pg;
 using Slon.Pg.Protocol;
 using Slon.Pg.Protocol.Flows;
+using Slon.Pg.Types;
 using Slon.Pools;
 using Slon.Transport;
 
@@ -69,7 +70,10 @@ static class PgTestPool
     {
         var options = NewOptions();
         var transport = await SocketStreamConnection.ConnectAsync(options.EndPoint);
-        var protocolOptions = new PgClientProtocolOptions(options);
+        var protocolOptions = new PgClientProtocolOptions(options)
+        {
+            BackendProvider = PostgreSqlBackendProvider.Instance
+        };
         configureOptions?.Invoke(protocolOptions);
         var protocol = PgClientProtocol.Create(protocolOptions);
         await protocol.StartAsync(options, transport);
@@ -148,7 +152,10 @@ static class PgTestPool
             var transport = await SocketStreamConnection.ConnectAsync(options.EndPoint);
             try
             {
-                var protocol = PgClientProtocol.Create(new PgClientProtocolOptions(options));
+                var protocol = PgClientProtocol.Create(new PgClientProtocolOptions(options)
+                {
+                    BackendProvider = PostgreSqlBackendProvider.Instance
+                });
                 var conn = new PooledProtocol(protocol);
                 conn._poolContext = poolContext;
                 // Register before startup so any startup-terminal path releases the registration
