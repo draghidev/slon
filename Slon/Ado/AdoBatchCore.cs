@@ -589,10 +589,14 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
     public int ExecuteNonQuery(DbParameterCollection? parameters)
     {
         ThrowIfDisposed();
-        if (SlonTracing.ShouldStart)
-            return TraceSync(static (ref AdoBatchCore<TCommand> core, DbParameterCollection? state) =>
-                core.ExecuteNonQueryCore(state), parameters);
-        return ExecuteNonQueryCore(parameters);
+        using var activity = StartActivity();
+        try { return ExecuteNonQueryCore(parameters); }
+        catch (Exception ex)
+        {
+            SlonTracing.RecordException(activity, ex);
+            AdoException.Throw(ex);
+            return default;
+        }
     }
 
     int ExecuteNonQueryCore(DbParameterCollection? parameters)
@@ -613,27 +617,39 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
     static async ValueTask<int> ExecuteNonQueryAsyncCore(FieldRef<AdoBatchCore<TCommand>> fieldRef, DbParameterCollection? parameters, CancellationToken cancellationToken)
     {
         ref var thisRef = ref fieldRef.Invoke();
-        thisRef.ThrowIfDisposed();
-        cancellationToken.ThrowIfCancellationRequested();
-        var flow = await thisRef.EnqueueAsync(parameters, CommandBehavior.Default, cancellationToken).ConfigureAwait(false);
-        return checked((int)await flow.ConsumeNonQueryAsync(cancellationToken).ConfigureAwait(false));
+        using var activity = thisRef.StartActivity();
+        try
+        {
+            thisRef.ThrowIfDisposed();
+            cancellationToken.ThrowIfCancellationRequested();
+            var flow = await thisRef.EnqueueAsync(parameters, CommandBehavior.Default, cancellationToken).ConfigureAwait(false);
+            return checked((int)await flow.ConsumeNonQueryAsync(cancellationToken).ConfigureAwait(false));
+        }
+        catch (Exception ex)
+        {
+            SlonTracing.RecordException(activity, ex);
+            AdoException.Throw(ex);
+            return default;
+        }
     }
 
     public ValueTask<int> ExecuteNonQueryAsync(DbParameterCollection? parameters, CancellationToken cancellationToken = default)
     {
         var fieldRef = _fieldRef;
-        return SlonTracing.ShouldStart
-            ? TraceAsync(() => ExecuteNonQueryAsyncCore(fieldRef, parameters, cancellationToken))
-            : ExecuteNonQueryAsyncCore(fieldRef, parameters, cancellationToken);
+        return ExecuteNonQueryAsyncCore(fieldRef, parameters, cancellationToken);
     }
 
     public object? ExecuteScalar(DbParameterCollection? parameters)
     {
         ThrowIfDisposed();
-        if (SlonTracing.ShouldStart)
-            return TraceSync(static (ref AdoBatchCore<TCommand> core, DbParameterCollection? state) =>
-                core.ExecuteScalarCore(state), parameters);
-        return ExecuteScalarCore(parameters);
+        using var activity = StartActivity();
+        try { return ExecuteScalarCore(parameters); }
+        catch (Exception ex)
+        {
+            SlonTracing.RecordException(activity, ex);
+            AdoException.Throw(ex);
+            return default;
+        }
     }
 
     object? ExecuteScalarCore(DbParameterCollection? parameters)
@@ -653,11 +669,12 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
     static async ValueTask<object?> ExecuteScalarAsyncCore(FieldRef<AdoBatchCore<TCommand>> fieldRef, DbParameterCollection? parameters, CancellationToken cancellationToken)
     {
         ref var thisRef = ref fieldRef.Invoke();
-        thisRef.ThrowIfDisposed();
-        cancellationToken.ThrowIfCancellationRequested();
+        using var activity = thisRef.StartActivity();
         CommandFlow.Enumerator enumerator = default;
         try
         {
+            thisRef.ThrowIfDisposed();
+            cancellationToken.ThrowIfCancellationRequested();
             enumerator = (await thisRef.EnqueueAsync(parameters, CommandBehavior.Default, cancellationToken).ConfigureAwait(false)).GetAsyncEnumerator(cancellationToken);
             while (await enumerator.MoveNextAsync().ConfigureAwait(false))
             {
@@ -679,6 +696,12 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
             }
             return null;
         }
+        catch (Exception ex)
+        {
+            SlonTracing.RecordException(activity, ex);
+            AdoException.Throw(ex);
+            return default;
+        }
         finally
         {
             await enumerator.DisposeAsync().ConfigureAwait(false);
@@ -688,19 +711,20 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
     public ValueTask<object?> ExecuteScalarAsync(DbParameterCollection? parameters, CancellationToken cancellationToken = default)
     {
         var fieldRef = _fieldRef;
-        return SlonTracing.ShouldStart
-            ? TraceAsync(() => ExecuteScalarAsyncCore(fieldRef, parameters, cancellationToken))
-            : ExecuteScalarAsyncCore(fieldRef, parameters, cancellationToken);
+        return ExecuteScalarAsyncCore(fieldRef, parameters, cancellationToken);
     }
 
     public SlonDataReader ExecuteReader(DbParameterCollection? parameters, CommandBehavior behavior)
     {
         ThrowIfDisposed();
-        if (SlonTracing.ShouldStart)
-            return TraceSync(static (ref AdoBatchCore<TCommand> core,
-                    (DbParameterCollection? Parameters, CommandBehavior Behavior) state) =>
-                core.ExecuteReaderCore(state.Parameters, state.Behavior), (parameters, behavior));
-        return ExecuteReaderCore(parameters, behavior);
+        using var activity = StartActivity();
+        try { return ExecuteReaderCore(parameters, behavior); }
+        catch (Exception ex)
+        {
+            SlonTracing.RecordException(activity, ex);
+            AdoException.Throw(ex);
+            return default;
+        }
     }
 
     SlonDataReader ExecuteReaderCore(DbParameterCollection? parameters, CommandBehavior behavior)
@@ -713,12 +737,8 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
         if (cancellationToken.IsCancellationRequested)
             return ValueTask.FromCanceled<DbDataReader>(cancellationToken);
 
-        var fieldRef = _fieldRef;
-        return SlonTracing.ShouldStart
-            ? TraceAsync(() => SlonDataReader.CreateAsync<DbDataReader>(behavior,
-                fieldRef.Invoke().EnqueueAsync(parameters, behavior, cancellationToken), cancellationToken))
-            : SlonDataReader.CreateAsync<DbDataReader>(behavior,
-                EnqueueAsync(parameters, behavior, cancellationToken), cancellationToken);
+        return ExecuteReaderAsyncCore<DbDataReader>(
+            _fieldRef, parameters, behavior, cancellationToken);
     }
 
     public ValueTask<SlonDataReader> ExecuteReaderAsync(DbParameterCollection? parameters, CommandBehavior behavior, CancellationToken cancellationToken = default)
@@ -728,41 +748,28 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
         if (cancellationToken.IsCancellationRequested)
             return ValueTask.FromCanceled<SlonDataReader>(cancellationToken);
 
-        var fieldRef = _fieldRef;
-        return SlonTracing.ShouldStart
-            ? TraceAsync(() => SlonDataReader.CreateAsync<SlonDataReader>(behavior,
-                fieldRef.Invoke().EnqueueAsync(parameters, behavior, cancellationToken), cancellationToken))
-            : SlonDataReader.CreateAsync<SlonDataReader>(behavior,
-                EnqueueAsync(parameters, behavior, cancellationToken), cancellationToken);
+        return ExecuteReaderAsyncCore<SlonDataReader>(
+            _fieldRef, parameters, behavior, cancellationToken);
     }
 
-    delegate TResult SyncOperation<TState, TResult>(ref AdoBatchCore<TCommand> core, TState state);
-
-    TResult TraceSync<TState, TResult>(SyncOperation<TState, TResult> operation, TState state)
+    static async ValueTask<TReader> ExecuteReaderAsyncCore<TReader>(
+        FieldRef<AdoBatchCore<TCommand>> fieldRef, DbParameterCollection? parameters,
+        CommandBehavior behavior, CancellationToken cancellationToken)
+        where TReader : DbDataReader
     {
-        using var activity = StartActivity();
+        ref var core = ref fieldRef.Invoke();
+        using var activity = core.StartActivity();
         try
         {
-            return operation(ref this, state);
+            return await SlonDataReader.CreateAsync<TReader>(behavior,
+                core.EnqueueAsync(parameters, behavior, cancellationToken), cancellationToken)
+                .ConfigureAwait(false);
         }
         catch (Exception ex)
         {
             SlonTracing.RecordException(activity, ex);
-            throw;
-        }
-    }
-
-    async ValueTask<TResult> TraceAsync<TResult>(Func<ValueTask<TResult>> operation)
-    {
-        using var activity = StartActivity();
-        try
-        {
-            return await operation().ConfigureAwait(false);
-        }
-        catch (Exception ex)
-        {
-            SlonTracing.RecordException(activity, ex);
-            throw;
+            AdoException.Throw(ex);
+            return default!;
         }
     }
 

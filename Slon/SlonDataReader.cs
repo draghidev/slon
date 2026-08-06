@@ -112,11 +112,16 @@ public sealed partial class SlonDataReader
                     _enumeratedSingleRow = true;
                     return true;
                 }
+
+                if (!_enumeratedSingleRow)
+                    Current?.GetCommandComplete();
             }
             else
             {
                 if (_rowEnumerator.MoveNext())
                     return true;
+
+                Current?.GetCommandComplete();
             }
 
             return false;
@@ -131,7 +136,21 @@ public sealed partial class SlonDataReader
             var task = cancellationToken.CanBeCanceled
                 ? _rowEnumerator.MoveNextAsync(cancellationToken)
                 : _rowEnumerator.MoveNextAsync();
-            return !task.IsCompletedSuccessfully ? task.AsTask() : Task.FromResult(task.Result);
+            if (!task.IsCompletedSuccessfully)
+                return CompleteReadAsync(task, Current);
+
+            var result = task.Result;
+            if (!result)
+                Current?.GetCommandComplete();
+            return Task.FromResult(result);
+
+            static async Task<bool> CompleteReadAsync(ValueTask<bool> pending, CommandResult? current)
+            {
+                var result = await pending.ConfigureAwait(false);
+                if (!result)
+                    current?.GetCommandComplete();
+                return result;
+            }
         }
 
         [MethodImpl(MethodImplOptions.NoInlining)]
@@ -142,6 +161,9 @@ public sealed partial class SlonDataReader
                 _enumeratedSingleRow = true;
                 return true;
             }
+
+            if (!_enumeratedSingleRow)
+                Current?.GetCommandComplete();
 
             await DisposeEnumeratorAsync().ConfigureAwait(false);
             return false;
@@ -557,7 +579,8 @@ public sealed partial class SlonDataReader : DbDataReader, IDbColumnSchemaGenera
     public override bool NextResult()
     {
         ThrowIfClosedOrDisposed();
-        return _core.NextResult();
+        try { return _core.NextResult(); }
+        catch (Exception ex) { AdoException.Throw(ex); return default; }
     }
 
     /// <inheritdoc/>
@@ -571,25 +594,30 @@ public sealed partial class SlonDataReader : DbDataReader, IDbColumnSchemaGenera
 
     async Task<bool> NextResultAsyncCore(CancellationToken cancellationToken)
     {
-        if (_core.Current is { IsComplete: false } current)
-            await current.DisposeAsync().ConfigureAwait(false);
+        try
+        {
+            if (_core.Current is { IsComplete: false } current)
+                await current.DisposeAsync().ConfigureAwait(false);
 
-        var next = false;
-        while (_core._remainingResults > 0
-            && (next = await (cancellationToken.CanBeCanceled
-                ? _core._enumerator.MoveNextAsync(cancellationToken)
-                : _core._enumerator.MoveNextAsync()).ConfigureAwait(false))
-            && !_core.ProcessCurrent()) { }
-        if (!next)
-            await _core.DisposeEnumeratorAsync().ConfigureAwait(false);
-        return next;
+            var next = false;
+            while (_core._remainingResults > 0
+                && (next = await (cancellationToken.CanBeCanceled
+                    ? _core._enumerator.MoveNextAsync(cancellationToken)
+                    : _core._enumerator.MoveNextAsync()).ConfigureAwait(false))
+                && !_core.ProcessCurrent()) { }
+            if (!next)
+                await _core.DisposeEnumeratorAsync().ConfigureAwait(false);
+            return next;
+        }
+        catch (Exception ex) { AdoException.Throw(ex); return default; }
     }
 
     /// <inheritdoc/>
     public override bool Read()
     {
         ThrowIfClosedOrDisposed();
-        return _core.Read();
+        try { return _core.Read(); }
+        catch (Exception ex) { AdoException.Throw(ex); return default; }
     }
 
     /// <inheritdoc/>
@@ -599,7 +627,13 @@ public sealed partial class SlonDataReader : DbDataReader, IDbColumnSchemaGenera
         if (GetExceptionIfClosedOrDisposed() is { } exception)
             return Task.FromException<bool>(exception);
 
-        return _core.ReadAsync(cancellationToken);
+        return ReadAsyncCore(cancellationToken);
+    }
+
+    async Task<bool> ReadAsyncCore(CancellationToken cancellationToken)
+    {
+        try { return await _core.ReadAsync(cancellationToken).ConfigureAwait(false); }
+        catch (Exception ex) { AdoException.Throw(ex); return default; }
     }
 
     /// <inheritdoc/>
@@ -768,7 +802,8 @@ public sealed partial class SlonDataReader : DbDataReader, IDbColumnSchemaGenera
             return;
 
         State = ReaderState.Closed;
-        CloseCore();
+        try { CloseCore(); }
+        catch (Exception ex) { AdoException.Throw(ex); }
     }
 
     /// <inheritdoc/>
@@ -778,7 +813,7 @@ public sealed partial class SlonDataReader : DbDataReader, IDbColumnSchemaGenera
             return Task.CompletedTask;
 
         State = ReaderState.Closed;
-        return CloseAsyncCore().AsTask();
+        return CloseAsyncProjected().AsTask();
     }
 
     /// <inheritdoc/>
@@ -788,7 +823,8 @@ public sealed partial class SlonDataReader : DbDataReader, IDbColumnSchemaGenera
             return;
 
         State = ReaderState.Disposed;
-        DisposeCore();
+        try { DisposeCore(); }
+        catch (Exception ex) { AdoException.Throw(ex); }
     }
 
     /// <inheritdoc/>
@@ -798,6 +834,18 @@ public sealed partial class SlonDataReader : DbDataReader, IDbColumnSchemaGenera
             return new();
 
         State = ReaderState.Disposed;
-        return DisposeAsyncCore();
+        return DisposeAsyncProjected();
+    }
+
+    async ValueTask CloseAsyncProjected()
+    {
+        try { await CloseAsyncCore().ConfigureAwait(false); }
+        catch (Exception ex) { AdoException.Throw(ex); }
+    }
+
+    async ValueTask DisposeAsyncProjected()
+    {
+        try { await DisposeAsyncCore().ConfigureAwait(false); }
+        catch (Exception ex) { AdoException.Throw(ex); }
     }
 }

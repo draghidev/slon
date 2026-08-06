@@ -146,7 +146,7 @@ public class PostgreSqlSslTests
         var protocolException = exception.InnerException as PgProtocolException;
         Assert.IsNotNull(protocolException);
         StringAssert.Contains(protocolException.Message, "invalid SSL response byte");
-        StringAssert.Contains(exception.Message, protocolException.Message);
+        Assert.AreEqual(PgClientException.Summary, exception.Message);
         Assert.IsNull(protocolException.InnerException);
         await server;
     }

@@ -3,7 +3,7 @@ using System.Diagnostics.CodeAnalysis;
 
 namespace Slon.Pg.Protocol;
 
-sealed class PgErrorException : Exception
+public sealed class PgErrorException : Exception
 {
     // Throwing is the escape boundary: the exception can propagate anywhere and be inspected long
     // after the message buffer is recycled, so it captures its message eagerly and Preserve()s the

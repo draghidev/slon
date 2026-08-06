@@ -326,6 +326,9 @@ public class RecoveryTests : ConnectionCreatingTest
             () => e.MoveNextAsync().AsTask().WaitAsync(TestTimeout.Hang));
         Assert.AreEqual(PgCollateralKind.ProtocolFailure, collateral.Kind);
         Assert.AreSame(violation, collateral.InnerException);
+        var projected = Assert.IsInstanceOfType<SlonException>(AdoException.Project(collateral));
+        Assert.AreEqual(SlonExceptionKind.Collateral, projected.Kind);
+        Assert.IsFalse(projected.IsTransient);
     }
 
     [TestMethod]

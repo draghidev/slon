@@ -1,6 +1,5 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
-using Slon.Pg.Protocol;
 
 namespace Slon.Tests;
 
@@ -25,7 +24,7 @@ public sealed class AdoTracingTests
         }
 
         await using (var command = dataSource.CreateCommand("select * from slon_missing_trace_table"))
-            await Assert.ThrowsExactlyAsync<PgErrorException>(() => command.ExecuteNonQueryAsync());
+            await Assert.ThrowsExactlyAsync<PostgresException>(() => command.ExecuteNonQueryAsync());
 
         var activities = listener.Stopped.Where(activity => activity.ParentSpanId == parent.SpanId).ToArray();
         Assert.AreEqual(2, activities.Length);
