@@ -1,4 +1,6 @@
 using System.Text;
+using Slon.Pg;
+
 namespace Slon;
 
 /// <summary>
@@ -6,56 +8,23 @@ namespace Slon;
 /// </summary>
 public sealed class ScopeResetOptions
 {
-    bool _closeCursors = true;
-    bool _resetSessionAuthorization = true;
-    bool _resetParameters = true;
-    bool _clearListeners = true;
-    bool _releaseAdvisoryLocks = true;
-    bool _dropTemporaryObjects = true;
-    string? _command;
-    bool _commandResolved;
-
     /// <summary>Closes cursors left open by the scope.</summary>
-    public bool CloseCursors
-    {
-        get => _closeCursors;
-        set => Set(ref _closeCursors, value);
-    }
+    public bool CloseCursors { get; set; } = true;
 
     /// <summary>Restores the authenticated session identity and clears an active role.</summary>
-    public bool ResetSessionAuthorization
-    {
-        get => _resetSessionAuthorization;
-        set => Set(ref _resetSessionAuthorization, value);
-    }
+    public bool ResetSessionAuthorization { get; set; } = true;
 
     /// <summary>Restores run-time parameters to their defaults.</summary>
-    public bool ResetParameters
-    {
-        get => _resetParameters;
-        set => Set(ref _resetParameters, value);
-    }
+    public bool ResetParameters { get; set; } = true;
 
     /// <summary>Removes asynchronous notification registrations.</summary>
-    public bool ClearListeners
-    {
-        get => _clearListeners;
-        set => Set(ref _clearListeners, value);
-    }
+    public bool ClearListeners { get; set; } = true;
 
     /// <summary>Releases session-level advisory locks.</summary>
-    public bool ReleaseAdvisoryLocks
-    {
-        get => _releaseAdvisoryLocks;
-        set => Set(ref _releaseAdvisoryLocks, value);
-    }
+    public bool ReleaseAdvisoryLocks { get; set; } = true;
 
     /// <summary>Drops temporary objects owned by the session.</summary>
-    public bool DropTemporaryObjects
-    {
-        get => _dropTemporaryObjects;
-        set => Set(ref _dropTemporaryObjects, value);
-    }
+    public bool DropTemporaryObjects { get; set; } = true;
 
     internal ScopeResetOptions Snapshot() => new()
     {
@@ -67,31 +36,21 @@ public sealed class ScopeResetOptions
         DropTemporaryObjects = DropTemporaryObjects,
     };
 
-    internal string? ResolveCommand()
+    internal string? ResolveCommand(PgBackendCapabilities capabilities)
     {
-        if (_commandResolved)
-            return _command;
-
+        // A configured reset action whose capability is absent is deliberately omitted: dialect
+        // compatibility may therefore provide weaker pool-reuse hygiene than PostgreSQL itself.
         var command = new StringBuilder();
-        Append(command, CloseCursors, "CLOSE ALL");
-        Append(command, ResetSessionAuthorization, "SET SESSION AUTHORIZATION DEFAULT");
-        Append(command, ResetParameters, "RESET ALL");
-        Append(command, ClearListeners, "UNLISTEN *");
-        Append(command, ReleaseAdvisoryLocks, "SELECT pg_advisory_unlock_all()");
-        Append(command, DropTemporaryObjects, "DISCARD TEMP");
+        Append(command, CloseCursors && capabilities.SupportsCloseAll, "CLOSE ALL");
+        Append(command, ResetSessionAuthorization && capabilities.SupportsSessionAuthorization,
+            "SET SESSION AUTHORIZATION DEFAULT");
+        Append(command, ResetParameters && capabilities.SupportsResetAll, "RESET ALL");
+        Append(command, ClearListeners && capabilities.SupportsUnlisten, "UNLISTEN *");
+        Append(command, ReleaseAdvisoryLocks && capabilities.SupportsAdvisoryLocks,
+            "SELECT pg_advisory_unlock_all()");
+        Append(command, DropTemporaryObjects && capabilities.SupportsDiscardTemp, "DISCARD TEMP");
 
-        _command = command.Length is 0 ? null : command.ToString();
-        _commandResolved = true;
-        return _command;
-    }
-
-    void Set(ref bool field, bool value)
-    {
-        if (field == value)
-            return;
-        field = value;
-        _command = null;
-        _commandResolved = false;
+        return command.Length is 0 ? null : command.ToString();
     }
 
     static void Append(StringBuilder command, bool enabled, string statement)

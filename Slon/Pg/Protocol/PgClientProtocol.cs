@@ -1,5 +1,6 @@
 using System.Buffers;
 using System.Buffers.Binary;
+using System.Collections.Immutable;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Security.Authentication;
@@ -63,6 +64,12 @@ sealed class PgClientProtocolOptions
     public TimeSpan CancelRequestDelay { get; set; }
     public ScopeResetOptions ScopeReset { get; set; } = new();
     public int DataRowStreamingThreshold { get; set; } = BackendMessageBatch.Segmenter.DefaultDataRowStreamingThreshold;
+    // Datasource bootstrap supplies this. A standalone raw protocol can omit backend identity and
+    // operate with the explicit lower-level compatibility capabilities instead.
+    public PgBackendInfoProvider? BackendProvider { get; set; }
+    public PgBackendInfo? ExpectedBackendInfo { get; set; }
+    public PgBackendCapabilities BackendCapabilities { get; set; }
+        = PgBackendCapabilities.PostgreSqlCompatibility;
 
     /// Sends a side-channel CancelRequest and classifies whether request bytes may have reached
     /// PostgreSQL. The attempt must have ended before it returns. Null disables server cancellation.
@@ -95,6 +102,10 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
     // BackendKeyData used for diagnostics and side-channel cancellation.
     int _backendProcessId;
     int _backendSecretKey;
+    readonly PgServerParameterState _serverParameterState = new();
+    PgBackendInfo? _backendInfo;
+    PgBackendCapabilities _backendCapabilities;
+    string? _scopeResetCommand;
     // Last transaction status observed at RFQ, shared by outer and nested flows on this wire.
     TransactionStatus _transactionStatus;
 
@@ -116,6 +127,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
     {
         _options = options;
         _scopeReset = options.ScopeReset.Snapshot();
+        _backendCapabilities = options.BackendCapabilities;
         _close = CloseSignal.CreateRoot();
         FlowControl = new Control(this, poolFacing: true);
     }
@@ -163,7 +175,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
     internal TransactionStatus TransactionStatus => _transactionStatus;
     // Raw shutdown cause, or null after clean completion.
     internal Exception? CompletionException => _close.Reason?.InnerException;
-    internal string? ScopeResetCommand => _scopeReset.ResolveCommand();
+    internal string? ScopeResetCommand => _scopeResetCommand;
     internal int CompareTo(PgClientProtocol? other)
     {
         // Empty slots are preferred.
@@ -388,6 +400,15 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
             // fields are effectively readonly.
             _backendProcessId = flow.BackendProcessId;
             _backendSecretKey = flow.BackendSecretKey;
+            var startupParameters = _serverParameterState.CompleteStartup();
+            if (_options.BackendProvider is { } backendProvider)
+            {
+                _backendInfo = backendProvider.CreateBackendInfo(startupParameters);
+                if (_options.ExpectedBackendInfo is { } expectedBackendInfo)
+                    backendProvider.ValidateConnectionCompatibility(expectedBackendInfo, _backendInfo);
+                _backendCapabilities = _backendInfo.Capabilities;
+            }
+            _scopeResetCommand = _scopeReset.ResolveCommand(_backendCapabilities);
             Volatile.Write(ref _queryProtocolEstablished, 1);
             SignalReady();
         }
@@ -1366,6 +1387,16 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         // inner-scope Control reads the same one. Idle / Transaction / Error, or Unknown pre-first-RFQ.
         public TransactionStatus TransactionStatus => protocol._transactionStatus;
         public bool QueryProtocolEstablished => Volatile.Read(ref protocol._queryProtocolEstablished) is not 0;
+        public IImmutableDictionary<string, string> StartupParameters
+            => protocol._serverParameterState.BaseSnapshot;
+        public IImmutableDictionary<string, string> SessionParameters
+            => protocol._serverParameterState.CurrentSnapshot;
+        public int SessionParametersRevision => protocol._serverParameterState.Revision;
+        public PgBackendInfo BackendInfo
+            => protocol._backendInfo ?? throw new InvalidOperationException(
+                "Backend identity is unavailable because startup has not completed or no backend provider was configured.");
+        public PgBackendCapabilities BackendCapabilities => protocol._backendCapabilities;
+        public Encoding ClientEncoding => protocol._protocolDataWriter.ClientEncoding;
 
         // Tokens come from the scope signal for an inner Control (so the scope cascade reaches inner
         // flows), else the protocol's _close. Both are stable across a flow's tenure. Surfaced through
@@ -1399,18 +1430,27 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
             message.DebugEnsureBuffered();
 
             var reader = message.BodyReader;
-            _ = reader.TryPeek(out var nameStart);
-            switch ((char)nameStart)
+            if (!reader.TryReadTo(out ReadOnlySequence<byte> nameBytes, (byte)0,
+                    advancePastDelimiter: true)
+                || !reader.TryReadTo(out ReadOnlySequence<byte> valueBytes, (byte)0,
+                    advancePastDelimiter: true))
+                throw PgProtocolException.NotEnoughData("ParameterStatus");
+            if (reader.Remaining is not 0)
+                throw new PgProtocolException("ParameterStatus contains trailing data.");
+
+            var name = Encoding.UTF8.GetString(nameBytes);
+            var value = protocol._protocolDataWriter.ClientEncoding.GetString(valueBytes);
+            protocol._serverParameterState.Set(name, value);
+
+            switch (name)
             {
-            case 'c':
+            case "client_encoding":
                 // If Postgres supported ASCII incompatible encodings there would be a catch-22
                 // reporting the new encoding value encoded in the new encoding.
                 // As it doesn't support e.g. utf16 we can always rely on the ascii bytes,
                 // which is enough to transmit encoding names.
-                if (reader.IsNext("client_encoding\0"u8, advancePast: true))
                 {
-                    _ = reader.TryReadTo(out ReadOnlySequence<byte> value, [(byte)'\0']);
-                    var newEncoding = protocol._protocolDataWriter.ClientEncoding.GetString(value);
+                    var newEncoding = value;
                     // Map from PG names to ICU/IANA names https://www.iana.org/assignments/character-sets/character-sets.xhtml.
                     // https://github.com/postgres/postgres/blob/713d9a847e6409a2a722aed90975eef6d75dc701/src/common/encnames.c#L414
                     // Server reports a new client_encoding (typically from SET CLIENT_ENCODING). Map the PG name
@@ -1471,13 +1511,8 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
                     }
                 }
                 break;
-            case 's':
-                if (reader.IsNext("search_path\0"u8, advancePast: true))
-                {
-                    _ = reader.TryReadTo(out ReadOnlySequence<byte> value, [(byte)'\0']);
-                    var newSearchPath = protocol._protocolDataWriter.ClientEncoding.GetString(value);
-                    protocol.CurrentSearchPath = newSearchPath;
-                }
+            case "search_path":
+                protocol.CurrentSearchPath = value;
                 break;
             default:
                 // TODO log ignored parameter status.
@@ -1553,6 +1588,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
 
         internal void OnReleasing(PgClientFlow flow, int remainingDepth)
         {
+            protocol._serverParameterState.CommitFlow();
             if (remainingDepth is 0)
                 Volatile.Write(ref _isIdle, true);
             protocol.OnFlowReleased(this, flow, remainingDepth);
