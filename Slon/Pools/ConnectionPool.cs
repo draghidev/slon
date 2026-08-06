@@ -655,6 +655,17 @@ internal sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
     public ValueTask<T> GetAsync<TState>(Func<ConnectionCandidate<T>, TState, bool>? schedule, TState state, TimeSpan timeout, CancellationToken cancellationToken = default)
         => GetCoreAsync(schedule, state, timeout, cancellationToken);
 
+    // Get normally transfers the idle token to work queued by its caller; that work returns the
+    // token when the connection becomes idle again. A caller that deliberately acquired without
+    // queuing anything must return that token explicitly.
+    internal void ReturnUnscheduled(T connection)
+    {
+        ThrowIfDisposed();
+        if (!connection.IsIdle || !connection.IsSchedulable)
+            throw new InvalidOperationException("Only an idle, schedulable connection can be returned without work.");
+        PublishIdle(connection);
+    }
+
     // Prefer DisposeAsync, so keep this explicitly implemented.
     void IDisposable.Dispose()
     {
