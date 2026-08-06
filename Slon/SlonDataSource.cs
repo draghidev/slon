@@ -1,12 +1,12 @@
 using System.Data.Common;
 using System.Net;
+using System.Net.Sockets;
 using Slon.Pg;
 using Slon.Pg.Protocol;
 using Slon.Pg.Protocol.Flows;
 using Slon.Pg.Types;
 using Slon.Pools;
 using Slon.Transport;
-using AddressFamily = System.Net.Sockets.AddressFamily;
 
 namespace Slon;
 
@@ -16,7 +16,7 @@ interface IFrontendTypeCatalog
     bool TryGetIdentifiers(SlonDbType slonDbType, out PgTypeId canonicalTypeId, out DataTypeName dataTypeName);
 }
 
-public record SlonDataSourceOptions
+public sealed record SlonDataSourceOptions
 {
     internal static TimeSpan DefaultCommandTimeout = TimeSpan.FromSeconds(30);
 
@@ -59,14 +59,25 @@ public record SlonDataSourceOptions
     /// Default is infinite, where behavior purely relies on read and write timeouts of the underlying protocol.
     /// </summary>
     public TimeSpan CommandTimeout { get; init; } = DefaultCommandTimeout;
-    public int AutoPreparationMinimumUses { get; set; } = 5;
-    public int MaxActiveAutoPreparations { get; set; }
+    public int AutoPreparationMinimumUses { get; init; } = 5;
+    public int MaxActiveAutoPreparations { get; init; }
     /// <summary>
     /// DataRows larger than this may cross the decoder boundary before their complete body has arrived.
     /// </summary>
     public int DataRowStreamingThreshold { get; init; } = BackendMessageBatch.Segmenter.DefaultDataRowStreamingThreshold;
     /// <summary>Configures which connection state is reset when an exclusive scope is released.</summary>
     public ScopeResetOptions ScopeReset { get; init; } = new();
+    /// <summary>
+    /// Optionally restricts ordinary type loading to <c>pg_catalog</c> and the listed schemas.
+    /// Category-U extension types and their canonical array counterparts remain discoverable
+    /// across schemas. An empty list leaves catalog loading unrestricted.
+    /// </summary>
+    public IReadOnlyList<string> TypeLoadingSchemas { get; init; } = [];
+    /// <summary>Whether table row types should be loaded as composites.</summary>
+    public bool LoadTableComposites { get; init; }
+
+    internal PgBackendProvider BackendProvider { get; init; } = PostgreSqlBackendProvider.Instance;
+    internal IReadOnlyList<PgTypeCatalogPlugin> TypeCatalogPlugins { get; init; } = [];
 
     // Internal, tests need to override these to drive maintenance flows on a tight loop. Public
     // surface would require thinking through "what's a sensible knob for end users."
@@ -93,6 +104,11 @@ public record SlonDataSourceOptions
     {
         ArgumentNullException.ThrowIfNull(Ssl);
         ArgumentNullException.ThrowIfNull(Authentication);
+        if ((ConnectionInitializer is null) != (AsyncConnectionInitializer is null))
+            throw new ArgumentException(
+                "Synchronous and asynchronous connection initializers must be configured together.");
+        for (var i = 0; i < TypeLoadingSchemas.Count; i++)
+            ArgumentException.ThrowIfNullOrWhiteSpace(TypeLoadingSchemas[i], nameof(TypeLoadingSchemas));
         Ssl.Validate();
         OAuth?.Validate();
         IntegratedSecurity?.Validate();
@@ -100,7 +116,28 @@ public record SlonDataSourceOptions
         return true;
     }
 
+    internal SlonDataSourceOptions Snapshot() => this with
+    {
+        EndPoint = EndPoint switch
+        {
+            IPEndPoint ip => new IPEndPoint(ip.Address, ip.Port),
+            DnsEndPoint dns => new DnsEndPoint(dns.Host, dns.Port, dns.AddressFamily),
+            UnixDomainSocketEndPoint unix => new UnixDomainSocketEndPoint(unix.ToString()),
+            _ => EndPoint
+        },
+        Ssl = Ssl.Snapshot(),
+        Authentication = Authentication.Snapshot(),
+        IntegratedSecurity = IntegratedSecurity?.Snapshot(),
+        ScopeReset = ScopeReset.Snapshot(),
+        TypeLoadingSchemas = [.. (TypeLoadingSchemas
+            ?? throw new ArgumentNullException(nameof(TypeLoadingSchemas)))]
+    };
+
     public static EndPoint ParseIpOrDnsEndPoint(string host) => PgClientOptions.ParseIpOrDnsEndPoint(host);
+
+    public override string ToString()
+        => $"{nameof(SlonDataSourceOptions)} {{ EndPoint = {EndPoint}, Username = {Username}, " +
+           $"Database = {Database}, Password = <redacted> }}";
 }
 
 class PgDatabaseInfo
