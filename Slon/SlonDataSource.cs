@@ -10,12 +10,6 @@ using Slon.Transport;
 
 namespace Slon;
 
-interface IFrontendTypeCatalog
-{
-    DataTypeName GetDataTypeName(PgTypeId pgTypeId);
-    bool TryGetIdentifiers(SlonDbType slonDbType, out PgTypeId canonicalTypeId, out DataTypeName dataTypeName);
-}
-
 public sealed record SlonDataSourceOptions
 {
     internal static TimeSpan DefaultCommandTimeout = TimeSpan.FromSeconds(30);
@@ -76,6 +70,9 @@ public sealed record SlonDataSourceOptions
     /// <summary>Whether table row types should be loaded as composites.</summary>
     public bool LoadTableComposites { get; init; }
 
+    // Public builder surface follows once the backend/type-loading contracts settle. Keep the
+    // configured backend singular; automatic backend detection is not reliable for PostgreSQL-
+    // compatible servers that deliberately advertise PostgreSQL identity.
     internal PgBackendProvider BackendProvider { get; init; } = PostgreSqlBackendProvider.Instance;
     internal IReadOnlyList<PgTypeCatalogPlugin> TypeCatalogPlugins { get; init; } = [];
 
@@ -118,6 +115,8 @@ public sealed record SlonDataSourceOptions
 
     internal SlonDataSourceOptions Snapshot() => this with
     {
+        // The BCL endpoint implementations are mutable classes. Unknown custom endpoint types are
+        // extension objects and are therefore required to provide immutable configuration semantics.
         EndPoint = EndPoint switch
         {
             IPEndPoint ip => new IPEndPoint(ip.Address, ip.Port),
@@ -140,53 +139,36 @@ public sealed record SlonDataSourceOptions
            $"Database = {Database}, Password = <redacted> }}";
 }
 
-class PgDatabaseInfo
-{
-    public PgDatabaseInfo(PgTypeCatalog typeCatalog)
-    {
-        TypeCatalog = typeCatalog;
-        ServerVersion = "PG";
-    }
-
-    public string ServerVersion { get; }
-
-    public PgTypeCatalog TypeCatalog { get; }
-}
-
-
-interface ISlonDatabaseInfoProvider
-{
-    PgDatabaseInfo Get(SlonDataSourceOptions options, TimeSpan timeSpan);
-    ValueTask<PgDatabaseInfo> GetAsync(SlonDataSourceOptions options, CancellationToken cancellationToken = default);
-}
-
-sealed class DefaultSlonDatabaseInfoProvider: ISlonDatabaseInfoProvider
-{
-    PgDatabaseInfo Create() => new(PgTypeCatalog.Default);
-    public PgDatabaseInfo Get(SlonDataSourceOptions options, TimeSpan timeSpan) => Create();
-    public ValueTask<PgDatabaseInfo> GetAsync(SlonDataSourceOptions options, CancellationToken cancellationToken = default) => new(Create());
-}
-
 /// <inheritdoc cref="System.Data.Common.DbDataSource" />
-public sealed class SlonDataSource: DbDataSource
+public sealed class SlonDataSource : DbDataSource
 {
     readonly SlonDataSourceOptions _options;
-    readonly ISlonDatabaseInfoProvider _slonDatabaseInfoProvider;
+    readonly PgBackendProvider _backendProvider;
+    readonly PgTypeCatalogPlugin[] _userTypeCatalogPlugins;
     readonly SemaphoreSlim _lifecycleLock;
+    readonly CancellationTokenSource _shutdown = new();
+    readonly Lock _reloadLock = new();
 
     // Initialized on the first real use.
     ConnectionPool<PgConnection> _connectionPool = null!;
     IPoolConnectionFactory<PgConnection> _clientFactory = null!;
     PgDbDependencies _dbDependencies = null!;
-    bool _isInitialized;
+    PgTypeCatalogFactory _typeCatalogFactory = null!;
+    PgTypeCatalogPlugin[] _typeCatalogPlugins = null!;
+    PgConnectionFactory _typeReloadConnectionFactory = null!;
+    Task? _typeReload;
+    volatile bool _isInitialized;
+    int _disposed;
 
-    public SlonDataSource(SlonDataSourceOptions options) : this(options, null) { }
-    internal SlonDataSource(SlonDataSourceOptions options, ISlonDatabaseInfoProvider? pgDatabaseInfoProvider = null)
+    public SlonDataSource(SlonDataSourceOptions options)
     {
-        options.Validate();
-        _options = options;
-        DisplayEndpoint = options.EndPoint.AddressFamily is AddressFamily.InterNetwork or AddressFamily.InterNetworkV6 ? $"tcp://{options.EndPoint}" : options.EndPoint.ToString()!;
-        _slonDatabaseInfoProvider = pgDatabaseInfoProvider ?? new DefaultSlonDatabaseInfoProvider();
+        _options = options.Snapshot();
+        _options.Validate();
+        DisplayEndpoint = _options.EndPoint.AddressFamily is AddressFamily.InterNetwork or AddressFamily.InterNetworkV6 ? $"tcp://{_options.EndPoint}" : _options.EndPoint.ToString()!;
+        _backendProvider = _options.BackendProvider
+            ?? throw new ArgumentNullException(nameof(_options.BackendProvider));
+        _userTypeCatalogPlugins = [.. (_options.TypeCatalogPlugins
+            ?? throw new ArgumentNullException(nameof(_options.TypeCatalogPlugins)))];
         _lifecycleLock = new(1);
     }
 
@@ -195,7 +177,15 @@ public sealed class SlonDataSource: DbDataSource
     // Store the result if multiple dependencies are required. The instance may be switched out during reloading.
     // To prevent any inconsistencies without having to obtain a lock on the data we instead use an immutable instance.
     // All relevant depedencies are bundled to provide a consistent view, it's either all new or all old data.
-    PgDbDependencies GetDbDependencies() => _dbDependencies ?? throw NotInitializedException();
+    internal PgDbDependencies GetDbDependencies(bool initializedOnly = false)
+    {
+        if (Volatile.Read(ref _dbDependencies) is { } dependencies)
+            return dependencies;
+        if (initializedOnly)
+            throw NotInitializedException();
+        EnsureInitialized(ConnectionTimeout);
+        return Volatile.Read(ref _dbDependencies) ?? throw NotInitializedException();
+    }
 
     // True for datasources that dispatch commands across different backends.
     // Among other effects this impacts cacheability of state derived from unstable backend type information.
@@ -211,7 +201,8 @@ public sealed class SlonDataSource: DbDataSource
     internal string Database => _options.Database ?? _options.Username;
     internal string DisplayEndpoint { get; }
 
-    internal string ServerVersion => GetDbDependencies().PgDatabaseInfo.ServerVersion;
+    internal string ServerVersion => GetDbDependencies().BackendInfo.ServerVersionString;
+    internal PgTypeCatalog TypeCatalog => GetDbDependencies().TypeCatalog;
 
     int DbDepsRevision { get; set; }
 
@@ -220,7 +211,7 @@ public sealed class SlonDataSource: DbDataSource
         return new(this, pgConnection, connection);
     }
 
-     ValueTask Initialize(bool async, TimeSpan timeout, CancellationToken cancellationToken)
+    ValueTask Initialize(bool async, TimeSpan timeout, CancellationToken cancellationToken)
     {
         if (_isInitialized)
             return new ValueTask();
@@ -235,13 +226,13 @@ public sealed class SlonDataSource: DbDataSource
                 _lifecycleLock.Wait(cancellationToken);
             try
             {
+                ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) is not 0, this);
                 if (_isInitialized)
                     return;
 
-                // We don't flow cancellationToken past this point, at least one thread has to finish the init.
-                // We do DbDeps first as it may throw, otherwise we'd need to cleanup the other dependencies again.
-                var deps = await CreateDbDeps(async, timeout, CancellationToken.None).ConfigureAwait(false);
-
+                // We don't flow cancellationToken past this point: one contender must finish the shared
+                // initialization. Wire-free dependencies are created before the bootstrap connection;
+                // the resulting backend/catalog snapshot is published only after that wire is settled.
                 var connectionInit = _options.ConnectionInitializer;
                 var asyncConnectionInit = _options.AsyncConnectionInitializer;
                 var oauthTokens = _options.OAuth is { } oauth
@@ -249,39 +240,98 @@ public sealed class SlonDataSource: DbDataSource
                     : null;
                 var clientOptions = _options.ToPgClientOptions(oauthTokens);
                 var transportFactory = SocketStreamConnection.CreateFactory(clientOptions.EndPoint);
-
+                var commandTracker = new CommandTracker(
+                    _options.MaxActiveAutoPreparations, _options.AutoPreparationMinimumUses);
                 var factory = new InitializingConnectionFactory<PgConnection>(
-                    factory: new PgConnectionFactory(clientOptions, transportFactory, tracker: deps.CommandsTracker),
+                    factory: new PgConnectionFactory(clientOptions, transportFactory,
+                        tracker: commandTracker,
+                        configureOptions: options =>
+                        {
+                            options.BackendProvider = _backendProvider;
+                            options.ExpectedBackendInfo = Volatile.Read(ref _dbDependencies)?.BackendInfo;
+                        }),
                     initializer: connectionInit is not null ? (pgConnection, timeout) =>
                         {
+                            if (Volatile.Read(ref _dbDependencies) is null)
+                                return;
                             using var conn = CreateConnection();
                             conn.SetProxy(CreateProxy(pgConnection, conn));
                             connectionInit(conn, timeout);
-                        } : null,
+                        }
+                    : null,
                     asyncInitializer:
                         asyncConnectionInit is not null ? async (pgConnection, cancellationToken) =>
                         {
+                            if (Volatile.Read(ref _dbDependencies) is null)
+                                return;
                             var conn = CreateConnection();
                             await using var _ = conn.ConfigureAwait(false);
                             conn.SetProxy(CreateProxy(pgConnection, conn));
                             await asyncConnectionInit(conn, cancellationToken).ConfigureAwait(false);
-                        } : null
+                        }
+                    : null
                 );
 
-                // Finally store all the fields
-                if (_options.MaxPoolSize > 0)
-                    _connectionPool = new ConnectionPool<PgConnection>(factory, new()
-                    {
-                        MinConnections = _options.MinPoolSize,
-                        MaxConnections = _options.MaxPoolSize,
-                        ConnectionIdleLifetime = _options.ConnectionIdleLifetime,
-                        ConnectionPruningInterval = _options.ConnectionPruningInterval,
-                        HeartbeatInterval = _options.HeartbeatInterval,
-                    });
-                _clientFactory = factory;
-                _dbDependencies = deps;
+                ConnectionPool<PgConnection>? pool = null;
+                try
+                {
+                    if (_options.MaxPoolSize > 0)
+                        pool = new ConnectionPool<PgConnection>(factory, new()
+                        {
+                            MinConnections = _options.MinPoolSize,
+                            MaxConnections = _options.MaxPoolSize,
+                            ConnectionIdleLifetime = _options.ConnectionIdleLifetime,
+                            ConnectionPruningInterval = _options.ConnectionPruningInterval,
+                            HeartbeatInterval = _options.HeartbeatInterval,
+                        });
 
-                _isInitialized = true;
+                    var bootstrapResult = await CreateDbDeps(
+                        async, timeout, clientOptions, transportFactory, commandTracker, pool,
+                        retainBootstrap: connectionInit is null, _shutdown.Token).ConfigureAwait(false);
+                    var deps = bootstrapResult.Dependencies;
+
+                    // A configured connection initializer may depend on the completed catalog. The
+                    // first connection therefore could not run it in the factory before bootstrap;
+                    // retire that exceptional connection and let the ordinary factory replace it.
+                    // Without an initializer, the bootstrap connection is already a complete pooled
+                    // connection and remains the pool's first idle member.
+                    if (bootstrapResult.Connection is { } bootstrap && connectionInit is not null)
+                    {
+                        await bootstrap.CompleteAsync().ConfigureAwait(false);
+                    }
+
+                    _connectionPool = pool!;
+                    _clientFactory = factory;
+                    _typeCatalogFactory = bootstrapResult.Factory;
+                    _typeCatalogPlugins = bootstrapResult.Plugins;
+                    _typeReloadConnectionFactory = new PgConnectionFactory(
+                        clientOptions, transportFactory,
+                        configureOptions: options =>
+                        {
+                            options.BackendProvider = _backendProvider;
+                            options.ExpectedBackendInfo = deps.BackendInfo;
+                        });
+
+                    // Commit the complete datasource state as one publication. GetDbDependencies is
+                    // itself an initialization gateway, so exposing the bundle before the pool and
+                    // reload recipe are installed would let a concurrent command bypass the lifecycle
+                    // lock and observe a partially initialized datasource.
+                    Volatile.Write(ref _dbDependencies, deps);
+                    _isInitialized = true;
+                    pool = null;
+                }
+                catch
+                {
+                    Volatile.Write(ref _dbDependencies, null!);
+                    if (pool is not null)
+                    {
+                        if (async)
+                            await pool.DisposeAsync().ConfigureAwait(false);
+                        else
+                            ((IDisposable)pool).Dispose();
+                    }
+                    throw;
+                }
             }
             finally
             {
@@ -289,18 +339,309 @@ public sealed class SlonDataSource: DbDataSource
             }
         }
 
-        async ValueTask<PgDbDependencies> CreateDbDeps(bool async, TimeSpan timeout, CancellationToken cancellationToken)
+        async ValueTask<(PgDbDependencies Dependencies, PgTypeCatalogFactory Factory,
+            PgTypeCatalogPlugin[] Plugins, PgConnection? Connection)> CreateDbDeps(
+            bool async,
+            TimeSpan timeout,
+            PgClientOptions clientOptions,
+            TransportConnection.Factory transportFactory,
+            CommandTracker commandTracker,
+            ConnectionPool<PgConnection>? pool,
+            bool retainBootstrap,
+            CancellationToken shutdownToken)
         {
-            var databaseInfo = async
-                ? _slonDatabaseInfoProvider.Get(_options, timeout)
-                : await _slonDatabaseInfoProvider.GetAsync(_options, cancellationToken).ConfigureAwait(false);
+            var bootstrapFactory = new PgConnectionFactory(clientOptions, transportFactory,
+                tracker: commandTracker,
+                configureOptions: options => options.BackendProvider = _backendProvider);
+            PgConnection? bootstrap = null;
+            Exception? error = null;
+            try
+            {
+                bootstrap = pool is null
+                    ? async
+                        ? await bootstrapFactory.CreateAsync(shutdownToken).ConfigureAwait(false)
+                        : bootstrapFactory.Create(timeout)
+                    : async
+                        ? await pool.GetAsync(timeout, shutdownToken).ConfigureAwait(false)
+                        : pool.Get(timeout);
 
-            return new PgDbDependencies(databaseInfo, new CommandTracker(_options.MaxActiveAutoPreparations, _options.AutoPreparationMinimumUses), DbDepsRevision++);
+                var backendInfo = bootstrap.Protocol.FlowControl.BackendInfo;
+                var catalogFactory = _backendProvider.CreateTypeCatalogFactory(backendInfo);
+                var dialectPlugins = _backendProvider.CreateTypeCatalogPlugins(backendInfo)
+                    ?? throw new InvalidOperationException(
+                        "The backend provider returned a null type-catalog plugin collection.");
+                var dialectPluginSnapshot = new PgTypeCatalogPlugin[dialectPlugins.Count];
+                for (var i = 0; i < dialectPluginSnapshot.Length; i++)
+                    dialectPluginSnapshot[i] = dialectPlugins[i]
+                        ?? throw new InvalidOperationException(
+                            $"The backend provider returned a null type-catalog plugin at index {i}.");
+                var configuredRequirements = _options.TypeLoadingSchemas.Count is not 0
+                    || _options.LoadTableComposites;
+                var plugins = new PgTypeCatalogPlugin[
+                    (configuredRequirements ? 1 : 0) + dialectPluginSnapshot.Length + _userTypeCatalogPlugins.Length];
+                var pluginOffset = 0;
+                if (configuredRequirements)
+                    plugins[pluginOffset++] = new ConfiguredTypeLoadingRequirements(
+                        _options.TypeLoadingSchemas, _options.LoadTableComposites);
+                dialectPluginSnapshot.CopyTo(plugins, pluginOffset);
+                _userTypeCatalogPlugins.CopyTo(plugins, pluginOffset + dialectPluginSnapshot.Length);
+
+                var context = new PgTypeCatalogFactoryContext(bootstrap.Protocol, shutdownToken);
+                PgTypeCatalog catalog;
+                if (async)
+                {
+                    var load = catalogFactory.CreateAsync(context, plugins, shutdownToken);
+                    if (catalogFactory.RequiresProtocol && !context.FlowQueued)
+                    {
+                        if (!load.IsCompleted)
+                            throw new InvalidOperationException(
+                                "A protocol-backed type catalog factory yielded before queuing its load flow.");
+                        // Preserve a synchronous factory failure instead of masking it as a contract error.
+                        load.GetAwaiter().GetResult();
+                        throw new InvalidOperationException(
+                            "A protocol-backed type catalog factory completed without queuing its load flow.");
+                    }
+                    catalog = await load.ConfigureAwait(false);
+                }
+                else
+                {
+                    catalog = catalogFactory.Create(context, plugins);
+                    if (catalogFactory.RequiresProtocol && !context.FlowQueued)
+                        throw new InvalidOperationException(
+                            "A protocol-backed type catalog factory completed without queuing its load flow.");
+                }
+                var dependencies = new PgDbDependencies(
+                    backendInfo, catalog, commandTracker, DbDepsRevision++);
+                if (pool is not null && retainBootstrap && !context.FlowQueued)
+                    pool.ReturnUnscheduled(bootstrap);
+                return (dependencies, catalogFactory, plugins, pool is null ? null : bootstrap);
+            }
+            catch (Exception ex)
+            {
+                error = ex;
+                throw;
+            }
+            finally
+            {
+                if (bootstrap is not null && (pool is null || error is not null))
+                {
+                    if (async)
+                        await bootstrap.CompleteAsync(error).ConfigureAwait(false);
+                    else
+                        bootstrap.CompleteAsync(error).GetAwaiter().GetResult();
+                }
+            }
         }
     }
 
     void EnsureInitialized(TimeSpan timeout) => Initialize(false, timeout, CancellationToken.None).GetAwaiter().GetResult();
-    ValueTask EnsureInitializedAsync(TimeSpan timeout, CancellationToken cancellationToken) => Initialize(true, timeout, cancellationToken);
+    ValueTask EnsureInitializedAsync(TimeSpan timeout, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var initialization = Initialize(true, timeout, CancellationToken.None);
+        return cancellationToken.CanBeCanceled
+            ? new(initialization.AsTask().WaitAsync(cancellationToken))
+            : initialization;
+    }
+
+    public void ReloadTypes()
+        => ReloadTypesCore(async: false, CancellationToken.None).AsTask().GetAwaiter().GetResult();
+
+    public ValueTask ReloadTypesAsync(CancellationToken cancellationToken = default)
+        => ReloadTypesCore(async: true, cancellationToken);
+
+    ValueTask ReloadTypesCore(bool async, CancellationToken cancellationToken)
+    {
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) is not 0, this);
+        if (!_isInitialized)
+        {
+            if (async)
+                return EnsureInitializedAsync(ConnectionTimeout, cancellationToken);
+            EnsureInitialized(ConnectionTimeout);
+            return ValueTask.CompletedTask;
+        }
+
+        // Prebuilt catalogs have nothing to reload. Keep this an internal factory distinction so
+        // generic ADO integrations can request a reload without first discovering the load strategy.
+        if (!_typeCatalogFactory.SupportsReload)
+            return ValueTask.CompletedTask;
+
+        Task reload;
+        TaskCompletionSource owner;
+        lock (_reloadLock)
+        {
+            if (_typeReload is not null)
+                return new(_typeReload.WaitAsync(cancellationToken));
+
+            owner = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            _typeReload = reload = owner.Task;
+        }
+        // The synchronous path may run to completion inline, including clearing _typeReload, so
+        // never start it while holding the publication lock.
+        _ = RunTypeReloadAsync(async, owner);
+        return new(reload.WaitAsync(cancellationToken));
+
+    }
+
+    async Task RunTypeReloadAsync(bool async, TaskCompletionSource completion)
+    {
+        try
+        {
+            if (async)
+                await _lifecycleLock.WaitAsync(CancellationToken.None).ConfigureAwait(false);
+            else
+                _lifecycleLock.Wait(CancellationToken.None);
+
+            try
+            {
+                ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) is not 0, this);
+                var current = GetDbDependencies();
+                var loaded = await LoadTypeCatalogAsync(current, async, _shutdown.Token).ConfigureAwait(false);
+
+                // Publish only the complete replacement. Existing executions retain their old
+                // immutable bundle; future executions observe this revision in one reference read.
+                // The backend identity and catalog retain the same physical-load provenance; the
+                // provider's compatibility policy licenses publishing that pair datasource-wide.
+                // The tracker can survive only because preparation identity includes the resolved
+                // parameter type/OID shape. Keep that shape in the identity as serializer resolution
+                // matures; SQL text alone is not stable across mapping-affecting reloads.
+                Volatile.Write(ref _dbDependencies, new PgDbDependencies(
+                    loaded.BackendInfo, loaded.Catalog, current.CommandsTracker, DbDepsRevision++));
+            }
+            finally
+            {
+                _lifecycleLock.Release();
+            }
+
+            ClearTypeReloadOwner(completion);
+            completion.TrySetResult();
+        }
+        catch (Exception ex)
+        {
+            ClearTypeReloadOwner(completion);
+            completion.TrySetException(ex);
+        }
+
+        void ClearTypeReloadOwner(TaskCompletionSource owner)
+        {
+            lock (_reloadLock)
+            {
+                if (ReferenceEquals(_typeReload, owner.Task))
+                    _typeReload = null;
+            }
+        }
+    }
+
+    async ValueTask<LoadedTypeCatalog> LoadTypeCatalogAsync(
+        PgDbDependencies current, bool async, CancellationToken shutdownToken)
+    {
+        if (!_typeCatalogFactory.RequiresProtocol)
+        {
+            var context = new PgTypeCatalogFactoryContext(current.BackendInfo, shutdownToken);
+            var catalog = async
+                ? await _typeCatalogFactory.CreateAsync(
+                    context, _typeCatalogPlugins, shutdownToken).ConfigureAwait(false)
+                : _typeCatalogFactory.Create(context, _typeCatalogPlugins);
+            return new(catalog, context.BackendInfo);
+        }
+
+        if (_connectionPool is not null)
+        {
+            var state = new TypeReloadScheduleState(
+                _typeCatalogFactory, _typeCatalogPlugins, async, shutdownToken);
+            if (async)
+                await _connectionPool.GetAsync(
+                    static (candidate, state) => state.TrySchedule(candidate), state,
+                    ConnectionTimeout, shutdownToken).ConfigureAwait(false);
+            else
+                _connectionPool.GetAsync(
+                        static (candidate, state) => state.TrySchedule(candidate), state,
+                        ConnectionTimeout, shutdownToken)
+                    .AsTask().GetAwaiter().GetResult();
+            var catalog = async
+                ? await state.Load.ConfigureAwait(false)
+                : state.Load.GetAwaiter().GetResult();
+            return new(catalog, state.BackendInfo);
+        }
+
+        // An unpooled datasource has no configured capacity to adopt from.
+        PgConnection? connection = null;
+        Exception? error = null;
+        try
+        {
+            connection = async
+                ? await _typeReloadConnectionFactory.CreateAsync(shutdownToken).ConfigureAwait(false)
+                : _typeReloadConnectionFactory.Create(ConnectionTimeout);
+            var context = new PgTypeCatalogFactoryContext(connection.Protocol, shutdownToken);
+            var catalog = async
+                ? await _typeCatalogFactory.CreateAsync(
+                    context, _typeCatalogPlugins, shutdownToken).ConfigureAwait(false)
+                : _typeCatalogFactory.Create(context, _typeCatalogPlugins);
+            return new(catalog, context.BackendInfo);
+        }
+        catch (Exception ex)
+        {
+            error = ex;
+            throw;
+        }
+        finally
+        {
+            if (connection is not null)
+            {
+                if (async)
+                    await connection.CompleteAsync(error).ConfigureAwait(false);
+                else
+                    connection.CompleteAsync(error).GetAwaiter().GetResult();
+            }
+        }
+    }
+
+    sealed class ConfiguredTypeLoadingRequirements(
+        IReadOnlyList<string> schemas, bool loadTableComposites) : PgTypeCatalogPlugin
+    {
+        public override void Configure(PgTypeLoadingOptionsBuilder options)
+        {
+            for (var i = 0; i < schemas.Count; i++)
+                options.AddTypeLoadingSchema(schemas[i]);
+            options.EnableTableCompositesLoading(loadTableComposites);
+        }
+    }
+
+    sealed class TypeReloadScheduleState(PgTypeCatalogFactory factory,
+        PgTypeCatalogPlugin[] plugins, bool async,
+        CancellationToken shutdownToken)
+    {
+        public ValueTask<PgTypeCatalog> Load { get; private set; }
+        public PgBackendInfo BackendInfo { get; private set; } = null!;
+
+        public bool TrySchedule(ConnectionCandidate<PgConnection> candidate)
+        {
+            // Pool callbacks run outside its synchronization lock. The synchronous path may therefore
+            // perform the cold catalog load inline while owning only this candidate.
+            var context = new PgTypeCatalogFactoryContext(
+                candidate.Connection.Protocol, shutdownToken);
+            BackendInfo = context.BackendInfo;
+            Load = async
+                ? factory.CreateAsync(context, plugins, shutdownToken)
+                : new(factory.Create(context, plugins));
+
+            if (!context.FlowQueued)
+            {
+                if (!Load.IsCompleted)
+                    throw new InvalidOperationException(
+                        "A protocol-backed type catalog factory yielded before queuing its load flow.");
+                // Surface a synchronous setup failure inside pool admission so its idle token is
+                // returned. A successful protocol factory must have queued a flow.
+                Load.GetAwaiter().GetResult();
+                throw new InvalidOperationException(
+                    "A protocol-backed type catalog factory completed without queuing a load flow.");
+            }
+
+            return true;
+        }
+    }
+
+    readonly record struct LoadedTypeCatalog(PgTypeCatalog Catalog, PgBackendInfo BackendInfo);
 
     // The multiplexed path lets the pool select a wire before materializing connection-local command
     // state. A rejected candidate rolls that attempt back and reuses the still-unqueued flow shell.
@@ -357,7 +698,7 @@ public sealed class SlonDataSource: DbDataSource
         if (initializedOnly && !_isInitialized)
             throw NotInitializedException();
 
-        EnsureInitialized(TimeSpan.Zero);
+        EnsureInitialized(ConnectionTimeout);
         return GetDbDependencies().CommandsTracker;
     }
 
@@ -367,8 +708,19 @@ public sealed class SlonDataSource: DbDataSource
 
         async ValueTask<CommandTracker> Core(CancellationToken cancellationToken)
         {
-            await EnsureInitializedAsync(TimeSpan.Zero, cancellationToken).ConfigureAwait(false);
+            await EnsureInitializedAsync(ConnectionTimeout, cancellationToken).ConfigureAwait(false);
             return GetDbDependencies().CommandsTracker;
+        }
+    }
+
+    internal ValueTask<PgDbDependencies> GetDbDependenciesAsync(CancellationToken cancellationToken)
+    {
+        return _isInitialized ? new(GetDbDependencies()) : Core(cancellationToken);
+
+        async ValueTask<PgDbDependencies> Core(CancellationToken token)
+        {
+            await EnsureInitializedAsync(ConnectionTimeout, token).ConfigureAwait(false);
+            return GetDbDependencies();
         }
     }
 
@@ -413,47 +765,59 @@ public sealed class SlonDataSource: DbDataSource
         // up to MaxPoolSize), so a process that creates many short-lived sources exhausts max_connections.
         // Guard on `disposing` so the DisposeAsync path (which runs DisposeAsyncCore then Dispose(false))
         // doesn't double-dispose; the pool's own _disposed makes a double harmless regardless.
-        if (disposing)
+        if (!disposing || Interlocked.Exchange(ref _disposed, 1) is not 0)
+            return;
+
+        _shutdown.Cancel();
+        _lifecycleLock.Wait();
+        try
+        {
             (_connectionPool as IDisposable)?.Dispose();
+        }
+        finally
+        {
+            _lifecycleLock.Release();
+            _shutdown.Dispose();
+        }
     }
 
     protected override async ValueTask DisposeAsyncCore()
     {
-        if (_connectionPool is not null)
-            await _connectionPool.DisposeAsync().ConfigureAwait(false);
+        if (Interlocked.Exchange(ref _disposed, 1) is not 0)
+            return;
+
+        _shutdown.Cancel();
+        await _lifecycleLock.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            if (_connectionPool is not null)
+                await _connectionPool.DisposeAsync().ConfigureAwait(false);
+        }
+        finally
+        {
+            _lifecycleLock.Release();
+            _shutdown.Dispose();
+        }
     }
 
     // Internal for testing.
-    internal class PgDbDependencies: IFrontendTypeCatalog
+    internal class PgDbDependencies
     {
-        public PgDbDependencies(PgDatabaseInfo pgDatabaseInfo, CommandTracker commandTracker, int revision)
+        public PgDbDependencies(PgBackendInfo backendInfo, PgTypeCatalog typeCatalog,
+            CommandTracker commandTracker, int revision)
         {
-            PgDatabaseInfo = pgDatabaseInfo;
+            BackendInfo = backendInfo;
+            TypeCatalog = typeCatalog;
             CommandsTracker = commandTracker;
             Revision = revision;
         }
 
-        public PgDatabaseInfo PgDatabaseInfo { get; }
+        public PgBackendInfo BackendInfo { get; }
+        public PgBackendCapabilities BackendCapabilities => BackendInfo.Capabilities;
+        public PgTypeCatalog TypeCatalog { get; }
         public CommandTracker CommandsTracker { get; }
         public int Revision { get; }
 
-        public PgTypeCatalog TypeCatalog => PgDatabaseInfo.TypeCatalog;
-
-        public bool TryGetIdentifiers(SlonDbType slonDbType, out PgTypeId canonicalTypeId, out DataTypeName dataTypeName)
-            => TryGetIdentifiers(TypeCatalog, slonDbType, out canonicalTypeId, out dataTypeName);
-
-        public DataTypeName GetDataTypeName(PgTypeId typeId) => TypeCatalog.GetDataTypeName(typeId);
-
-        internal static bool TryGetIdentifiers(PgTypeCatalog typeCatalog, SlonDbType slonDbType, out PgTypeId canonicalTypeId, out DataTypeName dataTypeName)
-        {
-            if (slonDbType.ResolveArrayType)
-                return typeCatalog.TryGetArrayIdentifiers(slonDbType.DataTypeName, out canonicalTypeId, out dataTypeName);
-
-            if (slonDbType.ResolveMultirangeType)
-                return typeCatalog.TryGetMultiRangeIdentifiers(slonDbType.DataTypeName, out canonicalTypeId, out dataTypeName);
-
-            return typeCatalog.TryGetIdentifiers(slonDbType.DataTypeName, out canonicalTypeId, out dataTypeName);
-        }
     }
 
     static Exception NotInitializedException() => new InvalidOperationException("DataSource is not initialized yet, at least one connection needs to be opened first.");
