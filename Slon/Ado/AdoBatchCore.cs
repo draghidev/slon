@@ -402,12 +402,20 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
     static void AttachPreparedTerminalObserver(CommandResult result, PgConnection connection)
         => result.OnCompleted(static (completed, state) =>
         {
-            if (completed.Error is not { } error)
-                return;
+            var connection = (PgConnection)state!;
+            try
+            {
+                if (completed.Error is not { } error)
+                    return;
 
-            var metadata = completed.GetMetadata();
-            if (metadata.IsPrepared)
-                ((PgConnection)state!).ReconcilePreparedError(metadata.ToPreparedDescriptor(), error.SqlState);
+                var metadata = completed.GetMetadata();
+                if (metadata.IsPrepared)
+                    connection.ReconcilePreparedError(metadata.ToPreparedDescriptor(), error.SqlState);
+            }
+            catch (Exception ex)
+            {
+                connection.ReportUnobservedCallback(ex, "a command-result observer");
+            }
         }, connection);
 
     CommandFlow Enqueue(DbParameterCollection? parameters, CommandBehavior behavior)

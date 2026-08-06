@@ -5,6 +5,8 @@ using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Security.Authentication;
 using System.Text;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using Slon.Pipelines;
 using Slon.Runtime.CompilerServices;
 using Slon.Runtime;
@@ -44,6 +46,7 @@ sealed class PgClientProtocolOptions
         FlowActivationTimeout = options.ConnectionTimeout;
         ScopeReset = options.ScopeReset.Snapshot();
         DataRowStreamingThreshold = options.DataRowStreamingThreshold;
+        LoggerFactory = options.LoggerFactory;
     }
 
     public TimeProvider TimeProvider { get; set; } = TimeProvider.System;
@@ -64,6 +67,7 @@ sealed class PgClientProtocolOptions
     public TimeSpan CancelRequestDelay { get; set; }
     public ScopeResetOptions ScopeReset { get; set; } = new();
     public int DataRowStreamingThreshold { get; set; } = BackendMessageBatch.Segmenter.DefaultDataRowStreamingThreshold;
+    public ILoggerFactory LoggerFactory { get; set; } = NullLoggerFactory.Instance;
     // Datasource bootstrap supplies this. A standalone raw protocol can omit backend identity and
     // operate with the explicit lower-level compatibility capabilities instead.
     public PgBackendInfoProvider? BackendProvider { get; set; }
@@ -80,6 +84,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
 {
     readonly PgClientProtocolOptions _options;
     readonly ScopeResetOptions _scopeReset;
+    readonly ILogger _logger;
     TransportConnection _connection = null!;
     IOutputWriter _pipeWriter = null!;
     ProtocolDataWriter _protocolDataWriter = null!;
@@ -125,8 +130,10 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
 
     PgClientProtocol(PgClientProtocolOptions options)
     {
+        ArgumentNullException.ThrowIfNull(options.LoggerFactory);
         _options = options;
         _scopeReset = options.ScopeReset.Snapshot();
+        _logger = options.LoggerFactory.CreateLogger("Slon.Pg.Protocol");
         _backendCapabilities = options.BackendCapabilities;
         _close = CloseSignal.CreateRoot();
         FlowControl = new Control(this, poolFacing: true);
@@ -225,7 +232,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         // consumers get working flow activation timeouts.
         if (onAvailability is null)
         {
-            _heartbeat = new(_options.HeartbeatInterval, _options.TimeProvider);
+            _heartbeat = new(_options.HeartbeatInterval, _options.TimeProvider, _logger);
             _heartbeat.Register(period => Heartbeat(period));
         }
         else
@@ -692,6 +699,9 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
     internal void FailProtocol(Exception? reason)
         => FireAndForget(DisposeAsyncCore(reason, collateral: true));
 
+    internal void ReportUnobservedCallback(Exception exception, string callback)
+        => SlonLogMessages.UnobservedCallbackException(_logger, exception, callback);
+
     /// Shared core for the Dispose paths: a forceful Shutdown, nothing more. Completion is the
     /// protocol's single terminal stage - Shutdown's completion finally releases EVERY resource
     /// (transport, heartbeat, scope signal, close signal), so a bare <see cref="CompleteAsync"/>
@@ -708,17 +718,16 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         await Shutdown(closeReason, forceful: true, collateral).ConfigureAwait(false);
     }
 
-    /// async void (not a discard) so the background drain's exceptions are observed here rather than
-    /// lost. Swallowed for now; route to a logging/unobserved-exception hook once one exists.
-    static async void FireAndForget(ValueTask task)
+    /// async void (not a discard) so the background drain's exceptions are observed and reported here.
+    async void FireAndForget(ValueTask task)
     {
         try
         {
             await task.ConfigureAwait(false);
         }
-        catch
+        catch (Exception ex)
         {
-            // TODO route to logging/unobserved-exception hook
+            SlonLogMessages.BackgroundProtocolOperationFailed(_logger, ex);
         }
     }
 
@@ -964,9 +973,10 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         {
             _source.OnActivationHeartbeat(period);
         }
-        catch (Exception)
+        catch (Exception ex)
         {
-            // TODO log it
+            SlonLogMessages.UnobservedCallbackException(
+                _logger, ex, "the source heartbeat callback");
         }
 
         foreach (var flow in GetFlows())
@@ -975,9 +985,10 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
             {
                 flow.GetExecutionControl(control).OnHeartbeat(period);
             }
-            catch (Exception)
+            catch (Exception ex)
             {
-                // TODO log it
+                SlonLogMessages.UnobservedCallbackException(
+                    _logger, ex, "a flow heartbeat callback");
             }
         }
         OnCancellationHeartbeat(period);
@@ -1515,7 +1526,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
                 protocol.CurrentSearchPath = value;
                 break;
             default:
-                // TODO log ignored parameter status.
+                SlonLogMessages.IgnoredParameterStatus(protocol._logger, name);
                 break;
             }
         }
@@ -1547,9 +1558,13 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
             // flow is queued (StartAsync); every other flow's own RFQ is read by ExecutePipelined before
             // its CompleteItem, so the status here is always this flow's own final state.
             if (poolFacing && completionException is null && protocol._transactionStatus is not TransactionStatus.Idle)
-                protocol.FailProtocol(new InvalidOperationException(
+            {
+                var exception = new InvalidOperationException(
                     $"A multiplexed flow completed leaving the connection in transaction status '{protocol._transactionStatus}'. " +
-                    "Transactions must run inside an exclusive scope; failing the connection to avoid corrupting subsequent flows."));
+                    "Transactions must run inside an exclusive scope; failing the connection to avoid corrupting subsequent flows.");
+                ReportProtocolInvariantViolation(exception);
+                protocol.FailProtocol(exception);
+            }
         }
 
         [AsyncMethodBuilder(typeof(NonContextRestoringPoolingValueTaskMethodBuilder<>))]
@@ -1582,6 +1597,13 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
 
         // Self-evict route for the flow layer's release-callback seam (see ExecutionControl.Release).
         internal void FailProtocol(Exception? reason) => protocol.FailProtocol(reason);
+        internal void FailProtocolFromCallback(Exception exception, string callback)
+        {
+            protocol.ReportUnobservedCallback(exception, callback);
+            protocol.FailProtocol(exception);
+        }
+        internal void ReportProtocolInvariantViolation(Exception exception)
+            => SlonLogMessages.ProtocolInvariantViolation(protocol._logger, exception);
 
         internal void RecoveryStarted() => protocol.SignalDraining();
         internal void RecoveryCompleted() => protocol.SignalReady();
@@ -1620,7 +1642,12 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
                 if (poolFacing)
                 {
                     try { protocol._poolConnectionAvailabilitySignal?.Invoke(true); }
-                    catch (Exception ex) { /* TODO log */ protocol.FailProtocol(ex); }
+                    catch (Exception ex)
+                    {
+                        SlonLogMessages.UnobservedCallbackException(
+                            protocol._logger, ex, "the pool availability callback");
+                        protocol.FailProtocol(ex);
+                    }
                 }
             }
         }

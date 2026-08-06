@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Logging;
 using Slon.Pg;
 using Slon.Pg.Protocol;
 using Slon.Threading;
@@ -47,6 +48,7 @@ sealed class PgConnection : IPoolConnection<PgConnection>
 {
     readonly PgClientProtocol _protocol;
     readonly CommandTracker? _tracker;
+    readonly ILogger _logger;
     // FIFO ordering synchronizes Preparing followers behind the winning Parse.
     readonly System.Collections.Concurrent.ConcurrentDictionary<TrackedCommand, TrackedStatus> _tracked = new();
 
@@ -72,11 +74,13 @@ sealed class PgConnection : IPoolConnection<PgConnection>
     ConnectionPoolContext<PgConnection>? _poolContext;
     int _isStarted;
 
-    PgConnection(PgClientProtocol protocol, CommandTracker? tracker, TimeSpan maintenanceInterval)
+    PgConnection(PgClientProtocol protocol, CommandTracker? tracker, TimeSpan maintenanceInterval,
+        ILogger logger)
     {
         _protocol = protocol;
         _tracker = tracker;
         _maintenanceInterval = maintenanceInterval;
+        _logger = logger;
     }
 
     // Armed only after wiring succeeds, so release never races resource installation. On a
@@ -91,7 +95,8 @@ sealed class PgConnection : IPoolConnection<PgConnection>
     public static PgConnection Create(PgClientProtocolOptions protocolOptions, PgClientOptions clientOptions, TransportConnection transport, CommandTracker? tracker = null, ConnectionPoolContext<PgConnection>? poolContext = null, TimeSpan timeout = default, Func<TransportConnection, TimeSpan, TransportConnection>? upgradeTransport = null, Action? onProtocolStarted = null)
     {
         var protocol = PgClientProtocol.Create(protocolOptions);
-        var conn = new PgConnection(protocol, tracker, clientOptions.MaintenanceInterval);
+        var conn = new PgConnection(protocol, tracker, clientOptions.MaintenanceInterval,
+            clientOptions.LoggerFactory.CreateLogger("Slon.Pg.Connection"));
         conn._poolContext = poolContext;
         protocol.Start(clientOptions, transport,
             poolContext is null ? NoopAvailability : conn.SignalAvailabilityIfStarted,
@@ -116,7 +121,8 @@ sealed class PgConnection : IPoolConnection<PgConnection>
     public static async ValueTask<PgConnection> CreateAsync(PgClientProtocolOptions protocolOptions, PgClientOptions clientOptions, TransportConnection transport, CommandTracker? tracker = null, ConnectionPoolContext<PgConnection>? poolContext = null, CancellationToken cancellationToken = default, Func<TransportConnection, CancellationToken, ValueTask<TransportConnection>>? upgradeTransport = null, Action? onProtocolStarted = null)
     {
         var protocol = PgClientProtocol.Create(protocolOptions);
-        var conn = new PgConnection(protocol, tracker, clientOptions.MaintenanceInterval);
+        var conn = new PgConnection(protocol, tracker, clientOptions.MaintenanceInterval,
+            clientOptions.LoggerFactory.CreateLogger("Slon.Pg.Connection"));
         conn._poolContext = poolContext;
         await protocol.StartAsync(clientOptions, transport,
             poolContext is null ? NoopAvailability : conn.SignalAvailabilityIfStarted,
@@ -158,7 +164,7 @@ sealed class PgConnection : IPoolConnection<PgConnection>
         }
         else
         {
-            var heartbeat = new Heartbeat(options.HeartbeatInterval);
+            var heartbeat = new Heartbeat(options.HeartbeatInterval, TimeProvider.System, _logger);
             heartbeat.Register(OnHeartbeat);
             _selfHeartbeat = heartbeat;
         }
@@ -186,6 +192,10 @@ sealed class PgConnection : IPoolConnection<PgConnection>
     public bool TryBeginPruning() => _protocol.TryBeginPruning();
 
     public Task CompleteAsync(Exception? exception = null) => _protocol.CompleteAsync(exception);
+    internal void ReportUnobservedCallback(Exception exception, string callback)
+        => SlonLogMessages.UnobservedCallbackException(_logger, exception, callback);
+    internal void ReportMaintenanceError(string sqlState, string messageText)
+        => SlonLogMessages.MaintenanceCommandFailed(_logger, sqlState, messageText);
 
     void ReleaseSessionLifetime()
     {

@@ -268,9 +268,10 @@ sealed partial class PgClientProtocol
         {
             state = await _options.CancelSender!(_backendProcessId, _backendSecretKey, AbortToken).ConfigureAwait(false);
         }
-        catch
+        catch (Exception ex)
         {
             state = CancelRequestState.Unknown;
+            SlonLogMessages.CancellationRequestFailed(_logger, ex, state);
         }
 
         lock (_syncRoot)

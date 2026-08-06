@@ -1,3 +1,5 @@
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Time.Testing;
 using Slon.Pg;
 using Slon.Pg.Protocol;
 using Slon.Pg.Protocol.Flows;
@@ -36,4 +38,41 @@ public class HeartbeatTests
         Assert.ThrowsExactly<ObjectDisposedException>(
             () => heartbeat.Register(static _ => ValueTask.CompletedTask));
     }
+
+    [TestMethod]
+    public async Task ThrowingCallback_IsReported()
+    {
+        var time = new FakeTimeProvider();
+        var logger = new RecordingLogger();
+        using var heartbeat = new Heartbeat(TimeSpan.FromSeconds(1), time, logger);
+        var calls = 0;
+        heartbeat.Register(_ =>
+        {
+            if (Interlocked.Increment(ref calls) == 1)
+                return ValueTask.FromException(new InvalidOperationException("callback failed"));
+            return ValueTask.CompletedTask;
+        });
+
+        time.Advance(TimeSpan.FromSeconds(1));
+        var entry = await logger.Entry.Task.WaitAsync(TestTimeout.Hang);
+
+        Assert.AreEqual(LogLevel.Error, entry.Level);
+        Assert.IsInstanceOfType<InvalidOperationException>(entry.Exception);
+        StringAssert.Contains(entry.Message, "heartbeat tick");
+    }
+
+    sealed class RecordingLogger : ILogger
+    {
+        public TaskCompletionSource<Entry> Entry { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state,
+            Exception? exception, Func<TState, Exception?, string> formatter)
+            => Entry.TrySetResult(new(logLevel, exception, formatter(state, exception)));
+    }
+
+    readonly record struct Entry(LogLevel Level, Exception? Exception, string Message);
 }

@@ -1,6 +1,8 @@
 using System.Data.Common;
 using System.Net;
 using System.Net.Sockets;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using Slon.Pg;
 using Slon.Pg.Protocol;
 using Slon.Pg.Protocol.Flows;
@@ -28,6 +30,8 @@ public sealed record SlonDataSourceOptions
     public TimeSpan CancellationTimeout { get; init; } = TimeSpan.FromSeconds(10);
     public int MinPoolSize { get; init; } = 1;
     public int MaxPoolSize { get; init; } = 10;
+    /// <summary>Receives sparse driver diagnostics. Logging is disabled by default.</summary>
+    public ILoggerFactory LoggerFactory { get; init; } = NullLoggerFactory.Instance;
     /// Duration over which the pool observes unused capacity before pruning it.
     /// Set to <see cref="Timeout.InfiniteTimeSpan"/> to let the pool grow without shrinking.
     /// Pruning is also disabled when <see cref="MinPoolSize"/> equals <see cref="MaxPoolSize"/>.
@@ -81,7 +85,8 @@ public sealed record SlonDataSourceOptions
     internal TimeSpan HeartbeatInterval { get; init; } = TimeSpan.FromSeconds(1);
     internal TimeSpan MaintenanceInterval { get; init; } = TimeSpan.FromSeconds(1);
 
-    internal PgClientOptions ToPgClientOptions(OAuthTokenCache? oauthTokens = null) => new()
+    internal PgClientOptions ToPgClientOptions(OAuthTokenCache? oauthTokens = null,
+        ILoggerFactory? loggerFactory = null) => new()
     {
         EndPoint = EndPoint,
         Username = Username,
@@ -91,6 +96,7 @@ public sealed record SlonDataSourceOptions
         AllowInsecureTransport = Authentication.AllowInsecureTransport,
         OAuthTokens = oauthTokens,
         IntegratedSecurity = IntegratedSecurity,
+        LoggerFactory = loggerFactory ?? NullLoggerFactory.Instance,
         HeartbeatInterval = HeartbeatInterval,
         MaintenanceInterval = MaintenanceInterval,
         ScopeReset = ScopeReset.Snapshot(),
@@ -101,6 +107,7 @@ public sealed record SlonDataSourceOptions
     {
         ArgumentNullException.ThrowIfNull(Ssl);
         ArgumentNullException.ThrowIfNull(Authentication);
+        ArgumentNullException.ThrowIfNull(LoggerFactory);
         if ((ConnectionInitializer is null) != (AsyncConnectionInitializer is null))
             throw new ArgumentException(
                 "Synchronous and asynchronous connection initializers must be configured together.");
@@ -148,6 +155,8 @@ public sealed class SlonDataSource : DbDataSource
     readonly SemaphoreSlim _lifecycleLock;
     readonly CancellationTokenSource _shutdown = new();
     readonly Lock _reloadLock = new();
+    readonly ILogger _adoLogger;
+    readonly ILoggerFactory _loggerFactory;
 
     // Initialized on the first real use.
     ConnectionPool<PgConnection> _connectionPool = null!;
@@ -164,6 +173,8 @@ public sealed class SlonDataSource : DbDataSource
     {
         _options = options.Snapshot();
         _options.Validate();
+        _loggerFactory = new SlonLoggerFactory(_options.LoggerFactory);
+        _adoLogger = _loggerFactory.CreateLogger("Slon");
         DisplayEndpoint = _options.EndPoint.AddressFamily is AddressFamily.InterNetwork or AddressFamily.InterNetworkV6 ? $"tcp://{_options.EndPoint}" : _options.EndPoint.ToString()!;
         _backendProvider = _options.BackendProvider
             ?? throw new ArgumentNullException(nameof(_options.BackendProvider));
@@ -198,6 +209,8 @@ public sealed class SlonDataSource : DbDataSource
     internal TimeSpan ConnectionTimeout => _options.ConnectionTimeout;
     internal TimeSpan DefaultCancellationTimeout => _options.CancellationTimeout;
     internal TimeSpan DefaultCommandTimeout => _options.CommandTimeout;
+    internal void ReportTransactionDisposeRollbackFailure(Exception exception)
+        => SlonLogMessages.TransactionDisposeRollbackFailed(_adoLogger, exception);
     internal string Database => _options.Database ?? _options.Username;
     internal string DisplayEndpoint { get; }
 
@@ -236,9 +249,11 @@ public sealed class SlonDataSource : DbDataSource
                 var connectionInit = _options.ConnectionInitializer;
                 var asyncConnectionInit = _options.AsyncConnectionInitializer;
                 var oauthTokens = _options.OAuth is { } oauth
-                    ? new OAuthTokenCache(oauth, new(_options.EndPoint, _options.Username, _options.Database))
+                    ? new OAuthTokenCache(oauth,
+                        new(_options.EndPoint, _options.Username, _options.Database),
+                        _loggerFactory.CreateLogger("Slon.Authentication"))
                     : null;
-                var clientOptions = _options.ToPgClientOptions(oauthTokens);
+                var clientOptions = _options.ToPgClientOptions(oauthTokens, _loggerFactory);
                 var transportFactory = SocketStreamConnection.CreateFactory(clientOptions.EndPoint);
                 var commandTracker = new CommandTracker(
                     _options.MaxActiveAutoPreparations, _options.AutoPreparationMinimumUses);
@@ -283,6 +298,7 @@ public sealed class SlonDataSource : DbDataSource
                             ConnectionIdleLifetime = _options.ConnectionIdleLifetime,
                             ConnectionPruningInterval = _options.ConnectionPruningInterval,
                             HeartbeatInterval = _options.HeartbeatInterval,
+                            LoggerFactory = _loggerFactory,
                         });
 
                     var bootstrapResult = await CreateDbDeps(

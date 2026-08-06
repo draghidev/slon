@@ -257,7 +257,11 @@ sealed class ExclusiveAccessFlow : PgClientFlow
     async void CompleteInnerThenEndScope(ValueTask completion)
     {
         try { await completion.ConfigureAwait(false); }
-        catch { /* TODO route to an unobserved-exception hook once one exists */ }
+        catch (Exception ex) when (ex is not PgClientClosedException)
+        {
+            _protocol.ReportUnobservedCallback(ex, "exclusive-scope shutdown");
+        }
+        catch (PgClientClosedException) { }
         finally { _scopeEnded.TrySetResult(); }
     }
 }

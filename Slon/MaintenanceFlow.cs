@@ -110,6 +110,11 @@ sealed class MaintenanceFlow : PgClientFlow
             while (true)
             {
                 var message = await decoder.GetNextAsync().ConfigureAwait(false);
+                if (message.Header.Type is BackendType.ErrorResponse)
+                {
+                    var error = ErrorOrNoticeMessage.Create(message, []);
+                    connection.ReportMaintenanceError(error.SqlState, error.MessageText);
+                }
                 if (message.Header.Type is BackendType.ReadyForQuery)
                     break;
             }

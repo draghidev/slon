@@ -757,7 +757,10 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
             flow._completed = true;
             flow._activationCancellationTokenRegistration.Dispose();
             try { flow.OnReleasing(exception); }
-            catch (Exception ex) { /* TODO log */ control.FailProtocol(ex); }
+            catch (Exception ex)
+            {
+                control.FailProtocolFromCallback(ex, "a flow release hook");
+            }
             // Wire-death fault delivery is NOT done here - it rides the OnStopping/OnAbort hooks (dispatched
             // flows from the heartbeat, backlog flows from the shutdown drain's DeliverClose), so a flow's
             // caller gate is faulted by the close verdict, not by completion. Completion just signals done
@@ -777,7 +780,10 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
             // pipeline won't drain naturally. Tear down via FailProtocol (fire-and-forget self-evict).
             // The flow itself is already completed (signal fired above); this callback is a notification.
             try { flow._completionAction?.Invoke(flow, exception, flow._completionState); }
-            catch (Exception ex) { /* TODO log */ control.FailProtocol(ex); }
+            catch (Exception ex)
+            {
+                control.FailProtocolFromCallback(ex, "a flow completion callback");
+            }
         }
 
         public ref readonly TState GetProtocolStatic<TState>()

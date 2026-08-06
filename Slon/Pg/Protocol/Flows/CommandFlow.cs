@@ -558,14 +558,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                     result.Initialize(_commandIndex, descriptor, _requestedRowDescription,
                         !resultCommand.DescribeOnly, resultCommand.IsSimple());
                 }
-                try
-                {
-                    _options.Observer?.OnCommandResult(this, result);
-                }
-                catch
-                {
-                    // Result observers are advisory and must not interrupt protocol progress.
-                }
+                _options.Observer?.OnCommandResult(this, result);
 
                 // Disposal drains without another result handoff. Graceful close instead faults the
                 // attached consumer, then uses the same autonomous drain. Command errors remain results.

@@ -1,5 +1,6 @@
 using System.Net.Security;
 using System.Net.Sockets;
+using Microsoft.Extensions.Logging;
 using Slon.Pg;
 using Slon.Pg.Protocol;
 using Slon.Pools;
@@ -15,6 +16,7 @@ sealed class PgConnectionFactory : IPoolConnectionFactory<PgConnection>
     readonly CommandTracker? _tracker;
     readonly Action<PgClientProtocolOptions>? _configureOptions;
     readonly PgClientProtocolOptions? _sharedOptions;
+    readonly ILogger _logger;
 
     public PgConnectionFactory(PgClientOptions clientOptions, TransportConnection.Factory transportConnectionFactory, CommandTracker? tracker = null, Action<PgClientProtocolOptions>? configureOptions = null)
     {
@@ -22,6 +24,7 @@ sealed class PgConnectionFactory : IPoolConnectionFactory<PgConnection>
         _transportConnectionFactory = transportConnectionFactory;
         _tracker = tracker;
         _configureOptions = configureOptions;
+        _logger = clientOptions.LoggerFactory.CreateLogger("Slon.Pg.Cancellation");
         if (configureOptions is null)
             _sharedOptions = new PgClientProtocolOptions(clientOptions) { CancelSender = SendCancelAsync };
     }
@@ -54,6 +57,8 @@ sealed class PgConnectionFactory : IPoolConnectionFactory<PgConnection>
         }
         catch (Exception ex)
         {
+            SlonLogMessages.CancellationRequestFailed(
+                _logger, ex, CancelRequestState.NotSent);
             if (transport is not null)
             {
                 transport.Abort();
@@ -72,6 +77,7 @@ sealed class PgConnectionFactory : IPoolConnectionFactory<PgConnection>
         {
             sendError = ex;
             delivery = CancelRequestState.Unknown;
+            SlonLogMessages.CancellationRequestFailed(_logger, ex, delivery);
         }
         finally
         {

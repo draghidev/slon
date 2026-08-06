@@ -169,6 +169,8 @@ public sealed partial class SlonConnection : IAdoConnection
     }
 
     internal TimeSpan DefaultCommandTimeout => DbDataSource.DefaultCommandTimeout;
+    internal void ReportTransactionDisposeRollbackFailure(Exception exception)
+        => DbDataSource.ReportTransactionDisposeRollbackFailure(exception);
     internal SlonTransaction? CurrentTransaction { get; private set; }
     string? _pendingTransactionStatement;
 

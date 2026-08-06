@@ -5,6 +5,8 @@ using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
 using System.Collections.Concurrent;
 using static Slon.Pools.ConnectionPool;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace Slon.Pools;
 
@@ -21,6 +23,7 @@ sealed class ConnectionPoolOptions
     public TimeSpan ConnectionPruningInterval { get; set; } = TimeSpan.FromSeconds(10);
     public TimeProvider TimeProvider { get; set; } = TimeProvider.System;
     public TimeSpan HeartbeatInterval { get; set; } = TimeSpan.FromSeconds(1);
+    public ILoggerFactory LoggerFactory { get; set; } = NullLoggerFactory.Instance;
 }
 
 internal sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
@@ -59,6 +62,7 @@ internal sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
     internal int WaiterCount => _waitQueue.Count;
 
     readonly Heartbeat _heartbeat;
+    readonly ILogger _logger;
     readonly TimeProvider _timeProvider;
     readonly int _minConnections;
     readonly TimeSpan _pruningInterval;
@@ -70,6 +74,7 @@ internal sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
 
     public ConnectionPool(IPoolConnectionFactory<T> factory, ConnectionPoolOptions options)
     {
+        ArgumentNullException.ThrowIfNull(options.LoggerFactory);
         var maxConnections = options.MaxConnections;
         if (maxConnections <= 0)
             throw new ArgumentOutOfRangeException(nameof(maxConnections), "Cannot be zero or negative.");
@@ -110,7 +115,8 @@ internal sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
             _idleSamples = new int[(int)sampleCount];
         }
         _timeProvider = options.TimeProvider;
-        _heartbeat = new(options.HeartbeatInterval, _timeProvider);
+        _logger = options.LoggerFactory.CreateLogger("Slon.Pool");
+        _heartbeat = new(options.HeartbeatInterval, _timeProvider, _logger);
         if (_idleSamples is not null)
             _heartbeat.Register(OnPoolHeartbeat);
         _context = new ConnectionPoolContext<T>(
@@ -172,7 +178,7 @@ internal sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
             {
                 RecordIdleRemovalForPruning();
                 count--;
-                _ = connection.CompleteAsync();
+                _ = CompletePrunedConnectionAsync(connection);
             }
             else
             {
@@ -181,6 +187,18 @@ internal sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
                 else
                     RecordIdleRemovalForPruning();
             }
+        }
+    }
+
+    async Task CompletePrunedConnectionAsync(T connection)
+    {
+        try
+        {
+            await connection.CompleteAsync().ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            SlonLogMessages.PoolConnectionTeardownFailed(_logger, ex, "pruning");
         }
     }
 
@@ -780,28 +798,28 @@ internal sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
                 pending[index++] = CompleteOpeningAsync(opening);
         return pending;
 
-        static async Task CompleteConnectionAsync(T connection)
+        async Task CompleteConnectionAsync(T connection)
         {
             try
             {
                 await connection.CompleteAsync().ConfigureAwait(false);
             }
-            catch
+            catch (Exception ex)
             {
-                // TODO This 'should' log something.
+                SlonLogMessages.PoolConnectionTeardownFailed(_logger, ex, "disposing");
             }
         }
 
-        static async Task CompleteOpeningAsync(Task<T?> completion)
+        async Task CompleteOpeningAsync(Task<T?> completion)
         {
             try
             {
                 if (await completion.ConfigureAwait(false) is { } connection)
                     await connection.CompleteAsync().ConfigureAwait(false);
             }
-            catch
+            catch (Exception ex)
             {
-                // TODO This 'should' log something.
+                SlonLogMessages.PoolConnectionTeardownFailed(_logger, ex, "disposing");
             }
         }
     }

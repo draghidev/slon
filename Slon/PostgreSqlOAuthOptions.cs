@@ -1,4 +1,6 @@
 using System.Net;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace Slon;
 
@@ -25,11 +27,14 @@ public sealed class PostgreSqlOAuthOptions
     }
 }
 
-sealed class OAuthTokenCache(PostgreSqlOAuthOptions options, PostgreSqlOAuthContext context)
+sealed class OAuthTokenCache(PostgreSqlOAuthOptions options, PostgreSqlOAuthContext context,
+    ILogger? logger = null)
 {
     readonly Lock _lock = new();
+    readonly ILogger _logger = logger ?? NullLogger.Instance;
     PostgreSqlOAuthToken _token;
     Task<PostgreSqlOAuthToken>? _refresh;
+    bool _fallbackFailureLogged;
 
     public ValueTask<PostgreSqlOAuthToken> GetAsync(bool async, CancellationToken cancellationToken)
         => async
@@ -76,16 +81,28 @@ sealed class OAuthTokenCache(PostgreSqlOAuthOptions options, PostgreSqlOAuthCont
             if (token.ExpiresAt is { } expiry && expiry <= DateTimeOffset.UtcNow)
                 throw new InvalidOperationException("The OAuth token provider returned an expired token.");
             lock (_lock)
+            {
                 _token = token;
+                _fallbackFailureLogged = false;
+            }
             completion.TrySetResult(token);
         }
         catch (Exception ex)
         {
             PostgreSqlOAuthToken fallback;
+            bool logFallbackFailure;
             lock (_lock)
+            {
                 fallback = _token;
+                logFallbackFailure = !_fallbackFailureLogged;
+                _fallbackFailureLogged = true;
+            }
             if (IsUsable(fallback))
+            {
+                if (logFallbackFailure)
+                    SlonLogMessages.OAuthRefreshFailedUsingFallback(_logger, ex);
                 completion.TrySetResult(fallback);
+            }
             else
                 completion.TrySetException(ex);
         }

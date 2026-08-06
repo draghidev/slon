@@ -200,14 +200,7 @@ abstract class CommandResult : IDisposable, IAsyncDisposable, IEnumerable<Row>, 
             var state = _completionActionState;
             _completionAction = null;
             _completionActionState = null;
-            try
-            {
-                action(this, state);
-            }
-            catch
-            {
-                // Result observers are advisory and must not interrupt protocol progress.
-            }
+            action(this, state);
         }
     }
 

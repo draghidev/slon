@@ -65,7 +65,7 @@ public sealed class SlonTransaction : DbTransaction
         {
             _completed = true;
             try { _connection.RollbackTransaction(this); }
-            catch { /* the wire is already gone; nothing left to roll back */ }
+            catch (Exception ex) { _connection.ReportTransactionDisposeRollbackFailure(ex); }
         }
         base.Dispose(disposing);
     }
@@ -77,7 +77,7 @@ public sealed class SlonTransaction : DbTransaction
         {
             _completed = true;
             try { await _connection.RollbackTransactionAsync(this, CancellationToken.None).ConfigureAwait(false); }
-            catch { /* the wire is already gone; nothing left to roll back */ }
+            catch (Exception ex) { _connection.ReportTransactionDisposeRollbackFailure(ex); }
         }
         GC.SuppressFinalize(this);
     }

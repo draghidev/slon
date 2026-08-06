@@ -1,5 +1,7 @@
 using System.Net;
 using System.Text;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using Slon.Pg.Protocol;
 
 namespace Slon.Pg;
@@ -20,6 +22,7 @@ sealed class PgClientOptions
     internal bool AllowInsecureTransport { get; init; }
     internal OAuthTokenCache? OAuthTokens { get; init; }
     internal PostgreSqlIntegratedSecurityOptions? IntegratedSecurity { get; init; }
+    internal ILoggerFactory LoggerFactory { get; init; } = NullLoggerFactory.Instance;
 
     public TimeSpan ReadTimeout { get; init; } = Timeout.InfiniteTimeSpan; // TimeSpan.FromSeconds(2);
     public TimeSpan WriteTimeout { get; init; } = TimeSpan.FromSeconds(10);

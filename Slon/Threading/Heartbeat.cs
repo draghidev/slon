@@ -1,5 +1,8 @@
 namespace Slon.Threading;
 
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
+
 sealed class Heartbeat : IDisposable
 {
     // Threshold for flagging a tick as drifted. 1.5x the requested interval matches the
@@ -15,6 +18,7 @@ sealed class Heartbeat : IDisposable
     readonly Lock _lock = new();
     readonly PeriodicTimer _timer;
     readonly TimeProvider _timeProvider;
+    readonly ILogger _logger;
     ActionNode? _actionHead;
     ActionNode? _actionTail;
     Action<TimeSpan, TimeSpan>? _onDrift;
@@ -31,11 +35,12 @@ sealed class Heartbeat : IDisposable
         set => Volatile.Write(ref _onDrift, value);
     }
 
-    public Heartbeat(TimeSpan interval) : this(interval, TimeProvider.System) { }
-    public Heartbeat(TimeSpan interval, TimeProvider timeProvider)
+    public Heartbeat(TimeSpan interval) : this(interval, TimeProvider.System, NullLogger.Instance) { }
+    public Heartbeat(TimeSpan interval, TimeProvider timeProvider, ILogger? logger = null)
     {
         _timer = new(interval, timeProvider);
         _timeProvider = timeProvider;
+        _logger = logger ?? NullLogger.Instance;
         // Task completes when timer is disposed.
         _ = DoHeartbeat();
         async Task DoHeartbeat()
@@ -93,9 +98,10 @@ sealed class Heartbeat : IDisposable
                             }
                         }
                     }
-                    catch (Exception)
+                    catch (Exception ex)
                     {
-                        //TODO log
+                        SlonLogMessages.UnobservedCallbackException(
+                            _logger, ex, "heartbeat tick");
                     }
 
                     actions.Clear();
