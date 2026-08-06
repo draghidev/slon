@@ -275,12 +275,12 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
     }
 
     protected virtual void OnHeartbeat(TimeSpan interval) {}
-    protected virtual void OnAbort(PgClientClosedException exception) {}
+    protected virtual void OnAbort(Exception exception) {}
     /// Graceful-shutdown observation point. Fires while StoppingToken is set but before the
     /// AbortToken escalation. Flow types whose body can park on a non-IO rendezvous (CommandFlow's
     /// GateTask) override this to wake it so the body short-circuits instead of waiting for
     /// AbortToken. Idempotent across heartbeat ticks (subclasses use TrySet).
-    protected virtual void OnStopping(PgClientClosedException exception) {}
+    protected virtual void OnStopping(Exception exception) {}
     /// Releases tenure-owned resources before the terminal signal makes this instance reusable.
     /// No overridable hook may run after that signal: a completion waiter can immediately Reset and
     /// enqueue the same object for its next tenure.
@@ -346,6 +346,10 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
         /// Materialized before the StoppingToken / AbortToken cancellations, so observers waking on
         /// those tokens always see a non-null value.
         public PgClientClosedException? ClosedException => _executionControl.ClosedException;
+
+        /// The per-flow terminal verdict. Internal protocol condemnation retains the canonical
+        /// close cause separately and presents affected siblings with a collateral exception.
+        public Exception FlowTerminationException => _executionControl.FlowTerminationException;
 
         public ref readonly TState GetProtocolStatic<TState>()
             => ref _executionControl.GetProtocolStatic<TState>();
@@ -662,6 +666,7 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
         internal ValueTask WaitForCancellationAttempt() => control.WaitForCancellationAttempt();
         public bool IsProtocolClosed => control.ClosedException is not null;
         public PgClientClosedException? ClosedException => control.ClosedException;
+        public Exception FlowTerminationException => control.FlowTerminationException;
 
         public ValueTask<FlowTasks> ExecuteAuto()
             => IsAsync ? flow.ExecuteAuto(new(this)) : ExecuteSynchronously();
@@ -697,7 +702,7 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
             // iterating the head flow is harmless.
             if (control.AbortToken.IsCancellationRequested && !flow._completed)
             {
-                var ex = control.ClosedException!;
+                var ex = control.FlowTerminationException;
                 flow._activationTaskSource.TrySetException(ex, runContinuationsAsynchronously: true);
                 flow.OnAbort(ex);
                 return;
@@ -708,7 +713,7 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
             // consumer stays parked until CompletionTimeout escalates to AbortToken. ClosedException is
             // materialized before _stoppingCts fires, so it's non-null here.
             if (control.StoppingToken.IsCancellationRequested && !flow._completed)
-                flow.OnStopping(control.ClosedException!);
+                flow.OnStopping(control.FlowTerminationException);
 
             OnActivationHeartbeat(interval);
 
@@ -732,7 +737,7 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
         /// take the IDENTICAL branch - no inner executor to drain, no graceful/forceful distinction to make -
         /// so one hook faults the caller gate (the flow is a bystander to the wire's death). Release then
         /// signals done (the TCS) and fires the action, whose exception drives e.g. the ADO connection Break.
-        public void FailUnstarted(PgClientClosedException exception)
+        public void FailUnstarted(Exception exception)
         {
             flow.OnStopping(exception);
             Release(exception);

@@ -5,4 +5,7 @@ public class PgClientException : IOException
 {
     internal PgClientException(Exception innerException)
         : base($"The PostgreSQL client could not complete the operation. {innerException.Message}", innerException) { }
+
+    internal PgClientException(string message, Exception innerException)
+        : base(message, innerException) { }
 }

@@ -639,7 +639,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
     /// fire-and-forget <see cref="DisposeAsync"/> / <see cref="Dispose"/> / <see cref="FailProtocol"/>.
     /// So forceful-and-await is just CompleteAsync(reason); graceful-and-await is CompleteAsync().
     public Task CompleteAsync(Exception? closeReason = null)
-        => Shutdown(closeReason, forceful: closeReason is not null);
+        => Shutdown(closeReason, forceful: closeReason is not null, collateral: false);
 
     /// Async forceful tear-down. Fires AbortToken immediately, fails activations for pipelined
     /// flows. The pipeline drain unwinds in the background; this method does NOT await it (the
@@ -649,7 +649,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
     {
         try
         {
-            FireAndForget(DisposeAsyncCore(closeReason: null));
+            FireAndForget(DisposeAsyncCore(closeReason: null, collateral: false));
             return ValueTask.CompletedTask;
         }
         catch (Exception ex)
@@ -663,13 +663,13 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
     /// connection/protocol cleanup). Same fire-and-forget semantics as <see cref="DisposeAsync"/>:
     /// AbortToken fires immediately, pipeline drain happens in the background. Idempotent.
     public void Dispose()
-        => FireAndForget(DisposeAsyncCore(closeReason: null));
+        => FireAndForget(DisposeAsyncCore(closeReason: null, collateral: false));
 
     /// Internal emergency self-evict for the two framework-internal "we cannot continue" sites
     /// (startup catch, OnParameterStatus encoding failure). Fire-and-forget shape so it can run
     /// from the message-processing thread. Pool eviction picks up via the status flag.
     internal void FailProtocol(Exception? reason)
-        => FireAndForget(DisposeAsyncCore(reason));
+        => FireAndForget(DisposeAsyncCore(reason, collateral: true));
 
     /// Shared core for the Dispose paths: a forceful Shutdown, nothing more. Completion is the
     /// protocol's single terminal stage - Shutdown's completion finally releases EVERY resource
@@ -677,14 +677,14 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
     /// is fully terminal and the Dispose verbs are aliases differing only in forcefulness and
     /// fire-and-forget shape. Idempotent via <c>_disposed</c>.
     bool _disposed;
-    async ValueTask DisposeAsyncCore(Exception? closeReason)
+    async ValueTask DisposeAsyncCore(Exception? closeReason, bool collateral)
     {
         // Pure alias over the terminal drain: forceful shutdown, all resource release happens in
         // Shutdown's completion finally (the single terminal stage). This gate only makes the
         // dispose VERB idempotent; it owns no resources of its own.
         if (Interlocked.Exchange(ref _disposed, true))
             return;
-        await Shutdown(closeReason, forceful: true).ConfigureAwait(false);
+        await Shutdown(closeReason, forceful: true, collateral).ConfigureAwait(false);
     }
 
     /// async void (not a discard) so the background drain's exceptions are observed here rather than
@@ -714,12 +714,13 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
     // callers await Completion. Separate from the completion TCS because that task must be observable
     // before shutdown begins.
     bool _shutdownStarted;
+    PgCollateralException? _collateralException;
     TaskCompletionSource? _executorStopped;
     bool _closeReleaseStarted;
     int _closeUsers;
     TaskCompletionSource? _closeUsersDrained;
 
-    Task Shutdown(Exception? closeReason, bool forceful)
+    Task Shutdown(Exception? closeReason, bool forceful, bool collateral)
     {
         bool owner;
         bool ownsCloseUse = false;
@@ -735,6 +736,13 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
                 // still null when the wire breaks, the raw ObjectDisposedException leaks instead. The owner
                 // sets it once; losers read the same instance. Wraps closeReason as inner. CloseSignal also
                 // re-materializes on every trip, so the invariant is structural, not just this ordering.
+                // Publish the per-flow verdict BEFORE ClosedException becomes observable. Some flow
+                // paths poll IsProtocolClosed rather than waking through the abort token; publishing
+                // the verdict first prevents such a successor from briefly selecting the canonical root cause
+                // instead of its collateral verdict. ClosedException is the publication flag here.
+                if (collateral)
+                    Volatile.Write(ref _collateralException,
+                        PgCollateralException.ForProtocolFailure(closeReason));
                 _close.MaterializeReason(closeReason);
                 _executorStopped = new(TaskCreationOptions.RunContinuationsAsynchronously);
                 _source.SetDrainSignal(_executorStopped);
@@ -835,7 +843,8 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         if (!forceful)
         {
             abortTimer = _options.TimeProvider.CreateTimer(
-                static state => _ = ((PgClientProtocol)state!).Shutdown(closeReason: null, forceful: true),
+                static state => _ = ((PgClientProtocol)state!).Shutdown(
+                    closeReason: null, forceful: true, collateral: false),
                 this, _options.CompletionTimeout, Timeout.InfiniteTimeSpan);
             await _close.StopAsync().ConfigureAwait(false);
         }
@@ -850,7 +859,10 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         try
         {
             await Task.WhenAny(executorStopped.Task, completeTask).ConfigureAwait(false);
-            _source.DrainInertItems(flow => flow.GetExecutionControl(FlowControl).FailUnstarted(closedException));
+            Exception flowTermination = Volatile.Read(ref _collateralException) is { } collateral
+                ? collateral
+                : closedException;
+            _source.DrainInertItems(flow => flow.GetExecutionControl(FlowControl).FailUnstarted(flowTermination));
             await completeTask.ConfigureAwait(false);
         }
         catch (PgClientClosedException)
@@ -982,6 +994,8 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public void CompleteItem(PgClientFlow item, int remainingDepth, Exception? exception)
         {
+            if (exception is PgClientClosedException && _control.ClosedException is not null)
+                exception = _control.FlowTerminationException;
             // OnReleasing (protocol bookkeeping: ActivatedFlow release, read-state recycle) must run
             // BEFORE Release (user-visible terminal): Release fires the flow's completion action,
             // which may Reset() and re-enqueue the SAME instance. If that next tenure's Activate lands
@@ -1160,7 +1174,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
             // failure says precisely that it may not: reading toward an RFQ can reinterpret body
             // bytes and condemn successors with misleading secondary failures. Publish the cause and
             // abort the connection instead; the failed flow keeps its specific exception while queued
-            // successors receive the canonical close verdict.
+            // successors receive the collateral flow-termination verdict.
             if (context.Exception is PgFramingException)
             {
                 _control.FailProtocol(context.Exception);
@@ -1365,6 +1379,10 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         /// AbortToken/StoppingToken sees a non-null value. For an inner Control a scope-only trip resolves
         /// the scope reason; a protocol trip chains through the link to the protocol reason.
         public PgClientClosedException? ClosedException => Close.Reason;
+        public Exception FlowTerminationException
+            => Volatile.Read(ref protocol._collateralException) is { } collateral
+                ? collateral
+                : ClosedException!;
 
         /// Throws PgClientClosedException if closed, no-op otherwise. For the OCE catch path inside
         /// existing async I/O frames, converting our abort-token OCE to the typed exception without an

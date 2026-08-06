@@ -42,13 +42,18 @@ sealed class PgErrorException : Exception
         var message = error.SqlState is { Length: > 0 } code
             ? $"{severity}: {text} (SQLSTATE {code})"
             : $"{severity}: {text}";
-        return error.IsCollateralCancellation
-            ? message + " This operation was canceled by a PostgreSQL CancelRequest intended for an earlier pipelined operation. " +
-                "PostgreSQL applies the request to whichever operation is running when it is processed, so clients cannot eliminate this race."
-            : message;
+        return message;
     }
 
     [DoesNotReturn]
     [StackTraceHidden]
-    internal static void Throw(PgError error) => throw new PgErrorException(error);
+    internal static void Throw(PgError error) => throw Create(error);
+
+    internal static Exception Create(PgError error)
+    {
+        var exception = new PgErrorException(error);
+        return error.IsCollateralCancellation
+            ? new PgCollateralException(PgCollateralKind.Cancellation, exception)
+            : exception;
+    }
 }

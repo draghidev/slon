@@ -228,7 +228,7 @@ public class ProtocolCompletionTests
     }
 
     [TestMethod]
-    public async Task FailProtocol_PendingReadCompletesAsEof_OriginalReasonWins()
+    public async Task FailProtocol_PendingReadRetainsCanonicalCause_ButFlowIsCollateral()
     {
         var options = PgTestPool.NewOptions();
         var transport = new ControlledEofTransport(Handshake());
@@ -249,13 +249,36 @@ public class ProtocolCompletionTests
 
         transport.CompleteServerOutput();
 
-        var observed = await Assert.ThrowsExactlyAsync<PgClientClosedException>(
+        var observed = await Assert.ThrowsExactlyAsync<PgCollateralException>(
             () => move.WaitAsync(TimeSpan.FromSeconds(5)));
-        Assert.AreSame(canonicalClose, observed,
-            "EOF after FailProtocol must surface the already-published canonical close instance");
+        Assert.AreEqual(PgCollateralKind.ProtocolFailure, observed.Kind);
         Assert.AreSame(violation, observed.InnerException,
             "a synthesized unexpected-EOF failure must not displace the FailProtocol reason");
         await protocol.Completion.WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    [TestMethod]
+    public async Task ExternalForcefulCompletion_IsNotClassifiedAsCollateral()
+    {
+        var options = PgTestPool.NewOptions();
+        var transport = new ControlledEofTransport(Handshake());
+        var protocol = PgClientProtocol.Create(new PgClientProtocolOptions(options));
+        await protocol.StartAsync(options, transport);
+
+        var flow = new CommandFlow(async: true, Command.Create("select 1"));
+        Assert.IsTrue(protocol.TryQueue(flow));
+        var e = flow.GetAsyncEnumerator();
+        var move = e.MoveNextAsync().AsTask();
+        await transport.ReadParked.WaitAsync(TimeSpan.FromSeconds(5));
+
+        var supplied = new InvalidOperationException("external shutdown");
+        var completion = protocol.CompleteAsync(supplied);
+        transport.CompleteServerOutput();
+
+        var observed = await Assert.ThrowsExactlyAsync<PgClientClosedException>(
+            () => move.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.AreSame(supplied, observed.InnerException);
+        await completion.WaitAsync(TimeSpan.FromSeconds(5));
     }
 
     // Graceful CompleteAsync racing forceful DisposeAsync on the SAME protocol under maximal

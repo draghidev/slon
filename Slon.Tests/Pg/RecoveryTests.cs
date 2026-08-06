@@ -302,7 +302,7 @@ public class RecoveryTests
     }
 
     [TestMethod]
-    public async Task FramingViolation_DoesNotRecover_QueuedSuccessorReceivesClose()
+    public async Task FramingViolation_DoesNotRecover_QueuedSuccessorIsCollateral()
     {
         await using var protocol = await ConnectAsync();
         var failureGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -322,9 +322,10 @@ public class RecoveryTests
         Assert.AreSame(violation, failed.InnerException);
 
         var e = successor.GetAsyncEnumerator();
-        var closed = await Assert.ThrowsExactlyAsync<PgClientClosedException>(
+        var collateral = await Assert.ThrowsExactlyAsync<PgCollateralException>(
             () => e.MoveNextAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(5)));
-        Assert.AreSame(violation, closed.InnerException);
+        Assert.AreEqual(PgCollateralKind.ProtocolFailure, collateral.Kind);
+        Assert.AreSame(violation, collateral.InnerException);
     }
 
     [TestMethod]

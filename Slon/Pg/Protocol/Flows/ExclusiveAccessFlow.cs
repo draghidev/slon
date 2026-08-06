@@ -221,7 +221,7 @@ sealed class ExclusiveAccessFlow : PgClientFlow
 
     // Close cascades must stop the inner executor and release both body and pre-activation caller gates.
     // Graceful close releases the body only after the inner pipeline drains.
-    protected override void OnStopping(PgClientClosedException exception)
+    protected override void OnStopping(Exception exception)
     {
         if (_innerStopping)
             return;
@@ -239,7 +239,7 @@ sealed class ExclusiveAccessFlow : PgClientFlow
 
     // Abort completes inner items with the close reason. The outer flow may retire only after the
     // inner pipeline stops; otherwise both source pumps can reach the shared writer concurrently.
-    protected override void OnAbort(PgClientClosedException exception)
+    protected override void OnAbort(Exception exception)
     {
         if (_innerAborting)
             return;

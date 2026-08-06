@@ -48,7 +48,7 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
 
     // Drain the inert head of the source: items enqueued but never picked up by the executor.
     // CompleteAsync only sees dispatched flows, so anything still in the SPSC queue needs separate
-    // disposition - the caller's handler faults each via ExecutionControl.Complete (future migration
+    // disposition - the caller's handler faults each via ExecutionControl.Release (future migration
     // rebinds them onto a new protocol here instead). Call only after the executor has stopped
     // pulling (Shutdown awaits DrainSignal first) so this is the sole consumer.
     public void DrainInertItems(Action<PgClientFlow> onInert)
@@ -207,7 +207,7 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
             // to claim a sync-head park too (see below): if the executor is parked at a sync head whose
             // caller is about to bail, that park must be un-parked here or it strands (DrainSignal never
             // fires). Un-parking the executor is ALL Complete does for sync callers now: each parked caller
-            // wakes when ITS OWN flow is drained inert (DrainInert -> ExecutionControl.Complete -> OnComplete
+            // wakes when ITS OWN flow is drained inert (DrainInert -> ExecutionControl.Release -> OnStopping
             // -> HandleException -> SignalProgress sets the flow's MRES), then re-reads IsCompleted and bails.
             // No direct wait-list head wake - there is no wait-list.
             WakeDriver.Drive(runContinuationsAsynchronously: true);

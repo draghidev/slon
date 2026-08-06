@@ -171,9 +171,9 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
             timeoutSet = true;
             return _pipe.ContinueCurrentMessage(consumed, consumedLength, GetRemainingTimeout());
         }
-        catch (Exception) when (_abortToken.IsCancellationRequested && _control.ClosedException is { } closed)
+        catch (Exception) when (_abortToken.IsCancellationRequested && _control.ClosedException is not null)
         {
-            throw closed;
+            throw _control.FlowTerminationException;
         }
         catch (EndOfStreamException ex)
         {
@@ -238,9 +238,9 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
             timeoutSet = true;
             return _pipe.ExtendCurrentMessage(GetRemainingTimeout());
         }
-        catch (Exception) when (_abortToken.IsCancellationRequested && _control.ClosedException is { } closed)
+        catch (Exception) when (_abortToken.IsCancellationRequested && _control.ClosedException is not null)
         {
-            throw closed;
+            throw _control.FlowTerminationException;
         }
         catch (EndOfStreamException ex)
         {
@@ -309,8 +309,8 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
     // (the scope token for a scope shell), so a scope-only abort breaks a parked read here.
     Exception TranslateReadCancellation(Exception cause, CancellationToken cancellationToken)
     {
-        if (_abortToken.IsCancellationRequested && _control.ClosedException is { } closed)
-            return closed;
+        if (_abortToken.IsCancellationRequested && _control.ClosedException is not null)
+            return _control.FlowTerminationException;
         if (cancellationToken.IsCancellationRequested)
             return new OperationCanceledException(cancellationToken);
         return new TimeoutException("Read timed out.", cause);
@@ -569,15 +569,16 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
     bool ReadCompleted()
     {
         // Closing a socket may settle a pending read as EOF instead of an exception. Once shutdown has
-        // published its reason, EOF is the same terminal event and must use the canonical close surface.
-        if (_control.ClosedException is { } closed)
-            throw closed;
+        // published its reason, EOF is the same terminal event and must use the flow's termination
+        // verdict. The protocol completion itself retains the canonical close.
+        if (_control.ClosedException is not null)
+            throw _control.FlowTerminationException;
         return false;
     }
 
     Exception TranslateEof(EndOfStreamException exception)
-        => _control.ClosedException is { } closed
-            ? closed
+        => _control.ClosedException is not null
+            ? _control.FlowTerminationException
             : PgProtocolException.UnexpectedEof(exception);
 
 
@@ -698,13 +699,13 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
                     {
                         success = pipe.MoveNext(GetRemainingTimeout());
                     }
-                    catch (Exception) when (_abortToken.IsCancellationRequested && _control.ClosedException is { } closed)
+                    catch (Exception) when (_abortToken.IsCancellationRequested && _control.ClosedException is not null)
                     {
                         // Sync reads block in a syscall no token reaches; a forceful abort breaks them
                         // by closing the socket, surfacing as ObjectDisposedException / IOException /
                         // TimeoutException rather than an OCE. Translate any of them to the typed closed
                         // exception, mirroring the async path's TranslateReadCancellation.
-                        throw closed;
+                        throw _control.FlowTerminationException;
                     }
                     catch (EndOfStreamException ex)
                     {

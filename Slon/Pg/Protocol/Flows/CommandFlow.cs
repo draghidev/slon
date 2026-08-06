@@ -53,7 +53,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
     bool _deliverCancelOce;
     // Errors encountered while draining are surfaced by a waiting DisposeAsync. Live consumers observe
     // their errors directly, and the list remains unallocated on the successful path.
-    List<PgErrorException>? _drainErrors;
+    List<Exception>? _drainErrors;
     // Set only by ConsumeNonQueryAsync, after enqueue but before any consumer-side gate release.
     // The body cannot reach first publication until such a release, and every release publishes
     // this write, so plain accesses suffice and the body observes the mode at first wake.
@@ -470,8 +470,8 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                 }
                 // After close, a fresh command must not consume bytes left by its predecessor. A draining
                 // flow may continue reading its own response to restore RFQ.
-                if (!IsDraining && context.IsProtocolClosed && context.ClosedException is { } preReadClose)
-                    throw preReadClose;
+                if (!IsDraining && context.IsProtocolClosed)
+                    throw context.FlowTerminationException;
 
                 if (IsAsync && hasPreparedDescription)
                 {
@@ -516,7 +516,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                 var capturedThisCommand = false;
                 if (IsConsumingAutonomously && _pgError is { } readError && !IsOwnCancellation(readError))
                 {
-                    (_drainErrors ??= new()).Add(new PgErrorException(readError));
+                    (_drainErrors ??= new()).Add(PgErrorException.Create(readError));
                     capturedThisCommand = true;
                 }
 
@@ -567,8 +567,9 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                 {
                     // Latch the close (a consumer that Resets past this point self-delivers it), wake a
                     // parked consumer, then drain.
-                    _callerInteractionCore.SetCloseLatch(context.ClosedException!);
-                    DeliverClose(context.ClosedException!);
+                    var close = context.FlowTerminationException;
+                    _callerInteractionCore.SetCloseLatch(close);
+                    DeliverClose(close);
                     MarkConsumerGoneByBody();
                 }
                 var consumeInternally = IsConsumingNonQuery || suppressEnumeration;
@@ -661,7 +662,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
 
                 if (suppressEnumeration && result.Error is { } suppressedError && !IsOwnCancellation(suppressedError))
                 {
-                    (_drainErrors ??= new()).Add(new PgErrorException(suppressedError));
+                    (_drainErrors ??= new()).Add(PgErrorException.Create(suppressedError));
                     capturedThisCommand = true;
                     if (!IsDraining)
                         MarkConsumerGoneByBody();
@@ -682,7 +683,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                     // above (current-mode check), so its errors are collected there.
                     if ((consumeInternally || IsConsumingNonQuery || IsDraining && !_isResultReady)
                         && !capturedThisCommand && completeError is { } err && !IsOwnCancellation(err.Error))
-                        (_drainErrors ??= new()).Add(new PgErrorException(err.Error));
+                        (_drainErrors ??= new()).Add(PgErrorException.Create(err.Error));
                 }
 
                 // Extended-query errors discard every following command through the next Sync. Skip
@@ -727,11 +728,11 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
 
             SetResult(null);
         }
-        catch (PgClientClosedException ex) when (context.IsProtocolClosed)
+        catch (PgClientClosedException) when (context.IsProtocolClosed)
         {
             // Scope to our own closure so a nested protocol's close doesn't get treated as ours.
             // Latch the close so a consumer that Resets after this point self-delivers it.
-            _callerInteractionCore.SetCloseLatch(ex);
+            _callerInteractionCore.SetCloseLatch(context.FlowTerminationException);
             // Consumer-gone means a dead wire is the expected terminal: complete the move-next source
             // (false) and RETURN cleanly, the same shape as the graceful StoppingToken transition above
             // (SetResult on close, fall through to a clean body completion - no throw). This keeps the
@@ -744,7 +745,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                     SetResult(null);
                 return;
             }
-            HandleException(ex);
+            HandleException(context.FlowTerminationException);
             throw;
         }
         catch (OperationCanceledException ex) when (ex.CancellationToken == _callerCancellationToken || ex.CancellationToken == _flowCancellationToken)
@@ -842,9 +843,9 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
     }
 
     /// Faults the caller-facing sources. Reached from the body's catch paths for in-body
-    /// faults, and from OnComplete for failures the body never observed (dispatch-time throw,
+    /// faults, and from release teardown for failures the body never observed (dispatch-time throw,
     /// pre-body protocol fault). Callers are structurally sequential with each other - the
-    /// framework completes an item only after its pipeline task settles, and OnComplete
+    /// framework releases an item only after its pipeline task settles, and teardown
     /// defers to a parked dispatch's unwind - so the _enumeratorCompleted guard suffices for
     /// double-call idempotency. The cancellation registration is the one genuinely concurrent
     /// completer; when a cancelable token armed it, the source is in thread-safe completion
@@ -1036,10 +1037,10 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
     void HandleException(Exception ex)
     {
         // A close fault must latch so a consumer that Resets past this delivery self-delivers it - the
-        // never-started path (OnComplete -> HandleException, body never ran so no body-side latch set)
+        // never-started path (OnStopping -> HandleException, body never ran so no body-side latch set)
         // is the one that strands an orphaned generation otherwise.
-        if (ex is PgClientClosedException closeEx)
-            _callerInteractionCore.SetCloseLatch(closeEx);
+        if (ex is PgClientClosedException or PgCollateralException)
+            _callerInteractionCore.SetCloseLatch(ex);
         if (_enumeratorCompleted)
             return;
         // Mark terminal only when the fault actually lands. A concurrent teardown TrySetException
@@ -1048,7 +1049,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
         // _enumeratorCompleted on that no-op would make the consumer's next MoveNext short-circuit onto
         // the stale consumed result; leaving it false lets that call fall through to its own faulted-
         // gate self-delivery, which completes the consumer's actual generation.
-        // HandleException can fire from teardown (OnComplete/OnAbort/OnStopping) on the heartbeat or
+        // HandleException can fire from teardown (OnAbort/OnStopping) on the heartbeat or
         // shutdown thread - NOT the consumer's thread - concurrently with the consumer's own completer.
         // The source is in concurrent mode for every live flow (armed in Initialize, sync and async
         // alike), so this is an atomic, idempotent CAS. A plain SetException would throw on an already-
@@ -1097,10 +1098,10 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
     static ref FlowCallerInteractionCore<FlowCallerInteractionCoreResult> GetCallerInteractionCore(CommandFlow instance)
         => ref instance._callerInteractionCore;
 
-    protected override void OnAbort(PgClientClosedException exception) => FaultCaller(exception);
+    protected override void OnAbort(Exception exception) => FaultCaller(exception);
 
     // Graceful stopping is the early wire-close wake and is idempotent across heartbeat ticks.
-    protected override void OnStopping(PgClientClosedException exception)
+    protected override void OnStopping(Exception exception)
     {
         if (!_bodyStarted || !IsAsync)
         {
@@ -1114,7 +1115,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
     }
 
     // Wake a running body so it owns fault delivery; directly fault a flow whose body never started.
-    void FaultCaller(PgClientClosedException exception)
+    void FaultCaller(Exception exception)
     {
         if (_bodyStarted)
             _callerInteractionCore.CancelPendingWait(exception);

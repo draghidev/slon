@@ -46,11 +46,13 @@ sealed class ProtocolDataWriter
     public void WaitWritable() => _pipe.WaitWritable();
 
     // Abort-to-typed-exception translation shared by the sync flush catch and the resumable driver:
-    // the canonical closed exception once the abort token has fired, else the original. Mirrors the
-    // async flush catch so every sync seam surfaces PgClientClosedException, not a bare deadline fault.
+    // the flow-termination verdict once the abort token has fired, else the original. The protocol's
+    // completion retains the canonical close; I/O driven for a flow receives its per-flow verdict.
     // Keyed on the SHELL's token (the scope token for a scope shell), so a scope-only abort fires here.
     public Exception TranslateAbort(Exception ex)
-        => _abortToken.IsCancellationRequested && _control.ClosedException is { } closed ? closed : ex;
+        => _abortToken.IsCancellationRequested && _control.ClosedException is not null
+            ? _control.FlowTerminationException
+            : ex;
 
     internal Func<PgTypeId, Oid> OidLookup => _pipe.OidLookup;
     internal Encoding ClientEncoding
@@ -89,9 +91,9 @@ sealed class ProtocolDataWriter
         {
             _pipe.Flush(timeout);
         }
-        catch (Exception) when (_control.ClosedException is { } closed)
+        catch (Exception) when (_control.ClosedException is not null)
         {
-            throw closed;
+            throw _control.FlowTerminationException;
         }
         catch (Exception ex) when (_abortToken.IsCancellationRequested)
         {
@@ -113,9 +115,9 @@ sealed class ProtocolDataWriter
         {
             task = _pipe.FlushAsync(_cts.Token);
         }
-        catch (Exception) when (_control.ClosedException is { } closed)
+        catch (Exception) when (_control.ClosedException is not null)
         {
-            throw closed;
+            throw _control.FlowTerminationException;
         }
         if (task.IsCompletedSuccessfully)
             return task;
@@ -128,9 +130,9 @@ sealed class ProtocolDataWriter
             {
                 await task.ConfigureAwait(false);
             }
-            catch (Exception) when (_control.ClosedException is { } closed)
+            catch (Exception) when (_control.ClosedException is not null)
             {
-                throw closed;
+                throw _control.FlowTerminationException;
             }
             catch (Exception ex) when (_abortToken.IsCancellationRequested)
             {

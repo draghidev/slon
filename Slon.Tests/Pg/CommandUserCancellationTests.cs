@@ -677,10 +677,13 @@ public class CommandUserCancellationTests
             var rows = result.GetAsyncEnumerator();
             while (await rows.MoveNextAsync()) { }
             await rows.DisposeAsync();
-            var collateral = Assert.ThrowsExactly<PgErrorException>(() => result.GetCommandComplete());
-            Assert.AreEqual(PgErrorCodes.QueryCanceled, collateral.SqlState);
-            Assert.IsTrue(collateral.IsCollateralCancellation);
-            StringAssert.Contains(collateral.Message, "clients cannot eliminate this race");
+            var collateral = Assert.ThrowsExactly<PgCollateralException>(
+                () => result.GetCommandComplete());
+            Assert.AreEqual(PgCollateralKind.Cancellation, collateral.Kind);
+            var backendError = Assert.IsInstanceOfType<PgErrorException>(collateral.InnerException);
+            Assert.AreEqual(PgErrorCodes.QueryCanceled, backendError.SqlState);
+            Assert.IsTrue(backendError.IsCollateralCancellation);
+            StringAssert.Contains(collateral.Message, "drivers cannot eliminate this race");
             Assert.IsFalse(await successor.MoveNextAsync());
             await successor.DisposeAsync();
 
