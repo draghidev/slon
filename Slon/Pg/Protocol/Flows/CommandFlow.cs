@@ -116,6 +116,9 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
     ValueTask _task;
     // Once the body starts, its catch paths own caller-facing fault propagation.
     bool _bodyStarted;
+    // Consumer terminality, body terminality, and framework release are distinct phases. A synchronous
+    // disposer owns body driving after takeover even when close delivery has already ended enumeration.
+    bool _bodyTerminated;
     // Consumer-thread-only. The first call uses the initial source generation; later calls rearm it.
     // Body start is not a substitute because an executor-driven body may finish before first consumption.
     bool _consumerAdvanced;
@@ -769,6 +772,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
             // decoder/wire state, so a faulted body can release oversized storage while recovery
             // retains the failed flow's framework tenure.
             context.GetProtocolStatic<ReadState>().RowDescription.PrepareForReuse();
+            PublishBodyTerminated();
         }
         void SetResult(CommandResult<ResultMessageEnumerator>? next)
         {
@@ -1073,6 +1077,8 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
         // unlocked teardown racing the locked consumer/body in MoveNextRearm.tla (Lock + WithTeardown).
         if (_enumeratorMoveNextTaskSource.TrySetException(ex, runContinuationsAsynchronously: true))
             _enumeratorCompleted = true;
+        if (!_bodyStarted)
+            Volatile.Write(ref _bodyTerminated, true);
         // Wake a sync caller / a sync disposer pumping the rendezvous (the WakeHandshake - see
         // WakePumpOnCompletion). The body just faulted in-flight, so no continuation will register.
         WakePumpOnCompletion();
@@ -1081,6 +1087,12 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
         // drains it. When a consumer is present (live or wait-for-drain) the body drains it ITSELF
         // (MarkConsumerGoneByBody + the _drainErrors / per-result surfacing) - recovery must not take it,
         // it is a blind read-drain and cannot publish ErrorResponses to a waiting consumer.
+    }
+
+    void PublishBodyTerminated()
+    {
+        Volatile.Write(ref _bodyTerminated, true);
+        WakePumpOnCompletion();
     }
 
 
@@ -1177,6 +1189,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
         _context = default;
         _task = default;
         _bodyStarted = false;
+        _bodyTerminated = false;
         _consumerAdvanced = false;
     }
 
@@ -1402,15 +1415,7 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
                 flow._callerInteractionCore.OpenGate(runContinuationsAsynchronously: false);
                 if (flow.WaitForDrainOnDispose)
                 {
-                    // Pump handed-off continuations inline until sticky terminal progress wakes us
-                    // without one.
-                    while (!Volatile.Read(ref flow._enumeratorCompleted))
-                    {
-                        var continuation = flow._callerInteractionCore.WaitForContinuation();
-                        if (continuation is null)
-                            break;
-                        continuation.Invoke();
-                    }
+                    DriveBodyToTermination(flow);
                     // Drain ran on this thread; surface accumulated drain errors (completes immediately).
                     flow.AwaitDrainOnDisposeSynchronously();
                 }
@@ -1424,8 +1429,34 @@ sealed class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSourc
 
             // A synchronous consumer drives the autonomous drain through the same rendezvous.
             flow.MarkConsumerGone();
-            while (MoveNext())
-                Current.Dispose();
+            try
+            {
+                while (MoveNext())
+                    Current.Dispose();
+            }
+            catch (PgClientClosedException) when (flow._bodyStarted)
+            {
+                // Close is consumer-terminal but does not release a sync caller's body-drive obligation.
+                DriveBodyToTermination(flow);
+                flow.AwaitDrainOnDisposeSynchronously();
+            }
+
+            static void DriveBodyToTermination(CommandFlow flow)
+            {
+                while (!Volatile.Read(ref flow._bodyTerminated))
+                {
+                    var continuation = flow._callerInteractionCore.WaitForContinuation();
+                    if (continuation is null)
+                    {
+                        if (Volatile.Read(ref flow._bodyTerminated))
+                            break;
+                        continuation = flow._callerInteractionCore.TryTakeContinuation();
+                        if (continuation is null)
+                            continue;
+                    }
+                    continuation.Invoke();
+                }
+            }
         }
 
         /// <inheritdoc />

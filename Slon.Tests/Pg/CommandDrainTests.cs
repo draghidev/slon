@@ -1,4 +1,3 @@
-using System.Reflection;
 using Microsoft.Extensions.Time.Testing;
 using Slon.Pg;
 using Slon.Pg.Protocol;
@@ -13,8 +12,6 @@ namespace Slon.Tests.Pg;
 [TestClass]
 public class CommandDrainTests : ConnectionCreatingTest
 {
-    const BindingFlags NonPublicInstance = BindingFlags.Instance | BindingFlags.NonPublic;
-
     sealed class ResultObserver : ICommandFlowObserver
     {
         public TaskCompletionSource Entered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -42,6 +39,12 @@ public class CommandDrainTests : ConnectionCreatingTest
             ReleaseEntered.TrySetResult();
             _continueRelease.Wait();
         }
+    }
+
+    sealed class CompletionFlow : PgClientFlow
+    {
+        public CompletionFlow() => IsAsync = true;
+        protected override ValueTask<FlowTasks> ExecuteAuto(Context context) => new(new FlowTasks());
     }
 
     [TestMethod]
@@ -73,41 +76,27 @@ public class CommandDrainTests : ConnectionCreatingTest
     [TestMethod]
     public void TerminalProgress_IsStickyBeforeSyncDisposerArms()
     {
-        var flow = new CommandFlow(async: true, Command.Create("select 1"));
-        typeof(CommandFlow).GetMethod("WakePumpOnCompletion", NonPublicInstance)!.Invoke(flow, null);
-
-        var core = typeof(CommandFlow).GetField("_callerInteractionCore", NonPublicInstance)!.GetValue(flow)!;
-        var progress = (int)core.GetType().GetField("_progressSignaled", NonPublicInstance)!.GetValue(core)!;
-        Assert.AreNotEqual(0, progress,
-            "terminal progress must remain sticky when delivery precedes synchronous-disposer arming");
+        var core = new FlowCallerInteractionCore<ValueTuple>();
+        core.Initialize();
+        core.SignalProgress();
+        Assert.IsNull(core.WaitForContinuation(),
+            "progress published before the waiter arms must be consumed without parking");
     }
 
     [TestMethod]
     public async Task SyncCompletionWait_DoesNotDependOnAsyncContinuationDispatch()
     {
         await using var protocol = await PgTestPool.NewIsolatedAsync();
-        var flow = new CommandFlow(async: true, Command.Create("select 1"));
-        var enumerator = flow.GetAsyncEnumerator();
-
-        // Model the observed ordering directly: the body publishes terminal progress, the synchronous
-        // disposal pump consumes it without a continuation, and lifecycle retirement is withheld.
-        typeof(CommandFlow).GetMethod("WakePumpOnCompletion", NonPublicInstance)!.Invoke(flow, null);
+        var flow = new CompletionFlow();
 
         var waiter = Task.Factory.StartNew(
-            () => enumerator.Dispose(),
+            () => flow.WaitForCompleteSynchronously(),
             CancellationToken.None,
             TaskCreationOptions.LongRunning,
             TaskScheduler.Default);
 
         Assert.IsTrue(SpinWait.SpinUntil(() => flow.CompletionWaiterPending, TestTimeout.Hang),
             "synchronous completion waiter did not arm");
-
-        var completionCore = typeof(PgClientFlow)
-            .GetField("_completionCore", NonPublicInstance)!.GetValue(flow)!;
-        var continuation = completionCore.GetType()
-            .GetField("_continuation", NonPublicInstance)!.GetValue(completionCore);
-        Assert.IsNull(continuation,
-            "synchronous completion must park on its event rather than register scheduler work");
 
         await Task.Factory.StartNew(
             () => flow.GetExecutionControl(protocol.FlowControl).Release(),
@@ -121,20 +110,18 @@ public class CommandDrainTests : ConnectionCreatingTest
     public async Task SyncCompletionBeforeEventRegistration_DoesNotPark()
     {
         await using var protocol = await PgTestPool.NewIsolatedAsync();
-        var flow = new CommandFlow(async: true, Command.Create("select 1"));
-        var enumerator = flow.GetAsyncEnumerator();
+        var flow = new CompletionFlow();
 
         // Complete before synchronous disposal has created its lazy event. Completion installs the
         // core's sentinel, so GetStatus observes the terminal level and disposal must not park.
-        typeof(CommandFlow).GetMethod("WakePumpOnCompletion", NonPublicInstance)!.Invoke(flow, null);
         flow.GetExecutionControl(protocol.FlowControl).Release();
 
-        var dispose = Task.Factory.StartNew(
-            () => enumerator.Dispose(),
+        var wait = Task.Factory.StartNew(
+            () => flow.WaitForCompleteSynchronously(),
             CancellationToken.None,
             TaskCreationOptions.LongRunning,
             TaskScheduler.Default);
-        await dispose.WaitAsync(TestTimeout.Hang);
+        await wait.WaitAsync(TestTimeout.Hang);
     }
 
     static async ValueTask Dispose(CommandFlow.Enumerator e, bool useAsyncDispose)

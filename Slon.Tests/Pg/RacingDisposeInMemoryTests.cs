@@ -495,6 +495,91 @@ public class RacingDisposeInMemoryTests
         }
     }
 
+    // The dump-captured obligation, made deterministic without a production hook. Dispose takes sync
+    // ownership while the async body is parked on its initial read. A heartbeat then supplies a
+    // progress-only wake; only afterwards does releasing the response let the body publish its sync
+    // handoff continuation. Null progress cannot be mistaken for body termination.
+    [TestMethod]
+    public async Task SyncDispose_ProgressWakeBeforeLateHandoff_DrivesBodyToTermination()
+    {
+        var clock = new FakeTimeProvider();
+        var transport = new GatedReplayTransport(_handshake!);
+        var protocol = PgClientProtocol.Create(new PgClientProtocolOptions(_options!)
+        {
+            TimeProvider = clock,
+            HeartbeatInterval = TimeSpan.FromSeconds(1),
+            CompletionTimeout = TimeSpan.FromSeconds(30),
+        });
+        await protocol.StartAsync(_options!, transport);
+
+        var readParked = transport.ArmReadPark();
+        var flow = new CommandFlow(async: true, Command.Create("select generate_series(1, 3)"));
+        Assert.IsTrue(protocol.TryQueue(flow));
+        var enumerator = flow.GetAsyncEnumerator();
+        var first = enumerator.MoveNextAsync().AsTask();
+        await readParked.WaitAsync(TestTimeout.Hang);
+
+        var complete = protocol.CompleteAsync();
+        var dispose = StartSyncDispose(enumerator, out var started);
+        using (started)
+            Assert.IsTrue(started.Wait(TestTimeout.Hang), "synchronous disposer did not start");
+
+        Assert.IsTrue(SpinWait.SpinUntil(
+                () => !flow.GetExecutionControl(protocol.FlowControl).IsAsync, TestTimeout.Hang),
+            "synchronous disposer did not take body-drive ownership");
+        clock.Advance(TimeSpan.FromSeconds(1));
+
+        foreach (var message in _messages!)
+            transport.ReleaseSegment(message);
+
+        var escaped = await dispose.WaitAsync(TestTimeout.Hang);
+        await complete.WaitAsync(TestTimeout.Hang);
+        Assert.IsNull(escaped, $"{escaped} escaped synchronous disposal");
+        try { await first.WaitAsync(TestTimeout.Hang); } catch (PgClientClosedException) { }
+    }
+
+    // A sync-at-bind body parked between command results still owns a continuation after close becomes
+    // consumer-terminal. Dispose must drive that continuation before returning or surfacing the close.
+    [TestMethod]
+    public async Task SyncFlow_CloseAtInterResultPark_DisposeRetainsDriveObligation()
+    {
+        var clock = new FakeTimeProvider();
+        var transport = new GatedReplayTransport(_handshake!);
+        var protocol = PgClientProtocol.Create(new PgClientProtocolOptions(_options!)
+        {
+            TimeProvider = clock,
+            HeartbeatInterval = TimeSpan.FromSeconds(1),
+            CompletionTimeout = TimeSpan.FromSeconds(30),
+        });
+        await protocol.StartAsync(_options!, transport);
+
+        var readParked = transport.ArmReadPark();
+        var flow = new CommandFlow(async: false,
+            Command.Create("select 1"), Command.Create("select 2"), Command.Create("select 3"));
+        Assert.IsTrue(protocol.TryQueue(flow));
+        var enumerator = flow.GetEnumerator();
+        var first = Task.Factory.StartNew(enumerator.MoveNext, CancellationToken.None,
+            TaskCreationOptions.LongRunning, TaskScheduler.Default);
+        await readParked.WaitAsync(TestTimeout.Hang);
+
+        var release = MessagesThroughFirstCommandComplete(_multiMessages!);
+        for (var i = 0; i < release; i++)
+            transport.ReleaseSegment(_multiMessages![i]);
+        Assert.IsTrue(await first.WaitAsync(TestTimeout.Hang), "first result was not delivered");
+
+        var complete = protocol.CompleteAsync();
+        clock.Advance(TimeSpan.FromSeconds(1));
+        for (var i = release; i < _multiMessages!.Count; i++)
+            transport.ReleaseSegment(_multiMessages[i]);
+
+        var dispose = StartSyncDispose(enumerator, out var started);
+        using (started)
+            Assert.IsTrue(started.Wait(TestTimeout.Hang), "synchronous disposer did not start");
+        var escaped = await dispose.WaitAsync(TestTimeout.Hang);
+        await complete.WaitAsync(TestTimeout.Hang);
+        Assert.IsNull(escaped, $"{escaped} escaped synchronous disposal");
+    }
+
     // Ordering 3 (gate-fault) - the predicted lost-completion HANG is NOT reachable: the heartbeat-
     // faulted gate makes HandleException no-op on the consumed V0 generation, but the same gate-fault
     // published CancelException, so the consumer's next MoveNextAsync self-delivers the close and the

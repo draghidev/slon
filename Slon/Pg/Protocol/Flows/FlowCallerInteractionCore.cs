@@ -135,6 +135,12 @@ struct FlowCallerInteractionCore<TResult>
         }
     }
 
+    // Dispose-pump escape hatch. A progress wake may win over a continuation published in the same
+    // window; ordinary MoveNext must leave that continuation deferred because the result owns its turn,
+    // while a disposing consumer has no result turn left and may claim it immediately.
+    public Action? TryTakeContinuation()
+        => Interlocked.Exchange(ref _wakeContinuation, null);
+
     // A rendezvous can publish a result and register the body's following continuation before the
     // caller wakes. The result owns this turn; put the continuation back so the next MoveNext drives it.
     public void DeferContinuation(Action continuation)
