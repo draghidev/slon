@@ -1,6 +1,7 @@
 using System.Buffers;
 using System.Buffers.Binary;
 using System.Diagnostics;
+using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
 using System.Text;
 using Slon.Buffers;
@@ -15,7 +16,7 @@ sealed class Row
     BackendMessage.Accessor _messageAccessor;
     RowDescription _rowDescription = null!;
     BackendMessageBodyReader? _bodyReader;
-    IColumnViewLease? _columnLease;
+    IColumnLease? _columnLease;
     int _leasedOrdinal;
 
     int _column = -1;
@@ -70,6 +71,8 @@ sealed class Row
 
     internal ref readonly RowDescriptionField GetFieldMetadata(int ordinal)
         => ref _rowDescription[ordinal];
+
+    internal bool IsColumnPast(int ordinal) => ordinal < _column;
 
     internal ReadOnlySequence<byte> GetBufferedField(int ordinal)
     {
@@ -151,7 +154,14 @@ sealed class Row
         _column = ordinal + 1;
     }
 
-    internal void LeaseColumn(int ordinal, IColumnViewLease lease)
+    internal bool TryGetColumnLease<T>(int ordinal, [NotNullWhen(true)] out T? lease)
+        where T : class, IColumnLease
+    {
+        lease = _leasedOrdinal == ordinal ? _columnLease as T : null;
+        return lease is not null;
+    }
+
+    internal void LeaseColumn(int ordinal, IColumnLease lease)
     {
         if (_columnLease is not null)
             throw new InvalidOperationException("A column lease is already active.");

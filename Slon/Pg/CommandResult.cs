@@ -90,6 +90,8 @@ abstract class CommandResult : IDisposable, IAsyncDisposable, IEnumerable<Row>, 
         return row.GetValueAsync<T, PgSerializerFieldReader<T>>(ordinal, reader, cancellationToken);
     }
 
+    internal PgConversionContext ConversionContext => _conversionContext;
+
     /// Returns all metadata known about the command after execution has taken place.
     public CommandMetadata GetMetadata()
     {

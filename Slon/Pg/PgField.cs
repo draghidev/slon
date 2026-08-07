@@ -1,9 +1,10 @@
 using System.Buffers;
+using System.Diagnostics.CodeAnalysis;
 using Slon.Pg.Serialization;
 
 namespace Slon.Pg;
 
-interface IColumnViewLease
+interface IColumnLease
 {
     int Revoke();
     ValueTask<int> RevokeAsync();
@@ -14,6 +15,7 @@ interface IColumnViewLease
 readonly struct PgField(Row row, int ordinal)
 {
     public ref readonly RowDescriptionField Metadata => ref row.GetFieldMetadata(ordinal);
+    public bool IsPast => row.IsColumnPast(ordinal);
 
     public ReadOnlySequence<byte> GetBuffered() => row.GetBufferedField(ordinal);
 
@@ -32,5 +34,8 @@ readonly struct PgField(Row row, int ordinal)
     public ValueTask CompleteReaderAsync(PgReader reader)
         => row.CompleteFieldReaderAsync(ordinal, reader);
 
-    public void Lease(IColumnViewLease lease) => row.LeaseColumn(ordinal, lease);
+    public bool TryGetLease<T>([NotNullWhen(true)] out T? lease) where T : class, IColumnLease
+        => row.TryGetColumnLease(ordinal, out lease);
+
+    public void Lease(IColumnLease lease) => row.LeaseColumn(ordinal, lease);
 }

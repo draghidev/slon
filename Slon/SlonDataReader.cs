@@ -59,6 +59,7 @@ public sealed partial class SlonDataReader
         bool EnumerateCommands => false; // _behavior.HasFlag((CommandBehavior)64);
 
         public CommandResult? Current => _enumerator.Current;
+        public bool IsSequential => _rowBuffering is CommandResult.RowBuffering.Streaming;
 
         public Row? CurrentRow => _rowEnumerator.Current;
 
@@ -725,7 +726,32 @@ public sealed partial class SlonDataReader : DbDataReader, IDbColumnSchemaGenera
     /// <inheritdoc/>
     public override long GetBytes(int ordinal, long dataOffset, byte[]? buffer, int bufferOffset, int length)
     {
-        throw new NotImplementedException();
+        if (dataOffset is < 0 or > int.MaxValue)
+            throw new ArgumentOutOfRangeException(nameof(dataOffset));
+        if (buffer is not null)
+        {
+            ArgumentOutOfRangeException.ThrowIfNegative(bufferOffset);
+            ArgumentOutOfRangeException.ThrowIfGreaterThan(bufferOffset, buffer.Length);
+            ArgumentOutOfRangeException.ThrowIfNegative(length);
+            ArgumentOutOfRangeException.ThrowIfGreaterThan(length, buffer.Length - bufferOffset);
+        }
+
+        var row = GetRowOrThrow();
+        var result = _core.Current ?? throw new InvalidOperationException("Reader is not on a result.");
+        var field = new PgField(row, ordinal);
+        if (!field.TryGetLease<ByteColumnLease>(out var lease))
+        {
+            if (_core.IsSequential && field.IsPast)
+                throw new InvalidOperationException(
+                    "Attempted to read a column preceding the sequential row cursor.");
+            var fieldReader = field.OpenReader(result.ConversionContext);
+            lease = new ByteColumnLease(fieldReader, _core.IsSequential);
+            field.Lease(lease);
+        }
+
+        if (buffer is null)
+            return lease.Length;
+        return lease.Read(checked((int)dataOffset), buffer.AsSpan(bufferOffset, length));
     }
 
     /// <inheritdoc/>

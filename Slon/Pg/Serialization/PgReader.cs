@@ -46,6 +46,27 @@ public sealed class PgReader : IDisposable, IAsyncDisposable
 
     public PgConversionContext ConversionContext { get; }
     public int CurrentRemaining => _fieldSize - checked(_released + (int)_position);
+    internal int FieldSize => _fieldSize;
+    internal int FieldOffset => checked(_released + (int)_position);
+
+    internal void Seek(int offset)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(offset);
+        if (offset > _fieldSize)
+            throw new ArgumentOutOfRangeException(nameof(offset));
+
+        var current = FieldOffset;
+        if (offset < current)
+        {
+            if (_source is not null || _released != 0)
+                throw new InvalidOperationException(
+                    "Attempted to read a position in a sequential column which has already been consumed.");
+            _position = offset;
+            return;
+        }
+
+        Consume(offset - current);
+    }
 
     public byte ReadByte()
     {
@@ -366,12 +387,12 @@ public sealed class PgReader : IDisposable, IAsyncDisposable
     }
 
     internal bool HasActiveView => _activeView is { IsDisposed: false };
-    internal IColumnViewLease ActiveViewLease
+    internal IColumnLease ActiveViewLease
         => _activeView is { IsDisposed: false } view
             ? view
             : throw new InvalidOperationException("No temporary column view is active.");
 
-    internal int RevokeView()
+    internal int RevokeField()
     {
         if (_revoked)
             throw new InvalidOperationException("The column lease has already been revoked.");
@@ -383,7 +404,7 @@ public sealed class PgReader : IDisposable, IAsyncDisposable
         return offset;
     }
 
-    internal async ValueTask<int> RevokeViewAsync()
+    internal async ValueTask<int> RevokeFieldAsync()
     {
         if (_revoked)
             throw new InvalidOperationException("The column lease has already been revoked.");
@@ -445,7 +466,7 @@ public sealed class PgReader : IDisposable, IAsyncDisposable
         Dispose();
     }
 
-    interface IReaderView : IColumnViewLease
+    interface IReaderView : IColumnLease
     {
         bool IsDisposed { get; }
         void DisposeView();
@@ -526,8 +547,8 @@ public sealed class PgReader : IDisposable, IAsyncDisposable
 
         public ValueTask DisposeViewAsync() => DisposeAsync();
 
-        int IColumnViewLease.Revoke() => _reader.RevokeView();
-        ValueTask<int> IColumnViewLease.RevokeAsync() => _reader.RevokeViewAsync();
+        int IColumnLease.Revoke() => _reader.RevokeField();
+        ValueTask<int> IColumnLease.RevokeAsync() => _reader.RevokeFieldAsync();
 
         public override bool CanRead => !_disposed;
         public override bool CanSeek => false;
@@ -600,16 +621,16 @@ public sealed class PgReader : IDisposable, IAsyncDisposable
         public void DisposeView() => Dispose();
         public ValueTask DisposeViewAsync() => DisposeAsyncCore();
 
-        int IColumnViewLease.Revoke()
+        int IColumnLease.Revoke()
         {
             Dispose();
-            return ((IColumnViewLease)_stream).Revoke();
+            return ((IColumnLease)_stream).Revoke();
         }
 
-        async ValueTask<int> IColumnViewLease.RevokeAsync()
+        async ValueTask<int> IColumnLease.RevokeAsync()
         {
             await DisposeAsyncCore().ConfigureAwait(false);
-            return await ((IColumnViewLease)_stream).RevokeAsync().ConfigureAwait(false);
+            return await ((IColumnLease)_stream).RevokeAsync().ConfigureAwait(false);
         }
     }
 
