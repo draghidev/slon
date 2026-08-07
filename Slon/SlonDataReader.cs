@@ -689,15 +689,18 @@ public sealed partial class SlonDataReader : DbDataReader, IDbColumnSchemaGenera
 
     // Non-gvm helper to make inlining GetBoolean GetString etc possible.
     T GetFieldValueCore<T>(int ordinal)
-        => GetRowOrThrow().GetValue<T>(ordinal);
+        => (_core.Current ?? throw new InvalidOperationException("Reader is not on a result."))
+            .ReadField<T>(GetRowOrThrow(), ordinal);
 
     // Non-gvm helper to make inlining GetTextReaderAsync etc possible.
     ValueTask<T> GetFieldValueCoreAsync<T>(int ordinal, CancellationToken cancellationToken)
     {
         var row = GetRowOrException(out var exception);
-        return exception is not null
-            ? ValueTask.FromException<T>(exception)
-            : row.GetValueAsync<T>(ordinal, cancellationToken);
+        if (exception is not null)
+            return ValueTask.FromException<T>(exception);
+
+        return (_core.Current ?? throw new InvalidOperationException("Reader is not on a result."))
+            .ReadFieldAsync<T>(row, ordinal, cancellationToken);
     }
 
     public byte[] GetBytes(int ordinal)

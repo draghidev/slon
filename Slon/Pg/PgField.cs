@@ -1,0 +1,28 @@
+using System.Buffers;
+using Slon.Pg.Serialization;
+
+namespace Slon.Pg;
+
+// A tenure-bound field handle. Strategies choose buffered access today; incremental cursor access
+// can be added here without exposing the protocol reader or changing Row's generic dispatch seam.
+readonly struct PgField(Row row, int ordinal)
+{
+    public ref readonly RowDescriptionField Metadata => ref row.GetFieldMetadata(ordinal);
+
+    public ReadOnlySequence<byte> GetBuffered() => row.GetBufferedField(ordinal);
+
+    public ValueTask<ReadOnlySequence<byte>> GetBufferedAsync(CancellationToken cancellationToken = default)
+        => row.GetBufferedFieldAsync(ordinal, cancellationToken);
+
+    public PgReader OpenReader(PgConversionContext conversionContext)
+        => row.OpenFieldReader(ordinal, conversionContext);
+
+    public ValueTask<PgReader> OpenReaderAsync(PgConversionContext conversionContext,
+        CancellationToken cancellationToken = default)
+        => row.OpenFieldReaderAsync(ordinal, conversionContext, cancellationToken);
+
+    public void CompleteReader(PgReader reader) => row.CompleteFieldReader(ordinal, reader);
+
+    public ValueTask CompleteReaderAsync(PgReader reader)
+        => row.CompleteFieldReaderAsync(ordinal, reader);
+}

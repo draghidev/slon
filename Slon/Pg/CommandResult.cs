@@ -3,6 +3,8 @@ using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
 using Slon.Pg.Protocol;
+using Slon.Pg.Serialization;
+using System.Text;
 
 namespace Slon.Pg;
 
@@ -16,6 +18,8 @@ abstract class CommandResult : IDisposable, IAsyncDisposable, IEnumerable<Row>, 
 
     readonly Row _row = new();
     RowDescription? _rowDescription;
+    PgSerializerOptions? _serializerOptions;
+    PgConversionContext _conversionContext = PgConversionContext.Empty;
     int _index;
     CommandDescriptor _descriptor;
     bool _requestedExecution;
@@ -29,7 +33,9 @@ abstract class CommandResult : IDisposable, IAsyncDisposable, IEnumerable<Row>, 
     object? _completionActionState;
 
     // The requested row description is what was returned for this exact command (i.e. commands that requested a describe).
-    protected void Initialize(int index, CommandDescriptor descriptor, RowDescription? requestedRowDescription, bool requestedExecution, bool simpleProtocol)
+    protected void Initialize(int index, CommandDescriptor descriptor, RowDescription? requestedRowDescription,
+        bool requestedExecution, bool simpleProtocol, PgSerializerOptions? serializerOptions = null,
+        Encoding? textEncoding = null)
     {
         _index = index;
         _descriptor = descriptor;
@@ -47,6 +53,10 @@ abstract class CommandResult : IDisposable, IAsyncDisposable, IEnumerable<Row>, 
             if (rowDescription is not null)
                 _row.Initialize(rowDescription);
         }
+        else if (rowDescription is not null)
+        {
+            _row.Initialize(rowDescription);
+        }
         _requestedExecution = requestedExecution;
         _simpleProtocol = simpleProtocol;
 
@@ -57,6 +67,27 @@ abstract class CommandResult : IDisposable, IAsyncDisposable, IEnumerable<Row>, 
         _errorMessage = null;
         _completionAction = null;
         _completionActionState = null;
+        _serializerOptions = serializerOptions;
+        _conversionContext = textEncoding is null
+            ? PgConversionContext.Empty
+            : new PgConversionContext { TextEncoding = textEncoding };
+    }
+
+    internal T ReadField<T>(Row row, int ordinal)
+    {
+        var reader = new PgSerializerFieldReader<T>(
+            _serializerOptions ?? throw new InvalidOperationException("No serializer was attached to this result."),
+            _conversionContext);
+        return row.GetValue<T, PgSerializerFieldReader<T>>(ordinal, ref reader);
+    }
+
+    internal ValueTask<T> ReadFieldAsync<T>(Row row, int ordinal,
+        CancellationToken cancellationToken = default)
+    {
+        var reader = new PgSerializerFieldReader<T>(
+            _serializerOptions ?? throw new InvalidOperationException("No serializer was attached to this result."),
+            _conversionContext);
+        return row.GetValueAsync<T, PgSerializerFieldReader<T>>(ordinal, reader, cancellationToken);
     }
 
     /// Returns all metadata known about the command after execution has taken place.
@@ -413,8 +444,11 @@ sealed class CommandResult<TEnumerator>(TEnumerator enumerator) : CommandResult
 {
     TEnumerator _messageEnumerator = enumerator;
 
-    internal new void Initialize(int index, CommandDescriptor descriptor, RowDescription? requestedRowDescription, bool requestedExecution, bool simpleProtocol)
-        => base.Initialize(index, descriptor, requestedRowDescription, requestedExecution, simpleProtocol);
+    internal new void Initialize(int index, CommandDescriptor descriptor, RowDescription? requestedRowDescription,
+        bool requestedExecution, bool simpleProtocol, PgSerializerOptions? serializerOptions = null,
+        Encoding? textEncoding = null)
+        => base.Initialize(index, descriptor, requestedRowDescription, requestedExecution, simpleProtocol,
+            serializerOptions, textEncoding);
 
     protected override BackendMessage GetCurrentMessage()
     {

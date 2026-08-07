@@ -2,13 +2,14 @@ using System.Buffers;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using Slon.Pipelines;
+using Slon.Buffers;
 using Slon.Runtime.CompilerServices;
 
 namespace Slon.Pg.Protocol;
 
 // Bounded view over a partially buffered message body. It releases consumed bytes to the pipe and
 // extends only to this message's declared boundary; the normal decoder resumes with its successor.
-sealed class BackendMessageBodyReader
+sealed class BackendMessageBodyReader : IInputReader
 {
     readonly BackendMessageContext _context;
     readonly short _token;

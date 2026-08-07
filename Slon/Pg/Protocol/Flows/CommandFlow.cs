@@ -490,7 +490,8 @@ sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
                             descriptor.CommandName, descriptor.ParameterTypes, _requestedRowDescription?.Preserve());
                     }
                     result.Initialize(_commandIndex, descriptor, _requestedRowDescription,
-                        !resultCommand.DescribeOnly, resultCommand.IsSimple());
+                        !resultCommand.DescribeOnly, resultCommand.IsSimple(), _options.SerializerOptions,
+                        _decoder.ClientEncoding);
                 }
                 _options.Observer?.OnCommandResult(this, result);
 
