@@ -428,7 +428,7 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
                 ValueTaskSourceOnCompletedFlags.UseSchedulingContext);
         }
 
-        // State-taking overloads: direct-dispatch escape hatch (e.g. CommandFlow's shared-promise
+        // State-taking overloads support direct dispatch (e.g. CommandFlow's shared-promise
         // pattern). Capture defaults mirror the Action overloads, callers that want to skip
         // scheduling-context capture go through ConfigureAwait(false) first.
         public void OnCompleted(Action<object?> continuation, object? state)
@@ -762,7 +762,7 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
                 control.FailProtocolFromCallback(ex, "a flow release hook");
             }
             // Wire-death fault delivery is NOT done here - it rides the OnStopping/OnAbort hooks (dispatched
-            // flows from the heartbeat, backlog flows from the shutdown drain's DeliverClose), so a flow's
+            // flows from the heartbeat, backlog flows from the shutdown drain's close delivery), so a flow's
             // caller gate is faulted by the close verdict, not by completion. Completion just signals done
             // and notifies the post-done action. Deliberately NO activation-source faulting here:
             // a parked deferred dispatch holds no resources, and Reset clears the registration on reuse.

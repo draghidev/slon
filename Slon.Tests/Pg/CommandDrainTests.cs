@@ -215,7 +215,7 @@ public class CommandDrainTests : ConnectionCreatingTest
     // Path coverage for the sync-dispose pump's cross-thread completion. The pump parks in
     // WaitForContinuation on an in-flight body; here a
     // forceful abort closes the socket so the in-flight read faults ON ITS POOL THREAD (SetResult(null)->
-    // DeliverTerminal, or HandleException), completing the body cross-thread while the pump is parked - the
+    // CompleteEnumeration, or CompleteEnumerationWithException), completing the body cross-thread while the pump is parked - the
     // sticky terminal publication must wake it. No other live-server test reaches this interleaving.
     [TestMethod]
     public async Task InFlightCompletion_RacesSyncDispose_PumpNeverStrands_Stress()

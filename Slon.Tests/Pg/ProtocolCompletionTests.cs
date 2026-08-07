@@ -413,7 +413,7 @@ public class ProtocolCompletionTests : ConnectionCreatingTest
     // Sync-flow variant of the racing teardown. The sync MoveNext rendezvous (WaitForContinuation)
     // is a different path than MoveNextAsync's gate-open self-delivery, so this exercises whether the
     // sync teardown also converges (the early sync-rendezvous wedge was a sync flow's
-    // SetContinuationAndUnblockWaiter). MoveNext blocks, so it runs on its own thread.
+    // YieldToCaller). MoveNext blocks, so it runs on its own thread.
     [TestMethod]
     public async Task CompleteAsync_RacingDisposeAsync_SyncFlow_ConvergesCleanly()
     {

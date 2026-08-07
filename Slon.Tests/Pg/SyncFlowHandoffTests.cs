@@ -99,7 +99,7 @@ public class SyncFlowHandoffTests : ConnectionCreatingTest
         var resumedOnThreadPool = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         var suspended = Suspend(holder, resumedOnThreadPool);
 
-        holder.Core.RequestWake(useDedicatedDriver: true);
+        holder.Core.WakeBody(useDedicatedDriver: true);
 
         Assert.IsFalse(await resumedOnThreadPool.Task.WaitAsync(TestTimeout.Hang));
         await suspended.WaitAsync(TestTimeout.Hang);
@@ -112,7 +112,7 @@ public class SyncFlowHandoffTests : ConnectionCreatingTest
             {
                 fieldRef = FieldRef<FlowCallerInteractionCore<ValueTuple>>.Create(&GetWakeCore, holder);
             }
-            await holder.Core.SetContinuationAndUnblockWaiter(fieldRef);
+            await holder.Core.YieldToCaller(fieldRef);
             resumedOnThreadPool.SetResult(Thread.CurrentThread.IsThreadPoolThread);
         }
     }
@@ -125,7 +125,7 @@ public class SyncFlowHandoffTests : ConnectionCreatingTest
 
         // Abort can precede creation of the synchronous disposer's event. The close must remain
         // observable as progress rather than disappear through a null event reference.
-        holder.Core.CancelPendingWait(new InvalidOperationException("close"));
+        holder.Core.FaultBodyWait(new InvalidOperationException("close"));
         Action? continuation = null;
         var waiter = new Thread(() => continuation = holder.Core.WaitForContinuation())
         {

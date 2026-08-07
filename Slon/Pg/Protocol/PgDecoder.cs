@@ -352,7 +352,7 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
             && Volatile.Read(ref _cancellationReadFrontierWindow) == observedWindow;
     }
 
-    /// Flow-owned escape hatch from a parked read. Without it the only break-out is protocol
+    /// Flow-owned cancellation path for a parked read. Without it the only break-out is protocol
     /// abort. An uncaught firing triggers the protocol's recovery path, so prefer a
     /// coordination-boundary check in connection-preserving flows.
     public ValueTask<bool> MoveNextAsync(CancellationToken cancellationToken = default)

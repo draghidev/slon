@@ -4,36 +4,23 @@ using Slon.Runtime.CompilerServices;
 
 namespace Slon.Pg.Protocol.Flows;
 
-// There are various cases where a flow should wait for caller action.
-// In asynchronous flows we await the GateTask which will be triggered by the caller when progress is requested.
-// We return a unique type so we won't clash with any other IValueTaskSource implementations, beyond that it is meaningless.
-// For synchronous flows we surface the continuation of the flow, and where it left things, to make progress on the same thread.
-// Each time the caller should process these new results we make the flow unwind the stack to get to the caller again.
-// If it unwinds for any other reason the mres will not be set, so those bugs will be easily diagnosable.
+// Coordinates the execution body with its result consumer. Async consumers resume the body through a
+// gate; sync consumers receive the body's continuation and run it on their own thread.
 struct FlowCallerInteractionCore<TResult>
 {
-    ManualResetEventSlim? _mres;
-    Action? _continuation;
-    // Wake-eligible continuation slot. Separate from _continuation because the latter
-    // deliberately stays set after the caller takes it (HasContinuation acts as a "handoff
-    // already done" marker). Re-queueing the stale _continuation on TP after the body has
-    // already resumed crashes the process: that continuation points at a completed state
-    // machine. _wakeContinuation has claim-and-clear semantics: set in OnCompleted and
-    // exchange-claimed by WaitForContinuation or RequestWake.
-    Action? _wakeContinuation;
+    ManualResetEventSlim? _waitEvent;
+    Action? _handoffContinuation;
+    // The handoff remains as a marker after consumption; the pending slot is claim-and-clear and is
+    // the only continuation that may be scheduled or returned to a caller.
+    Action? _pendingContinuation;
     int _progressSignaled;
-    // One-shot flag set by RequestWake; consumed by the OnCompleted post-store re-check.
+    // One-shot flag set by WakeBody; consumed by the OnCompleted post-store re-check.
     bool _wakeRequested;
     // Cancellation may have to take ownership from a sync caller that will not return. Once set,
     // a claimed handoff runs on a dedicated driver instead of occupying a pool worker.
     bool _dedicatedWakeRequested;
-    // The sticky close-latch: the flow-termination exception for this tenure, set out-of-band by
-    // the protocol abort/stopping (CancelPendingWait) AND by the body's terminal close paths. The
-    // consumer reads it on every Reset rearm to self-deliver the close to its just-armed generation,
-    // so the live generation always has a completer regardless of which writer set the latch. Two
-    // authorities (protocol abort, consumer Reset) agree without the abort ever targeting a version:
-    // the abort only flips this monotone latch; the consumer delivers. First-writer-wins via CAS so a
-    // concurrent abort + body-terminal cannot tear it. Cleared per tenure in Reset.
+    // First close wins for the current tenure. The consumer replays this durable state onto whichever
+    // task-source generation it arms, so teardown never needs to target a generation directly.
     Exception? _closeException;
     public Exception? CloseException => Volatile.Read(ref _closeException);
     // Set the latch, monotone (first writer wins). Returns the latched exception (this call's or the
@@ -41,22 +28,18 @@ struct FlowCallerInteractionCore<TResult>
     public Exception SetCloseLatch(Exception exception)
         => Interlocked.CompareExchange(ref _closeException, exception, null) ?? exception;
 
-    // The async result/await channel. Encapsulated: callers drive it through the gate-intent methods below,
-    // never the raw MRVTSC. The inline-vs-async continuation mode (runContinuationsAsynchronously) is the
-    // load-bearing knob - inline = a sync disposer's park-before-open takeover resumes the body on its own
-    // thread; async = an autonomous wake that must not run the body inline on the signaller's stack.
+    // Inline completion transfers the body to a synchronous caller; asynchronous completion preserves
+    // autonomous execution without running the body on the signaller's stack.
     Slon.Threading.Tasks.Sources.ManualResetValueTaskSourceCore<TResult> _gate;
     public void Initialize()
     {
         _gate.CanCompleteConcurrently = true;
     }
 
-    public ValueTask<TResult> GetGateTask(IValueTaskSource<TResult> source) => new(source, _gate.Version);
+    public ValueTask<TResult> WaitForCaller(IValueTaskSource<TResult> source) => new(source, _gate.Version);
 
-    // ---- Gate intent surface (the IVTS facade forwards its three interface methods to these) ----
-    // Complete the gate. runContinuationsAsynchronously=false resumes a parked body inline on THIS thread
-    // (the takeover); true schedules it (the autonomous wake).
-    public void OpenGate(bool runContinuationsAsynchronously)
+    // The IVTS facade forwards through this gate surface.
+    public void ResumeBody(bool runContinuationsAsynchronously)
         => _gate.TrySetResult(default!, runContinuationsAsynchronously);
     public System.Threading.Tasks.Sources.ValueTaskSourceStatus GateStatus(short token) => _gate.GetStatus(token);
     public void OnGateCompleted(Action<object?> continuation, object? state, short token, ValueTaskSourceOnCompletedFlags flags)
@@ -69,7 +52,7 @@ struct FlowCallerInteractionCore<TResult>
         return result;
     }
 
-    public void CancelPendingWait(Exception exception)
+    public void FaultBodyWait(Exception exception)
     {
         // Latch first (monotone), then fault the gate, so a consumer observing the gate fault always
         // reads the latch set.
@@ -80,54 +63,44 @@ struct FlowCallerInteractionCore<TResult>
         SignalProgress();
     }
 
-    // Public: a sync flow exposes this as its handoff rendezvous primitive (HandoffEvent) for the
-    // wait-list-free source handoff. The turn-handshake is strictly sequential BEFORE any body<->caller
-    // WaitForContinuation, so reusing the one MRES across both roles is safe.
-    public ManualResetEventSlim GetMres()
+    // The source handoff completes before body/consumer rendezvous begins, so both may reuse this event.
+    public ManualResetEventSlim GetWaitEvent()
     {
-        if (_mres is not { } mres)
+        if (_waitEvent is not { } waitEvent)
         {
-            mres = new();
-            if (Interlocked.CompareExchange(ref _mres, mres, null) is { } existing)
-                mres = existing;
+            waitEvent = new();
+            if (Interlocked.CompareExchange(ref _waitEvent, waitEvent, null) is { } existing)
+                waitEvent = existing;
         }
 
-        return mres;
+        return waitEvent;
     }
 
     public bool IsWaiting { get; private set; }
-    public bool HasContinuation => _continuation is not null;
+    public bool HasHandoff => _handoffContinuation is not null;
 
-    // Park the caller until the body either registers a continuation for us to drive forward,
-    // or signals progress via SignalProgress (because the body resumed on its own via async I/O
-    // completion and produced a result or completion on the move-next task source). The two
-    // wake conditions share one MRES. Returns the continuation to invoke, or null if the wake
-    // came from a progress signal alone (the task source completed without a new continuation
-    // being registered, e.g. body completion via SetResult(null)). Importantly, _continuation
-    // is not cleared on wake. The body's SetContinuationAndUnblockWaiter overwrites it next
-    // time, and HasContinuation acts as a "handoff already done" marker that ExecutePipelined
-    // reads to skip a redundant handoff when it runs on TP while the caller is still inside
-    // its first MoveNext.
+    // Returns a continuation for the caller to run, or null when result/terminal progress produced the
+    // wake. The durable handoff marker prevents a redundant first handoff.
     public Action? WaitForContinuation()
     {
-        var mres = GetMres();
+        var waitEvent = GetWaitEvent();
 
         IsWaiting = true;
         try
         {
-            // Check progress BEFORE blocking. A SignalProgress that ran before this GetMres (e.g. a body
-            // that faulted while _mres was still null) left the mres unset but _progressSignaled true; without
-            // this pre-check mres.Wait would block forever waiting for a Set that already (no-op) happened.
+            // Check progress BEFORE blocking. A SignalProgress that ran before this GetWaitEvent (e.g. a body
+            // that faulted while _waitEvent was still null) left the waitEvent unset but _progressSignaled true; without
+            // this pre-check waitEvent.Wait would block forever waiting for a Set that already (no-op) happened.
             if (ConsumeProgress())
                 return null;
-            mres.Wait();
-            mres.Reset();
+            waitEvent.Wait();
+            waitEvent.Reset();
             if (ConsumeProgress())
                 return null;
-            // Claim wake-eligibility so a concurrent RequestWake doesn't also queue the
-            // continuation. _continuation itself stays for HasContinuation's marker role.
-            Interlocked.Exchange(ref _wakeContinuation, null);
-            return _continuation!;
+            // Claim the continuation itself. _handoffContinuation is only a durable marker; returning
+            // it after another driver claimed _pendingContinuation would execute the same pooled state
+            // machine twice.
+            return Interlocked.Exchange(ref _pendingContinuation, null);
         }
         finally
         {
@@ -135,33 +108,29 @@ struct FlowCallerInteractionCore<TResult>
         }
     }
 
-    // Dispose-pump escape hatch. A progress wake may win over a continuation published in the same
+    // Dispose-pump continuation claim. A progress wake may win over a continuation published in the same
     // window; ordinary MoveNext must leave that continuation deferred because the result owns its turn,
     // while a disposing consumer has no result turn left and may claim it immediately.
-    public Action? TryTakeContinuation()
-        => Interlocked.Exchange(ref _wakeContinuation, null);
+    public Action? TryTakePendingContinuation()
+        => Interlocked.Exchange(ref _pendingContinuation, null);
 
     // A rendezvous can publish a result and register the body's following continuation before the
     // caller wakes. The result owns this turn; put the continuation back so the next MoveNext drives it.
     public void DeferContinuation(Action continuation)
     {
-        Interlocked.Exchange(ref _wakeContinuation, continuation);
-        GetMres().Set();
+        Interlocked.Exchange(ref _pendingContinuation, continuation);
+        GetWaitEvent().Set();
     }
 
-    // External wake request from consumer-side state changes (Enumerator.Dispose /
-    // DisposeAsync). Fires both wake mechanisms:
-    //   - SignalProgress wakes a sync caller blocked in WaitForContinuation.
-    //   - Interlocked.Exchange on _wakeContinuation claims the body's resume action if present,
-    //     covering consumer abandonment while a sync body is suspended. Ordinary wakes use the
-    //     thread pool; cancellation may graduate the flow to a dedicated driver.
-    public void RequestWake(bool useDedicatedDriver = false)
+    // Wake a parked caller and claim any pending body continuation. Cancellation may use a dedicated
+    // driver when the original synchronous caller will not return.
+    public void WakeBody(bool useDedicatedDriver = false)
     {
         if (useDedicatedDriver)
             Volatile.Write(ref _dedicatedWakeRequested, true);
         Volatile.Write(ref _wakeRequested, true);
         SignalProgress();
-        var stored = Interlocked.Exchange(ref _wakeContinuation, null);
+        var stored = Interlocked.Exchange(ref _pendingContinuation, null);
         if (stored is not null)
             Dispatch(stored, Volatile.Read(ref _dedicatedWakeRequested));
     }
@@ -190,27 +159,27 @@ struct FlowCallerInteractionCore<TResult>
     // Wake any WaitForContinuation that's parked without registering a continuation. Used by
     // the body's result-delivery and completion paths so a sync caller can wake even when the
     // body's progress came from an async-I/O continuation that ran on a TP thread without
-    // routing through SetContinuationAndUnblockWaiter.
+    // routing through YieldToCaller.
     public void SignalProgress()
     {
         // Atomic publication is load-bearing in both directions. Its full fence orders this level
-        // before the following _mres read: if that read misses a concurrently-installed event, the
+        // before the following _waitEvent read: if that read misses a concurrently-installed event, the
         // waiter's fenced install and consume must observe the level instead. Atomic consume in
         // WaitForContinuation also cannot erase a newer publication with a trailing false store.
         Interlocked.Exchange(ref _progressSignaled, 1);
-        _mres?.Set();
+        _waitEvent?.Set();
     }
 
     bool ConsumeProgress() => Interlocked.Exchange(ref _progressSignaled, 0) != 0;
 
-    public ContinuationCapturingAwaitable SetContinuationAndUnblockWaiter(FieldRef<FlowCallerInteractionCore<TResult>> fieldRef)
+    public CallerHandoffAwaitable YieldToCaller(FieldRef<FlowCallerInteractionCore<TResult>> fieldRef)
         => new(fieldRef);
 
     public void Reset()
     {
-        _mres?.Reset();
-        _continuation = null;
-        _wakeContinuation = null;
+        _waitEvent?.Reset();
+        _handoffContinuation = null;
+        _pendingContinuation = null;
         _progressSignaled = 0;
         _wakeRequested = false;
         _dedicatedWakeRequested = false;
@@ -218,7 +187,7 @@ struct FlowCallerInteractionCore<TResult>
         _gate.Reset();
     }
 
-    public readonly struct ContinuationCapturingAwaitable(FieldRef<FlowCallerInteractionCore<TResult>> fieldRef)
+    public readonly struct CallerHandoffAwaitable(FieldRef<FlowCallerInteractionCore<TResult>> fieldRef)
     {
         public Awaiter GetAwaiter() => new(fieldRef);
 
@@ -228,7 +197,7 @@ struct FlowCallerInteractionCore<TResult>
 
             public void GetResult()
             {
-                // Surface a pending cancellation set by CancelPendingWait. The gate source is
+                // Surface a pending cancellation set by FaultBodyWait. The gate source is
                 // only completed when cancellation fires. In the normal sync-flow handoff path
                 // it stays Pending and we just return.
                 var gate = fieldRef.Invoke()._gate;
@@ -239,20 +208,20 @@ struct FlowCallerInteractionCore<TResult>
             public void OnCompleted(Action continuation)
             {
                 ref var field = ref fieldRef.Invoke();
-                if (!ReferenceEquals(field._continuation, continuation))
-                    Volatile.Write(ref field._continuation, continuation);
-                // _wakeContinuation is the wake-eligibility slot. Interlocked.Exchange acts
-                // as a full memory barrier so the prior store to _continuation is ordered
+                if (!ReferenceEquals(field._handoffContinuation, continuation))
+                    Volatile.Write(ref field._handoffContinuation, continuation);
+                // _pendingContinuation is the wake-eligibility slot. Interlocked.Exchange acts
+                // as a full memory barrier so the prior store to _handoffContinuation is ordered
                 // before the _wakeRequested read below (StoreLoad).
-                Interlocked.Exchange(ref field._wakeContinuation, continuation);
-                field.GetMres().Set();
-                // Race-safe re-check: if RequestWake ran before our store, it saw
-                // _wakeContinuation = null and didn't queue. _wakeRequested stays set; self-
-                // wake here. Exchange-claim ensures exactly-once delivery if RequestWake races
+                Interlocked.Exchange(ref field._pendingContinuation, continuation);
+                field.GetWaitEvent().Set();
+                // Race-safe re-check: if WakeBody ran before our store, it saw
+                // _pendingContinuation = null and didn't queue. _wakeRequested stays set; self-
+                // wake here. Exchange-claim ensures exactly-once delivery if WakeBody races
                 // (one observes non-null, the other gets null).
                 if (Volatile.Read(ref field._wakeRequested))
                 {
-                    var stored = Interlocked.Exchange(ref field._wakeContinuation, null);
+                    var stored = Interlocked.Exchange(ref field._pendingContinuation, null);
                     if (stored is not null)
                         Dispatch(stored, Volatile.Read(ref field._dedicatedWakeRequested));
                 }

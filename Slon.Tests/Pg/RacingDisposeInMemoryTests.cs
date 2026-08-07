@@ -17,7 +17,7 @@ namespace Slon.Tests.Pg;
 // race the teardown. Two teardown signals are UNSYNCHRONIZED:
 //   read-fault  - AbortToken faults the in-flight decoder read (PgDecoder.TranslateReadCancellation),
 //                 the body throws PgClientClosedException out of its read.
-//   gate-fault  - the heartbeat's OnAbort/OnStopping calls CancelPendingWait, faulting the gate the
+//   gate-fault  - the heartbeat's OnAbort/OnStopping calls FaultBodyWait, faulting the gate the
 //                 body parks on between results and setting the sticky CancelException.
 //
 // The existing in-memory harness (StoppingTokenInMemoryTests) already gives us:
@@ -190,7 +190,7 @@ public class RacingDisposeInMemoryTests
         public required CommandFlow.Enumerator Enumerator { get; set; }
         public required IReadOnlyList<byte[]> Messages { get; init; }
 
-        // Fire the heartbeat tick (drives OnAbort/OnStopping -> CancelPendingWait -> gate-fault).
+        // Fire the heartbeat tick (drives OnAbort/OnStopping -> FaultBodyWait -> gate-fault).
         public void Heartbeat() => Clock.Advance(TimeSpan.FromSeconds(1));
 
         // Release one captured wire message to the reader.
@@ -581,7 +581,7 @@ public class RacingDisposeInMemoryTests
     }
 
     // Ordering 3 (gate-fault) - the predicted lost-completion HANG is NOT reachable: the heartbeat-
-    // faulted gate makes HandleException no-op on the consumed V0 generation, but the same gate-fault
+    // faulted gate makes CompleteEnumerationWithException no-op on the consumed V0 generation, but the same gate-fault
     // published CancelException, so the consumer's next MoveNextAsync self-delivers the close and the
     // loop converges. Asserts convergence (a hang here would regress that protection).
     [TestMethod]
@@ -606,7 +606,7 @@ public class RacingDisposeInMemoryTests
     }
 
     // Ordering 3 (read-fault) - the no-op never happens: with the body on its drain read, a forceful
-    // abort lands HandleException on the LIVE (Reset) generation, because every body read in this flow
+    // abort lands CompleteEnumerationWithException on the LIVE (Reset) generation, because every body read in this flow
     // is preceded by a consumer Reset. Documents why the read-fault alone cannot produce the hang.
     [TestMethod]
     public async Task Ordering3_ReadFaultPath_NeverNoOps_Converges()
@@ -661,7 +661,7 @@ public class RacingDisposeInMemoryTests
     // NextMoveNextSurfacesClosedException). Result 1 delivered, body parked on the inter-result gate; a
     // forceful teardown fires AbortToken and one heartbeat tick faults that gate BEFORE the consumer's
     // next MoveNextAsync (the live test's Task.Delay(50) window, made deterministic via the
-    // FakeTimeProvider). The body's HandleException then no-ops on the already-consumed result-1
+    // FakeTimeProvider). The body's CompleteEnumerationWithException then no-ops on the already-consumed result-1
     // generation; the next MoveNextAsync must self-deliver the close (or complete) and NEVER re-yield
     // the stale result 1. Ordering3_GateFaultNoOp asserts the read loop converges; a stale re-yield does
     // not hang, so this pins the specific next-call outcome the loop cannot catch.

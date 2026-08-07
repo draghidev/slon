@@ -208,7 +208,8 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
             // caller is about to bail, that park must be un-parked here or it strands (DrainSignal never
             // fires). Un-parking the executor is ALL Complete does for sync callers now: each parked caller
             // wakes when ITS OWN flow is drained inert (DrainInert -> ExecutionControl.Release -> OnStopping
-            // -> HandleException -> SignalProgress sets the flow's MRES), then re-reads IsCompleted and bails.
+            // -> CompleteEnumerationWithException -> SignalProgress sets the flow's wait event), then
+            // re-reads IsCompleted and bails.
             // No direct wait-list head wake - there is no wait-list.
             WakeDriver.Drive(runContinuationsAsynchronously: true);
         }
