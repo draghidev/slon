@@ -177,10 +177,18 @@ public sealed partial class SlonDataReader
 
             try
             {
+                var rowEnumerator = _rowEnumerator;
                 var enumerator = _enumerator;
                 _enumerator = default;
                 _rowEnumerator = default;
-                enumerator.Dispose();
+                try
+                {
+                    rowEnumerator.RevokeColumnLease();
+                }
+                finally
+                {
+                    enumerator.Dispose();
+                }
             }
             finally
             {
@@ -196,10 +204,18 @@ public sealed partial class SlonDataReader
 
             try
             {
+                var rowEnumerator = _rowEnumerator;
                 var enumerator = _enumerator;
                 _enumerator = default;
                 _rowEnumerator = default;
-                await enumerator.DisposeAsync().ConfigureAwait(false);
+                try
+                {
+                    await rowEnumerator.RevokeColumnLeaseAsync().ConfigureAwait(false);
+                }
+                finally
+                {
+                    await enumerator.DisposeAsync().ConfigureAwait(false);
+                }
             }
             finally
             {
@@ -761,7 +777,20 @@ public sealed partial class SlonDataReader : DbDataReader, IDbColumnSchemaGenera
     /// <inheritdoc/>
     public override long GetChars(int ordinal, long dataOffset, char[]? buffer, int bufferOffset, int length)
     {
-        throw new NotImplementedException();
+        if (dataOffset is < 0 or > int.MaxValue)
+            throw new ArgumentOutOfRangeException(nameof(dataOffset));
+        if (buffer is not null)
+        {
+            ArgumentOutOfRangeException.ThrowIfNegative(bufferOffset);
+            ArgumentOutOfRangeException.ThrowIfGreaterThan(bufferOffset, buffer.Length);
+            ArgumentOutOfRangeException.ThrowIfNegative(length);
+            ArgumentOutOfRangeException.ThrowIfGreaterThan(length, buffer.Length - bufferOffset);
+        }
+
+        var lease = (_core.Current ?? throw new InvalidOperationException("Reader is not on a result."))
+            .ReadChars(GetRowOrThrow(), ordinal, _core.IsSequential);
+        return lease.Read(buffer is null ? 0 : checked((int)dataOffset),
+            buffer is null ? default : buffer.AsSpan(bufferOffset, length), buffer is null);
     }
 
     /// <inheritdoc/>

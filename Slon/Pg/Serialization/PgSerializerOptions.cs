@@ -36,6 +36,8 @@ sealed class PgSerializerOptions
             ? _typeCatalog.GetDataTypeName(typeId)
             : _typeCatalog.GetOid(typeId);
 
+    internal DataTypeName GetDataTypeName(PgTypeId typeId) => _typeCatalog.GetDataTypeName(typeId);
+
     public PgTypeInfo GetTypeInfo(Type? type, PgTypeId? pgTypeId = null)
     {
         if (type?.IsEnum is true)

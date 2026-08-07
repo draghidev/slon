@@ -92,6 +92,14 @@ abstract class CommandResult : IDisposable, IAsyncDisposable, IEnumerable<Row>, 
 
     internal PgConversionContext ConversionContext => _conversionContext;
 
+    internal CharsColumnLease ReadChars(Row row, int ordinal, bool sequential)
+    {
+        var reader = new GetCharsFieldReader(
+            _serializerOptions ?? throw new InvalidOperationException("No serializer was attached to this result."),
+            _conversionContext, sequential);
+        return row.GetValue<CharsColumnLease, GetCharsFieldReader>(ordinal, ref reader);
+    }
+
     /// Returns all metadata known about the command after execution has taken place.
     public CommandMetadata GetMetadata()
     {
@@ -407,6 +415,13 @@ abstract class CommandResult : IDisposable, IAsyncDisposable, IEnumerable<Row>, 
         }
 
         public Row Current => _row!;
+
+        internal void RevokeColumnLease() => _row?.RevokeColumnLease();
+
+        internal ValueTask RevokeColumnLeaseAsync()
+            => _row is { HasColumnLease: true } row
+                ? row.RevokeColumnLeaseAsync()
+                : default;
 
         // We enumerate all so we always get to store the error or command complete message.
         public void Dispose()

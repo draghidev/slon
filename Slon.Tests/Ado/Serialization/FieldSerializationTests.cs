@@ -1,6 +1,6 @@
 using System.Data;
 
-namespace Slon.Tests.Pg;
+namespace Slon.Tests.Ado.Serialization;
 
 [TestClass]
 public class FieldSerializationTests
@@ -102,4 +102,80 @@ public class FieldSerializationTests
         Assert.ThrowsExactly<InvalidOperationException>(() =>
             reader.GetBytes(0, 5, buffer, 0, buffer.Length));
     }
+
+    [TestMethod]
+    public async Task GetChars_ReusesBufferedLeaseAndSupportsRandomCharacterOffsets()
+    {
+        await using var command = AdoTestPool.CreateCommand("select 'aé日z'::text");
+        await using var reader = await command.ExecuteReaderAsync();
+
+        Assert.IsTrue(await reader.ReadAsync());
+        Assert.AreEqual(4, reader.GetChars(0, 0, null, 0, 0));
+        var buffer = new char[2];
+        Assert.AreEqual(2, reader.GetChars(0, 1, buffer, 0, buffer.Length));
+        CollectionAssert.AreEqual(new[] { 'é', '日' }, buffer);
+        Assert.AreEqual(2, reader.GetChars(0, 0, buffer, 0, buffer.Length));
+        CollectionAssert.AreEqual(new[] { 'a', 'é' }, buffer);
+    }
+
+    [TestMethod]
+    public async Task GetChars_SequentialLeaseStreamsAndRejectsCharacterRewind()
+    {
+        await using var command = AdoTestPool.CreateCommand("select 'aé日z'::text, 42::int4");
+        await using var reader = await command.ExecuteReaderAsync(CommandBehavior.SequentialAccess);
+
+        Assert.IsTrue(await reader.ReadAsync());
+        var buffer = new char[2];
+        Assert.AreEqual(2, reader.GetChars(0, 1, buffer, 0, buffer.Length));
+        CollectionAssert.AreEqual(new[] { 'é', '日' }, buffer);
+        Assert.ThrowsExactly<InvalidOperationException>(() =>
+            reader.GetChars(0, 1, buffer, 0, buffer.Length));
+
+        Assert.AreEqual(42, reader.GetInt32(1));
+        Assert.ThrowsExactly<InvalidOperationException>(() =>
+            reader.GetChars(0, 3, buffer, 0, buffer.Length));
+    }
+
+    [TestMethod]
+    public async Task GetChars_ComposesOverJsonbVersionPrefix()
+    {
+        await using var command = AdoTestPool.CreateCommand("select '\"hello\"'::jsonb");
+        await using var reader = await command.ExecuteReaderAsync(CommandBehavior.SequentialAccess);
+
+        Assert.IsTrue(await reader.ReadAsync());
+        var buffer = new char[5];
+        Assert.AreEqual(5, reader.GetChars(0, 1, buffer, 0, buffer.Length));
+        CollectionAssert.AreEqual("hello".ToCharArray(), buffer);
+    }
+
+    [TestMethod]
+    public async Task GetChars_RejectsTypesWithoutCharacterProjection()
+    {
+        await using var command = AdoTestPool.CreateCommand("select 42::int4");
+        await using var reader = await command.ExecuteReaderAsync();
+
+        Assert.IsTrue(await reader.ReadAsync());
+        var buffer = new char[2];
+        Assert.ThrowsExactly<InvalidCastException>(() =>
+            reader.GetChars(0, 0, buffer, 0, buffer.Length));
+    }
+
+    [TestMethod]
+    public async Task ReaderDisposal_RevokesActiveCharacterLeaseBeforeResultReuse()
+    {
+        await using var connection = await AdoTestPool.OpenConnectionAsync();
+        await using (var command = connection.CreateCommand("select 'hello'::text"))
+        await using (var reader = await command.ExecuteReaderAsync(CommandBehavior.SequentialAccess))
+        {
+            Assert.IsTrue(await reader.ReadAsync());
+            var buffer = new char[1];
+            Assert.AreEqual(1, reader.GetChars(0, 0, buffer, 0, 1));
+        }
+
+        await using var nextCommand = connection.CreateCommand("select 42::int4");
+        await using var nextReader = await nextCommand.ExecuteReaderAsync();
+        Assert.IsTrue(await nextReader.ReadAsync());
+        Assert.AreEqual(42, nextReader.GetInt32(0));
+    }
+
 }
