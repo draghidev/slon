@@ -6,6 +6,7 @@ using System.Text;
 using Slon.Buffers;
 using Slon.Text;
 using Slon.Transport;
+using Slon.Pg.Serialization;
 using static Slon.Pg.Protocol.PgTypes;
 
 namespace Slon.Pg.Protocol;
@@ -224,6 +225,7 @@ readonly struct PgEncoder
         }
 
         var encoding = ClientEncoding;
+        var pgWriter = new PgWriter(_writer, new PgConversionContext { TextEncoding = encoding });
         var portalNameBytes = portalName.AsNullTerminatedSpan(encoding);
         var commandNameBytes = commandName.AsNullTerminatedSpan(encoding);
 
@@ -272,14 +274,9 @@ readonly struct PgEncoder
                 else
                 {
                     _writer.WriteInt(p.GetSize());
-                    if (p.ResolvedValueType == typeof(int))
-                    {
-                        _writer.WriteInt((int)p.Value);
-                    }
-                    else
-                    {
-                        ThrowHelper.ThrowNotSupported("Only int parameters are supported for now.");
-                    }
+                    pgWriter.Init(new PgConversionContext { TextEncoding = encoding });
+                    p.Write(pgWriter);
+                    pgWriter.EndWrite(p.GetSize());
                 }
             }
         }

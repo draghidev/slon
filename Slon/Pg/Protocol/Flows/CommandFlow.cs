@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Threading.Tasks.Sources;
 using Slon.Runtime.CompilerServices;
+using Slon.Pg.Serialization;
 // A unique result type distinguishes the caller gate from this flow's other IValueTaskSource faces.
 using FlowCallerInteractionCoreResult = System.ValueTuple;
 
@@ -18,6 +19,9 @@ readonly struct CommandFlowOptions
 {
     public ICommandFlowObserver? Observer { get; init; }
     public CommandList Commands { get; init; }
+    // Captured while the ADO command is bound. Catalog reload publishes a new options instance,
+    // while this flow continues against the immutable revision it resolved with.
+    public PgSerializerOptions? SerializerOptions { get; init; }
 }
 
 sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSource<FlowCallerInteractionCoreResult>, IValueTaskSource
@@ -864,13 +868,22 @@ sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
     {
         Volatile.Read(ref _cancelDelivery)?.TrySetResult();
         _options.Observer?.OnFlowEnded(this);
+        ReleaseParameterState();
         _options.Commands.Return();
     }
 
     protected override void OnDiscarded()
     {
         _options.Observer?.OnFlowEnded(this);
+        ReleaseParameterState();
         _options.Commands.Return();
+    }
+
+    void ReleaseParameterState()
+    {
+        foreach (ref readonly var command in _options.Commands)
+            foreach (ref readonly var parameter in command.Parameters.AsSpan())
+                parameter.Release();
     }
 
     protected override void OnReset()

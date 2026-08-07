@@ -1,10 +1,15 @@
 using Slon.Pg.Types;
+using Slon.Pg.Serialization;
 
 namespace Slon.Pg;
 
 readonly struct Parameter
 {
-    public int GetSize() => GetSize(ResolvedValueType);
+    PgValueBinding Binding { get; init; }
+
+    public int GetSize() => Binding.Converter is not null
+        ? Binding.Size?.Value ?? -1
+        : GetLegacySize(ResolvedValueType);
     public PgTypeId PgTypeId { get; private init; }
     public object? Value { get; private init; }
 
@@ -21,8 +26,55 @@ readonly struct Parameter
         }
     };
 
+    internal static Parameter Create(object? value, PgSerializerOptions options,
+        PgConversionContext conversionContext, PgTypeId? pgTypeId = null)
+    {
+        if (value is IParameter parameter)
+        {
+            var binder = new ParameterBinder(options, conversionContext, pgTypeId, parameter);
+            parameter.ApplyReader(ref binder);
+            return binder.Result;
+        }
+
+        var typeInfo = options.GetTypeInfo(ResolveValueType(value), pgTypeId);
+        return new Parameter
+        {
+            Value = value,
+            PgTypeId = typeInfo.PgTypeId,
+            Binding = typeInfo.BindParameterValue(conversionContext, value)
+        };
+    }
+
+    internal void Write(PgWriter writer)
+    {
+        if (Binding.Converter is null)
+        {
+            if (ResolvedValueType == typeof(int))
+            {
+                writer.WriteInt32((int)Value!);
+                return;
+            }
+            throw new NotSupportedException("Only int parameters are supported without serializer options.");
+        }
+
+        if (Binding.IsDbNullBinding)
+            return;
+
+        if (Value is IParameter parameter)
+        {
+            var valueWriter = new ParameterWriter(Binding.Converter, writer);
+            parameter.ApplyReader(ref valueWriter);
+        }
+        else
+        {
+            Binding.Converter.Write(writer, Value);
+        }
+    }
+
+    internal void Release() => (Binding.WriteState as IDisposable)?.Dispose();
+
     // Fixed length only for now.
-    static int GetSize(Type? type) => type switch
+    static int GetLegacySize(Type? type) => type switch
     {
         null => -1,
         _ when type == typeof(int) => sizeof(int),
@@ -33,4 +85,26 @@ readonly struct Parameter
     static Type? ResolveValueType(object? value) => value is IParameter p
         ? p.StaticValueType is var type && type == typeof(object) ? p.Value?.GetType() : type
         : value?.GetType();
+
+    ref struct ParameterBinder(PgSerializerOptions options, PgConversionContext conversionContext,
+        PgTypeId? pgTypeId, IParameter parameter) : IParameterValueReader
+    {
+        public Parameter Result { get; private set; }
+
+        public void Read<T>(T? value)
+        {
+            var typeInfo = options.GetTypeInfo(typeof(T), pgTypeId);
+            Result = new Parameter
+            {
+                Value = parameter,
+                PgTypeId = typeInfo.PgTypeId,
+                Binding = typeInfo.BindParameterValue(conversionContext, value)
+            };
+        }
+    }
+
+    ref struct ParameterWriter(PgConverter converter, PgWriter writer) : IParameterValueReader
+    {
+        public void Read<T>(T? value) => converter.Write(writer, value);
+    }
 }

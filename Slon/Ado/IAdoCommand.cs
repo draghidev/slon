@@ -4,6 +4,7 @@ using System.Data.Common;
 using System.Diagnostics;
 using Slon.Pg;
 using Slon.Text;
+using Slon.Pg.Serialization;
 
 namespace Slon;
 
@@ -21,7 +22,10 @@ interface IAdoCommand
 
 static class AdoCommandExtensions
 {
-    public static (Command, TrackerResult) CreateCommand<TCommand>(this TCommand command, bool enableErrorBarriers, CommandBehavior behavior, in TrackerContext trackerContext, DbParameterCollection? dbParameters, TimeSpan timeout)
+    public static (Command, TrackerResult) CreateCommand<TCommand>(this TCommand command, bool enableErrorBarriers,
+        CommandBehavior behavior, in TrackerContext trackerContext, DbParameterCollection? dbParameters,
+        TimeSpan timeout, PgSerializerOptions? serializerOptions = null,
+        PgConversionContext? conversionContext = null)
         where TCommand : IAdoCommand
     {
         dbParameters ??= command.Parameters;
@@ -37,7 +41,9 @@ static class AdoCommandExtensions
                     if (kv.Key != SlonParameters.PositionalName)
                         throw new NotSupportedException("Named parameters are not yet supported, these require client-side SQL parsing for PostgreSQL.");
 
-                    builder.Add(Parameter.Create(kv.Value));
+                    builder.Add(serializerOptions is null
+                        ? Parameter.Create(kv.Value)
+                        : Parameter.Create(kv.Value, serializerOptions, conversionContext ?? PgConversionContext.Empty));
                 }
             }
             else
@@ -47,7 +53,9 @@ static class AdoCommandExtensions
                     if (kv.Key != SlonParameters.PositionalName)
                         throw new NotSupportedException("Named parameters are not yet supported, these require client-side SQL parsing for PostgreSQL.");
 
-                    builder.Add(Parameter.Create(kv.Value));
+                    builder.Add(serializerOptions is null
+                        ? Parameter.Create(kv.Value)
+                        : Parameter.Create(kv.Value, serializerOptions, conversionContext ?? PgConversionContext.Empty));
                 }
             }
 

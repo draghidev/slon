@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Net.Sockets;
 using System.Text;
 using Slon.Buffers;
@@ -12,7 +13,7 @@ namespace Slon.Pg.Protocol;
 // tracking and writes) lives in the pipe; the shell delegates. Each exclusive scope gets its own
 // shell with the scope token over the shared pipe; the single-pump invariant keeps only one
 // shell active at a time.
-sealed class ProtocolDataWriter
+sealed class ProtocolDataWriter : IOutputWriter
 {
     readonly ProtocolWritePipe _pipe;
     readonly CancellationToken _abortToken;
@@ -62,6 +63,10 @@ sealed class ProtocolDataWriter
     }
 
     public long UnflushedBytes => _pipe.UnflushedBytes;
+
+    public Memory<byte> GetMemory(int sizeHint = 0) => _pipe.GetMemory(sizeHint);
+    public Span<byte> GetSpan(int sizeHint = 0) => _pipe.GetSpan(sizeHint);
+    public void Advance(int count) => _pipe.Advance(count);
 
     internal const long UnflushedBytesFlushThreshold = ProtocolWritePipe.UnflushedBytesFlushThreshold;
 

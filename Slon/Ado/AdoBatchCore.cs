@@ -7,6 +7,7 @@ using System.Runtime.CompilerServices;
 using Slon.Pg;
 using Slon.Pg.Protocol;
 using Slon.Pg.Protocol.Flows;
+using Slon.Pg.Serialization;
 using Slon.Runtime.CompilerServices;
 
 namespace Slon;
@@ -33,13 +34,16 @@ readonly struct MultiplexedEnqueueArgs<TCommand> where TCommand : IAdoCommand
     public readonly DbParameterCollection? Parameters;
     public readonly CommandBehavior Behavior;
     public readonly CommandTracker Tracker;
+    public readonly PgSerializerOptions SerializerOptions;
 
-    public MultiplexedEnqueueArgs(FieldRef<AdoBatchCore<TCommand>> fieldRef, DbParameterCollection? parameters, CommandBehavior behavior, CommandTracker tracker)
+    public MultiplexedEnqueueArgs(FieldRef<AdoBatchCore<TCommand>> fieldRef, DbParameterCollection? parameters,
+        CommandBehavior behavior, CommandTracker tracker, PgSerializerOptions serializerOptions)
     {
         FieldRef = fieldRef;
         Parameters = parameters;
         Behavior = behavior;
         Tracker = tracker;
+        SerializerOptions = serializerOptions;
     }
 }
 
@@ -207,7 +211,9 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
         return false;
     }
 
-    CommandFlowOptions CreateCommandFlowOptions(ReadOnlySpan<DbParameterCollection?> parametersSpan, CommandBehavior behavior, SlonConnection? connection = null, CommandTracker? tracker = null, PgConnection? pgConnection = null)
+    CommandFlowOptions CreateCommandFlowOptions(ReadOnlySpan<DbParameterCollection?> parametersSpan,
+        CommandBehavior behavior, SlonConnection? connection = null, CommandTracker? tracker = null,
+        PgConnection? pgConnection = null, PgSerializerOptions? serializerOptions = null)
     {
         if (_commands.Count is 0)
             ThrowHelper.ThrowInvalidOperation("No commands were added to the batch.");
@@ -250,7 +256,12 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
                 }
 
                 var parameters = indexParameters ? parametersSpan[i] : !parametersSpan.IsEmpty ? parametersSpan[0] : null;
-                result = adoCommand.CreateCommand(_enableErrorBarriers, behavior, trackerContext, parameters, Timeout);
+                var conversionContext = pgConnection is null ? null : new PgConversionContext
+                {
+                    TextEncoding = pgConnection.Protocol.FlowControl.ClientEncoding
+                };
+                result = adoCommand.CreateCommand(_enableErrorBarriers, behavior, trackerContext, parameters,
+                    Timeout, serializerOptions, conversionContext);
                 // Refresh the cache when the tracker resolved to a different TC than the one we
                 // passed in (catches workload-tracker recreation via DbDepsRevision++ and similar).
                 if (result.TrackerResult.Tracked is not null && !ReferenceEquals(adoCommand.Tracked, result.TrackerResult.Tracked))
@@ -385,7 +396,8 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
             return new()
             {
                 Observer = (ICommandFlowObserver)_fieldRef.Instance,
-                Commands = commandArray is null ? new(result.Command) : new(commandArray, commandCount, isPooled: true)
+                Commands = commandArray is null ? new(result.Command) : new(commandArray, commandCount, isPooled: true),
+                SerializerOptions = serializerOptions ?? connection?.DbDataSource.GetDbDependencies().SerializerOptions
             };
         }
         catch
@@ -423,11 +435,13 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
         if (TryGetDataSource(out var dataSource, out var connection))
         {
             ThrowIfHasCloseConnection(behavior);
-            var tracker = dataSource.GetCommandTracker();
+            var dependencies = dataSource.GetDbDependencies();
             return dataSource.EnqueueCommands(
                 static (pgConnection, args) => args.FieldRef.Invoke().CreateCommandFlowOptions(
-                    [args.Parameters], args.Behavior, tracker: args.Tracker, pgConnection: pgConnection),
-                new MultiplexedEnqueueArgs<TCommand>(_fieldRef, parameters, behavior, tracker));
+                    [args.Parameters], args.Behavior, tracker: args.Tracker, pgConnection: pgConnection,
+                    serializerOptions: args.SerializerOptions),
+                new MultiplexedEnqueueArgs<TCommand>(_fieldRef, parameters, behavior,
+                    dependencies.CommandsTracker, dependencies.SerializerOptions));
         }
 
         return connection.Enqueue(
@@ -463,11 +477,13 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
         static async ValueTask<CommandFlow> DataSourceCore(FieldRef<AdoBatchCore<TCommand>> fieldRef, SlonDataSource dataSource, DbParameterCollection? parameters, CommandBehavior behavior, CancellationToken cancellationToken)
         {
             fieldRef.Invoke().ThrowIfHasCloseConnection(behavior);
-            var tracker = await dataSource.GetCommandTrackerAsync(cancellationToken).ConfigureAwait(false);
+            var dependencies = await dataSource.GetDbDependenciesAsync(cancellationToken).ConfigureAwait(false);
             return await dataSource.EnqueueCommandsAsync(
                 static (pgConnection, args) => args.FieldRef.Invoke().CreateCommandFlowOptions(
-                    [args.Parameters], args.Behavior, tracker: args.Tracker, pgConnection: pgConnection),
-                new MultiplexedEnqueueArgs<TCommand>(fieldRef, parameters, behavior, tracker),
+                    [args.Parameters], args.Behavior, tracker: args.Tracker, pgConnection: pgConnection,
+                    serializerOptions: args.SerializerOptions),
+                new MultiplexedEnqueueArgs<TCommand>(fieldRef, parameters, behavior,
+                    dependencies.CommandsTracker, dependencies.SerializerOptions),
                 cancellationToken).ConfigureAwait(false);
         }
     }

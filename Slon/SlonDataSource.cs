@@ -7,6 +7,7 @@ using Slon.Pg;
 using Slon.Pg.Protocol;
 using Slon.Pg.Protocol.Flows;
 using Slon.Pg.Types;
+using Slon.Pg.Serialization;
 using Slon.Pools;
 using Slon.Transport;
 
@@ -832,6 +833,7 @@ public sealed class SlonDataSource : DbDataSource
         {
             BackendInfo = backendInfo;
             TypeCatalog = typeCatalog;
+            SerializerOptions = new(typeCatalog);
             CommandsTracker = commandTracker;
             Revision = revision;
         }
@@ -839,6 +841,7 @@ public sealed class SlonDataSource : DbDataSource
         public PgBackendInfo BackendInfo { get; }
         public PgBackendCapabilities BackendCapabilities => BackendInfo.Capabilities;
         public PgTypeCatalog TypeCatalog { get; }
+        public PgSerializerOptions SerializerOptions { get; }
         public CommandTracker CommandsTracker { get; }
         public int Revision { get; }
 

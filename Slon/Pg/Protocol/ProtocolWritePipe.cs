@@ -64,6 +64,10 @@ sealed class ProtocolWritePipe(IOutputWriter writer, Encoding clientEncoding, Ac
     // (PgEncoder.CanDeferFlush) and the source's arm gate (PgClientFlowSource) both key off it.
     internal const long UnflushedBytesFlushThreshold = 1000;
 
+    internal Memory<byte> GetMemory(int sizeHint = 0) => _bufferingWriter.GetMemory(sizeHint);
+    internal Span<byte> GetSpan(int sizeHint = 0) => _bufferingWriter.GetSpan(sizeHint);
+    internal void Advance(int count) => _bufferingWriter.Advance(count);
+
     // Validates the previous message, arms length tracking for the new one, then writes its
     // five-byte header directly into the buffered span. Keeping these together avoids a second
     // shell traversal and a temporary header copy. Mid-message flushes are handled by
