@@ -3,6 +3,12 @@ using Slon.Pg.Serialization;
 
 namespace Slon.Pg;
 
+interface IColumnViewLease
+{
+    int Revoke();
+    ValueTask<int> RevokeAsync();
+}
+
 // A tenure-bound field handle. Strategies choose buffered access today; incremental cursor access
 // can be added here without exposing the protocol reader or changing Row's generic dispatch seam.
 readonly struct PgField(Row row, int ordinal)
@@ -25,4 +31,6 @@ readonly struct PgField(Row row, int ordinal)
 
     public ValueTask CompleteReaderAsync(PgReader reader)
         => row.CompleteFieldReaderAsync(ordinal, reader);
+
+    public void Lease(IColumnViewLease lease) => row.LeaseColumn(ordinal, lease);
 }

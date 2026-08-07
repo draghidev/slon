@@ -271,6 +271,8 @@ abstract class CommandResult : IDisposable, IAsyncDisposable, IEnumerable<Row>, 
             if (instance is null)
                 return false;
 
+            _row?.RevokeColumnLease();
+
             if (!instance.MoveNextMessage())
             {
                 if (instance._requestedExecution && instance._commandCompleteMessage is null && instance._errorMessage is null)
@@ -307,6 +309,9 @@ abstract class CommandResult : IDisposable, IAsyncDisposable, IEnumerable<Row>, 
             if (instance is null)
                 return new(false);
 
+            if (_row is { HasColumnLease: true } leasedRow)
+                return MoveNextAfterRevokeAsync(leasedRow);
+
             var task = instance.MoveNextMessageAsync();
             if (!task.IsCompletedSuccessfully)
                 return MoveNextAsyncCore(task);
@@ -338,6 +343,13 @@ abstract class CommandResult : IDisposable, IAsyncDisposable, IEnumerable<Row>, 
             }
 
             return new(HandleUncommon(current));
+        }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        async ValueTask<bool> MoveNextAfterRevokeAsync(Row row)
+        {
+            await row.RevokeColumnLeaseAsync().ConfigureAwait(false);
+            return await MoveNextAsync().ConfigureAwait(false);
         }
 
         [MethodImpl(MethodImplOptions.NoInlining)]

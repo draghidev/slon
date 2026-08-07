@@ -15,6 +15,8 @@ sealed class Row
     BackendMessage.Accessor _messageAccessor;
     RowDescription _rowDescription = null!;
     BackendMessageBodyReader? _bodyReader;
+    IColumnViewLease? _columnLease;
+    int _leasedOrdinal;
 
     int _column = -1;
     int _columnOffset;
@@ -49,6 +51,7 @@ sealed class Row
 
     T GetValueCore<T>(int ordinal, Encoding? textEncoding)
     {
+        RevokeColumnLease();
         EnsureBuffered();
         if (TryGetFieldSpan(ordinal, out var field))
             return RawFieldDecoder.Read<T>(field, textEncoding);
@@ -91,6 +94,7 @@ sealed class Row
 
     internal PgReader OpenFieldReader(int ordinal, PgConversionContext conversionContext)
     {
+        RevokeColumnLease();
         if (_bodyReader is null)
             return new(GetFieldSequence(ordinal), conversionContext);
         if (ordinal < _column)
@@ -105,6 +109,8 @@ sealed class Row
     internal ValueTask<PgReader> OpenFieldReaderAsync(int ordinal,
         PgConversionContext conversionContext, CancellationToken cancellationToken = default)
     {
+        if (_columnLease is not null)
+            return RevokeAndOpenFieldReaderAsync(ordinal, conversionContext, cancellationToken);
         if (_bodyReader is null)
             return new(new PgReader(GetFieldSequence(ordinal), conversionContext));
         if (ordinal < _column)
@@ -119,6 +125,14 @@ sealed class Row
                 await SkipLiveFieldAsync(token).ConfigureAwait(false);
             return await OpenCurrentLiveFieldAsync(context, token).ConfigureAwait(false);
         }
+    }
+
+    async ValueTask<PgReader> RevokeAndOpenFieldReaderAsync(int ordinal,
+        PgConversionContext conversionContext, CancellationToken cancellationToken)
+    {
+        await RevokeColumnLeaseAsync().ConfigureAwait(false);
+        return await OpenFieldReaderAsync(ordinal, conversionContext, cancellationToken)
+            .ConfigureAwait(false);
     }
 
     internal void CompleteFieldReader(int ordinal, PgReader reader)
@@ -136,6 +150,40 @@ sealed class Row
             _columnOffset = offset;
         _column = ordinal + 1;
     }
+
+    internal void LeaseColumn(int ordinal, IColumnViewLease lease)
+    {
+        if (_columnLease is not null)
+            throw new InvalidOperationException("A column lease is already active.");
+        _leasedOrdinal = ordinal;
+        _columnLease = lease;
+    }
+
+    internal void RevokeColumnLease()
+    {
+        if (_columnLease is not { } lease)
+            return;
+        _columnLease = null;
+        var ordinal = _leasedOrdinal;
+        var offset = lease.Revoke();
+        if (offset >= 0)
+            _columnOffset = offset;
+        _column = ordinal + 1;
+    }
+
+    internal async ValueTask RevokeColumnLeaseAsync()
+    {
+        if (_columnLease is not { } lease)
+            return;
+        _columnLease = null;
+        var ordinal = _leasedOrdinal;
+        var offset = await lease.RevokeAsync().ConfigureAwait(false);
+        if (offset >= 0)
+            _columnOffset = offset;
+        _column = ordinal + 1;
+    }
+
+    internal bool HasColumnLease => _columnLease is not null;
 
     PgReader OpenCurrentLiveField(PgConversionContext conversionContext)
     {
@@ -342,6 +390,7 @@ sealed class Row
 
     public Reader GetReader()
     {
+        RevokeColumnLease();
         EnsureBuffered();
         return new(this);
     }
@@ -393,6 +442,8 @@ sealed class Row
 
     internal void InitializeRow(in BackendMessage row)
     {
+        if (_columnLease is not null)
+            throw new InvalidOperationException("The previous column lease must be revoked before advancing the row.");
         _bodyReader = row.Buffered ? null : row.OpenBodyReader();
         _column = 0;
         _columnOffset = sizeof(short);

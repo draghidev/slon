@@ -5,6 +5,7 @@ namespace Slon.Pg.Serialization.Converters;
 static class TextConverter
 {
     public static PgConverter<string> CreateStringConverter() => new StringTextConverter();
+    public static PgConverter<TextReader> CreateTextReaderConverter() => new TextReaderConverter();
 
     sealed class StringTextConverter : PgStreamingConverter<string>
     {
@@ -41,5 +42,30 @@ static class TextConverter
             CancellationToken cancellationToken = default)
             => writer.WriteCharsAsync(value.AsMemory(), writer.ConversionContext.TextEncoding,
                 cancellationToken);
+    }
+
+    sealed class TextReaderConverter : PgStreamingConverter<TextReader>
+    {
+        public override ConverterDescriptor GetDescriptor(in DescriptorContext context)
+            => ConverterDescriptor.Invariant with { BufferRequirements = BufferRequirements.Streaming };
+
+        public override TextReader Read(PgReader reader)
+            => reader.GetTextReader(reader.ConversionContext.TextEncoding);
+
+        public override ValueTask<TextReader> ReadAsync(PgReader reader,
+            CancellationToken cancellationToken = default)
+            => reader.GetTextReaderAsync(reader.ConversionContext.TextEncoding, cancellationToken);
+
+        protected override Size BindValue(in BindContext context, TextReader value,
+            ref object? writeState)
+            => throw new NotSupportedException("TextReader parameter writing is not implemented yet.");
+
+        public override void Write(PgWriter writer, TextReader value)
+            => throw new NotSupportedException("TextReader parameter writing is not implemented yet.");
+
+        public override ValueTask WriteAsync(PgWriter writer, TextReader value,
+            CancellationToken cancellationToken = default)
+            => ValueTask.FromException(
+                new NotSupportedException("TextReader parameter writing is not implemented yet."));
     }
 }
