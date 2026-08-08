@@ -1,6 +1,7 @@
 using System.Buffers.Binary;
 using System.IO.Pipelines;
 using Draghi.Pipelining;
+using Microsoft.Extensions.Time.Testing;
 using Slon.Pg;
 using Slon.Pg.Protocol;
 using Slon.Pg.Protocol.Flows;
@@ -45,6 +46,9 @@ public class FlushBatchingTests
         {
             CompletionTimeout = TimeSpan.FromSeconds(30),
             HeartbeatInterval = TimeSpan.FromSeconds(5),
+            // No test advances this clock. Forceful disposal must propagate directly to an acquired
+            // exclusive flow rather than waiting for a periodic heartbeat to discover it.
+            TimeProvider = new FakeTimeProvider(),
             ExecutionScheduler = scheduler,
             BackendProvider = TestBackendProvider.Instance
         };

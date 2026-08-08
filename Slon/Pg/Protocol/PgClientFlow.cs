@@ -700,6 +700,19 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
 
         public void OnHeartbeat(TimeSpan interval)
         {
+            if (PropagateTermination())
+                return;
+
+            OnActivationHeartbeat(interval);
+
+            flow._decoderOnHeartbeatAction?.Invoke(interval);
+            flow.OnHeartbeat(interval);
+        }
+
+        // Returns true after abort propagation because no timed callback may run once the flow has been
+        // forcefully stopped. Graceful stopping still permits ordinary heartbeat work while it drains.
+        public bool PropagateTermination()
+        {
             // Abort propagation gates on AbortToken. Graceful Shutdown materializes
             // ClosedException up front but defers AbortToken until CompletionTimeout
             // escalation, so in-flight flows drain naturally until then. ClosedException is
@@ -712,7 +725,7 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
                 var ex = control.FlowTerminationException;
                 flow._activationTaskSource.TrySetException(ex, runContinuationsAsynchronously: true);
                 flow.OnAbort(ex);
-                return;
+                return true;
             }
 
             // Graceful-stopping propagation. AbortToken faults the activation source, but StoppingToken
@@ -721,11 +734,7 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
             // materialized before _stoppingCts fires, so it's non-null here.
             if (control.StoppingToken.IsCancellationRequested && !flow._completed)
                 flow.OnStopping(control.FlowTerminationException);
-
-            OnActivationHeartbeat(interval);
-
-            flow._decoderOnHeartbeatAction?.Invoke(interval);
-            flow.OnHeartbeat(interval);
+            return false;
         }
 
         public void OnActivationHeartbeat(TimeSpan interval)

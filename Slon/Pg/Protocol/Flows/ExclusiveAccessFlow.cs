@@ -37,7 +37,7 @@ sealed class ExclusiveAccessFlow : PgClientFlow
     TaskCompletionSource _consumerGone = new(TaskCreationOptions.RunContinuationsAsynchronously);
     // Idempotence guards for the cascade hooks (fire once per tenure). Reset in OnReset.
     bool _innerStopping;
-    bool _innerAborting;
+    int _innerAborting;
     // Lazily allocated and reused rendezvous for caller-thread execution of synchronous scopes.
     ManualResetEventSlim? _handoffEvent;
 
@@ -78,7 +78,7 @@ sealed class ExclusiveAccessFlow : PgClientFlow
         _scopeEnded = new(TaskCreationOptions.RunContinuationsAsynchronously);
         _consumerGone = new(TaskCreationOptions.RunContinuationsAsynchronously);
         _innerStopping = false;
-        _innerAborting = false;
+        _innerAborting = 0;
         _handoffEvent?.Reset();
     }
 
@@ -254,9 +254,10 @@ sealed class ExclusiveAccessFlow : PgClientFlow
     // inner pipeline stops; otherwise both source pumps can reach the shared writer concurrently.
     protected override void OnAbort(Exception exception)
     {
-        if (_innerAborting)
+        // Forceful shutdown performs an immediate propagation pass while the periodic heartbeat may
+        // already be visiting this flow. Claim the cascade once across both callers.
+        if (Interlocked.Exchange(ref _innerAborting, 1) is not 0)
             return;
-        _innerAborting = true;
         if (Volatile.Read(ref _acquired))
             CompleteInnerThenEndScope(_completeInner(exception));
         else

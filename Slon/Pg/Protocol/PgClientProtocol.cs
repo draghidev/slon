@@ -807,6 +807,11 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
             {
                 _close.Abort();
                 _connection?.Abort();
+                // A forceful close must release non-I/O flows immediately. In particular, an acquired
+                // exclusive flow may be parked solely on its inner pipeline and therefore has no socket
+                // operation for the transport abort to wake. Periodic propagation repeats this pass for
+                // a flow crossing an enumeration visibility window.
+                PropagateFlowTermination();
             }
             finally
             {
@@ -969,6 +974,13 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
             _throughputPerTick = Alpha * completedThisTick + (1 - Alpha) * _throughputPerTick;
         }
 
+        PropagateFlowHeartbeat(period);
+        OnCancellationHeartbeat(period);
+        return new();
+    }
+
+    void PropagateFlowHeartbeat(TimeSpan period)
+    {
         var control = FlowControl;
         try
         {
@@ -992,8 +1004,23 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
                     _logger, ex, "a flow heartbeat callback");
             }
         }
-        OnCancellationHeartbeat(period);
-        return new();
+    }
+
+    void PropagateFlowTermination()
+    {
+        var control = FlowControl;
+        foreach (var flow in GetFlows())
+        {
+            try
+            {
+                flow.GetExecutionControl(control).PropagateTermination();
+            }
+            catch (Exception ex)
+            {
+                SlonLogMessages.UnobservedCallbackException(
+                    _logger, ex, "a flow termination callback");
+            }
+        }
     }
 
     public struct Enumerator
