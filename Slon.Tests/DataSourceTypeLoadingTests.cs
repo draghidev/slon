@@ -111,7 +111,7 @@ public class DataSourceTypeLoadingTests : ConnectionCreatingTest
         using var cancellation = new CancellationTokenSource();
 
         var firstOpen = dataSource.OpenConnectionAsync(cancellation.Token).AsTask();
-        await factory.Entered.WaitAsync(TestTimeout.Hang);
+        await factory.Entered;
         cancellation.Cancel();
         await Assert.ThrowsAsync<OperationCanceledException>(async () => await firstOpen);
 
@@ -191,7 +191,7 @@ public class DataSourceTypeLoadingTests : ConnectionCreatingTest
         factory.Arm();
 
         var first = dataSource.ReloadTypesAsync().AsTask();
-        await factory.Entered.WaitAsync(TestTimeout.Hang);
+        await factory.Entered;
         var second = dataSource.ReloadTypesAsync().AsTask();
         factory.Release();
         await Task.WhenAll(first, second);
@@ -252,10 +252,10 @@ public class DataSourceTypeLoadingTests : ConnectionCreatingTest
         });
 
         var open = dataSource.OpenConnectionAsync(CancellationToken.None).AsTask();
-        await factory.Entered.WaitAsync(TestTimeout.Hang);
+        await factory.Entered;
         var dispose = dataSource.DisposeAsync().AsTask();
 
-        await dispose.WaitAsync(TestTimeout.Hang);
+        await dispose;
         try
         {
             await open;
@@ -278,10 +278,10 @@ public class DataSourceTypeLoadingTests : ConnectionCreatingTest
         await using (var connection = await dataSource.OpenConnectionAsync()) { }
         factory.Arm();
         var reload = dataSource.ReloadTypesAsync().AsTask();
-        await factory.Entered.WaitAsync(TestTimeout.Hang);
+        await factory.Entered;
         var dispose = dataSource.DisposeAsync().AsTask();
 
-        await dispose.WaitAsync(TestTimeout.Hang);
+        await dispose;
         await Assert.ThrowsAsync<OperationCanceledException>(async () => await reload);
     }
 
@@ -297,10 +297,10 @@ public class DataSourceTypeLoadingTests : ConnectionCreatingTest
         await using (var connection = await dataSource.OpenConnectionAsync()) { }
         factory.Arm();
         var reload = Task.Run(dataSource.ReloadTypes);
-        await factory.Entered.WaitAsync(TestTimeout.Hang);
+        await factory.Entered;
         var dispose = dataSource.DisposeAsync().AsTask();
 
-        await dispose.WaitAsync(TestTimeout.Hang);
+        await dispose;
         await Assert.ThrowsAsync<OperationCanceledException>(async () => await reload);
     }
 

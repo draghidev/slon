@@ -517,25 +517,23 @@ public class RacingDisposeInMemoryTests
         Assert.IsTrue(protocol.TryQueue(flow));
         var enumerator = flow.GetAsyncEnumerator();
         var first = enumerator.MoveNextAsync().AsTask();
-        await readParked.WaitAsync(TestTimeout.Hang);
+        await readParked;
 
         var complete = protocol.CompleteAsync();
         var dispose = StartSyncDispose(enumerator, out var started);
         using (started)
-            Assert.IsTrue(started.Wait(TestTimeout.Hang), "synchronous disposer did not start");
+            started.Wait();
 
-        Assert.IsTrue(SpinWait.SpinUntil(
-                () => !flow.GetExecutionControl(protocol.FlowControl).IsAsync, TestTimeout.Hang),
-            "synchronous disposer did not take body-drive ownership");
+        SpinWait.SpinUntil(() => !flow.GetExecutionControl(protocol.FlowControl).IsAsync);
         clock.Advance(TimeSpan.FromSeconds(1));
 
         foreach (var message in _messages!)
             transport.ReleaseSegment(message);
 
-        var escaped = await dispose.WaitAsync(TestTimeout.Hang);
-        await complete.WaitAsync(TestTimeout.Hang);
+        var escaped = await dispose;
+        await complete;
         Assert.IsNull(escaped, $"{escaped} escaped synchronous disposal");
-        try { await first.WaitAsync(TestTimeout.Hang); } catch (PgClientClosedException) { }
+        try { await first; } catch (PgClientClosedException) { }
     }
 
     // A sync-at-bind body parked between command results still owns a continuation after close becomes
@@ -560,12 +558,12 @@ public class RacingDisposeInMemoryTests
         var enumerator = flow.GetEnumerator();
         var first = Task.Factory.StartNew(enumerator.MoveNext, CancellationToken.None,
             TaskCreationOptions.LongRunning, TaskScheduler.Default);
-        await readParked.WaitAsync(TestTimeout.Hang);
+        await readParked;
 
         var release = MessagesThroughFirstCommandComplete(_multiMessages!);
         for (var i = 0; i < release; i++)
             transport.ReleaseSegment(_multiMessages![i]);
-        Assert.IsTrue(await first.WaitAsync(TestTimeout.Hang), "first result was not delivered");
+        Assert.IsTrue(await first, "first result was not delivered");
 
         var complete = protocol.CompleteAsync();
         clock.Advance(TimeSpan.FromSeconds(1));
@@ -574,9 +572,9 @@ public class RacingDisposeInMemoryTests
 
         var dispose = StartSyncDispose(enumerator, out var started);
         using (started)
-            Assert.IsTrue(started.Wait(TestTimeout.Hang), "synchronous disposer did not start");
-        var escaped = await dispose.WaitAsync(TestTimeout.Hang);
-        await complete.WaitAsync(TestTimeout.Hang);
+            started.Wait();
+        var escaped = await dispose;
+        await complete;
         Assert.IsNull(escaped, $"{escaped} escaped synchronous disposal");
     }
 

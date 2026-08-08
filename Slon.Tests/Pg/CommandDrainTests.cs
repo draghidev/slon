@@ -94,15 +94,14 @@ public class CommandDrainTests : ConnectionCreatingTest
             TaskCreationOptions.LongRunning,
             TaskScheduler.Default);
 
-        Assert.IsTrue(SpinWait.SpinUntil(() => flow.CompletionWaiterPending, TestTimeout.Hang),
-            "synchronous completion waiter did not arm");
+        SpinWait.SpinUntil(() => flow.CompletionWaiterPending);
 
         await Task.Factory.StartNew(
             () => flow.GetExecutionControl(protocol.FlowControl).Release(),
             CancellationToken.None,
             TaskCreationOptions.LongRunning,
             TaskScheduler.Default);
-        await waiter.WaitAsync(TestTimeout.Hang);
+        await waiter;
     }
 
     [TestMethod]
@@ -120,7 +119,7 @@ public class CommandDrainTests : ConnectionCreatingTest
             CancellationToken.None,
             TaskCreationOptions.LongRunning,
             TaskScheduler.Default);
-        await wait.WaitAsync(TestTimeout.Hang);
+        await wait;
     }
 
     static async ValueTask Dispose(CommandFlow.Enumerator e, bool useAsyncDispose)

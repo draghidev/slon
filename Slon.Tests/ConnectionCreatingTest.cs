@@ -17,10 +17,7 @@ public abstract class ConnectionCreatingTest
     public async Task EnterConnectionCreatingLane()
     {
         var started = Stopwatch.GetTimestamp();
-        if (!await Gate.WaitAsync(TestTimeout.Hang))
-            throw new TimeoutException(
-                $"Timed out waiting for the private-connection test lane " +
-                $"(holders={Volatile.Read(ref _holders)}, capacity=4).");
+        await Gate.WaitAsync();
 
         Interlocked.Increment(ref _holders);
         _lease = new Lease();

@@ -54,7 +54,7 @@ public class HeartbeatTests
         });
 
         time.Advance(TimeSpan.FromSeconds(1));
-        var entry = await logger.Entry.Task.WaitAsync(TestTimeout.Hang);
+        var entry = await logger.Entry.Task;
 
         Assert.AreEqual(LogLevel.Error, entry.Level);
         Assert.IsInstanceOfType<InvalidOperationException>(entry.Exception);

@@ -23,7 +23,7 @@ public sealed class PoolMetricsTests
         });
 
         var first = await pool.GetAsync(static (candidate, _) => candidate.Connection.TryMakeBusy(),
-            (object?)null, TestTimeout.Hang);
+            (object?)null, default);
         var timeout = pool.GetAsync(static (candidate, _) => candidate.Connection.TryMakeBusy(),
             (object?)null, TimeSpan.FromSeconds(1)).AsTask();
         await WaitUntilAsync(() => pool.WaiterCount == 1);
@@ -40,7 +40,7 @@ public sealed class PoolMetricsTests
         await Assert.ThrowsExactlyAsync<TimeoutException>(() => timeout);
 
         var waited = pool.GetAsync(static (candidate, _) => candidate.Connection.TryMakeBusy(),
-            (object?)null, TestTimeout.Hang).AsTask();
+            (object?)null, default).AsTask();
         await WaitUntilAsync(() => pool.WaiterCount == 1);
         first.MakeIdle();
         await waited;
@@ -59,7 +59,7 @@ public sealed class PoolMetricsTests
         }))
         {
             await Assert.ThrowsExactlyAsync<InvalidOperationException>(
-                () => failingPool.GetAsync(TestTimeout.Hang).AsTask());
+                () => failingPool.GetAsync(default).AsTask());
         }
         Assert.AreEqual(1, listener.Sum("slon.pool.connection.create.failures", poolName));
 

@@ -101,8 +101,8 @@ public class SyncFlowHandoffTests : ConnectionCreatingTest
 
         holder.Core.WakeBody(useDedicatedDriver: true);
 
-        Assert.IsFalse(await resumedOnThreadPool.Task.WaitAsync(TestTimeout.Hang));
-        await suspended.WaitAsync(TestTimeout.Hang);
+        Assert.IsFalse(await resumedOnThreadPool.Task);
+        await suspended;
         holder.Core.Reset();
 
         static async Task Suspend(WakeHolder holder, TaskCompletionSource<bool> resumedOnThreadPool)

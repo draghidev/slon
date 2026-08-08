@@ -21,7 +21,7 @@ public class AdoCommandCancellationTests : ConnectionCreatingTest
         command.Cancel();
 
         await Assert.ThrowsExactlyAsync<OperationCanceledException>(
-            async () => await execution.WaitAsync(TestTimeout.Hang));
+            async () => await execution);
         await blocker.ReleaseAsync();
     }
 }

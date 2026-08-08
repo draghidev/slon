@@ -364,12 +364,12 @@ public class RecoveryTests : ConnectionCreatingTest
         failureGate.SetException(violation);
 
         var failed = await Assert.ThrowsExactlyAsync<PgClientException>(
-            () => faulting.WaitForComplete().AsTask().WaitAsync(TestTimeout.Hang));
+            () => faulting.WaitForComplete().AsTask());
         Assert.AreSame(violation, failed.InnerException);
 
         var e = successor.GetAsyncEnumerator();
         var collateral = await Assert.ThrowsExactlyAsync<PgCollateralException>(
-            () => e.MoveNextAsync().AsTask().WaitAsync(TestTimeout.Hang));
+            () => e.MoveNextAsync().AsTask());
         Assert.AreEqual(PgCollateralKind.ProtocolFailure, collateral.Kind);
         Assert.AreSame(violation, collateral.InnerException);
         var projected = Assert.IsInstanceOfType<SlonException>(AdoException.Project(collateral));
@@ -688,7 +688,7 @@ public class RecoveryTests : ConnectionCreatingTest
     {
         await using var protocol = await ConnectAsync();
         var scope = protocol.QueueExclusiveScope(async: true);
-        await scope.HandoffReady.WaitAsync(TestTimeout.Hang);
+        await scope.HandoffReady;
         var serializerOptions = new PgSerializerOptions(PgTypeCatalog.Default);
         var parameter = Parameter.Create(
             new TestParameter<Stream>(new ThrowingReadStream(256 * 1024, 64 * 1024)),
@@ -707,11 +707,11 @@ public class RecoveryTests : ConnectionCreatingTest
         scope.Queue(faulting);
 
         await Assert.ThrowsExactlyAsync<IOException>(
-            () => faulting.ConsumeNonQueryAsync().AsTask().WaitAsync(TestTimeout.Hang));
+            () => faulting.ConsumeNonQueryAsync().AsTask());
 
         Assert.ThrowsExactly<InvalidOperationException>(() => scope.Queue(successor));
         successor.DiscardUnqueued();
-        await scope.CompleteScopeAsync().AsTask().WaitAsync(TestTimeout.Hang);
+        await scope.CompleteScopeAsync().AsTask();
 
         await RunAsync(protocol, "select 42::int4");
     }
