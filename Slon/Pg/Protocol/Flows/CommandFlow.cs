@@ -109,11 +109,12 @@ sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
     ValueTaskSourcePromise<bool>? _pipelinePromise;
     Context _context;
     ValueTask _task;
-    // Once the body starts, its catch paths own caller-facing fault propagation.
-    bool _bodyStarted;
-    // Consumer terminality, body terminality, and framework release are distinct phases. A synchronous
-    // disposer owns body driving after takeover even when close delivery has already ended enumeration.
-    bool _bodyTerminated;
+    // Consumer terminality, body terminality, and framework release are distinct phases. Start and
+    // pre-start termination race during shutdown, so one atomic state owns that decision.
+    const int BodyNotStarted = 0;
+    const int BodyRunning = 1;
+    const int BodyTerminated = 2;
+    int _bodyState;
     CommandFlow() : base(supportsDeferredFlush: true)
     {
         _callerInteractionCore.Initialize();
@@ -222,6 +223,7 @@ sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
         }
         catch (Exception ex)
         {
+            TerminateBodyBeforeStart();
             CompleteEnumerationWithException(ex);
             throw;
         }
@@ -267,6 +269,7 @@ sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
         }
         catch (Exception ex)
         {
+            TerminateBodyBeforeStart();
             CompleteEnumerationWithException(ex);
             throw;
         }
@@ -372,14 +375,19 @@ sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
     [AsyncMethodBuilder(typeof(PromiseAsyncValueTaskMethodBuilder))]
     async ValueTask ExecutePipelined(Context context)
     {
-        _bodyStarted = true;
-        // If we have a continuation stored we must already be on the caller thread,
-        // otherwise we must make sure to unblock the executor (see comment in the write phase).
-        if (!IsAsync && !_callerInteractionCore.HasHandoff)
-            await YieldToCaller();
-
+        // Pre-start teardown may have already claimed terminality. In that case the consumer has its
+        // fault and this late dispatch has no body tenure to establish.
+        if (Interlocked.CompareExchange(ref _bodyState, BodyRunning, BodyNotStarted) != BodyNotStarted)
+            return;
         try
         {
+            // If we have a continuation stored we must already be on the caller thread,
+            // otherwise we must make sure to unblock the executor (see comment in the write phase).
+            // This first handoff is body execution too: close may fault it, so it belongs inside the
+            // same terminal envelope that publishes the consumer fault and body termination.
+            if (!IsAsync && !_callerInteractionCore.HasHandoff)
+                await YieldToCaller();
+
             // User cancellation must not cancel activation or wire I/O. The flow observes it after
             // activation, drains itself to RFQ, then delivers OCE without invoking pipeline recovery.
             _decoder = await context.GetDecoderAuto().ConfigureAwait(false);
@@ -475,11 +483,10 @@ sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
                     await _flowCancellationTokenRegistration.DisposeAsync().ConfigureAwait(false);
                 // Cancellation switches to autonomous drain; terminal delivery follows RFQ and tenure release.
                 if ((Volatile.Read(ref _cancelRequested) || EffectiveCancellationToken.IsCancellationRequested)
-                    && !_enumeratorCompleted)
+                    && !IsEnumerationCompleted)
                 {
                     _cancelDeliverToken = EffectiveCancellationToken.IsCancellationRequested ? EffectiveCancellationToken : _cancelDeliverToken;
                     _deliverCancelOce = true;
-                    _enumeratorCompleted = true;
                     if (!IsDraining)
                         MarkBodyInitiatedDrain();
                 }
@@ -508,7 +515,8 @@ sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
 
                 // Disposal drains without another result handoff. Graceful close instead faults the
                 // attached consumer, then uses the same autonomous drain. Command errors remain results.
-                if (context.StoppingToken.IsCancellationRequested && !IsDraining && !_enumeratorCompleted)
+                if (context.StoppingToken.IsCancellationRequested && !IsDraining
+                    && !IsEnumerationCompleted)
                 {
                     // Latch the close (a consumer that Resets past this point self-delivers it), wake a
                     // parked consumer, then drain.
@@ -663,7 +671,7 @@ sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
             // A detached consumer treats close as drain completion; a live consumer observes the close.
             if (IsDraining)
             {
-                if (!_enumeratorCompleted)
+                if (!IsEnumerationCompleted)
                     SetResult(null);
                 return;
             }
@@ -724,7 +732,7 @@ sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
                 // this lock or the pipeline frame that still owns the shared promise.
                 using (_rearmLock.EnterScope())
                 {
-                    _enumeratorCompleted = true;
+                    PublishEnumerationCompleted();
                     CompleteEnumeration();
                 }
                 return;
@@ -799,7 +807,7 @@ sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
     void EnterStoppingDrainIfNeeded(Context context)
     {
         if (_callerInteractionCore.CloseException is { } close && context.StoppingToken.IsCancellationRequested
-            && !IsDraining && !_enumeratorCompleted)
+            && !IsDraining && !IsEnumerationCompleted)
         {
             CompleteEnumerationWithException(close);
             MarkBodyInitiatedDrain();
@@ -816,14 +824,12 @@ sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
         // Close state must survive task-source rearming, including flows whose body never started.
         if (ex is PgClientClosedException or PgCollateralException)
             _callerInteractionCore.SetCloseLatch(ex);
-        if (_enumeratorCompleted)
+        if (IsEnumerationCompleted)
             return;
         // Teardown may race the consumer. The task source is the completion authority;
         // _enumeratorCompleted follows only when this call wins the current generation.
         if (_enumeratorMoveNextTaskSource.TrySetException(ex, runContinuationsAsynchronously: true))
-            _enumeratorCompleted = true;
-        if (!_bodyStarted)
-            Volatile.Write(ref _bodyTerminated, true);
+            PublishEnumerationCompleted();
         // A faulted body will not publish another continuation.
         SignalPumpProgress();
         // Wire recovery remains with the body or the framework recovery flow; this method only completes
@@ -832,9 +838,15 @@ sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
 
     void PublishBodyTerminated()
     {
-        Volatile.Write(ref _bodyTerminated, true);
+        Volatile.Write(ref _bodyState, BodyTerminated);
         SignalPumpProgress();
     }
+
+    bool TerminateBodyBeforeStart()
+        => Interlocked.CompareExchange(ref _bodyState, BodyTerminated, BodyNotStarted) == BodyNotStarted;
+
+    bool IsBodyRunning => Volatile.Read(ref _bodyState) == BodyRunning;
+    bool IsBodyTerminated => Volatile.Read(ref _bodyState) == BodyTerminated;
 
     // Source handoff finishes before body/consumer rendezvous begins, so both reuse the same wait event.
     protected override ManualResetEventSlim? HandoffEvent => _callerInteractionCore.GetWaitEvent();
@@ -859,7 +871,7 @@ sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
     // Graceful stopping is the early wire-close wake and is idempotent across heartbeat ticks.
     protected override void OnStopping(Exception exception)
     {
-        if (!_bodyStarted || !IsAsync)
+        if (!IsBodyRunning || !IsAsync)
         {
             FaultCaller(exception);
             return;
@@ -873,7 +885,19 @@ sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
     // Wake a running body so it owns fault delivery; directly fault a flow whose body never started.
     void FaultCaller(Exception exception)
     {
-        if (_bodyStarted)
+        if (TerminateBodyBeforeStart())
+        {
+            CompleteEnumerationWithException(exception);
+            // A synchronous flow may already have entered ExecuteAfterHandoff while its inner read
+            // body is still NotStarted. Terminating that body does not complete the outer execution:
+            // fault and wake its initial handoff so the framework task can settle and release tenure.
+            _callerInteractionCore.FaultBodyWait(exception);
+            _callerInteractionCore.WakeBody();
+            return;
+        }
+
+        // A concurrent body start may have beaten the pre-start terminal claim.
+        if (IsBodyRunning)
             _callerInteractionCore.FaultBodyWait(exception);
         else
             CompleteEnumerationWithException(exception);
@@ -935,8 +959,7 @@ sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
         _pipelinePromise = null;
         _context = default;
         _task = default;
-        _bodyStarted = false;
-        _bodyTerminated = false;
+        _bodyState = BodyNotStarted;
         _consumerAdvanced = false;
     }
 

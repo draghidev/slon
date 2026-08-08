@@ -110,6 +110,36 @@ public class CommandUserCancellationTests : ConnectionCreatingTest
     }
 
     [TestMethod]
+    public async Task UserCt_ThenProtocolClose_DuringDrain_CompletesPendingMoveNext()
+    {
+        await using var firstBlocker = await PgAdvisoryLock.AcquireAsync();
+        await using var secondBlocker = await PgAdvisoryLock.AcquireAsync();
+        await using var protocol = await PgTestPool.NewIsolatedAsync(o =>
+            o.CancelSender = (_, _, _) => new(CancelRequestState.NotSent));
+
+        using var cts = new CancellationTokenSource();
+        var flow = new CommandFlow(async: true,
+            firstBlocker.WaitCommand with { WithSync = true },
+            secondBlocker.WaitCommand);
+        Assert.IsTrue(protocol.TryQueue(flow, cancellationToken: cts.Token));
+        var enumerator = flow.GetAsyncEnumerator(cts.Token);
+        var moveNext = enumerator.MoveNextAsync(cts.Token).AsTask();
+
+        await firstBlocker.WaitUntilContendedAsync(protocol.FlowControl.BackendProcessId);
+        cts.Cancel();
+        await firstBlocker.ReleaseAsync();
+
+        // Cancellation has now been observed at the first command boundary and the body is draining
+        // autonomously. Closing the wire while the second command is in flight must still publish a
+        // terminal result to the already-armed MoveNext generation.
+        await secondBlocker.WaitUntilContendedAsync(protocol.FlowControl.BackendProcessId);
+        await protocol.DisposeAsync();
+
+        await Assert.ThrowsExactlyAsync<PgClientClosedException>(async () => await moveNext);
+        await enumerator.DisposeAsync();
+    }
+
+    [TestMethod]
     public async Task ServerCancel_InterruptsBlockedCommand_AndProtocolRemainsUsable()
     {
         await using var blocker = await PgAdvisoryLock.AcquireAsync();

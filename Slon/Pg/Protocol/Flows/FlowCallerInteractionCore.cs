@@ -22,6 +22,7 @@ struct FlowCallerInteractionCore<TResult>
     // First close wins for the current tenure. The consumer replays this durable state onto whichever
     // task-source generation it arms, so teardown never needs to target a generation directly.
     Exception? _closeException;
+    int _isWaiting;
     public Exception? CloseException => Volatile.Read(ref _closeException);
     // Set the latch, monotone (first writer wins). Returns the latched exception (this call's or the
     // prior winner's), never null.
@@ -76,8 +77,8 @@ struct FlowCallerInteractionCore<TResult>
         return waitEvent;
     }
 
-    public bool IsWaiting { get; private set; }
-    public bool HasHandoff => _handoffContinuation is not null;
+    public bool IsWaiting => Volatile.Read(ref _isWaiting) != 0;
+    public bool HasHandoff => Volatile.Read(ref _handoffContinuation) is not null;
 
     // Returns a continuation for the caller to run, or null when result/terminal progress produced the
     // wake. The durable handoff marker prevents a redundant first handoff.
@@ -85,7 +86,7 @@ struct FlowCallerInteractionCore<TResult>
     {
         var waitEvent = GetWaitEvent();
 
-        IsWaiting = true;
+        Volatile.Write(ref _isWaiting, 1);
         try
         {
             // Check progress BEFORE blocking. A SignalProgress that ran before this GetWaitEvent (e.g. a body
@@ -104,7 +105,7 @@ struct FlowCallerInteractionCore<TResult>
         }
         finally
         {
-            IsWaiting = false;
+            Volatile.Write(ref _isWaiting, 0);
         }
     }
 
@@ -184,6 +185,7 @@ struct FlowCallerInteractionCore<TResult>
         _wakeRequested = false;
         _dedicatedWakeRequested = false;
         _closeException = null;
+        _isWaiting = 0;
         _gate.Reset();
     }
 

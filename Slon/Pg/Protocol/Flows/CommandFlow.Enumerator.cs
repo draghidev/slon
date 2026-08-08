@@ -17,6 +17,9 @@ sealed partial class CommandFlow
     // Body start is not a substitute because an executor-driven body may finish before first consumption.
     bool _consumerAdvanced;
 
+    bool IsEnumerationCompleted => Volatile.Read(ref _enumeratorCompleted);
+    void PublishEnumerationCompleted() => Volatile.Write(ref _enumeratorCompleted, true);
+
     ValueTask<bool> EnumeratorMoveNextTask => new(this, _enumeratorMoveNextTaskSource.Version);
 
     bool IValueTaskSource<bool>.GetResult(short token) => _enumeratorMoveNextTaskSource.GetResult(token);
@@ -84,9 +87,26 @@ sealed partial class CommandFlow
 
     void CompleteEnumerationWithClose(Exception closeException)
     {
-        _enumeratorMoveNextTaskSource.TrySetException(closeException, runContinuationsAsynchronously: true);
-        _enumeratorCompleted = true;
+        // A result may already own this generation. Preserve the close in the latch, but only publish
+        // terminal enumeration state when the close wins the generation; otherwise the consumer must
+        // observe the result once, rearm, and self-deliver the latched close on its next move.
+        _callerInteractionCore.SetCloseLatch(closeException);
+        if (_enumeratorMoveNextTaskSource.TrySetException(closeException, runContinuationsAsynchronously: true))
+            PublishEnumerationCompleted();
         SignalPumpProgress();
+    }
+
+    // Consumer terminality can precede body terminality under shutdown. Transfer a live body to the
+    // autonomous driver without re-entering MoveNext: its gate may already be faulted while its handoff
+    // continuation is pending.
+    bool TransferLiveBodyToDrain()
+    {
+        if (IsBodyTerminated)
+            return false;
+        if (WaitForDrainOnDispose) MarkConsumerWaitForDrain(); else MarkConsumerGone();
+        _callerInteractionCore.ResumeBody(runContinuationsAsynchronously: true);
+        _callerInteractionCore.WakeBody();
+        return true;
     }
 
     // Terminal state outlives task-source generations. Close takes precedence over caller cancellation;
@@ -102,7 +122,7 @@ sealed partial class CommandFlow
                 new OperationCanceledException(EffectiveCancellationToken.IsCancellationRequested ? EffectiveCancellationToken : _cancelDeliverToken),
                 runContinuationsAsynchronously: true);
         // Rearming after a clean terminal still needs to complete the new generation.
-        else if (_enumeratorCompleted)
+        else if (IsEnumerationCompleted)
             _enumeratorMoveNextTaskSource.TrySetResult(false, runContinuationsAsynchronously: true);
     }
 
@@ -134,7 +154,7 @@ sealed partial class CommandFlow
             {
                 // See MoveNextAsync: terminal enumeration state can outlive a completed source generation.
                 // Ensure the current generation carries that terminal before returning it.
-                if (flow._enumeratorCompleted)
+                if (flow.IsEnumerationCompleted)
                 {
                     flow.EnsureEnumerationCompleted();
                     return flow.EnumeratorMoveNextTask.Result;
@@ -171,21 +191,24 @@ sealed partial class CommandFlow
                 if (delivered.IsCompleted)
                     return delivered.Result;
             }
-            // Two wake reasons: a continuation was registered (drive the body forward inline)
-            // or the body signaled progress (a result, completion, or fault landed on the
-            // move-next task source while we were parked). In the progress-only case there is
-            // no continuation to invoke. The task is already complete.
-            var continuation = flow._callerInteractionCore.WaitForContinuation();
-            var task = flow.EnumeratorMoveNextTask;
-            if (task.IsCompleted)
+            // A progress wake may precede both result completion and publication of the body's next
+            // handoff continuation (close faults the gate before a resumed body reaches YieldToCaller).
+            // Keep rendezvousing until either the result owns this turn or there is body work to drive.
+            while (true)
             {
-                if (continuation is not null)
-                    flow._callerInteractionCore.DeferContinuation(continuation);
-                return task.Result;
+                var continuation = flow._callerInteractionCore.WaitForContinuation();
+                var task = flow.EnumeratorMoveNextTask;
+                if (task.IsCompleted)
+                {
+                    if (continuation is not null)
+                        flow._callerInteractionCore.DeferContinuation(continuation);
+                    return task.Result;
+                }
+                continuation ??= flow._callerInteractionCore.TryTakePendingContinuation();
+                if (continuation is null)
+                    continue;
+                continuation.Invoke();
             }
-            continuation?.Invoke();
-            task = flow.EnumeratorMoveNextTask;
-            return task.IsCompleted ? task.Result : task.AsTask().GetAwaiter().GetResult();
         }
 
         // DisposeAsync always calls MoveNextAsync to confirm the enumerator is done without tracking additional state.
@@ -227,7 +250,7 @@ sealed partial class CommandFlow
 
                 // Terminal enumeration state may outlive its completed source generation. Complete the
                 // newly armed generation with the same close, cancellation, or clean-end outcome.
-                if (flow._enumeratorCompleted)
+                if (flow.IsEnumerationCompleted)
                 {
                     flow.EnsureEnumerationCompleted();
                     return flow.EnumeratorMoveNextTask;
@@ -263,11 +286,15 @@ sealed partial class CommandFlow
             if (flow is null)
                 return;
 
-            // If the flow already terminally completed, there's nothing to drain. Skipping
-            // also avoids re-throwing a previously-observed fault from EnumeratorMoveNextTask.Result
-            // during foreach's exception unwind.
-            if (flow._enumeratorCompleted)
+            // Consumer terminality can precede body terminality under shutdown. A terminal consumer must
+            // still transfer a live body to autonomous drain, but must not re-enter the ordinary MoveNext
+            // pump: its gate may already be faulted while its handoff continuation is pending.
+            if (flow.IsEnumerationCompleted)
+            {
+                if (flow.TransferLiveBodyToDrain() && flow.WaitForDrainOnDispose)
+                    flow.AwaitDrainOnDisposeSynchronously();
                 return;
+            }
 
             // Synchronous disposal takes over an async body through a two-way rendezvous. A gate-parked
             // body resumes inline; an in-flight body later hands over its continuation. Waiting on this
@@ -302,21 +329,25 @@ sealed partial class CommandFlow
                 while (MoveNext())
                     Current.Dispose();
             }
-            catch (PgClientClosedException) when (flow._bodyStarted)
+            catch (PgClientClosedException)
             {
-                // Close is consumer-terminal but does not release a sync caller's body-drive obligation.
-                DriveBodyToTermination(flow);
-                flow.AwaitDrainOnDisposeSynchronously();
+                // Disposal absorbs the consumer-facing close. If the body remains live, close still does
+                // not release this synchronous caller's drive obligation.
+                if (!flow.IsBodyTerminated)
+                {
+                    DriveBodyToTermination(flow);
+                    flow.AwaitDrainOnDisposeSynchronously();
+                }
             }
 
             static void DriveBodyToTermination(CommandFlow flow)
             {
-                while (!Volatile.Read(ref flow._bodyTerminated))
+                while (!flow.IsBodyTerminated)
                 {
                     var continuation = flow._callerInteractionCore.WaitForContinuation();
                     if (continuation is null)
                     {
-                        if (Volatile.Read(ref flow._bodyTerminated))
+                        if (flow.IsBodyTerminated)
                             break;
                         continuation = flow._callerInteractionCore.TryTakePendingContinuation();
                         if (continuation is null)
@@ -333,9 +364,12 @@ sealed partial class CommandFlow
             if (flow is null)
                 return new();
 
-            if (flow._enumeratorCompleted)
+            if (flow.IsEnumerationCompleted)
+            {
                 // A completed awaited drain may still have errors to surface.
+                flow.TransferLiveBodyToDrain();
                 return flow.WaitForDrainOnDispose ? flow.AwaitDrainOnDispose() : new();
+            }
 
             // Mark autonomous drain, open the async result gate, and wake any synchronous rendezvous.
             // Pipeline tenure keeps successors behind the body until it reaches RFQ.
