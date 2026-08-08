@@ -6,7 +6,6 @@ using System.Text;
 using Slon.Buffers;
 using Slon.Text;
 using Slon.Transport;
-using Slon.Pg.Serialization;
 using static Slon.Pg.Protocol.PgTypes;
 
 namespace Slon.Pg.Protocol;
@@ -177,22 +176,33 @@ readonly struct PgEncoder
         return new();
     }
 
-    // Today identical to WriteBind in body. The full serializer hasn't landed yet, so
-    // parameter writes are just buffer fills with no flush points. Once the serializer is in
-    // and large parameter payloads need to flush mid-write, this method takes the async-flush
-    // path (FlushAsync) while WriteBind takes the sync-flush path (Flush).
-    public ValueTask WriteBindAsync(EncodedString commandName = default, EncodedString portalName = default,
+    public async ValueTask WriteBindAsync(EncodedString commandName = default, EncodedString portalName = default,
         ImmutableArray<Parameter> parameters = default, ImmutableArray<PgFormat> resultFormats = default,
+        ParameterWriterStrategy? parameterWriterStrategy = null,
         CancellationToken cancellationToken = default)
     {
-        WriteBind(commandName, portalName, parameters, resultFormats);
-        return new();
+        NormalizeAndValidate(ref parameters, ref resultFormats);
+        WriteBindPreamble(commandName, portalName, parameters, resultFormats);
+        var strategy = parameterWriterStrategy ?? ParameterWriterStrategy.Raw;
+        object? state = null;
+        foreach (var parameter in parameters)
+        {
+            var size = parameter.GetSize();
+            _writer.WriteInt(size);
+            if (size < 0)
+                continue;
+
+            state ??= _writer.GetParameterWriterState(strategy);
+            await strategy.WriteAsync(state, parameter, cancellationToken).ConfigureAwait(false);
+        }
+        WriteResultFormats(resultFormats);
     }
 
     // See WriteQueryResumable for the contract.
     public ValueTask WriteBindResumable(EncodedString commandName = default, EncodedString portalName = default,
-        ImmutableArray<Parameter> parameters = default, ImmutableArray<PgFormat> resultFormats = default)
-        => WriteBindAsync(commandName, portalName, parameters, resultFormats);
+        ImmutableArray<Parameter> parameters = default, ImmutableArray<PgFormat> resultFormats = default,
+        ParameterWriterStrategy? parameterWriterStrategy = null)
+        => WriteBindAsync(commandName, portalName, parameters, resultFormats, parameterWriterStrategy);
 
     public void WriteBind(EncodedString commandName)
     {
@@ -207,91 +217,88 @@ readonly struct PgEncoder
     }
 
     public void WriteBind(EncodedString commandName = default, EncodedString portalName = default,
-        ImmutableArray<Parameter> parameters = default, ImmutableArray<PgFormat> resultFormats = default)
+        ImmutableArray<Parameter> parameters = default, ImmutableArray<PgFormat> resultFormats = default,
+        ParameterWriterStrategy? parameterWriterStrategy = null)
     {
-        // The signature invites `default` for the no-parameters case; a default ImmutableArray
-        // NREs on every member, so normalize before first use.
-        if (parameters.IsDefault)
-            parameters = ImmutableArray<Parameter>.Empty;
-        if (resultFormats.IsDefault)
-            resultFormats = ImmutableArray<PgFormat>.Empty;
-        if (resultFormats.Length > ushort.MaxValue)
-            throw new ArgumentException("Too many result format codes.", nameof(resultFormats));
-        foreach (var format in resultFormats)
+        NormalizeAndValidate(ref parameters, ref resultFormats);
+        WriteBindPreamble(commandName, portalName, parameters, resultFormats);
+        var strategy = parameterWriterStrategy ?? ParameterWriterStrategy.Raw;
+        object? state = null;
+        foreach (var parameter in parameters)
         {
-            if (format is not PgFormat.Text and not PgFormat.Binary)
-                throw new ArgumentOutOfRangeException(
-                    nameof(resultFormats), format, "Unknown PostgreSQL result format code.");
-        }
+            var size = parameter.GetSize();
+            _writer.WriteInt(size);
+            if (size < 0)
+                continue;
 
+            state ??= _writer.GetParameterWriterState(strategy);
+            strategy.Write(state, in parameter);
+        }
+        WriteResultFormats(resultFormats);
+    }
+
+    void WriteBindPreamble(EncodedString commandName, EncodedString portalName,
+        ImmutableArray<Parameter> parameters, ImmutableArray<PgFormat> resultFormats)
+    {
         var encoding = ClientEncoding;
-        var pgWriter = new PgWriter(_writer, new PgConversionContext { TextEncoding = encoding });
         var portalNameBytes = portalName.AsNullTerminatedSpan(encoding);
         var commandNameBytes = commandName.AsNullTerminatedSpan(encoding);
-
-        var totalParameterSize = sizeof(ushort);
         var parameterCount = checked((ushort)parameters.Length);
-        if (parameterCount > 0)
+        var parameterBytes = sizeof(ushort);
+        foreach (var parameter in parameters)
         {
-            foreach (var p in parameters)
-            {
-                var size = p.GetSize();
-                totalParameterSize += sizeof(int) + (size > 0 ? size : 0); // length + value
-            }
+            var size = parameter.GetSize();
+            parameterBytes = checked(parameterBytes + sizeof(int) + Math.Max(0, size));
         }
+        var formatCodeBytes = parameterCount is 0 ? sizeof(ushort) : 2 * sizeof(ushort);
 
-        var totalFormatCodeSize = parameterCount is 0 ? sizeof(ushort) : sizeof(ushort) + sizeof(ushort);
-
-        StartMessage(FrontendType.Bind, bodyLength:
-            commandNameBytes.Length + // Null-terminated command name
-            portalNameBytes.Length + // Null-terminated portal name
-            totalFormatCodeSize +
-            totalParameterSize +
-            sizeof(ushort) + // Number of result format codes
-            Math.Max(1, resultFormats.Length) * sizeof(ushort)
-        );
-
+        StartMessage(FrontendType.Bind, bodyLength: checked(
+            commandNameBytes.Length + portalNameBytes.Length + formatCodeBytes + parameterBytes
+            + sizeof(ushort) + Math.Max(1, resultFormats.Length) * sizeof(ushort)));
         _writer.WriteRaw(portalNameBytes);
         _writer.WriteRaw(commandNameBytes);
-
         if (parameterCount is 0)
         {
-            _writer.WriteUShort(0); // format codes
-            _writer.WriteUShort(parameterCount);
+            _writer.WriteUShort(0);
+            _writer.WriteUShort(0);
         }
         else
         {
             _writer.WriteUShort(1);
-            _writer.WriteUShort(1); // all binary for now
-
+            _writer.WriteUShort((ushort)PgFormat.Binary);
             _writer.WriteUShort(parameterCount);
-            foreach (var p in parameters)
-            {
-                if (p.Value is null)
-                {
-                    _writer.WriteInt(-1);
-                }
-                else
-                {
-                    _writer.WriteInt(p.GetSize());
-                    pgWriter.Init(new PgConversionContext { TextEncoding = encoding });
-                    p.Write(pgWriter);
-                    pgWriter.EndWrite(p.GetSize());
-                }
-            }
         }
+    }
 
+    void WriteResultFormats(ImmutableArray<PgFormat> resultFormats)
+    {
         if (resultFormats.Length is 0)
         {
             _writer.WriteUShort(1);
             _writer.WriteUShort((ushort)PgFormat.Binary);
+            return;
         }
-        else
-        {
-            _writer.WriteUShort((ushort)resultFormats.Length);
-            foreach (var format in resultFormats)
-                _writer.WriteUShort((ushort)format);
-        }
+
+        _writer.WriteUShort((ushort)resultFormats.Length);
+        foreach (var format in resultFormats)
+            _writer.WriteUShort((ushort)format);
+    }
+
+    static void NormalizeAndValidate(ref ImmutableArray<Parameter> parameters,
+        ref ImmutableArray<PgFormat> resultFormats)
+    {
+        if (parameters.IsDefault)
+            parameters = ImmutableArray<Parameter>.Empty;
+        if (resultFormats.IsDefault)
+            resultFormats = ImmutableArray<PgFormat>.Empty;
+        if (parameters.Length > ushort.MaxValue)
+            throw new ArgumentException("Too many parameters.", nameof(parameters));
+        if (resultFormats.Length > ushort.MaxValue)
+            throw new ArgumentException("Too many result format codes.", nameof(resultFormats));
+        foreach (var format in resultFormats)
+            if (format is not PgFormat.Text and not PgFormat.Binary)
+                throw new ArgumentOutOfRangeException(
+                    nameof(resultFormats), format, "Unknown PostgreSQL result format code.");
     }
 
     public void WriteDescribe(EncodedString name = default, bool portalName = true)

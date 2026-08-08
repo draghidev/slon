@@ -19,6 +19,9 @@ sealed class ProtocolDataWriter : IOutputWriter
     readonly CancellationToken _abortToken;
     readonly PgClientProtocol.Control _control;
     CancellationTokenSource _cts;
+    ParameterWriterStrategy? _parameterWriterStrategy;
+    object? _parameterWriterState;
+    Encoding? _parameterWriterEncoding;
 
     ProtocolDataWriter(ProtocolWritePipe pipe, CancellationToken abortToken, PgClientProtocol.Control control)
     {
@@ -60,6 +63,22 @@ sealed class ProtocolDataWriter : IOutputWriter
     {
         get => _pipe.ClientEncoding;
         set => _pipe.ClientEncoding = value;
+    }
+
+    // The state may retain this token-bearing shell (PgWriter does), so cache it here rather
+    // than on the shared pipe. A base protocol and each exclusive scope consequently retain
+    // their own opaque serializer state while Bind remains allocation-free after first use.
+    internal object GetParameterWriterState(ParameterWriterStrategy strategy)
+    {
+        var encoding = ClientEncoding;
+        if (!ReferenceEquals(_parameterWriterStrategy, strategy)
+            || !ReferenceEquals(_parameterWriterEncoding, encoding))
+        {
+            _parameterWriterState = strategy.CreateState(this, encoding);
+            _parameterWriterStrategy = strategy;
+            _parameterWriterEncoding = encoding;
+        }
+        return _parameterWriterState!;
     }
 
     public long UnflushedBytes => _pipe.UnflushedBytes;

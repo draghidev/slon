@@ -22,6 +22,7 @@ readonly struct CommandFlowOptions
     // Captured while the ADO command is bound. Catalog reload publishes a new options instance,
     // while this flow continues against the immutable revision it resolved with.
     public PgSerializerOptions? SerializerOptions { get; init; }
+    public ParameterWriterStrategy? ParameterWriterStrategy { get; init; }
 }
 
 sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSource<FlowCallerInteractionCoreResult>, IValueTaskSource
@@ -241,12 +242,14 @@ sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
                 // Caller cancellation never cancels wire I/O. A partially cancelled write requires
                 // protocol recovery and can strand already-pipelined successors; the body instead
                 // observes the latched intent and drains every written command to RFQ.
-                writeTask = _options.Commands.WriteCommandsAsync(context.GetEncoder(), appendSync, default);
+                writeTask = _options.Commands.WriteCommandsAsync(context.GetEncoder(), appendSync,
+                    _options.ParameterWriterStrategy ?? ParameterWriterStrategy.Raw, default);
             }
             else
             {
                 using (encoder.BeginResumableScope())
-                    writeTask = _options.Commands.WriteCommandsResumable(encoder, appendSync);
+                    writeTask = _options.Commands.WriteCommandsResumable(encoder, appendSync,
+                        _options.ParameterWriterStrategy ?? ParameterWriterStrategy.Raw);
             }
 
             // Observe synchronous faults here; pending writes remain the framework-owned trailing task.

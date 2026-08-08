@@ -2,7 +2,9 @@ using System;
 using System.Text;
 using Microsoft.VisualStudio.TestTools.UnitTesting;
 using Slon.Buffers;
+using Slon.Pg;
 using Slon.Pg.Protocol;
+using Slon.Pg.Serialization;
 
 namespace Slon.Tests.Pg;
 
@@ -69,6 +71,20 @@ public class ProtocolDataWriterMessageBudgetTests
     }
 
     [TestMethod]
+    public void ZeroSizeHint_ReturnsNonEmptyBuffer_BeforeAndAfterFlush()
+    {
+        var (writer, _) = NewWriter();
+
+        Assert.IsGreaterThan(0, writer.GetMemory().Length);
+        Assert.IsGreaterThan(0, writer.GetSpan().Length);
+
+        writer.Flush();
+
+        Assert.IsGreaterThan(0, writer.GetMemory().Length);
+        Assert.IsGreaterThan(0, writer.GetSpan().Length);
+    }
+
+    [TestMethod]
     public void StackedMessages_BothExact_FlushSucceeds()
     {
         var (writer, sink) = NewWriter();
@@ -115,5 +131,64 @@ public class ProtocolDataWriterMessageBudgetTests
     {
         var (writer, _) = NewWriter();
         Assert.AreEqual(0, writer.CompleteCurrentMessageWithPadding());
+    }
+
+    [TestMethod]
+    public void Padding_AccountsForAbortedSerializerLocalBytes()
+    {
+        const int bodyLength = 256 * 1024;
+        var (writer, sink) = NewWriter();
+        writer.StartMessage((byte)'B', bodyLength);
+        var serializer = new PgWriter(writer).Init(flushMode: FlushMode.Blocking);
+        serializer.WriteBytes(new byte[64 * 1024 + 1]);
+        serializer.AbortWrite();
+
+        var padded = writer.CompleteCurrentMessageWithPadding();
+        writer.Flush();
+
+        Assert.AreEqual(bodyLength + sizeof(byte) + sizeof(uint), sink.ToArray().Length);
+        Assert.IsGreaterThan(0, padded);
+    }
+
+    [TestMethod]
+    public void ParameterWriterState_IsCachedPerTokenBearingShell()
+    {
+        var (writer, _) = NewWriter();
+        var strategy = new CountingParameterWriterStrategy();
+
+        var first = writer.GetParameterWriterState(strategy);
+        var second = writer.GetParameterWriterState(strategy);
+
+        Assert.AreSame(first, second);
+        Assert.AreEqual(1, strategy.CreateCount);
+    }
+
+    [TestMethod]
+    public void ParameterWriterState_IsRecreatedAfterClientEncodingChanges()
+    {
+        var (writer, _) = NewWriter();
+        var strategy = new CountingParameterWriterStrategy();
+        var first = writer.GetParameterWriterState(strategy);
+
+        writer.ClientEncoding = Encoding.Latin1;
+        var second = writer.GetParameterWriterState(strategy);
+
+        Assert.AreNotSame(first, second);
+        Assert.AreEqual(2, strategy.CreateCount);
+    }
+
+    sealed class CountingParameterWriterStrategy : ParameterWriterStrategy
+    {
+        public int CreateCount { get; private set; }
+
+        public override object CreateState(IOutputWriter output, Encoding textEncoding)
+        {
+            CreateCount++;
+            return new object();
+        }
+
+        public override void Write(object state, in Parameter parameter) => throw new NotSupportedException();
+        public override ValueTask WriteAsync(object state, Parameter parameter,
+            CancellationToken cancellationToken = default) => throw new NotSupportedException();
     }
 }

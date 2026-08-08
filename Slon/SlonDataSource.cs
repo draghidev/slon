@@ -834,6 +834,7 @@ public sealed class SlonDataSource : DbDataSource
             BackendInfo = backendInfo;
             TypeCatalog = typeCatalog;
             SerializerOptions = new(typeCatalog);
+            ParameterWriterStrategy = SerializerParameterWriterStrategy.Instance;
             CommandsTracker = commandTracker;
             Revision = revision;
         }
@@ -842,6 +843,7 @@ public sealed class SlonDataSource : DbDataSource
         public PgBackendCapabilities BackendCapabilities => BackendInfo.Capabilities;
         public PgTypeCatalog TypeCatalog { get; }
         public PgSerializerOptions SerializerOptions { get; }
+        public ParameterWriterStrategy ParameterWriterStrategy { get; }
         public CommandTracker CommandsTracker { get; }
         public int Revision { get; }
 

@@ -57,6 +57,22 @@ public class SerializerSubstrateTests
     }
 
     [TestMethod]
+    public void PgWriter_AbortRevokesPartialWriteStateBeforeReuse()
+    {
+        var output = new ArrayBufferWriter<byte>();
+        var writer = new PgWriter(output).Init(writeState: new object());
+        writer.WriteByte(1);
+
+        writer.AbortWrite();
+        writer.Init();
+        writer.WriteInt32(42);
+        writer.EndWrite(sizeof(int));
+
+        CollectionAssert.AreEqual(new byte[] { 0, 0, 0, 42 }, output.WrittenSpan.ToArray());
+        Assert.IsNull(writer.WriteState);
+    }
+
+    [TestMethod]
     public async Task PgReader_StreamsAcrossInputWindows()
     {
         var bytes = Enumerable.Range(0, 31).Select(static x => (byte)x).ToArray();

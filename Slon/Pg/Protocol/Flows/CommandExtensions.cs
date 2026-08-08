@@ -15,7 +15,8 @@ static class CommandExtensions
     // Callers picking sync vs async make that choice once at this level rather than threading
     // a mode flag through every encoder helper underneath. Keeping the list loop in this state
     // machine avoids one nested async invocation per command while preserving the one-command path.
-    public static ValueTask WriteCommandsAsync(this CommandList commands, PgEncoder encoder, bool appendSync, CancellationToken cancellationToken = default)
+    public static ValueTask WriteCommandsAsync(this CommandList commands, PgEncoder encoder, bool appendSync,
+        ParameterWriterStrategy parameterWriterStrategy, CancellationToken cancellationToken = default)
     {
         for (var i = 0; i < commands.Count; i++)
         {
@@ -23,7 +24,7 @@ static class CommandExtensions
             var descriptor = command.Descriptor;
             if (!descriptor.IsPrepared || command.Parameters.Length is not 0
                 || descriptor.ParameterTypes.Count is not 0 || command.ResultFormats.Length is not 0)
-                return WriteCommandsAsyncCore(commands, encoder, appendSync, cancellationToken, i);
+                return WriteCommandsAsyncCore(commands, encoder, appendSync, parameterWriterStrategy, cancellationToken, i);
 
             encoder.WriteBind(descriptor.CommandName);
             CompletePreparedWrite(command, descriptor, encoder);
@@ -32,7 +33,8 @@ static class CommandExtensions
             encoder.WriteSync();
         return encoder.FlushAsync(cancellationToken);
 
-        static async ValueTask WriteCommandsAsyncCore(CommandList commands, PgEncoder encoder, bool appendSync, CancellationToken cancellationToken, int startIndex)
+        static async ValueTask WriteCommandsAsyncCore(CommandList commands, PgEncoder encoder, bool appendSync,
+            ParameterWriterStrategy parameterWriterStrategy, CancellationToken cancellationToken, int startIndex)
         {
             for (var i = startIndex; i < commands.Count; i++)
             {
@@ -50,7 +52,8 @@ static class CommandExtensions
                     }
 
                     await encoder.WriteBindAsync(descriptor.CommandName, parameters: parameters,
-                        resultFormats: command.ResultFormats, cancellationToken: cancellationToken).ConfigureAwait(false);
+                        resultFormats: command.ResultFormats, parameterWriterStrategy: parameterWriterStrategy,
+                        cancellationToken: cancellationToken).ConfigureAwait(false);
                     CompletePreparedWrite(command, descriptor, encoder);
                 }
                 else if (command.IsSimple())
@@ -71,7 +74,8 @@ static class CommandExtensions
                     // Extended unprepared.
                     await encoder.WriteParseAsync(descriptor.UnpreparedCommandText, descriptor.CommandName, descriptor.ParameterTypes, cancellationToken: cancellationToken).ConfigureAwait(false);
                     await encoder.WriteBindAsync(descriptor.CommandName, parameters: parameters,
-                        resultFormats: command.ResultFormats, cancellationToken: cancellationToken).ConfigureAwait(false);
+                        resultFormats: command.ResultFormats, parameterWriterStrategy: parameterWriterStrategy,
+                        cancellationToken: cancellationToken).ConfigureAwait(false);
                     encoder.WriteDescribe();
                     if (!command.DescribeOnly)
                         encoder.WriteExecute();
@@ -105,7 +109,8 @@ static class CommandExtensions
     // async state machine for the whole command. Any WouldBlock from a mid-message auto-flush
     // (post-serializer) suspends here. The resumption picks up at the exact same composition
     // point with all state intact. Cf. encoder.WriteQueryResumable for the per-message contract.
-    public static async ValueTask WriteCommandsResumable(this CommandList commands, PgEncoder encoder, bool appendSync)
+    public static async ValueTask WriteCommandsResumable(this CommandList commands, PgEncoder encoder,
+        bool appendSync, ParameterWriterStrategy parameterWriterStrategy)
     {
         for (var i = 0; i < commands.Count; i++)
         {
@@ -123,7 +128,8 @@ static class CommandExtensions
                 }
 
                 await encoder.WriteBindResumable(descriptor.CommandName, parameters: parameters,
-                    resultFormats: command.ResultFormats).ConfigureAwait(false);
+                    resultFormats: command.ResultFormats,
+                    parameterWriterStrategy: parameterWriterStrategy).ConfigureAwait(false);
 
                 if (command.DescribeOnly)
                     encoder.WriteDescribe();
@@ -155,7 +161,8 @@ static class CommandExtensions
 
                 await encoder.WriteParseResumable(descriptor.UnpreparedCommandText, descriptor.CommandName, descriptor.ParameterTypes).ConfigureAwait(false);
                 await encoder.WriteBindResumable(descriptor.CommandName, parameters: parameters,
-                    resultFormats: command.ResultFormats).ConfigureAwait(false);
+                    resultFormats: command.ResultFormats,
+                    parameterWriterStrategy: parameterWriterStrategy).ConfigureAwait(false);
                 encoder.WriteDescribe();
                 if (!command.DescribeOnly)
                     encoder.WriteExecute();

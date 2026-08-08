@@ -71,6 +71,28 @@ readonly struct Parameter
         }
     }
 
+    internal ValueTask WriteAsync(PgWriter writer, CancellationToken cancellationToken = default)
+    {
+        if (Binding.Converter is null)
+        {
+            Write(writer);
+            return default;
+        }
+
+        if (Binding.IsDbNullBinding)
+            return default;
+
+        if (Value is IParameter parameter)
+        {
+            var valueWriter = new AsyncParameterWriter(Binding.Converter, writer, cancellationToken);
+            parameter.ApplyReader(ref valueWriter);
+            return valueWriter.Task;
+        }
+        return Binding.Converter.WriteAsync(writer, Value, cancellationToken);
+    }
+
+    internal object? WriteState => Binding.WriteState;
+
     internal void Release() => (Binding.WriteState as IDisposable)?.Dispose();
 
     // Fixed length only for now.
@@ -106,5 +128,12 @@ readonly struct Parameter
     ref struct ParameterWriter(PgConverter converter, PgWriter writer) : IParameterValueReader
     {
         public void Read<T>(T? value) => converter.Write(writer, value);
+    }
+
+    ref struct AsyncParameterWriter(PgConverter converter, PgWriter writer,
+        CancellationToken cancellationToken) : IParameterValueReader
+    {
+        public ValueTask Task { get; private set; }
+        public void Read<T>(T? value) => Task = converter.WriteAsync(writer, value, cancellationToken);
     }
 }

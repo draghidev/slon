@@ -18,13 +18,19 @@ readonly struct EnqueueArgs<TCommand> where TCommand : IAdoCommand
     public readonly DbParameterCollection? Parameters;
     public readonly CommandBehavior Behavior;
     public readonly SlonConnection Connection;
+    public readonly PgSerializerOptions SerializerOptions;
+    public readonly ParameterWriterStrategy ParameterWriterStrategy;
 
-    public EnqueueArgs(FieldRef<AdoBatchCore<TCommand>> fieldRef, DbParameterCollection? parameters, CommandBehavior behavior, SlonConnection connection)
+    public EnqueueArgs(FieldRef<AdoBatchCore<TCommand>> fieldRef, DbParameterCollection? parameters,
+        CommandBehavior behavior, SlonConnection connection, PgSerializerOptions serializerOptions,
+        ParameterWriterStrategy parameterWriterStrategy)
     {
         FieldRef = fieldRef;
         Parameters = parameters;
         Behavior = behavior;
         Connection = connection;
+        SerializerOptions = serializerOptions;
+        ParameterWriterStrategy = parameterWriterStrategy;
     }
 }
 
@@ -35,15 +41,18 @@ readonly struct MultiplexedEnqueueArgs<TCommand> where TCommand : IAdoCommand
     public readonly CommandBehavior Behavior;
     public readonly CommandTracker Tracker;
     public readonly PgSerializerOptions SerializerOptions;
+    public readonly ParameterWriterStrategy ParameterWriterStrategy;
 
     public MultiplexedEnqueueArgs(FieldRef<AdoBatchCore<TCommand>> fieldRef, DbParameterCollection? parameters,
-        CommandBehavior behavior, CommandTracker tracker, PgSerializerOptions serializerOptions)
+        CommandBehavior behavior, CommandTracker tracker, PgSerializerOptions serializerOptions,
+        ParameterWriterStrategy parameterWriterStrategy)
     {
         FieldRef = fieldRef;
         Parameters = parameters;
         Behavior = behavior;
         Tracker = tracker;
         SerializerOptions = serializerOptions;
+        ParameterWriterStrategy = parameterWriterStrategy;
     }
 }
 
@@ -213,7 +222,8 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
 
     CommandFlowOptions CreateCommandFlowOptions(ReadOnlySpan<DbParameterCollection?> parametersSpan,
         CommandBehavior behavior, SlonConnection? connection = null, CommandTracker? tracker = null,
-        PgConnection? pgConnection = null, PgSerializerOptions? serializerOptions = null)
+        PgConnection? pgConnection = null, PgSerializerOptions? serializerOptions = null,
+        ParameterWriterStrategy? parameterWriterStrategy = null)
     {
         if (_commands.Count is 0)
             ThrowHelper.ThrowInvalidOperation("No commands were added to the batch.");
@@ -397,7 +407,8 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
             {
                 Observer = (ICommandFlowObserver)_fieldRef.Instance,
                 Commands = commandArray is null ? new(result.Command) : new(commandArray, commandCount, isPooled: true),
-                SerializerOptions = serializerOptions ?? connection?.DbDataSource.GetDbDependencies().SerializerOptions
+                SerializerOptions = serializerOptions ?? connection?.DbDataSource.GetDbDependencies().SerializerOptions,
+                ParameterWriterStrategy = parameterWriterStrategy ?? SerializerParameterWriterStrategy.Instance
             };
         }
         catch
@@ -439,19 +450,26 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
             return dataSource.EnqueueCommands(
                 static (pgConnection, args) => args.FieldRef.Invoke().CreateCommandFlowOptions(
                     [args.Parameters], args.Behavior, tracker: args.Tracker, pgConnection: pgConnection,
-                    serializerOptions: args.SerializerOptions),
+                    serializerOptions: args.SerializerOptions,
+                    parameterWriterStrategy: args.ParameterWriterStrategy),
                 new MultiplexedEnqueueArgs<TCommand>(_fieldRef, parameters, behavior,
-                    dependencies.CommandsTracker, dependencies.SerializerOptions));
+                    dependencies.CommandsTracker, dependencies.SerializerOptions,
+                    dependencies.ParameterWriterStrategy));
         }
 
+        connection ??= ThrowConnectionNotInitialized();
+        var connectionDependencies = connection.DbDataSource.GetDbDependencies();
         return connection.Enqueue(
             static (pgConnection, args) =>
             {
                 ref var core = ref args.FieldRef.Invoke();
-                var options = core.CreateCommandFlowOptions([args.Parameters], args.Behavior, args.Connection, tracker: null, pgConnection);
+                var options = core.CreateCommandFlowOptions([args.Parameters], args.Behavior,
+                    args.Connection, tracker: null, pgConnection, args.SerializerOptions,
+                    args.ParameterWriterStrategy);
                 return new CommandFlow(async: false, options);
             },
-            new EnqueueArgs<TCommand>(_fieldRef, parameters, behavior, connection),
+            new EnqueueArgs<TCommand>(_fieldRef, parameters, behavior, connection,
+                connectionDependencies.SerializerOptions, connectionDependencies.ParameterWriterStrategy),
             closeConnection: HasCloseConnection(behavior));
     }
 
@@ -460,6 +478,8 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
         if (TryGetDataSource(out var dataSource, out var connection))
             return DataSourceCore(_fieldRef, dataSource, parameters, behavior, cancellationToken);
 
+        connection ??= ThrowConnectionNotInitialized();
+        var connectionDependencies = connection.DbDataSource.GetDbDependencies();
         return connection.EnqueueAsync(
             static (pgConnection, args) =>
             {
@@ -467,10 +487,13 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
                 // and three-shape baking happens here so the wire-shape decisions are atomic against
                 // the connection the flow will run on.
                 ref var core = ref args.FieldRef.Invoke();
-                var options = core.CreateCommandFlowOptions([args.Parameters], args.Behavior, args.Connection, tracker: null, pgConnection);
+                var options = core.CreateCommandFlowOptions([args.Parameters], args.Behavior,
+                    args.Connection, tracker: null, pgConnection, args.SerializerOptions,
+                    args.ParameterWriterStrategy);
                 return new CommandFlow(async: true, options);
             },
-            new EnqueueArgs<TCommand>(_fieldRef, parameters, behavior, connection),
+            new EnqueueArgs<TCommand>(_fieldRef, parameters, behavior, connection,
+                connectionDependencies.SerializerOptions, connectionDependencies.ParameterWriterStrategy),
             closeConnection: HasCloseConnection(behavior),
             cancellationToken);
 
@@ -481,12 +504,18 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
             return await dataSource.EnqueueCommandsAsync(
                 static (pgConnection, args) => args.FieldRef.Invoke().CreateCommandFlowOptions(
                     [args.Parameters], args.Behavior, tracker: args.Tracker, pgConnection: pgConnection,
-                    serializerOptions: args.SerializerOptions),
+                    serializerOptions: args.SerializerOptions,
+                    parameterWriterStrategy: args.ParameterWriterStrategy),
                 new MultiplexedEnqueueArgs<TCommand>(fieldRef, parameters, behavior,
-                    dependencies.CommandsTracker, dependencies.SerializerOptions),
+                    dependencies.CommandsTracker, dependencies.SerializerOptions,
+                    dependencies.ParameterWriterStrategy),
                 cancellationToken).ConfigureAwait(false);
         }
     }
+
+    [DoesNotReturn]
+    static SlonConnection ThrowConnectionNotInitialized()
+        => throw new InvalidOperationException("The command has no connection or data source.");
 
     public void Prepare(DbParameterCollection? parameters)
     {

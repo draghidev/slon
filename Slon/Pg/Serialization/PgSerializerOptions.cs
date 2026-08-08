@@ -49,14 +49,21 @@ sealed class PgSerializerOptions
 
         Mapping? mapping = null;
         if (type is not null && type != typeof(object))
+        {
             _byClrType.TryGetValue(type, out mapping);
+            if (mapping is null && typeof(Stream).IsAssignableFrom(type))
+                _byClrType.TryGetValue(typeof(Stream), out mapping);
+            if (mapping is null && typeof(TextReader).IsAssignableFrom(type))
+                _byClrType.TryGetValue(typeof(TextReader), out mapping);
+        }
         if (mapping is null && pgTypeId is { } id)
             _byPgTypeId.TryGetValue(GetCanonicalTypeId(id), out mapping);
         if (mapping is null)
             throw new NotSupportedException(
                 $"No serializer mapping exists for CLR type '{type}' and PostgreSQL type '{pgTypeId}'.");
 
-        if (type is not null && type != typeof(object) && type != mapping.ClrType)
+        if (type is not null && type != typeof(object) && type != mapping.ClrType
+            && !mapping.ClrType.IsAssignableFrom(type))
             throw new NotSupportedException(
                 $"PostgreSQL type '{mapping.DataTypeName}' maps to CLR type '{mapping.ClrType}', not '{type}'.");
         if (pgTypeId is { } requestedTypeId
@@ -85,4 +92,5 @@ sealed class PgSerializerOptions
         public PgTypeInfo Create(PgSerializerOptions options, Type? requestedType)
             => new(options, Converter, DataTypeName, requestedType);
     }
+
 }

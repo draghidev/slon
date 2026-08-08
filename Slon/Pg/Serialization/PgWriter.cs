@@ -20,6 +20,7 @@ public sealed class PgWriter
     int _committed;
     int _totalBytesWritten;
     PgConversionContext _conversionContext = PgConversionContext.Empty;
+    object? _writeState;
     FlushMode _flushMode;
 
     internal PgWriter(IBufferWriter<byte> writer, PgConversionContext? conversionContext = null)
@@ -29,15 +30,17 @@ public sealed class PgWriter
     }
 
     public PgConversionContext ConversionContext => _conversionContext;
+    public object? WriteState => _writeState;
 
     internal PgWriter Init(PgConversionContext? conversionContext = null,
-        FlushMode flushMode = FlushMode.None)
+        FlushMode flushMode = FlushMode.None, object? writeState = null)
     {
         if (_position != _committed)
             throw new InvalidOperationException("PgWriter still has uncommitted bytes.");
 
         _conversionContext = conversionContext ?? PgConversionContext.Empty;
         _flushMode = flushMode;
+        _writeState = writeState;
         _totalBytesWritten = 0;
         RequestBuffer(0);
         return this;
@@ -77,9 +80,22 @@ public sealed class PgWriter
         Commit();
         var actual = _totalBytesWritten;
         _totalBytesWritten = 0;
+        _writeState = null;
         if (actual != expectedByteCount.GetValueOrDefault())
             throw new InvalidOperationException(
                 $"Bytes written ({actual}) and expected byte count ({expectedByteCount}) do not match.");
+    }
+
+    // A converter can fail with bytes still staged in this facade. The protocol owns recovery
+    // of bytes already committed to the underlying writer; discard only this writer's local
+    // view and implementation state so the cached instance can begin the next Bind cleanly.
+    internal void AbortWrite()
+    {
+        _buffer = default;
+        _position = _committed = 0;
+        _totalBytesWritten = 0;
+        _writeState = null;
+        _flushMode = FlushMode.None;
     }
 
     public void WriteByte(byte value)

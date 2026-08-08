@@ -256,7 +256,7 @@ sealed class ProtocolWritePipe(IOutputWriter writer, Encoding clientEncoding, Ac
 
         public Memory<byte> GetMemory(int sizeHint = 0)
         {
-            if (_remaining < sizeHint)
+            if (_remaining == 0 || _remaining < sizeHint)
             {
                 _writer.Advance(Consumed);
                 _memory = _writer.GetMemory(sizeHint);
@@ -269,7 +269,7 @@ sealed class ProtocolWritePipe(IOutputWriter writer, Encoding clientEncoding, Ac
 
         public Span<byte> GetSpan(int sizeHint = 0)
         {
-            if (_remaining < sizeHint)
+            if (_remaining == 0 || _remaining < sizeHint)
             {
                 _writer.Advance(Consumed);
                 _memory = _writer.GetMemory(sizeHint);
