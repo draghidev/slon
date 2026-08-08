@@ -12,13 +12,12 @@ namespace Slon.Tests.Pg;
 [TestClass]
 public class CommandDrainTests : ConnectionCreatingTest
 {
-    sealed class ResultObserver : ICommandFlowObserver
+    sealed class ResultObserver : CommandFlowObserver
     {
         public TaskCompletionSource Entered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
-        public void OnFlowStarted(CommandFlow flow) { }
-        public void OnCommandResult(CommandFlow flow, CommandResult result) => Entered.TrySetResult();
-        public void OnFlowEnded(CommandFlow flow) { }
+        internal override void OnCommandResult(CommandFlow flow, CommandResult result, object? state)
+            => Entered.TrySetResult();
     }
 
     sealed class ReleaseOrderingFlow : PgClientFlow

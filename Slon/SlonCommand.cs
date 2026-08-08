@@ -9,7 +9,7 @@ using Slon.Pg.Protocol.Flows;
 namespace Slon;
 
 /// <inheritdoc cref="System.Data.Common.DbCommand" />
-public sealed class SlonCommand: DbCommand, ICommandFlowObserver
+public sealed class SlonCommand: DbCommand
 {
     AdoBatchCore<AdoCommand> _batchCore;
 
@@ -25,16 +25,19 @@ public sealed class SlonCommand: DbCommand, ICommandFlowObserver
         _isOverallStateDirty = true;
         _overallCommandText = commandText ?? string.Empty;
         _overallCommandType = CommandType.Text;
+        var fieldRef = FieldRef<AdoBatchCore<AdoCommand>>.Create(&GetBatchCore, this);
         if (connection is not null)
         {
-            _batchCore = new(connection, FieldRef<AdoBatchCore<AdoCommand>>.Create(&GetBatchCore, this));
+            _batchCore = new(connection, fieldRef);
             _batchCore.Timeout = connection.DefaultCommandTimeout;
         }
         else if (dataSource is not null)
         {
-            _batchCore = new(dataSource, FieldRef<AdoBatchCore<AdoCommand>>.Create(&GetBatchCore, this));
+            _batchCore = new(dataSource, fieldRef);
             _batchCore.Timeout = dataSource.DefaultCommandTimeout;
         }
+        else
+            _batchCore = new(fieldRef);
 
         // ReSharper disable once AddressOfMarshalByRefObject
         static ref AdoBatchCore<AdoCommand> GetBatchCore(SlonCommand instance) => ref instance._batchCore;
@@ -220,7 +223,7 @@ public sealed class SlonCommand: DbCommand, ICommandFlowObserver
     /// <see cref="SlonConnection.BeginTransaction()"/>
     /// </summary>
     public new SlonTransaction? Transaction
-        => !_batchCore.TryGetDataSource(out _, out var connection) ? connection.CurrentTransaction : null;
+        => !_batchCore.TryGetDataSource(out _, out var connection) ? connection?.CurrentTransaction : null;
 
     /// <inheritdoc/>
     public override bool DesignTimeVisible { get; set; }
@@ -233,14 +236,14 @@ public sealed class SlonCommand: DbCommand, ICommandFlowObserver
     public Task CancelAsync(CancellationToken cancellationToken = default)
         => _batchCore.CancelAsync(cancellationToken);
 
-    void ICommandFlowObserver.OnFlowStarted(CommandFlow flow)
+    internal void OnFlowStarted(CommandFlow flow)
         => _batchCore.OnFlowStarted(flow);
 
-    void ICommandFlowObserver.OnCommandResult(CommandFlow flow, CommandResult result)
+    internal void OnCommandResult(CommandFlow flow, CommandResult result)
         => _batchCore.OnCommandResult(flow, result);
 
-    void ICommandFlowObserver.OnFlowEnded(CommandFlow flow)
-        => _batchCore.OnFlowEnded(flow);
+    internal void OnFlowCompleting(CommandFlow flow, Exception? exception)
+        => _batchCore.OnFlowCompleting(flow, exception);
 
     /// <summary>Executes the command against its connection object, returning the number of rows affected.</summary>
     /// <returns>The number of records affected.</returns>

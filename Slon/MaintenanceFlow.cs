@@ -24,21 +24,24 @@ sealed class MaintenanceFlow : PgClientFlow
         IsAsync = true;
     }
 
-    // Owned by MaintenanceFlow (rather than wired externally) so PgConnection.TryArmAndSchedule
-    // doesn't need to know how the flow's lifecycle hooks together. Bind sets the completion
-    // action too. The static delegate captures the connection from state, returns the flow to
-    // the cache, disarms, and re-arms if work arrived during the drain.
-    static readonly Action<PgClientFlow, Exception?, object?> OnCompletedAction =
-        static (flow, _, state) =>
+    // Owned by MaintenanceFlow so PgConnection.TryArmAndSchedule doesn't need to know how the
+    // lifecycle hooks together. The stateless observer receives the bound connection as state,
+    // returns the flow to the cache, disarms, and re-arms if work arrived during the drain.
+    sealed class ObserverImpl : PgClientFlowObserver
+    {
+        internal static readonly ObserverImpl Instance = new();
+
+        internal override void OnCompleted(PgClientFlow flow, Exception? exception, object? state)
         {
             var conn = (PgConnection)state!;
             conn.OnMaintenanceFlowCompleted((MaintenanceFlow)flow);
-        };
+        }
+    }
 
     internal void Bind(PgConnection connection)
     {
         _connection = connection;
-        SetCompletionAction(OnCompletedAction, connection);
+        SetObserver(ObserverImpl.Instance, connection);
     }
 
     public new void Reset()

@@ -78,7 +78,7 @@ sealed partial class PgClientProtocol
             var innerSource = PgClientFlowSource.Create(protocol, _innerControl, protocol._options.ExecutionScheduler);
             var first = _innerPipeline is null;
             _innerPipeline = Pipeline.Create<PgClientFlow, Policy, PgClientFlowSource, PgClientFlowSource.Enumerator>(
-                new Policy(protocol, _innerControl), innerSource, _innerPipeline);
+                new Policy(protocol, _innerControl, this), innerSource, _innerPipeline);
             _innerControl.BindSource(innerSource);
             if (first)
                 _innerControl.BindPipeline(_innerPipeline);
@@ -87,6 +87,11 @@ sealed partial class PgClientProtocol
 
         public bool IsPipelineEmpty(PgClientFlowSource source)
             => source.Backlog == 0 && _innerPipeline!.Depth == 0;
+
+        public Task Completion => _innerPipeline!.Completion;
+
+        internal void Terminate(Exception exception)
+            => _ = _innerPipeline!.CompleteAsync(exception);
 
         // Abort scope I/O without aborting the pooled protocol.
         public void AbortScope() => _scopeClose.Abort();

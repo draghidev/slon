@@ -12,6 +12,34 @@ using Slon.Runtime.CompilerServices;
 
 namespace Slon;
 
+sealed class SlonCommandFlowObserver : CommandFlowObserver
+{
+    internal static readonly SlonCommandFlowObserver Instance = new();
+
+    internal override void OnStarted(CommandFlow flow, object? state)
+        => ((SlonCommand)state!).OnFlowStarted(flow);
+
+    internal override void OnCommandResult(CommandFlow flow, CommandResult result, object? state)
+        => ((SlonCommand)state!).OnCommandResult(flow, result);
+
+    internal override void OnCompleting(PgClientFlow flow, Exception? exception, object? state)
+        => ((SlonCommand)state!).OnFlowCompleting((CommandFlow)flow, exception);
+}
+
+sealed class SlonBatchFlowObserver : CommandFlowObserver
+{
+    internal static readonly SlonBatchFlowObserver Instance = new();
+
+    internal override void OnStarted(CommandFlow flow, object? state)
+        => ((SlonBatch)state!).OnFlowStarted(flow);
+
+    internal override void OnCommandResult(CommandFlow flow, CommandResult result, object? state)
+        => ((SlonBatch)state!).OnCommandResult(flow, result);
+
+    internal override void OnCompleting(PgClientFlow flow, Exception? exception, object? state)
+        => ((SlonBatch)state!).OnFlowCompleting((CommandFlow)flow, exception);
+}
+
 readonly struct EnqueueArgs<TCommand> where TCommand : IAdoCommand
 {
     public readonly FieldRef<AdoBatchCore<TCommand>> FieldRef;
@@ -78,6 +106,12 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
     Action<CommandResult, object?>? _onCommandResultAction;
     object? _onCommandResultActionState;
     AdoCommandList<TCommand> _commands;
+
+    public AdoBatchCore(FieldRef<AdoBatchCore<TCommand>> fieldRef)
+    {
+        _dataSourceOrConnection = null!;
+        _fieldRef = fieldRef;
+    }
 
     public AdoBatchCore(SlonConnection connection, FieldRef<AdoBatchCore<TCommand>> fieldRef)
     {
@@ -177,7 +211,8 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
 
         // Conceptually a Dispose against the old connection (release owned state, clear stale
         // tracking refs) followed by a re-bind to the new one.
-        ReleaseOwned(oldConnection);
+        if (oldConnection is not null)
+            ReleaseOwned(oldConnection);
         ClearTrackedRefs();
 
         _dataSourceOrConnection = connection;
@@ -205,18 +240,18 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public bool TryGetDataSource([NotNullWhen(true)]out SlonDataSource? dataSource, [NotNullWhen(false)]out SlonConnection? connection)
+    public bool TryGetDataSource([NotNullWhen(true)]out SlonDataSource? dataSource,
+        out SlonConnection? connection)
     {
-        Debug.Assert(_dataSourceOrConnection is not null);
-        if (_dataSourceOrConnection.GetType() == typeof(SlonDataSource))
+        if (_dataSourceOrConnection is SlonDataSource source)
         {
-            dataSource = (SlonDataSource)_dataSourceOrConnection;
+            dataSource = source;
             connection = null;
             return true;
         }
 
         dataSource = null;
-        connection = (SlonConnection)_dataSourceOrConnection;
+        connection = _dataSourceOrConnection as SlonConnection;
         return false;
     }
 
@@ -403,9 +438,17 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
 
             _onCommandResultAction = onResultAction;
             _onCommandResultActionState = onResultActionState;
+            var observerState = _fieldRef.Instance;
+            var observer = observerState switch
+            {
+                SlonCommand => (CommandFlowObserver)SlonCommandFlowObserver.Instance,
+                SlonBatch => SlonBatchFlowObserver.Instance,
+                _ => throw new NotSupportedException($"Unsupported ADO command owner {observerState.GetType()}.")
+            };
             return new()
             {
-                Observer = (ICommandFlowObserver)_fieldRef.Instance,
+                Observer = observer,
+                ObserverState = observerState,
                 Commands = commandArray is null ? new(result.Command) : new(commandArray, commandCount, isPooled: true),
                 SerializerOptions = serializerOptions ?? connection?.DbDataSource.GetDbDependencies().SerializerOptions,
                 ParameterWriterStrategy = parameterWriterStrategy ?? SerializerParameterWriterStrategy.Instance
@@ -846,7 +889,8 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
             return;
         }
 
-        ReleaseOwned(connection);
+        if (connection is not null)
+            ReleaseOwned(connection);
     }
 
     public ValueTask DisposeAsync()
@@ -861,7 +905,7 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
             return new();
         }
 
-        return ReleaseOwnedAsync(connection);
+        return connection is null ? default : ReleaseOwnedAsync(connection);
     }
 
     public void Cancel()
@@ -886,8 +930,14 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
             _onCommandResultAction?.Invoke(result, _onCommandResultActionState);
     }
 
-    internal void OnFlowEnded(CommandFlow flow)
+    internal void OnFlowCompleting(CommandFlow flow, Exception? exception)
     {
+        // A flow-level fault while holding an ADO connection lease breaks that lease. SQL errors don't
+        // reach here: they surface on CommandResult and the flow completes cleanly. OnCompleting runs
+        // before terminal publication, so an awaiter observing the fault also observes Broken.
+        if (exception is not null && !TryGetDataSource(out _, out var connection) && connection is not null)
+            ((IAdoConnection)connection).Break(exception);
+
         if (!ReferenceEquals(Interlocked.CompareExchange(ref _activeFlow, null, flow), flow))
             return;
 

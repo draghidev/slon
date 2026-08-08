@@ -675,7 +675,7 @@ public sealed partial class SlonConnection : DbConnection
 
     /// <summary>Creates and returns a <see cref="T:System.Data.Common.DbCommand" /> object associated with the current connection.</summary>
     /// <returns>A <see cref="Slon.SlonCommand" /> object.</returns>
-    public new SlonCommand CreateCommand() => new();
+    public new SlonCommand CreateCommand() => new(this);
 
     public override bool CanCreateBatch => true;
 

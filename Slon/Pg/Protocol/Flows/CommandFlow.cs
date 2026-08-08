@@ -8,16 +8,16 @@ using FlowCallerInteractionCoreResult = System.ValueTuple;
 
 namespace Slon.Pg.Protocol.Flows;
 
-interface ICommandFlowObserver
+abstract class CommandFlowObserver : PgClientFlowObserver
 {
-    void OnFlowStarted(CommandFlow flow);
-    void OnCommandResult(CommandFlow flow, CommandResult result);
-    void OnFlowEnded(CommandFlow flow);
+    internal virtual void OnStarted(CommandFlow flow, object? state) { }
+    internal virtual void OnCommandResult(CommandFlow flow, CommandResult result, object? state) { }
 }
 
 readonly struct CommandFlowOptions
 {
-    public ICommandFlowObserver? Observer { get; init; }
+    public CommandFlowObserver? Observer { get; init; }
+    public object? ObserverState { get; init; }
     public CommandList Commands { get; init; }
     // Captured while the ADO command is bound. Catalog reload publishes a new options instance,
     // while this flow continues against the immutable revision it resolved with.
@@ -135,8 +135,15 @@ sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
     public CommandFlow Initialize(bool async, in CommandFlowOptions options)
     {
         IsAsync = async;
-        _options = options;
-        options.Observer?.OnFlowStarted(this);
+        if (options.Observer is { } observer)
+            SetObserver(observer, options.ObserverState);
+        _options = new()
+        {
+            Commands = options.Commands,
+            SerializerOptions = options.SerializerOptions,
+            ParameterWriterStrategy = options.ParameterWriterStrategy
+        };
+        options.Observer?.OnStarted(this, options.ObserverState);
         // Arm before publication: teardown may complete the source concurrently even before enumeration.
         _enumeratorMoveNextTaskSource.CanCompleteConcurrently = true;
         return this;
@@ -496,7 +503,8 @@ sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
                         !resultCommand.DescribeOnly, resultCommand.IsSimple(), _options.SerializerOptions,
                         _decoder.ClientEncoding);
                 }
-                _options.Observer?.OnCommandResult(this, result);
+                ((CommandFlowObserver?)GetObserver(out var observerState))
+                    ?.OnCommandResult(this, result, observerState);
 
                 // Disposal drains without another result handoff. Graceful close instead faults the
                 // attached consumer, then uses the same autonomous drain. Command errors remain results.
@@ -871,14 +879,14 @@ sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
     protected override void OnReleasing(Exception? exception)
     {
         Volatile.Read(ref _cancelDelivery)?.TrySetResult();
-        _options.Observer?.OnFlowEnded(this);
         ReleaseParameterState();
         _options.Commands.Return();
     }
 
     protected override void OnDiscarded()
     {
-        _options.Observer?.OnFlowEnded(this);
+        // Discarded flows never enter the base release path.
+        GetObserver(out var observerState)?.OnCompleting(this, null, observerState);
         ReleaseParameterState();
         _options.Commands.Return();
     }

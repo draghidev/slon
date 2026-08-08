@@ -33,7 +33,7 @@ sealed class ResyncRecoveryFlow : PgClientFlow
 
     /// The flow this recovery supplanted, carried so the policy can complete it when the
     /// recovery completes. The failed item's lifetime deliberately extends as far as the
-    /// recovery does: completion is the reuse gate (completion actions Reset and re-enqueue
+    /// recovery does: completion is the reuse gate (completed observers Reset and re-enqueue
     /// instances), and reuse must be causally after the protocol stops referencing the failed
     /// tenure's machinery (parked dispatch state, inherited RFQ bookkeeping, registrations).
     /// Ordering of anything enqueued after the failure is already handled by the pipeline.
@@ -190,12 +190,14 @@ sealed class ResyncRecoveryFlow : PgClientFlow
     // Realign the wire and discard whatever the failed flow left uncommitted (taken whenever the write
     // window is open):
     //   1. PadCurrentMessage - complete any torn outgoing frame so the server exits at a framing boundary.
-    //   2. Query("BEGIN") (only when canWriteSync) - the failed flow ended mid extended-query, so its
-    //      executed commands sit in an OPEN implicit block PG holds to the Sync (verified: a bare Sync
-    //      COMMITS them - see Recovery_PipelinedImplicitBlock_SurvivorCount). BEGIN upgrades that block to
-    //      an explicit transaction so the ROLLBACK can unwind it. It also lands the realigning RFQ. When
-    //      the flow already opened an explicit transaction, BEGIN-in-transaction is a harmless WARNING
-    //      (NOT an error), a no-op that leaves the open transaction for the ROLLBACK.
+    //   2. Parse/Bind/Execute("BEGIN") + Sync (only when canWriteSync) - the failed flow ended mid
+    //      extended-query, so the server discards frontend messages through the next Sync after an
+    //      error. If the padded frame errors, BEGIN is discarded and Sync rolls back the failed implicit
+    //      block. If it does not, the executed commands sit in an OPEN implicit block PG holds to the Sync
+    //      (verified: a bare Sync COMMITS them - see Recovery_PipelinedImplicitBlock_SurvivorCount), and
+    //      BEGIN upgrades that block to explicit before Sync so the ROLLBACK can unwind it. When the flow
+    //      already opened an explicit transaction, BEGIN-in-transaction is a harmless WARNING (NOT an
+    //      error), leaving the open transaction for the ROLLBACK.
     //   3. Query("ROLLBACK") - rolls back the now-explicit (or already-explicit) transaction; a
     //      no-op-with-notice when already Idle. When canWriteSync is false the flow's own Query/Sync
     //      already terminated its block, so this is the only message - closing any open BEGIN it left.
@@ -206,13 +208,15 @@ sealed class ResyncRecoveryFlow : PgClientFlow
     {
         encoder.PadCurrentMessage();
         if (_canWriteSync)
-            // The failed flow ended mid extended-query: its executed commands sit in an OPEN implicit
-            // block that a bare Sync would COMMIT - PG holds pipelined Executes to the Sync, it does NOT
-            // commit per statement. BEGIN upgrades that implicit block into an explicit transaction, so
-            // the ROLLBACK below unwinds the whole thing. (When canWriteSync is false the flow's own
-            // Query/Sync already terminated its block - nothing to upgrade, just close any open BEGIN.)
-            // The trailing comment tags the resync move in server logs / pg_stat_activity.
-            encoder.WriteQuery("BEGIN -- Slon connection recovery");
+        {
+            // BEGIN must be in the extended stream before the realigning Sync. A simple Query is itself
+            // discarded while the server is recovering from an extended-query error and therefore cannot
+            // provide either the transaction upgrade or the boundary.
+            encoder.WriteParse("BEGIN -- Slon connection recovery");
+            encoder.WriteBind();
+            encoder.WriteExecute();
+            encoder.WriteSync();
+        }
         // Closes the now-explicit (or already-explicit) transaction; a no-op-with-notice when Idle.
         encoder.WriteQuery("ROLLBACK -- Slon connection recovery");
         ExclusiveAccessFlow.WriteScopeReset(encoder, _scopeResetCommand);

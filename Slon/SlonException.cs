@@ -112,6 +112,7 @@ static class AdoException
                 protocol.Message, protocol, protocol.InnerException),
             PgClientClosedException closed => new SlonException(
                 closed.Message, closed, closed.InnerException),
+            IOException io => new SlonException(io.Message, io, io.InnerException),
             _ => exception
         };
     }

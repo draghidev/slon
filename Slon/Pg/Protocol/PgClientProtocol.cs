@@ -538,7 +538,8 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
     }
 
     // Begin an exclusive-access scope: the user-driven sibling of the startup handshake. Builds (or
-    // reuses) a nested pipeline (poolFacing:false, so no pool-unit signaling and no inner recovery)
+    // reuses) a nested pipeline (poolFacing:false, so no pool-unit signaling). A recoverable inner
+    // failure resyncs the shared wire but terminates this private pipeline instead of restoring admission.
     // and queues the cached ExclusiveAccessFlow on the outer pipeline. The returned flow is the scope
     // handle: await HandoffReady to acquire, Submit subflows, CompleteScopeAsync to release. One scope
     // at a time per connection.
@@ -1010,14 +1011,17 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
     {
         readonly Control _control;
         readonly ValueTaskSourcePromise<PipelineItemResult> _promise;
+        readonly ExclusiveScopeState? _localPipeline;
 
         // Parameterized by Control (not the protocol) so the same policy drives both the protocol's
         // outer pipeline (FlowControl) and an exclusive flow's inner pipeline (its own Control reading
-        // the inner pipeline's slots). The divergence lives in the Control, not here.
-        public Policy(PgClientProtocol protocol, Control control)
+        // the inner pipeline's slots). The optional local owner changes only recovery disposition:
+        // resync still runs, but that private pipeline closes admission afterwards.
+        public Policy(PgClientProtocol protocol, Control control, ExclusiveScopeState? localPipeline = null)
         {
             _control = control;
             _promise = new();
+            _localPipeline = localPipeline;
             ActivationScheduler = protocol._options.ActivationScheduler;
         }
 
@@ -1029,7 +1033,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
             if (exception is PgClientClosedException && _control.ClosedException is not null)
                 exception = _control.FlowTerminationException;
             // OnReleasing (protocol bookkeeping: ActivatedFlow release, read-state recycle) must run
-            // BEFORE Release (user-visible terminal): Release fires the flow's completion action,
+            // BEFORE Release (user-visible terminal): Release fires the flow's completed observer,
             // which may Reset() and re-enqueue the SAME instance. If that next tenure's Activate lands
             // before OnReleasing's depth-0 CAS, the comparand matches the new activation (ABA) and
             // severs a live binding. Ordering the release first closes this by causality. Recovery
@@ -1053,7 +1057,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         [MethodImpl(MethodImplOptions.NoInlining)]
         void CompleteRecoveryItem(ResyncRecoveryFlow resyncRecovery, PgClientFlow failedFlow, int remainingDepth, Exception? exception)
         {
-            // Capture the binding BEFORE Release fires the resyncRecovery's completion action:
+            // Capture the binding BEFORE Release fires the resyncRecovery's completed observer:
             // completion is the reuse gate, and a Reset on reuse clears the binding (same
             // causality as the OnReleasing-before-Release ordering below).
             var failureException = resyncRecovery.FailureException!;
@@ -1229,14 +1233,6 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
                 return false;
             }
 
-            // Nested exclusive-scope pipeline: don't recover here. The failure propagates to the root
-            // pipeline, which owns the wire and performs the takeover/resync.
-            if (!_control.RecoversWireFailures)
-            {
-                recoveryItem = null;
-                return false;
-            }
-
             var failedItemControl = failedItem.GetExecutionControl(_control);
 
             // Substitute-write gate. Both must hold for recovery to inject a terminating Sync:
@@ -1271,11 +1267,13 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
             // far as the recovery, so its dispatch state, RFQ bookkeeping, and registrations release
             // before the instance can be reused.
             var recovery = ResyncRecoveryFlow.Create(
-                _control, failedItem, context.Exception, outstandingPhase, outstandingIsRead, failedItemControl.RfqCount, canWriteSync, canWrite);
+                _control, failedItem, context.Exception, outstandingPhase, outstandingIsRead,
+                failedItemControl.RfqCount, canWriteSync, canWrite);
             recoveryItem = recovery;
             if (recovery.BlocksAdmission)
                 _control.RecoveryStarted();
             _control.OnFlowSubstituted(failedItem, recoveryItem);
+            _localPipeline?.Terminate(context.Exception);
             return true;
         }
 
@@ -1376,12 +1374,6 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         }
 
         PgDecoder Decoder => _decoder ?? protocol._pgDecoder;
-
-        // Only the root (pool-facing) control owns wire recovery. A nested exclusive-scope pipeline
-        // lets an inner subflow's failure propagate to the root, which performs the wire takeover /
-        // resync - an inner recovery would fight the root for the single writer. (Exclusive = no scope
-        // recovery, yes wire recovery, mediated by the root.)
-        public bool RecoversWireFailures => poolFacing;
 
         public PgClientFlow? ExecutingFlow => _slots.Executing;
         public PgClientFlow? ActivatedFlow => _slots.Activated;

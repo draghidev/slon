@@ -1,8 +1,11 @@
 using System.Buffers.Binary;
+using System.Text;
 using System.Threading.Tasks.Sources;
 using Slon.Pg;
 using Slon.Pg.Protocol;
 using Slon.Pg.Protocol.Flows;
+using Slon.Pg.Serialization;
+using Slon.Pg.Types;
 using Slon.Runtime.CompilerServices;
 using Slon.Transport;
 
@@ -114,6 +117,49 @@ public class RecoveryTests : ConnectionCreatingTest
             _awaitObserved.TrySetResult();
             _core.OnCompleted(continuation, state, token, flags);
         }
+    }
+
+    sealed class TestParameter<T>(T? value) : IParameter<T>
+    {
+        public ParameterKind Kind => ParameterKind.Input;
+        public string Name => string.Empty;
+        public Type StaticValueType => typeof(T);
+        object? IParameter.Value => value;
+        public T? Value => value;
+        public void SetOutputResult(object? value) => throw new NotSupportedException();
+        public void SetOutputResult(T? value) => throw new NotSupportedException();
+        public void ApplyReader<TReader>(ref TReader reader)
+            where TReader : IParameterValueReader, allows ref struct
+            => reader.Read(value);
+    }
+
+    sealed class ThrowingReadStream(int length, int throwAfter) : Stream
+    {
+        int _position;
+
+        public override int Read(Span<byte> buffer)
+        {
+            if (_position >= throwAfter)
+                throw new IOException("Synthetic parameter read failure.");
+            var count = Math.Min(buffer.Length, throwAfter - _position);
+            buffer.Slice(0, count).Clear();
+            _position += count;
+            return count;
+        }
+
+        public override ValueTask<int> ReadAsync(Memory<byte> buffer,
+            CancellationToken cancellationToken = default)
+            => new(Read(buffer.Span));
+        public override bool CanRead => true;
+        public override bool CanSeek => true;
+        public override bool CanWrite => false;
+        public override long Length => length;
+        public override long Position { get => _position; set => throw new NotSupportedException(); }
+        public override void Flush() { }
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+        public override int Read(byte[] buffer, int offset, int count) => Read(buffer.AsSpan(offset, count));
     }
 
     // Test flow that lets each test pick its failure phase and write shape. Recovery's input
@@ -635,6 +681,39 @@ public class RecoveryTests : ConnectionCreatingTest
         var e = sibling.GetAsyncEnumerator();
         while (await e.MoveNextAsync()) { }
         await e.DisposeAsync();
+    }
+
+    [TestMethod]
+    public async Task TornStreamedBind_TerminatesScopeButPhysicalProtocolRecovers()
+    {
+        await using var protocol = await ConnectAsync();
+        var scope = protocol.QueueExclusiveScope(async: true);
+        await scope.HandoffReady.WaitAsync(TestTimeout.Hang);
+        var serializerOptions = new PgSerializerOptions(PgTypeCatalog.Default);
+        var parameter = Parameter.Create(
+            new TestParameter<Stream>(new ThrowingReadStream(256 * 1024, 64 * 1024)),
+            serializerOptions, new() { TextEncoding = Encoding.UTF8 });
+        var command = Command.Create("select octet_length($1::bytea)", new([parameter])) with
+        {
+            Parameters = [parameter]
+        };
+        var faulting = new CommandFlow(async: true, new CommandFlowOptions
+        {
+            Commands = new(command),
+            SerializerOptions = serializerOptions,
+            ParameterWriterStrategy = SerializerParameterWriterStrategy.Instance
+        });
+        var successor = new CommandFlow(async: true, Command.Create("select 42::int4"));
+        scope.Queue(faulting);
+
+        await Assert.ThrowsExactlyAsync<IOException>(
+            () => faulting.ConsumeNonQueryAsync().AsTask().WaitAsync(TestTimeout.Hang));
+
+        Assert.ThrowsExactly<InvalidOperationException>(() => scope.Queue(successor));
+        successor.DiscardUnqueued();
+        await scope.CompleteScopeAsync().AsTask().WaitAsync(TestTimeout.Hang);
+
+        await RunAsync(protocol, "select 42::int4");
     }
 
     // Two faulting flows back to back. The first fails, the second is enqueued behind, also

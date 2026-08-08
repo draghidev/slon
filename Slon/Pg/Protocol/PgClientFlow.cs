@@ -4,6 +4,12 @@ using System.Threading.Tasks.Sources;
 
 namespace Slon.Pg.Protocol;
 
+abstract class PgClientFlowObserver
+{
+    internal virtual void OnCompleting(PgClientFlow flow, Exception? exception, object? state) { }
+    internal virtual void OnCompleted(PgClientFlow flow, Exception? exception, object? state) { }
+}
+
 abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgClientFlow>, IThreadPoolWorkItem
 {
     protected internal enum BackendCancellationTiming : byte
@@ -72,9 +78,8 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
     CancellationTokenRegistration _activationCancellationTokenRegistration;
     TimeSpan _remainingActivationTimeout;
 
-    // Completion state.
-    Action<PgClientFlow, Exception?, object?>? _completionAction;
-    object? _completionState;
+    PgClientFlowObserver? _observer;
+    object? _observerState;
 
     /// The flow's body. "Auto" is the protocol-package convention for "adapts to the bound mode
     /// (sync or async)": the body dispatches between sync and async I/O per read based on IsAsync,
@@ -150,10 +155,16 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
         _completionCore.CanCompleteConcurrently = true;
     }
 
-    public void SetCompletionAction(Action<PgClientFlow, Exception?, object?> action, object? state)
+    protected void SetObserver(PgClientFlowObserver observer, object? state)
     {
-        _completionAction = action;
-        _completionState = state;
+        _observer = observer;
+        _observerState = state;
+    }
+
+    protected PgClientFlowObserver? GetObserver(out object? state)
+    {
+        state = _observerState;
+        return _observer;
     }
 
     // Bind the caller's cancellation token at submit so the (eager) write, and the reads by default,
@@ -248,12 +259,8 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
         _cancellationWindow = 0;
         _lastMessageInducesRfq = false;
         _boundControl = null;
-        // Clear the completion action: it is captured per-tenure (with its state), so a recycled flow must
-        // not carry the prior tenure's action into the next - it would fire a stale callback (wrong
-        // connection's depth-decrement / Break). Every setter re-arms per use (MaintenanceFlow.Bind,
-        // AdoConnectionProxy per-queue, ExclusiveAccessFlow.PrepareScope), so clearing here is the safe default.
-        _completionAction = null;
-        _completionState = null;
+        _observer = null;
+        _observerState = null;
         OnReset();
     }
 
@@ -756,10 +763,18 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
                 return;
             flow._completed = true;
             flow._activationCancellationTokenRegistration.Dispose();
+            var observer = flow._observer;
+            var observerState = flow._observerState;
             try { flow.OnReleasing(exception); }
             catch (Exception ex)
             {
                 control.FailProtocolFromCallback(ex, "a flow release hook");
+            }
+            // State transitions which must be visible with the terminal result belong here.
+            try { observer?.OnCompleting(flow, exception, observerState); }
+            catch (Exception ex)
+            {
+                control.FailProtocolFromCallback(ex, "a flow completing callback");
             }
             // Wire-death fault delivery is NOT done here - it rides the OnStopping/OnAbort hooks (dispatched
             // flows from the heartbeat, backlog flows from the shutdown drain's close delivery), so a flow's
@@ -774,15 +789,15 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
             else
                 flow._completionCore.TrySetResult(flow, runContinuationsAsynchronously: true);
             flow._completionEvent?.Set();
-            // The completion callback runs from CompleteItem in the advancer/retirement work-item
+            // The completed observer runs from CompleteItem in the advancer/retirement work-item
             // context: a raw throw would crash that thread unobserved. Don't swallow either - a
-            // throwing completion callback means the consumer-side integration is broken, so the
+            // throwing completed observer means the consumer-side integration is broken, so the
             // pipeline won't drain naturally. Tear down via FailProtocol (fire-and-forget self-evict).
             // The flow itself is already completed (signal fired above); this callback is a notification.
-            try { flow._completionAction?.Invoke(flow, exception, flow._completionState); }
+            try { observer?.OnCompleted(flow, exception, observerState); }
             catch (Exception ex)
             {
-                control.FailProtocolFromCallback(ex, "a flow completion callback");
+                control.FailProtocolFromCallback(ex, "a flow completed observer");
             }
         }
 

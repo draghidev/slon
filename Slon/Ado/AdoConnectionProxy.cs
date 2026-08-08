@@ -140,15 +140,6 @@ sealed class AdoConnectionProxy : IDisposable, IAsyncDisposable
 
     bool TryQueueOn(PgConnection connection, PgClientFlow flow)
     {
-        flow.SetCompletionAction(static (flow, exception, state) =>
-        {
-            var instance = (AdoConnectionProxy)state!;
-            // A flow-level fault while holding an exclusive scope breaks the connection (the wire is the
-            // connection's; a torn flow means a torn session). SQL errors don't reach here - they surface
-            // on the result, the flow completes cleanly.
-            if (exception is not null && instance._exclusiveFlow is not null)
-                instance._connection.Break(exception);
-        }, this);
         // A SlonConnection holds an exclusive scope for its lease: route the command as a subflow into the
         // held scope's inner pipeline (serial on this one wire) instead of onto the multiplexed protocol
         // pipeline. The data-source path never acquires a scope, so it falls through to the direct enqueue.

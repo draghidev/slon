@@ -5,6 +5,22 @@ namespace Slon.Pg.Protocol.Flows;
 // reused because an open ADO connection commonly holds one scope across many commands.
 sealed class ExclusiveAccessFlow : PgClientFlow
 {
+    sealed class ObserverImpl : PgClientFlowObserver
+    {
+        internal static readonly ObserverImpl Instance = new();
+
+        internal override void OnCompleted(PgClientFlow completed, Exception? exception, object? state)
+        {
+            var flow = (ExclusiveAccessFlow)completed;
+            if (exception is PgClientClosedException closed)
+            {
+                flow._handoffReady.TrySetException(closed);
+                flow._scopeEnded.TrySetResult();
+            }
+            ((PgClientProtocol.ExclusiveScopeState)state!).ReleaseFlow(flow);
+        }
+    }
+
     // Stable state shared across reusable scope tenures.
     readonly PgClientProtocol _protocol;
     readonly PgClientProtocol.Control _innerControl;
@@ -44,18 +60,10 @@ sealed class ExclusiveAccessFlow : PgClientFlow
         _acquired = false;
         _activationTimeout = activationTimeout;
         IsAsync = async;
-        // Release the reusable flow only after terminal state is visible. A close may complete a flow
-        // dispatched across the source cutoff without starting it, so also resolve its caller gates here.
-        SetCompletionAction(static (f, ex, s) =>
-        {
-            var flow = (ExclusiveAccessFlow)f;
-            if (ex is PgClientClosedException closed)
-            {
-                flow._handoffReady.TrySetException(closed);
-                flow._scopeEnded.TrySetResult();
-            }
-            ((PgClientProtocol.ExclusiveScopeState)s!).ReleaseFlow(flow);
-        }, _state);
+        SetObserver(ObserverImpl.Instance, _state);
+        // The completed observer releases the reusable flow only after terminal state is visible. A close
+        // may complete a flow dispatched across the source cutoff without starting it, so it also resolves
+        // the caller gates.
         // Async scopes never allocate the synchronous handoff.
         if (!async)
             _handoffEvent ??= new(false);
@@ -169,8 +177,13 @@ sealed class ExclusiveAccessFlow : PgClientFlow
             await _completeInner(null).ConfigureAwait(false);
             return ValueTask.CompletedTask;
         }
-        // An abandoned held scope must still drain before the reusable flow retires.
-        var ended = await Task.WhenAny(_scopeEnded.Task, _consumerGone.Task).ConfigureAwait(false);
+        // A failed private pipeline resyncs its own wire obligations, but closes admission instead of
+        // recovering availability. Its clean completion means the resync item has fully retired; the
+        // hosting scope can then perform its ordinary reset and return the physical connection.
+        var innerCompletion = _state.Completion;
+        var ended = await Task.WhenAny(_scopeEnded.Task, _consumerGone.Task, innerCompletion).ConfigureAwait(false);
+        if (ended == innerCompletion)
+            await innerCompletion.ConfigureAwait(false);
         if (ended == _consumerGone.Task && Volatile.Read(ref _acquired))
             await _completeInner(null).ConfigureAwait(false);
         if (_protocol.TransactionStatus is not TransactionStatus.Idle)

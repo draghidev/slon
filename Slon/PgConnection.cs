@@ -378,7 +378,7 @@ sealed class PgConnection : IPoolConnection<PgConnection>
             return _maintenanceHead is not null;
     }
 
-    // Called by MaintenanceFlow's completion action after the protocol has marked the flow
+    // Called by MaintenanceFlow's completed observer after the protocol has marked the flow
     // fully completed, safe to Reset+reuse the instance for the successor. Returns the flow to
     // the cache, disarms, and if there's outstanding work (either retries from a failed flow or
     // items appended during this flow), schedules a successor.
@@ -398,8 +398,8 @@ sealed class PgConnection : IPoolConnection<PgConnection>
             return;
         // We won the arm race. Rent (or allocate) the flow and queue it. A producer that pushed
         // after our enqueue and lost their own arm CAS will rely on either this in-flight flow's
-        // drain to pick up their item, or on the flow's completion action's re-check to schedule
-        // a successor (which can reuse this same instance, see MaintenanceFlow.OnCompletedAction).
+        // drain to pick up their item, or on the flow's completed observer's re-check to schedule
+        // a successor (which can reuse this same instance).
         var flow = Interlocked.Exchange(ref _cachedMaintenanceFlow, null) ?? new MaintenanceFlow();
         flow.Bind(this);
         if (!_protocol.TryQueue(flow))
