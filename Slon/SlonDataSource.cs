@@ -162,6 +162,7 @@ public sealed class SlonDataSource : DbDataSource
     readonly Lock _reloadLock = new();
     readonly ILogger _adoLogger;
     readonly ILoggerFactory _loggerFactory;
+    readonly string _connectionString;
 
     // Initialized on the first real use.
     ConnectionPool<PgConnection> _connectionPool = null!;
@@ -182,6 +183,7 @@ public sealed class SlonDataSource : DbDataSource
         _adoLogger = _loggerFactory.CreateLogger("Slon");
         DisplayEndpoint = _options.EndPoint.AddressFamily is AddressFamily.InterNetwork or AddressFamily.InterNetworkV6 ? $"tcp://{_options.EndPoint}" : _options.EndPoint.ToString()!;
         Name = _options.Name ?? $"{DisplayEndpoint}/{Database}";
+        _connectionString = $"Endpoint={DisplayEndpoint};Username={_options.Username};Database={Database}";
         _backendProvider = _options.BackendProvider
             ?? throw new ArgumentNullException(nameof(_options.BackendProvider));
         _userTypeCatalogPlugins = [.. (_options.TypeCatalogPlugins
@@ -716,8 +718,7 @@ public sealed class SlonDataSource : DbDataSource
         }
     }
 
-    internal string SensitiveConnectionString => throw new NotImplementedException();
-    public override string ConnectionString => ""; //TODO
+    public override string ConnectionString => _connectionString;
     internal CommandTracker GetCommandTracker(bool initializedOnly = false)
     {
         if (initializedOnly && !_isInitialized)

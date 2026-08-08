@@ -18,11 +18,10 @@ public sealed partial class SlonConnection : IAdoConnection
     static StateChangeEventArgs StateChangeOpen { get; } = new(originalState: ConnectionState.Closed, ConnectionState.Open);
     static StateChangeEventArgs StateChangeClosed { get; } = new(originalState: ConnectionState.Open, ConnectionState.Closed);
 
-    SlonDataSource? _dataSource;
+    readonly SlonDataSource _dataSource;
     ConnectionState _state;
     Exception? _breakException;
     bool _disposed;
-    string? _connectionString;
     AdoConnectionProxy? _proxy;
     bool _closingConnection;
     bool _stateChangeEventHandlerAdded;
@@ -31,13 +30,11 @@ public sealed partial class SlonConnection : IAdoConnection
     internal AdoConnectionProxy? UnderlyingProxy => _proxy;
     internal PgConnection? UnderlyingPgConnection => _proxy?.PgConnection;
 
-    SlonConnection(string? connectionString, SlonDataSource? dataSource)
+    internal SlonConnection(SlonDataSource dataSource)
     {
         GC.SuppressFinalize(this);
-        _connectionString = connectionString;
         _dataSource = dataSource;
     }
-    internal SlonConnection(SlonDataSource dataSource) : this(dataSource.ConnectionString, dataSource) { }
 
     // Used internally to create pre-opened connections.
     internal void SetProxy(AdoConnectionProxy proxy)
@@ -54,24 +51,7 @@ public sealed partial class SlonConnection : IAdoConnection
     [MemberNotNullWhen(true, nameof(_proxy))]
     bool HasProxy => _state is ConnectionState.Open or ConnectionState.Broken;
 
-    string GetConnectionString() => _proxy?.ConnectionString ?? _connectionString ?? string.Empty;
-
-    internal SlonDataSource DbDataSource
-    {
-        get
-        {
-            return _dataSource ?? Core();
-
-            [MethodImpl(MethodImplOptions.NoInlining)]
-            SlonDataSource Core()
-            {
-                if (_dataSource is null && _connectionString is "")
-                    ThrowHelper.ThrowInvalidOperation($"{nameof(DbDataSource)} cannot be resolved, {nameof(ConnectionString)} is not set.");
-
-                return _dataSource ??= ChangeDataSource(_connectionString);
-            }
-        }
-    }
+    internal SlonDataSource DbDataSource => _dataSource;
 
     void ThrowIfDisposed() => ObjectDisposedException.ThrowIf(_disposed, this);
 
@@ -349,27 +329,7 @@ public sealed partial class SlonConnection : IAdoConnection
         }
     }
 
-    SlonDataSource ChangeDataSource(string? connectionString)
-    {
-        ThrowIfDisposed();
-        if (_state is not (ConnectionState.Closed or ConnectionState.Broken))
-            throw new InvalidOperationException("Cannot change connection string while the connection is open.");
-
-        _proxy = null;
-        _dataSource = null;
-        // TODO change the datasource etc.
-        _connectionString = _dataSource!.ConnectionString;
-
-        throw new NotImplementedException();
-    }
-
-    SlonConnection CloneCore()
-    {
-        if (_dataSource is not null)
-            return _dataSource.CreateConnection();
-
-        return new SlonConnection(_connectionString, null);
-    }
+    SlonConnection CloneCore() => _dataSource.CreateConnection();
 
     internal CommandFlow EnqueueCommands(in CommandFlowOptions options, bool closeConnection)
     {
@@ -558,18 +518,14 @@ public sealed partial class SlonConnection : IAdoConnection
 // Public surface & ADO.NET
 public sealed partial class SlonConnection : DbConnection
 {
-    /// <summary>
-    /// Initializes a new instance of <see cref="SlonConnection"/> with the given connection string.
-    /// </summary>
-    /// <param name="connectionString">The connection used to open the PostgreSQL database.</param>
-    public SlonConnection(string connectionString) : this(connectionString, null) { }
-
     /// <inheritdoc />
     [AllowNull]
     public override string ConnectionString
     {
-        get => GetConnectionString();
-        set => ChangeDataSource(value);
+        get => _dataSource.ConnectionString;
+        set => throw new NotSupportedException(
+            $"{nameof(SlonConnection)} configuration is owned by its {nameof(SlonDataSource)}. " +
+            "Create a data source with the desired options instead.");
     }
 
     /// <inheritdoc />
@@ -595,25 +551,13 @@ public sealed partial class SlonConnection : DbConnection
 
     /// <inheritdoc />
     public override void ChangeDatabase(string databaseName)
-    {
-        // TODO actually update the databasename.
-        throw new NotImplementedException();
-        // var updatedConnectionString = DbDataSource.ConnectionString;
-        // Close();
-        // ChangeDataSource(updatedConnectionString);
-        // Open();
-    }
+        => throw new NotSupportedException(
+            $"Database selection is owned by {nameof(SlonDataSource)}. Create or use a data source for '{databaseName}'.");
 
     /// <inheritdoc />
     public override Task ChangeDatabaseAsync(string databaseName, CancellationToken cancellationToken = default)
-    {
-        // TODO actually update the databasename.
-        throw new NotImplementedException();
-        // var updatedConnectionString = DbDataSource.ConnectionString;
-        // await CloseAsyncCore();
-        // ChangeDataSource(updatedConnectionString);
-        // await OpenAsyncCore(cancellationToken);
-    }
+        => Task.FromException(new NotSupportedException(
+            $"Database selection is owned by {nameof(SlonDataSource)}. Create or use a data source for '{databaseName}'."));
 
     /// <summary>Creates a new object that is a copy of the current instance.</summary>
     /// <returns>A new object that is a copy of this instance.</returns>

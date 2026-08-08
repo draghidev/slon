@@ -49,8 +49,6 @@ sealed class AdoConnectionProxy : IDisposable, IAsyncDisposable
         _pgConnection = pgConnection;
     }
 
-    public string ConnectionString => ""; // TODO pull from client or pass it in somehow.
-
     internal PgClientFlow? CurrentReadingFlow { get; set; }
     internal PgClientFlow? CurrentWritingFlow { get; set; }
 
