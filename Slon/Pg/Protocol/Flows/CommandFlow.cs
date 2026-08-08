@@ -501,7 +501,7 @@ sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
                     }
                     result.Initialize(_commandIndex, descriptor, _requestedRowDescription,
                         !resultCommand.DescribeOnly, resultCommand.IsSimple(), _options.SerializerOptions,
-                        _decoder.ClientEncoding);
+                        _decoder.ClientEncoding, _pgError);
                 }
                 ((CommandFlowObserver?)GetObserver(out var observerState))
                     ?.OnCommandResult(this, result, observerState);
@@ -598,6 +598,9 @@ sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
                     resultEnumerator.Dispose();
                     completeError = resultEnumerator.CompleteError;
                 }
+
+                if (_options.Commands.ItemRef(_commandIndex).DescribeOnly && _pgError is null)
+                    result.CompleteDescribe(completeError?.Error);
 
                 if (suppressEnumeration && result.Error is { } suppressedError && !IsOwnCancellation(suppressedError))
                 {

@@ -605,6 +605,8 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
         finally
         {
             enumerator.Dispose();
+            if (!_explicitlyPrepared)
+                connection!.CloseOwned(_fieldRef.Instance);
         }
 
         IEnumerable<Exception> SelectException(List<(int, Exception)> exceptions)
@@ -662,6 +664,8 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
         finally
         {
             await enumerator.DisposeAsync().ConfigureAwait(false);
+            if (!fieldRef.Invoke()._explicitlyPrepared)
+                await connection!.CloseOwnedAsync(fieldRef.Instance).ConfigureAwait(false);
         }
 
         IEnumerable<Exception> SelectException(List<(int, Exception)> exceptions)

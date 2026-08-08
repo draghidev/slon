@@ -182,6 +182,21 @@ sealed class CommandTracker : IDisposable, IAsyncDisposable
         return sink.Count is 0 ? [] : sink.ToArray();
     }
 
+    // Remove one ownership group before returning its commands. Disposing the group suppresses
+    // its finalizer so the same names cannot later reappear through leaked-name salvage.
+    public TrackedCommand[] TakeOwned(object owningInstance)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (_owned is null || !_owned.TryGetValue(owningInstance, out var ownedTracker)
+            || !_owned.Remove(owningInstance))
+            return [];
+
+        var sink = new List<TrackedCommand>();
+        ownedTracker.CollectInto(sink);
+        ownedTracker.Dispose();
+        return sink.Count is 0 ? [] : sink.ToArray();
+    }
+
     public void Dispose()
     {
         if (Interlocked.Exchange(ref _disposed, true))

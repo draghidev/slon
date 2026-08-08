@@ -29,13 +29,14 @@ abstract class CommandResult : IDisposable, IAsyncDisposable, IEnumerable<Row>, 
     long _recordsAffected;
     CommandCompleteMessage? _commandCompleteMessage;
     PgError? _errorMessage;
+    bool _describeCompleted;
     Action<CommandResult, object?>? _completionAction;
     object? _completionActionState;
 
     // The requested row description is what was returned for this exact command (i.e. commands that requested a describe).
     protected void Initialize(int index, CommandDescriptor descriptor, RowDescription? requestedRowDescription,
         bool requestedExecution, bool simpleProtocol, PgSerializerOptions? serializerOptions = null,
-        Encoding? textEncoding = null)
+        Encoding? textEncoding = null, PgError? error = null)
     {
         _index = index;
         _descriptor = descriptor;
@@ -64,7 +65,8 @@ abstract class CommandResult : IDisposable, IAsyncDisposable, IEnumerable<Row>, 
         _firstRowEnumerated = false;
         _recordsAffected = default;
         _commandCompleteMessage = null;
-        _errorMessage = null;
+        _errorMessage = error;
+        _describeCompleted = false;
         _completionAction = null;
         _completionActionState = null;
         _serializerOptions = serializerOptions;
@@ -213,22 +215,39 @@ abstract class CommandResult : IDisposable, IAsyncDisposable, IEnumerable<Row>, 
     public bool CanHaveRows => _rowDescription is null || !_rowDescription.IsNoData;
     // We have rows if we requested execution, can have rows and read one, or the command isn't yet completed (this means rows must be coming).
     // This distinction is important for result-set based readers (e.g. DbDataReader) which must always enumerate commands that have a row description.
-    public bool HasRows => _requestedExecution && CanHaveRows && (_firstRowEnumerated || !TryGetCommandComplete(out _));
-    // True once the command has run to its terminal (CommandComplete / EmptyQueryResponse / ErrorResponse)
-    // - i.e. all rows have been read. The completion-dependent members (RecordsAffected, GetCommandComplete)
-    // throw until this is true; check it first to avoid the throw. NOTE: a result completes by being
-    // CONSUMED (enumerated to the end / GetCommandComplete), not on its own - this is the "have I read it
-    // through" state, not a "wait for it to flip" signal.
-    public bool IsComplete => _commandCompleteMessage is not null || _errorMessage is not null;
+    public bool HasRows
+    {
+        get
+        {
+            if (_errorMessage is not null)
+                PgErrorException.Throw(_errorMessage);
+            return _requestedExecution && CanHaveRows && (_firstRowEnumerated || !TryGetCommandComplete(out _));
+        }
+    }
+    // True once the command reached its terminal: an already-read setup error, completed description,
+    // or a consumed Execute terminal (CommandComplete / EmptyQueryResponse / ErrorResponse).
+    public bool IsComplete => _describeCompleted || _commandCompleteMessage is not null || _errorMessage is not null;
 
     internal PgError? Error => _errorMessage;
 
     internal void OnCompleted(Action<CommandResult, object?> action, object? state)
     {
-        Debug.Assert(!IsComplete);
+        if (IsComplete)
+        {
+            action(this, state);
+            return;
+        }
         Debug.Assert(_completionAction is null);
         _completionAction = action;
         _completionActionState = state;
+    }
+
+    internal void CompleteDescribe(PgError? error)
+    {
+        Debug.Assert(_commandCompleteMessage is null && _errorMessage is null);
+        _errorMessage = error;
+        _describeCompleted = true;
+        InvokeCompletionAction();
     }
 
     // RecordsAffected is only known once the command has run to its CommandComplete / ErrorResponse.
@@ -266,7 +285,8 @@ abstract class CommandResult : IDisposable, IAsyncDisposable, IEnumerable<Row>, 
 
     void CompleteCommand(BackendMessage message)
     {
-        Debug.Assert(_commandCompleteMessage is null && _errorMessage is null);
+        Debug.Assert(_commandCompleteMessage is null
+            && (_errorMessage is null || message.Header.Type is PgTypes.BackendType.ErrorResponse));
         switch (message.Header.Type)
         {
             case PgTypes.BackendType.EmptyQueryResponse:
@@ -284,6 +304,11 @@ abstract class CommandResult : IDisposable, IAsyncDisposable, IEnumerable<Row>, 
                 break;
         }
 
+        InvokeCompletionAction();
+    }
+
+    void InvokeCompletionAction()
+    {
         if (_completionAction is { } action)
         {
             var state = _completionActionState;
@@ -523,9 +548,9 @@ sealed class CommandResult<TEnumerator>(TEnumerator enumerator) : CommandResult
 
     internal new void Initialize(int index, CommandDescriptor descriptor, RowDescription? requestedRowDescription,
         bool requestedExecution, bool simpleProtocol, PgSerializerOptions? serializerOptions = null,
-        Encoding? textEncoding = null)
+        Encoding? textEncoding = null, PgError? error = null)
         => base.Initialize(index, descriptor, requestedRowDescription, requestedExecution, simpleProtocol,
-            serializerOptions, textEncoding);
+            serializerOptions, textEncoding, error);
 
     protected override BackendMessage GetCurrentMessage()
     {

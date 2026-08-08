@@ -37,12 +37,6 @@ sealed class CloseStatement(EncodedString name) : MaintenanceWork
     public EncodedString Name { get; } = name;
 }
 
-// Multiple DEALLOCATEs sharing one maintenance node and Sync window.
-sealed class CloseStatements(EncodedString[] names) : MaintenanceWork
-{
-    public EncodedString[] Names { get; } = names;
-}
-
 // ADO-owned session state around the protocol. Prepared presence and maintenance survive pool leases.
 sealed class PgConnection : IPoolConnection<PgConnection>
 {

@@ -8,6 +8,20 @@ namespace Slon.Tests.Pg;
 public class CommandResultEnumerationTests
 {
     [TestMethod]
+    public async Task DescribeOnlyErrorSurfacesWhenInspectingTheResult()
+    {
+        var protocol = await PgTestPool.GetProtocolAsync();
+        var flow = protocol.Queue(new CommandFlow(async: true,
+            Command.Create("THIS IS NOT SQL") with { DescribeOnly = true }));
+        var enumerator = flow.GetAsyncEnumerator();
+
+        Assert.IsTrue(await enumerator.MoveNextAsync());
+        Assert.ThrowsExactly<PgErrorException>(() => _ = enumerator.Current.HasRows);
+        Assert.IsFalse(await enumerator.MoveNextAsync());
+        await enumerator.DisposeAsync();
+    }
+
+    [TestMethod]
     public async Task AsyncFlow_CanSwitchToSynchronousResultAdvancement()
     {
         var protocol = await PgTestPool.GetProtocolAsync();

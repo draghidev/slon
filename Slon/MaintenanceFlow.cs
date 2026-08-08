@@ -80,10 +80,6 @@ sealed class MaintenanceFlow : PgClientFlow
                 case CloseStatement close:
                     encoder.WriteClose(close.Name);
                     break;
-                case CloseStatements many:
-                    foreach (var name in many.Names)
-                        encoder.WriteClose(name);
-                    break;
             }
             if (ReferenceEquals(node, tail))
                 break;

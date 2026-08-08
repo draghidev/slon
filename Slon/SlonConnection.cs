@@ -161,7 +161,7 @@ public sealed partial class SlonConnection : IAdoConnection
         _disposed = true;
         try
         {
-            ReleaseOwnedAndLeakedToMaintenance();
+            ReleaseOwnedAndLeaked(awaitable: false).GetAwaiter().GetResult();
             CloseCore();
         }
         finally
@@ -178,7 +178,7 @@ public sealed partial class SlonConnection : IAdoConnection
         _disposed = true;
         try
         {
-            ReleaseOwnedAndLeakedToMaintenance();
+            await ReleaseOwnedAndLeaked(awaitable: true).ConfigureAwait(false);
             await CloseAsyncCore().ConfigureAwait(false);
         }
         finally
@@ -189,27 +189,20 @@ public sealed partial class SlonConnection : IAdoConnection
         }
     }
 
-    // Push owned tracked commands + drained leaked names onto the current PgConnection's
-    // maintenance queue. Fire-and-forget: dispose returns without waiting for the wire
-    // DEALLOCATEs to complete. The PgConnection survives the lease (pooled), so its
-    // MaintenanceFlow will process the queue on the next pipeline turn.
-    void ReleaseOwnedAndLeakedToMaintenance()
+    // Owned statements are ordered through the lease's exclusive pipeline. Only names whose
+    // owners were lost go to physical-session maintenance, where no ADO ordering edge remains.
+    ValueTask ReleaseOwnedAndLeaked(bool awaitable)
     {
         if (_proxy is null)
-            return;
+            return default;
         var pgConnection = _proxy.PgConnection;
-        if (_ownedTracker is not null)
-        {
-            foreach (var t in _ownedTracker.CollectOwned())
-                pgConnection.PushMaintenance(new EvictDeallocate(t));
-            _ownedTracker.Dispose();
-            _ownedTracker = null;
-        }
+        var owned = UnprepareAllImpl(awaitable);
         if (_proxy.Tracker.DrainLeakedNames() is { Count: > 0 } leakedNames)
         {
             foreach (var name in leakedNames)
                 pgConnection.PushMaintenance(new CloseStatement(name));
         }
+        return owned;
     }
 
     // The data-source open paths (SlonDataSource.OpenConnection*) SetProxy directly rather than going
@@ -403,11 +396,8 @@ public sealed partial class SlonConnection : IAdoConnection
 
     ValueTask UnprepareAllAsyncCore() => UnprepareAllImpl(awaitable: true);
 
-    // Invalidate the TrackedCommands and clear presence locally so the caller sees immediate
-    // effect, then push a single CloseStatements (plural) maintenance item carrying all names
-    // for the wire-side DEALLOCATE. One node for the whole batch, single allocation, single
-    // optional completion TCS. If awaitable, the TCS fires once MaintenanceFlow commits the
-    // batch. Awaiting it confirms the server-side DEALLOCATEs landed.
+    // Invalidate the TrackedCommands and clear presence locally, then close every name in one
+    // exclusive-pipeline flow. Awaiting it confirms the server-side closes landed.
     ValueTask UnprepareAllImpl(bool awaitable)
     {
         if (_ownedTracker is null)
@@ -420,41 +410,56 @@ public sealed partial class SlonConnection : IAdoConnection
             return default;
         }
 
+        _ownedTracker.Dispose();
+        _ownedTracker = null;
+        return CloseOwnedStatements(tracked, awaitable);
+    }
+
+    ValueTask UnprepareOwned(object owningInstance, bool awaitable)
+    {
+        if (_ownedTracker is null)
+            return default;
+        return CloseOwnedStatements(_ownedTracker.TakeOwned(owningInstance), awaitable);
+    }
+
+    ValueTask CloseOwnedStatements(TrackedCommand[] tracked, bool awaitable)
+    {
+        if (tracked.Length is 0 || _proxy is null)
+            return default;
+
         var pgConnection = _proxy.PgConnection;
         var names = new EncodedString[tracked.Length];
         for (var i = 0; i < tracked.Length; i++)
         {
-            var t = tracked[i];
-            names[i] = t.StoredCommandName;
-            t.Invalidate();
-            pgConnection.RemoveTracked(t);
+            var command = tracked[i];
+            names[i] = command.StoredCommandName;
+            command.Invalidate();
+            pgConnection.RemoveTracked(command);
         }
 
-        var tcs = awaitable ? new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously) : null;
-        pgConnection.PushMaintenance(new CloseStatements(names) { Completion = tcs });
+        var flow = new OwnedStatementCloseFlow(names, async: awaitable);
+        if (!awaitable)
+        {
+            _proxy.Enqueue(flow);
+            flow.WaitForCompleteSynchronously();
+            return default;
+        }
 
-        _ownedTracker.Dispose();
-        _ownedTracker = null;
+        var completion = flow.WaitForComplete();
+        _proxy.Enqueue(flow);
+        return AwaitCompletion(completion);
 
-        return tcs is null ? default : new ValueTask(tcs.Task);
-    }
-
-    void UnprepareOwned(object owningInstance)
-    {
-        // TODO unprepare all tracked commands for the given instance.
-        throw new NotImplementedException();
+        static async ValueTask AwaitCompletion(ValueTask<PgClientFlow> completion)
+            => _ = await completion.ConfigureAwait(false);
     }
 
     internal void CloseOwned(object owningInstance)
     {
-        UnprepareOwned(owningInstance);
+        UnprepareOwned(owningInstance, awaitable: false).GetAwaiter().GetResult();
     }
 
     internal ValueTask CloseOwnedAsync(object owningInstance)
-    {
-        UnprepareOwned(owningInstance);
-        return new();
-    }
+        => UnprepareOwned(owningInstance, awaitable: true);
 
     internal void CommitTransaction(SlonTransaction slonTransaction)
     {
