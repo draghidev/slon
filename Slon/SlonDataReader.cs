@@ -658,39 +658,43 @@ public sealed partial class SlonDataReader : DbDataReader, IDbColumnSchemaGenera
 
     /// <inheritdoc/>
     public override string GetDataTypeName(int ordinal)
-    {
-        throw new NotImplementedException();
-    }
+        => (_core.Current ?? throw new InvalidOperationException("Reader is not on a result."))
+            .GetDataTypeName(ordinal);
 
     /// <inheritdoc/>
     [return: DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicProperties | DynamicallyAccessedMemberTypes.PublicFields)]
     public override Type GetFieldType(int ordinal)
-    {
-        throw new NotImplementedException();
-    }
+        => (_core.Current ?? throw new InvalidOperationException("Reader is not on a result."))
+            .GetFieldType(ordinal);
 
     /// <inheritdoc/>
     public override string GetName(int ordinal)
-    {
-        throw new NotImplementedException();
-    }
+        => (_core.Current ?? throw new InvalidOperationException("Reader is not on a result."))
+            .GetName(ordinal);
 
     /// <inheritdoc/>
     public override int GetOrdinal(string name)
-    {
-        throw new NotImplementedException();
-    }
+        => (_core.Current ?? throw new InvalidOperationException("Reader is not on a result."))
+            .GetOrdinal(name);
 
     /// <inheritdoc/>
     public override bool IsDBNull(int ordinal)
-    {
-        throw new NotImplementedException();
-    }
+        => (_core.Current ?? throw new InvalidOperationException("Reader is not on a result."))
+            .IsDBNull(GetRowOrThrow(), ordinal);
 
     /// <inheritdoc/>
     public override Task<bool> IsDBNullAsync(int ordinal, CancellationToken cancellationToken)
+        => IsDBNullAsyncCore(ordinal, cancellationToken);
+
+    async Task<bool> IsDBNullAsyncCore(int ordinal, CancellationToken cancellationToken)
     {
-        throw new NotImplementedException();
+        try
+        {
+            return await (_core.Current
+                    ?? throw new InvalidOperationException("Reader is not on a result."))
+                .IsDBNullAsync(GetRowOrThrow(), ordinal, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex) { AdoException.Throw(ex); return default; }
     }
 
     /// <summary>Returns a nested data reader for the requested column.</summary>
@@ -706,8 +710,12 @@ public sealed partial class SlonDataReader : DbDataReader, IDbColumnSchemaGenera
 
     // Non-gvm helper to make inlining GetBoolean GetString etc possible.
     T GetFieldValueCore<T>(int ordinal)
-        => (_core.Current ?? throw new InvalidOperationException("Reader is not on a result."))
-            .ReadField<T>(GetRowOrThrow(), ordinal);
+    {
+        var result = _core.Current ?? throw new InvalidOperationException("Reader is not on a result.");
+        return typeof(T) == typeof(object)
+            ? (T)result.ReadObject(GetRowOrThrow(), ordinal)
+            : result.ReadField<T>(GetRowOrThrow(), ordinal);
+    }
 
     // Non-gvm helper to make inlining GetTextReaderAsync etc possible.
     ValueTask<T> GetFieldValueCoreAsync<T>(int ordinal, CancellationToken cancellationToken)
@@ -716,8 +724,14 @@ public sealed partial class SlonDataReader : DbDataReader, IDbColumnSchemaGenera
         if (exception is not null)
             return ValueTask.FromException<T>(exception);
 
-        return (_core.Current ?? throw new InvalidOperationException("Reader is not on a result."))
-            .ReadFieldAsync<T>(row, ordinal, cancellationToken);
+        var result = _core.Current ?? throw new InvalidOperationException("Reader is not on a result.");
+        if (typeof(T) == typeof(object))
+            return ReadObjectAsync<T>(result, row, ordinal, cancellationToken);
+        return result.ReadFieldAsync<T>(row, ordinal, cancellationToken);
+
+        static async ValueTask<TResult> ReadObjectAsync<TResult>(CommandResult result, Row row, int ordinal,
+            CancellationToken cancellationToken)
+            => (TResult)await result.ReadObjectAsync(row, ordinal, cancellationToken).ConfigureAwait(false);
     }
 
     public byte[] GetBytes(int ordinal)

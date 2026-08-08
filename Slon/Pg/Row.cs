@@ -74,6 +74,46 @@ sealed class Row
 
     internal bool IsColumnPast(int ordinal) => ordinal < _column;
 
+    internal bool IsDBNull(int ordinal)
+    {
+        RevokeColumnLease();
+        if (_bodyReader is null)
+            return IsBufferedFieldNull(ordinal);
+
+        while (_column < ordinal)
+            SkipLiveField();
+        EnsureLiveHeader(_bodyReader);
+        return ReadFieldLength(_bodyReader.Buffer, _columnOffset) < 0;
+    }
+
+    internal ValueTask<bool> IsDBNullAsync(int ordinal,
+        CancellationToken cancellationToken = default)
+    {
+        if (_columnLease is null && _bodyReader is null)
+            return new(IsBufferedFieldNull(ordinal));
+        return Core(ordinal, cancellationToken);
+
+        async ValueTask<bool> Core(int fieldOrdinal, CancellationToken token)
+        {
+            await RevokeColumnLeaseAsync().ConfigureAwait(false);
+            if (_bodyReader is null)
+                return IsBufferedFieldNull(fieldOrdinal);
+
+            while (_column < fieldOrdinal)
+                await SkipLiveFieldAsync(token).ConfigureAwait(false);
+            await EnsureLiveHeaderAsync(_bodyReader, token).ConfigureAwait(false);
+            return ReadFieldLength(_bodyReader.Buffer, _columnOffset) < 0;
+        }
+    }
+
+    bool IsBufferedFieldNull(int ordinal)
+    {
+        var reader = GetColumnReader(ordinal, out var columnIndex, out var columnOffset);
+        if (!TrySeek(ref reader, ref columnIndex, ordinal, ref columnOffset, out var length))
+            ThrowHelper.ThrowInvalidOperation("Field length is truncated.");
+        return length < 0;
+    }
+
     internal ReadOnlySequence<byte> GetBufferedField(int ordinal)
     {
         EnsureBuffered();
@@ -289,11 +329,12 @@ sealed class Row
         var reader = new SequenceReader<byte>(Message.GetSequence(columnOffset));
         while (columnIndex < ordinal)
         {
-            if (!reader.TryReadBigEndian(out int skippedLength) || skippedLength < 0
-                || reader.Remaining < skippedLength)
+            if (!reader.TryReadBigEndian(out int skippedLength) || skippedLength < -1
+                || reader.Remaining < Math.Max(0, skippedLength))
                 ThrowHelper.ThrowInvalidOperation("Field is null, truncated, or unavailable.");
-            reader.Advance(skippedLength);
-            columnOffset += sizeof(int) + skippedLength;
+            var skippedDataLength = Math.Max(0, skippedLength);
+            reader.Advance(skippedDataLength);
+            columnOffset += sizeof(int) + skippedDataLength;
             columnIndex++;
         }
 

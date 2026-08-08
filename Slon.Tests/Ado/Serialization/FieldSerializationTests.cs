@@ -6,6 +6,65 @@ namespace Slon.Tests.Ado.Serialization;
 public class FieldSerializationTests
 {
     [TestMethod]
+    public async Task TypeNamedAdoGettersProjectResolvedValues()
+    {
+        await using var command = AdoTestPool.CreateCommand(
+            "select true, 12::int2, 42::int4, 84::int8, 1.5::float4, 2.5::float8, " +
+            "'00112233-4455-6677-8899-aabbccddeeff'::uuid, 'value'::text");
+        await using var reader = await command.ExecuteReaderAsync();
+
+        Assert.IsTrue(await reader.ReadAsync());
+        Assert.IsTrue(reader.GetBoolean(0));
+        Assert.AreEqual((short)12, reader.GetInt16(1));
+        Assert.AreEqual(42, reader.GetInt32(2));
+        Assert.AreEqual(84L, reader.GetInt64(3));
+        Assert.AreEqual(1.5f, reader.GetFloat(4));
+        Assert.AreEqual(2.5d, reader.GetDouble(5));
+        Assert.AreEqual(Guid.Parse("00112233-4455-6677-8899-aabbccddeeff"), reader.GetGuid(6));
+        Assert.AreEqual("value", reader.GetString(7));
+    }
+
+    [TestMethod]
+    public async Task ReaderProjectsFieldMetadataAndNullability()
+    {
+        await using var command = AdoTestPool.CreateCommand(
+            "select 42::int4 as \"ExactName\", null::text as nullable_text, 'value'::text as value_text");
+        await using var reader = await command.ExecuteReaderAsync(CommandBehavior.SequentialAccess);
+
+        Assert.AreEqual("ExactName", reader.GetName(0));
+        Assert.AreEqual(0, reader.GetOrdinal("ExactName"));
+        Assert.AreEqual(0, reader.GetOrdinal("exactname"));
+        Assert.ThrowsExactly<ArgumentException>(() => reader.GetOrdinal(""));
+        Assert.ThrowsExactly<IndexOutOfRangeException>(() => reader.GetOrdinal("missing"));
+        Assert.AreEqual(typeof(int), reader.GetFieldType(0));
+        Assert.AreEqual(typeof(string), reader.GetFieldType(1));
+        Assert.AreEqual("integer", reader.GetDataTypeName(0));
+        Assert.AreEqual("text", reader.GetDataTypeName(1));
+
+        Assert.IsTrue(await reader.ReadAsync());
+        Assert.AreEqual(42, reader.GetValue(0));
+        Assert.IsTrue(reader.IsDBNull(1));
+        Assert.AreSame(DBNull.Value, reader.GetValue(1));
+        Assert.AreSame(DBNull.Value,
+            await reader.GetFieldValueAsync<object>(1, CancellationToken.None));
+        Assert.IsFalse(await reader.IsDBNullAsync(2, CancellationToken.None));
+        Assert.AreEqual("value", reader.GetString(2));
+    }
+
+    [TestMethod]
+    public async Task GetValuesProjectsDefaultObjectsAndDbNull()
+    {
+        await using var command = AdoTestPool.CreateCommand(
+            "select 42::int4, null::text, 'value'::text");
+        await using var reader = await command.ExecuteReaderAsync();
+
+        Assert.IsTrue(await reader.ReadAsync());
+        var values = new object[3];
+        Assert.AreEqual(3, reader.GetValues(values));
+        CollectionAssert.AreEqual(new object[] { 42, DBNull.Value, "value" }, values);
+    }
+
+    [TestMethod]
     public async Task SequentialAccessStreamsFieldThroughSerializerReader()
     {
         const int length = 256 * 1024;

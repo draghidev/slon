@@ -92,6 +92,54 @@ abstract class CommandResult : IDisposable, IAsyncDisposable, IEnumerable<Row>, 
 
     internal PgConversionContext ConversionContext => _conversionContext;
 
+    internal string GetName(int ordinal) => GetField(ordinal).Name;
+
+    internal int GetOrdinal(string name)
+    {
+        var rowDescription = _rowDescription
+            ?? throw new InvalidOperationException("The current result has no row description.");
+        return rowDescription.GetFieldIndex(name);
+    }
+
+    internal string GetDataTypeName(int ordinal)
+        => GetSerializerOptions().GetDataTypeName(GetField(ordinal).TypeOid).DisplayName;
+
+    internal Type GetFieldType(int ordinal)
+        => GetSerializerOptions().GetTypeInfo(type: null, GetField(ordinal).TypeOid).Type;
+
+    internal object ReadObject(Row row, int ordinal)
+        => IsDBNull(row, ordinal) ? DBNull.Value : ReadField<object>(row, ordinal);
+
+    internal async ValueTask<object> ReadObjectAsync(Row row, int ordinal,
+        CancellationToken cancellationToken = default)
+        => await IsDBNullAsync(row, ordinal, cancellationToken).ConfigureAwait(false)
+            ? DBNull.Value
+            : await ReadFieldAsync<object>(row, ordinal, cancellationToken).ConfigureAwait(false);
+
+    internal bool IsDBNull(Row row, int ordinal)
+    {
+        _ = GetField(ordinal);
+        return row.IsDBNull(ordinal);
+    }
+
+    internal ValueTask<bool> IsDBNullAsync(Row row, int ordinal,
+        CancellationToken cancellationToken = default)
+    {
+        _ = GetField(ordinal);
+        return row.IsDBNullAsync(ordinal, cancellationToken);
+    }
+
+    ref readonly RowDescriptionField GetField(int ordinal)
+    {
+        if (_rowDescription is null)
+            throw new InvalidOperationException("The current result has no row description.");
+        return ref _rowDescription[ordinal];
+    }
+
+    PgSerializerOptions GetSerializerOptions()
+        => _serializerOptions
+            ?? throw new InvalidOperationException("No serializer was attached to this result.");
+
     internal CharsColumnLease ReadChars(Row row, int ordinal, bool sequential)
     {
         var reader = new GetCharsFieldReader(

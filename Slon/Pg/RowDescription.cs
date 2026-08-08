@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Globalization;
 using System.Text;
 using Slon.Pg.Protocol;
 using Slon.Pg.Types;
@@ -19,6 +20,12 @@ sealed class RowDescription
     const int MaxRetainedFieldCapacity = 256;
     RowDescriptionField[] _fields = [];
     int _fieldCount;
+    Dictionary<string, int>? _nameIndex;
+    Dictionary<string, int>? _insensitiveNameIndex;
+
+    static readonly StringComparer InsensitiveNameComparer =
+        CultureInfo.InvariantCulture.CompareInfo.GetStringComparer(
+            CompareOptions.IgnoreWidth | CompareOptions.IgnoreCase | CompareOptions.IgnoreKanaType);
 
     public int FieldCount => _fieldCount;
     public ref readonly RowDescriptionField this[int ordinal]
@@ -30,8 +37,31 @@ sealed class RowDescription
         }
     }
 
+    public int GetFieldIndex(string name)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(name);
+        var exact = _nameIndex ??= BuildNameIndex(StringComparer.Ordinal);
+        if (exact.TryGetValue(name, out var ordinal))
+            return ordinal;
+
+        var insensitive = _insensitiveNameIndex ??= BuildNameIndex(InsensitiveNameComparer);
+        if (insensitive.TryGetValue(name, out ordinal))
+            return ordinal;
+        throw new IndexOutOfRangeException($"Column '{name}' does not exist in the result.");
+    }
+
+    Dictionary<string, int> BuildNameIndex(StringComparer comparer)
+    {
+        var result = new Dictionary<string, int>(_fieldCount, comparer);
+        for (var i = 0; i < _fieldCount; i++)
+            result.TryAdd(_fields[i].Name, i);
+        return result;
+    }
+
     public void Initialize(SequenceReader<byte> reader, Encoding? encoding = null)
     {
+        _nameIndex = null;
+        _insensitiveNameIndex = null;
         if (!reader.TryReadBigEndian(out short fieldCount) || fieldCount < 0)
             throw PgProtocolException.NotEnoughData(nameof(RowDescription));
 
@@ -92,6 +122,8 @@ sealed class RowDescription
             _fields.AsSpan(0, _fieldCount).Clear();
 
         _fieldCount = 0;
+        _nameIndex = null;
+        _insensitiveNameIndex = null;
     }
 
     public bool IsNoData => ReferenceEquals(this, NoData);
