@@ -538,6 +538,113 @@ public class CommandUserCancellationTests : ConnectionCreatingTest
     }
 
     [TestMethod]
+    public async Task ServerCancel_AcknowledgedWindowConvergesWhileSenderSettlementIsPending()
+    {
+        await using var firstBlocker = await PgAdvisoryLock.AcquireAsync();
+        await using var secondBlocker = await PgAdvisoryLock.AcquireAsync();
+        var settleFirstAttempt = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var options = PgTestPool.NewOptions();
+        var sender = PgTestPool.CreateCancelSender(options);
+        var attempts = 0;
+        await using var protocol = await PgTestPool.NewIsolatedAsync(o =>
+        {
+            o.HeartbeatInterval = TimeSpan.FromHours(1);
+            o.CancelRequestDelay = TimeSpan.FromHours(1);
+            o.CancelSender = async (processId, secretKey, token) =>
+            {
+                var attempt = Interlocked.Increment(ref attempts);
+                var result = await sender(processId, secretKey, token);
+                if (attempt == 1)
+                    await settleFirstAttempt.Task;
+                return result;
+            };
+        });
+
+        var flow = new CommandFlow(async: true,
+            firstBlocker.WaitCommand with { WithSync = true, Timeout = TimeSpan.FromSeconds(100) },
+            secondBlocker.WaitCommand);
+        Assert.IsTrue(protocol.TryQueue(flow));
+        var enumerator = flow.GetAsyncEnumerator();
+        var moveNext = enumerator.MoveNextAsync().AsTask();
+
+        try
+        {
+            await firstBlocker.WaitUntilContendedAsync(protocol.FlowControl.BackendProcessId);
+            await protocol.Heartbeat(TimeSpan.FromSeconds(100));
+            await Assert.ThrowsExactlyAsync<TimeoutException>(async () => await moveNext);
+
+            // The first request has already advanced the flow to its second command while the sender
+            // task still owns settlement. Its exposure may already satisfy that successor, or settling
+            // it may dispatch the successor's retained intent; either outcome must converge.
+            await secondBlocker.WaitUntilContendedAsync(protocol.FlowControl.BackendProcessId);
+            settleFirstAttempt.TrySetResult();
+            await enumerator.DisposeAsync();
+            Assert.IsTrue(Volatile.Read(ref attempts) is 1 or 2);
+            await WaitUntilAsync(() => !protocol.HasPendingCancellation);
+            await PgTestPool.RunAsync(protocol, "select 1");
+        }
+        finally
+        {
+            settleFirstAttempt.TrySetResult();
+        }
+    }
+
+    [TestMethod]
+    public async Task ServerCancel_LatePredecessorRequestSatisfiesSuccessorIntent()
+    {
+        await using var firstBlocker = await PgAdvisoryLock.AcquireAsync();
+        await using var secondBlocker = await PgAdvisoryLock.AcquireAsync();
+        var senderEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var sendRequest = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var options = PgTestPool.NewOptions();
+        var sender = PgTestPool.CreateCancelSender(options);
+        var attempts = 0;
+        await using var protocol = await PgTestPool.NewIsolatedAsync(o =>
+        {
+            o.HeartbeatInterval = TimeSpan.FromHours(1);
+            o.CancelRequestDelay = TimeSpan.FromHours(1);
+            o.CancelSender = async (processId, secretKey, token) =>
+            {
+                Interlocked.Increment(ref attempts);
+                senderEntered.TrySetResult();
+                await sendRequest.Task;
+                return await sender(processId, secretKey, token);
+            };
+        });
+
+        var flow = new CommandFlow(async: true,
+            firstBlocker.WaitCommand with { WithSync = true, Timeout = TimeSpan.FromSeconds(100) },
+            secondBlocker.WaitCommand);
+        Assert.IsTrue(protocol.TryQueue(flow));
+        var enumerator = flow.GetAsyncEnumerator();
+        var moveNext = enumerator.MoveNextAsync().AsTask();
+
+        try
+        {
+            await firstBlocker.WaitUntilContendedAsync(protocol.FlowControl.BackendProcessId);
+            await protocol.Heartbeat(TimeSpan.FromSeconds(100));
+            await senderEntered.Task;
+            await Assert.ThrowsExactlyAsync<TimeoutException>(async () => await moveNext);
+
+            // Let the requested window finish before its delayed CancelRequest reaches PostgreSQL.
+            // The request then cancels the successor and must satisfy, rather than dispatch, the
+            // successor intent retained while its reach was ambiguous.
+            await firstBlocker.ReleaseAsync();
+            await secondBlocker.WaitUntilContendedAsync(protocol.FlowControl.BackendProcessId);
+            sendRequest.TrySetResult();
+            await enumerator.DisposeAsync();
+
+            Assert.AreEqual(1, Volatile.Read(ref attempts));
+            await WaitUntilAsync(() => !protocol.HasPendingCancellation);
+            await PgTestPool.RunAsync(protocol, "select 1");
+        }
+        finally
+        {
+            sendRequest.TrySetResult();
+        }
+    }
+
+    [TestMethod]
     public async Task ServerCancel_DisposeCancelsEveryRemainingCommandWindow()
     {
         await using var firstBlocker = await PgAdvisoryLock.AcquireAsync();

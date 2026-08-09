@@ -126,6 +126,8 @@ sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
         _ = GetOrCreateCancelDelivery();
         RequestCancel(default, CancellationScope.RemainingFlow, BackendCancellationTiming.AfterGrace,
             BackendCancellationTiming.AtReadFrontier);
+        _callerInteractionCore.ResumeBody(runContinuationsAsynchronously: true);
+        _callerInteractionCore.WakeBody(useDedicatedDriver: true);
     }
 
     // Enumeration already ended; only transfer the live body tail to autonomous ownership.
@@ -461,6 +463,7 @@ sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
             while (++_commandIndex < CommandCount)
             {
                 _isResultReady = false;
+                var commandCancellationWindow = CancellationWindow;
                 bool hasPreparedDescription;
                 bool suppressEnumeration;
                 {
@@ -478,12 +481,12 @@ sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
                 {
                     Debug.Assert(IsAsync);
                     _callerCancellationTokenRegistration = _callerCancellationToken.UnsafeRegister(static (state, token)
-                        => ((CommandFlow)state!).RequestCancel(token, CancellationScope.CurrentWindow), this);
+                        => ((CommandFlow)state!).RequestCancelAndWake(token, CancellationScope.CurrentWindow), this);
                 }
                 if (_flowCancellationToken.CanBeCanceled && !IsDraining)
                 {
                     _flowCancellationTokenRegistration = _flowCancellationToken.UnsafeRegister(static (state, token)
-                        => ((CommandFlow)state!).RequestCancel(token, CancellationScope.RemainingFlow), this);
+                        => ((CommandFlow)state!).RequestCancelAndWake(token, CancellationScope.RemainingFlow), this);
                 }
                 // After close, a fresh command must not consume bytes left by its predecessor. A draining
                 // flow may continue reading its own response to restore RFQ.
@@ -536,9 +539,12 @@ sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
 
                 // A draining consumer cannot observe CommandResult, so retain read errors for disposal.
                 var capturedThisCommand = false;
-                if (IsConsumingAutonomously && _pgError is { } readError && !IsOwnCancellation(readError))
+                var readErrorIsOwnCancellation = _pgError is { } readError
+                    && IsOwnCancellation(readError, commandCancellationWindow);
+                if (IsConsumingAutonomously && _pgError is { } readErrorToCapture
+                    && !readErrorIsOwnCancellation)
                 {
-                    (_drainErrors ??= new()).Add(PgErrorException.Create(readError));
+                    (_drainErrors ??= new()).Add(PgErrorException.Create(readErrorToCapture));
                     capturedThisCommand = true;
                 }
 
@@ -676,7 +682,10 @@ sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
                 if (_options.Commands.ItemRef(_commandIndex).DescribeOnly && _pgError is null)
                     result.CompleteDescribe(completeError?.Error);
 
-                if (suppressEnumeration && result.Error is { } suppressedError && !IsOwnCancellation(suppressedError))
+                var resultErrorIsOwnCancellation = result.Error is { } resultError
+                    && IsOwnCancellation(resultError, commandCancellationWindow);
+                if (suppressEnumeration && result.Error is { } suppressedError
+                    && !resultErrorIsOwnCancellation)
                 {
                     (_drainErrors ??= new()).Add(PgErrorException.Create(suppressedError));
                     capturedThisCommand = true;
@@ -687,8 +696,11 @@ sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
                 {
                     // Accumulate each command's fresh error while draining, but do not duplicate an error
                     // already captured during its read phase or delivered to a live consumer.
+                    var completeErrorIsOwnCancellation = completeError is { } completedWithError
+                        && IsOwnCancellation(completedWithError.Error, commandCancellationWindow);
                     if ((consumeInternally || IsConsumingNonQuery || IsDraining && !_isResultReady)
-                        && !capturedThisCommand && completeError is { } err && !IsOwnCancellation(err.Error))
+                        && !capturedThisCommand && completeError is { } err
+                        && !completeErrorIsOwnCancellation)
                         (_drainErrors ??= new()).Add(PgErrorException.Create(err.Error));
                 }
 
@@ -751,9 +763,9 @@ sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
         }
         catch (TimeoutException ex)
         {
-            CompleteEnumerationWithException(ex);
             RequestCancel(default, CancellationScope.RemainingFlow, BackendCancellationTiming.Immediate,
                 BackendCancellationTiming.AtReadFrontier);
+            CompleteEnumerationWithException(ex);
 
             // The timeout is terminal for the consumer, not for the body. Keep ownership of the
             // command sequence and drain every remaining RFQ window; reaching each RFQ requests
@@ -843,7 +855,7 @@ sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
             delivery.TrySetResult();
             return delivery.Task;
         }
-        RequestCancel(default, CancellationScope.RemainingFlow);
+        RequestCancelAndWake(default, CancellationScope.RemainingFlow);
         if (IsCompleted)
             delivery.TrySetResult();
         return delivery.Task;
@@ -858,10 +870,12 @@ sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
         return Interlocked.CompareExchange(ref _cancelDelivery, created, null) ?? created;
     }
 
-    void RequestCancel(CancellationToken token, CancellationScope scope,
+    bool RequestCancel(CancellationToken token, CancellationScope scope,
         BackendCancellationTiming timing = BackendCancellationTiming.AfterGrace,
         BackendCancellationTiming subsequentTiming = BackendCancellationTiming.AfterGrace)
     {
+        if (IsEnumerationCompleted)
+            return false;
         _cancelDeliverToken = token;
         var observedScope = Volatile.Read(ref _cancellationScope);
         while ((int)scope > observedScope)
@@ -892,6 +906,14 @@ sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
         }
         var delivery = Volatile.Read(ref _cancelDelivery);
         RequestBackendCancellation(timing, delivery);
+        return true;
+    }
+
+    void RequestCancelAndWake(CancellationToken token, CancellationScope scope)
+    {
+        if (!RequestCancel(token, scope))
+            return;
+        var delivery = Volatile.Read(ref _cancelDelivery);
         _callerInteractionCore.ResumeBody(runContinuationsAsynchronously: true);
         _callerInteractionCore.WakeBody(useDedicatedDriver: !IsAsync && delivery is not null);
     }
@@ -913,8 +935,17 @@ sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
                 Volatile.Read(ref _cancelDelivery));
     }
 
-    bool IsOwnCancellation(PgError error)
-        => Volatile.Read(ref _cancelRequested) && error.SqlState == PgErrorCodes.QueryCanceled;
+    bool IsOwnCancellation(PgError error, int window)
+    {
+        if (!Volatile.Read(ref _cancelRequested) || error.SqlState != PgErrorCodes.QueryCanceled)
+            return false;
+        // The same observation that classifies this as our cancellation also pins its exposure to
+        // this window. Sender settlement may lag the server response and must not move that reach
+        // forward to a successor window which still needs its own cancellation.
+        if (Volatile.Read(ref _contextPublished))
+            _context.OnBackendCancellationObserved(this, window);
+        return true;
+    }
 
     void EnterStoppingDrainIfNeeded(Context context)
     {

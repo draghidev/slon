@@ -445,6 +445,8 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
         internal void RequestBackendCancellation(PgClientFlow instigator, int window,
             BackendCancellationTiming timing, TaskCompletionSource? delivery)
             => _executionControl.RequestServerCancellation(instigator, window, timing, delivery);
+        internal void OnBackendCancellationObserved(PgClientFlow instigator, int window)
+            => _executionControl.OnBackendCancellationObserved(instigator, window);
 
         /// Returns an awaitable for the decoder. Activation is a cross-flow rendezvous completed by
         /// another flow's thread, so GetResult throws if not yet completed - async bodies await,
@@ -764,6 +766,8 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
         internal void RequestServerCancellation(PgClientFlow instigator, int window,
             BackendCancellationTiming timing, TaskCompletionSource? delivery)
             => control.RequestServerCancellation(instigator, window, timing, delivery);
+        internal void OnBackendCancellationObserved(PgClientFlow instigator, int window)
+            => control.OnBackendCancellationObserved(instigator, window);
         public bool IsProtocolClosed => control.ClosedException is not null;
         public PgClientClosedException? ClosedException => control.ClosedException;
         public Exception FlowTerminationException => control.FlowTerminationException;

@@ -608,6 +608,8 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
         var flow = execution.Flow;
         if (_control.HasPriorCancellationExposure(flow, flow.CancellationWindow))
             message.MarkPriorCancellationExposure();
+        if (message.TryCreateError(out var error) && error.SqlState == PgErrorCodes.QueryCanceled)
+            _control.OnBackendCancellationObserved(flow, flow.CancellationWindow);
         return message;
     }
 

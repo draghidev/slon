@@ -228,8 +228,11 @@ sealed partial class CommandFlow
             if (cancellationToken is { IsCancellationRequested: true } preCanceledToken)
             {
                 flow._callerCancellationToken = preCanceledToken;
-                flow.RequestCancel(preCanceledToken, CancellationScope.CurrentWindow);
-                flow._callerInteractionCore.ResumeBody(runContinuationsAsynchronously: false);
+                if (flow.RequestCancel(preCanceledToken, CancellationScope.CurrentWindow))
+                {
+                    flow._callerInteractionCore.ResumeBody(runContinuationsAsynchronously: false);
+                    flow._callerInteractionCore.WakeBody();
+                }
                 return ValueTask.FromException<bool>(new OperationCanceledException(preCanceledToken));
             }
 

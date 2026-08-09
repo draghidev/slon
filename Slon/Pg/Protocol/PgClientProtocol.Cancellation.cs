@@ -67,15 +67,17 @@ sealed partial class PgClientProtocol
 
     // Possible wire-wide reach of a cancellation request. It may outlive its instigating flow
     // until idle or an RFQ boundary proves that it cannot strike later work.
-    sealed class CancellationExposure(PgClientFlow instigator, Control control)
+    sealed class CancellationExposure(PgClientFlow instigator, Control control, int requestedWindow)
     {
         internal readonly PgClientFlow Instigator = instigator;
         internal readonly Control Control = control;
+        internal readonly int RequestedWindow = requestedWindow;
         internal CancellationExposure? Next;
         internal PgClientFlow? BoundaryFlow;
         internal int BoundaryWindow;
         // The sender still owns settlement, so an idle sweep must not remove this exposure.
         internal bool PendingDispatch;
+        internal bool Acknowledged;
     }
 
     internal void RequestServerCancellation(PgClientFlow instigator, Control control,
@@ -95,17 +97,6 @@ sealed partial class PgClientProtocol
             {
                 delivery?.TrySetResult();
                 return;
-            }
-            for (var exposure = _exposureHead; exposure is not null; exposure = exposure.Next)
-            {
-                if (ReferenceEquals(exposure.Instigator, instigator)
-                    && ReferenceEquals(exposure.Control, control)
-                    && ReferenceEquals(exposure.BoundaryFlow, instigator)
-                    && exposure.BoundaryWindow == window)
-                {
-                    delivery?.TrySetResult();
-                    return;
-                }
             }
             for (var existing = _cancellationHead; existing is not null; existing = existing.Next)
             {
@@ -152,6 +143,7 @@ sealed partial class PgClientProtocol
             || intent.InstigatorCompleted || intent.Attempts >= 2
             || intent.RemainingDelayTicks > 0
             || intent.RequiresCancellationReadFrontier && !IsAtCancellationReadFrontierLocked(intent)
+            || HasOwnCancellationExposureAtBoundaryLocked(intent)
             || !ReferenceEquals(intent.Control.ActivatedFlow, intent.Instigator))
             return false;
         _cancellationDispatching = true;
@@ -159,7 +151,7 @@ sealed partial class PgClientProtocol
         intent.Attempts++;
         ArmCancellationAttemptLocked();
         // Register before sending so completion cannot erase the request's possible reach.
-        var exposure = new CancellationExposure(intent.Instigator, intent.Control) { PendingDispatch = true };
+        var exposure = new CancellationExposure(intent.Instigator, intent.Control, intent.Window) { PendingDispatch = true };
         AppendCancellationExposureLocked(exposure);
         intent.Exposure = exposure;
         return true;
@@ -167,6 +159,19 @@ sealed partial class PgClientProtocol
 
     bool IsAtCancellationReadFrontierLocked(CancellationIntent intent)
         => intent.Control.IsAtCancellationReadFrontier(intent.Instigator, intent.Window);
+
+    bool HasOwnCancellationExposureAtBoundaryLocked(CancellationIntent intent)
+    {
+        for (var exposure = _exposureHead; exposure is not null; exposure = exposure.Next)
+        {
+            if (ReferenceEquals(exposure.Instigator, intent.Instigator)
+                && ReferenceEquals(exposure.Control, intent.Control)
+                && ReferenceEquals(exposure.BoundaryFlow, intent.Instigator)
+                && exposure.BoundaryWindow == intent.Window)
+                return true;
+        }
+        return false;
+    }
 
     internal void OnCancellationReadFrontier(Control control, PgClientFlow flow, int window)
     {
@@ -293,7 +298,13 @@ sealed partial class PgClientProtocol
             var exposure = intent.Exposure!;
             intent.Exposure = null;
             exposure.PendingDispatch = false;
-            if (state is CancelRequestState.NotSent)
+            if (exposure.Acknowledged)
+            {
+                RemoveCancellationExposureLocked(exposure);
+                RemoveCancellationIntentLocked(intent);
+                intent.Delivery?.TrySetResult();
+            }
+            else if (state is CancelRequestState.NotSent)
             {
                 // Nothing reached the server.
                 RemoveCancellationExposureLocked(exposure);
@@ -392,7 +403,8 @@ sealed partial class PgClientProtocol
                 var next = exposure.Next;
                 if (ReferenceEquals(exposure.Control, control)
                     && ReferenceEquals(exposure.BoundaryFlow, flow)
-                    && completedWindow >= exposure.BoundaryWindow)
+                    && completedWindow >= exposure.BoundaryWindow
+                    && !exposure.PendingDispatch)
                     RemoveCancellationExposureLocked(exposure);
                 exposure = next;
             }
@@ -406,6 +418,50 @@ sealed partial class PgClientProtocol
                     RemoveCancellationIntentLocked(intent);
                 break;
             }
+        }
+    }
+
+    internal void OnBackendCancellationObserved(Control control, PgClientFlow flow, int window)
+    {
+        if (!Volatile.Read(ref _hasCancellationExposures))
+            return;
+        var removed = false;
+        lock (_syncRoot)
+        {
+            for (var exposure = _exposureHead; exposure is not null; exposure = exposure.Next)
+            {
+                if (!ReferenceEquals(exposure.Control, control)
+                    || !ReferenceEquals(exposure.Instigator, flow)
+                    || exposure.RequestedWindow != window
+                    && (!ReferenceEquals(exposure.BoundaryFlow, flow) || exposure.BoundaryWindow != window))
+                    continue;
+                // A predecessor request may itself strike this successor window. In that case the
+                // retained intent for this window is satisfied, not newly dispatchable; sending it
+                // again could cancel the following window after this RFQ advances.
+                SatisfyCancellationIntentLocked(control, flow, window);
+                exposure.Acknowledged = true;
+                if (!exposure.PendingDispatch)
+                {
+                    RemoveCancellationExposureLocked(exposure);
+                    removed = true;
+                }
+                break;
+            }
+        }
+        if (removed)
+            TryDispatchNextCancellation();
+    }
+
+    void SatisfyCancellationIntentLocked(Control control, PgClientFlow flow, int window)
+    {
+        for (var intent = _cancellationHead; intent is not null; intent = intent.Next)
+        {
+            if (!ReferenceEquals(intent.Control, control) || !ReferenceEquals(intent.Instigator, flow)
+                || intent.Window != window)
+                continue;
+            RemoveCancellationIntentLocked(intent);
+            intent.Delivery?.TrySetResult();
+            return;
         }
     }
 

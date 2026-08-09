@@ -1446,6 +1446,8 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         public void RequestServerCancellation(PgClientFlow instigator, int window,
             PgClientFlow.BackendCancellationTiming timing, TaskCompletionSource? delivery = null)
             => protocol.RequestServerCancellation(instigator, this, window, timing, delivery);
+        public void OnBackendCancellationObserved(PgClientFlow instigator, int window)
+            => protocol.OnBackendCancellationObserved(this, instigator, window);
         public bool IsAtCancellationReadFrontier(PgClientFlow flow, int window)
             => Decoder.IsAtCancellationReadFrontier(flow, window);
         public void EnterCancellationReadFrontier(PgClientFlow flow, int window)
