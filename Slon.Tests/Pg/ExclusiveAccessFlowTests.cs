@@ -499,54 +499,6 @@ public class ExclusiveAccessFlowTests : ConnectionCreatingTest
     }
 
     [TestMethod]
-    public async Task ScopeAbort_BreaksSubflowParkedOnRead_ProtocolSurvives()
-    {
-        var time = new FakeTimeProvider();
-        var protocol = await PgTestPool.NewIsolatedAsync(o =>
-        {
-            o.HeartbeatInterval = TimeSpan.FromSeconds(1);
-            o.TimeProvider = time;
-        });
-        try
-        {
-            await using var blocker = await PgAdvisoryLock.AcquireAsync();
-            var scope = protocol.QueueExclusiveScope(async: true);
-            await scope.HandoffReady;
-            var sub = scope.Queue(new CommandFlow(async: true, blocker.WaitCommand));
-
-            var run = Task.Run(async () =>
-            {
-                var e = sub.GetAsyncEnumerator();
-                try
-                {
-                    while (await e.MoveNextAsync()) { }
-                    await e.DisposeAsync();
-                    return (Exception?)null;
-                }
-                catch (Exception ex)
-                {
-                    return ex;
-                }
-            });
-
-            protocol.AbortActiveScope();
-            time.Advance(TimeSpan.FromSeconds(1));
-            await blocker.ReleaseAsync();
-
-            var observed = await run;
-            Assert.IsNotNull(observed);
-            while (observed is not PgClientClosedException && observed.InnerException is not null)
-                observed = observed.InnerException;
-            Assert.IsInstanceOfType<PgClientClosedException>(observed);
-            Assert.IsFalse(protocol.IsCompleted);
-        }
-        finally
-        {
-            await protocol.DisposeAsync();
-        }
-    }
-
-    [TestMethod]
     public async Task ScopeAbort_BreaksWriterParkedOnFlush()
     {
         var closedProtocol = await PgTestPool.NewIsolatedAsync();

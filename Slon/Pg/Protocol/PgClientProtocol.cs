@@ -545,11 +545,10 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
     // at a time per connection.
     //
     // An ADO connection IS an exclusive scope (the protocol underneath is pooled and outlives the
-    // connection), so connection-dispose is scope teardown, not protocol teardown. The scope CloseSignal
-    // can be tripped independently (AbortActiveScope), and the per-scope decoder/writer shells over the
-    // shared read/write pipes carry the scope's token, so a scope-only abort breaks a subflow parked on
-    // a wire read/write while the pooled protocol survives. The shells are created once here alongside the
-    // flyweight and reused across scopes.
+    // connection), so connection-dispose is scope teardown, not protocol teardown. A linked CloseSignal
+    // gives the per-scope decoder/writer shells stable tokens while allowing root protocol termination to
+    // cascade through every scope using the shared physical pipes. The shells are created once here
+    // alongside the flyweight and reused across scopes.
     // Low-level queue half used by handoff/race tests. Ordinary callers use the acquired-scope
     // methods below so the queue/ownership split does not leak through their control flow.
     internal ExclusiveAccessFlow QueueExclusiveScope(bool async)
@@ -600,29 +599,6 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         var scope = QueueExclusiveScope(async: true);
         await scope.WaitForHandoffAsync(cancellationToken).ConfigureAwait(false);
         return scope;
-    }
-
-    // Scope-only abort: trips the active scope's CloseSignal, breaking any subflow parked on a wire
-    // read/write via the scope shells' tokens, without touching the protocol's own token (the pooled
-    // protocol survives). The future ADO connection-dispose path drives this.
-    internal void AbortActiveScope()
-    {
-        ExclusiveScopeState? scope;
-        lock (_syncRoot)
-        {
-            if (_closeReleaseStarted || (scope = _exclusiveScope) is null)
-                return;
-            _closeUsers++;
-        }
-
-        try
-        {
-            scope.AbortScope();
-        }
-        finally
-        {
-            ReleaseCloseUse();
-        }
     }
 
     bool TryQueueFlow<TState>(PgClientFlow flow, Func<TState, bool>? predicate = null, TState state = default!)
@@ -697,7 +673,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
     /// Internal emergency self-evict for the two framework-internal "we cannot continue" sites
     /// (startup catch, OnParameterStatus encoding failure). Fire-and-forget shape so it can run
     /// from the message-processing thread. Pool eviction picks up via the status flag.
-    internal void FailProtocol(Exception? reason)
+    void FailProtocol(Exception? reason)
         => FireAndForget(DisposeAsyncCore(reason, collateral: true));
 
     internal void ReportUnobservedCallback(Exception exception, string callback)
@@ -747,14 +723,10 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
     bool _shutdownStarted;
     PgCollateralException? _collateralException;
     TaskCompletionSource? _executorStopped;
-    bool _closeReleaseStarted;
-    int _closeUsers;
-    TaskCompletionSource? _closeUsersDrained;
-
     Task Shutdown(Exception? closeReason, bool forceful, bool collateral)
     {
         bool owner;
-        bool ownsCloseUse = false;
+        CloseSignal.Lease closeLease = default;
         TaskCompletionSource completion;
         lock (_syncRoot)
         {
@@ -786,11 +758,8 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
 
             // The drain owner retains the close signal through RunShutdownAsync. A forceful loser
             // leases it only for the synchronous escalation below; terminal release waits for leases.
-            if (forceful && !owner && !_closeReleaseStarted)
-            {
-                _closeUsers++;
-                ownsCloseUse = true;
-            }
+            if (forceful && !owner)
+                closeLease = _close.TryAcquire();
         }
 
         // Forceful escalation: idempotent, applied by ANY forceful caller - including one that loses the
@@ -801,9 +770,9 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         // happens-after the owner's materialize. _abortCts is live: DisposeAsyncCore (the only forceful
         // caller, gated by _disposed so it runs once) fires this before its await and disposes the CTSes
         // only afterwards.
-        if (forceful && (owner || ownsCloseUse))
+        if (forceful && (owner || closeLease.IsAcquired))
         {
-            try
+            using (closeLease)
             {
                 _close.Abort();
                 _connection?.Abort();
@@ -813,38 +782,11 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
                 // a flow crossing an enumeration visibility window.
                 PropagateFlowTermination();
             }
-            finally
-            {
-                if (ownsCloseUse)
-                    ReleaseCloseUse();
-            }
         }
 
         if (owner)
             _ = DriveShutdownAsync(forceful, completion);
         return completion.Task;
-    }
-
-    void ReleaseCloseUse()
-    {
-        lock (_syncRoot)
-        {
-            Debug.Assert(_closeUsers > 0);
-            if (--_closeUsers == 0)
-                _closeUsersDrained?.SetResult();
-        }
-    }
-
-    Task? BeginCloseRelease()
-    {
-        lock (_syncRoot)
-        {
-            Debug.Assert(!_closeReleaseStarted);
-            _closeReleaseStarted = true;
-            return _closeUsers == 0
-                ? null
-                : (_closeUsersDrained ??= new(TaskCreationOptions.RunContinuationsAsynchronously)).Task;
-        }
     }
 
     // Owns the single drain body and publishes its outcome to every awaiting caller. Run outside
@@ -889,6 +831,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         // executor's source pull returns completed, allowing inert items to migrate without waiting
         // for already-dispatched flows to drain.
         var executorStopped = _executorStopped!;
+        var cleanShutdown = false;
 
         // AsTask once: consumed by both the source-drain gate and the final await.
         var completeTask = _pipeline.CompleteAsync(closedException).AsTask();
@@ -900,6 +843,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
                 : closedException;
             _source.DrainInertItems(flow => flow.GetExecutionControl(FlowControl).FailUnstarted(flowTermination));
             await completeTask.ConfigureAwait(false);
+            cleanShutdown = !FlowControl.AbortToken.IsCancellationRequested;
         }
         catch (PgClientClosedException)
         {
@@ -929,28 +873,38 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
                 if (_connection is not null)
                 {
                     // Release the transport through the endpoints the protocol holds - the connection owns
-                    // no teardown. Error-complete the writer (DISCARDS any buffered write rather than
-                    // flushing it: graceful reached a clean RFQ, forceful already Abort'd the socket; the
-                    // error completion writes nothing and never starts the flush promise), then complete
-                    // the reader via the enumerator that owns it. The completed pipeline has already joined
-                    // every read owner and retired its borrowed buffer before reader completion can return
-                    // pooled segments. Both endpoints dispose the shared stream idempotently.
+                    // no teardown. A clean drain first flushes its best-effort Terminate; error-completing
+                    // the writer then discards anything left by a failed Terminate (forceful shutdown already
+                    // Abort'd the socket). Complete the reader through the enumerator that owns it. The
+                    // completed pipeline has already joined every read owner and retired its borrowed buffer
+                    // before reader completion can return pooled segments. Both endpoints dispose the shared
+                    // stream idempotently.
+                    if (cleanShutdown)
+                    {
+                        try
+                        {
+                            // The completed pipeline has retired every writer owner. Terminate is a
+                            // best-effort PostgreSQL courtesy at this sole-owner boundary; failure to
+                            // send it cannot make an otherwise-complete local shutdown fail.
+                            _protocolDataWriter.WriteTerminate();
+                            await _protocolDataWriter.FlushAsync(default).ConfigureAwait(false);
+                        }
+                        catch (Exception ex)
+                        {
+                            SlonLogMessages.TerminateWriteFailed(_logger, ex);
+                        }
+                    }
                     await _connection.Writer.CompleteAsync(closedException).ConfigureAwait(false);
                     await ((IAsyncDisposable)_pgDecoder).DisposeAsync().ConfigureAwait(false);
                 }
             }
             finally
             {
-                // Stop new signal users and wait for any synchronous forceful escalation already
-                // admitted by Shutdown or AbortActiveScope. The pipeline itself is fully drained.
-                if (BeginCloseRelease() is { } closeUsersDrained)
-                    await closeUsersDrained.ConfigureAwait(false);
-
                 try
                 {
                     _heartbeat?.Dispose();
                     _exclusiveScope?.Dispose();
-                    _close.Dispose();
+                    await _close.DisposeAsync().ConfigureAwait(false);
                 }
                 finally
                 {

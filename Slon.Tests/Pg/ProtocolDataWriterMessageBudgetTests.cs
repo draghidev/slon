@@ -169,6 +169,19 @@ public class ProtocolDataWriterMessageBudgetTests
     }
 
     [TestMethod]
+    public void Terminate_WritesHeaderOnlyFrontendMessage()
+    {
+        var (writer, sink) = NewWriter();
+
+        writer.WriteTerminate();
+        writer.Flush();
+
+        CollectionAssert.AreEqual(
+            new byte[] { (byte)'X', 0, 0, 0, 4 },
+            sink.ToArray());
+    }
+
+    [TestMethod]
     public void ParameterWriterState_IsCachedPerTokenBearingShell()
     {
         var (writer, _) = NewWriter();

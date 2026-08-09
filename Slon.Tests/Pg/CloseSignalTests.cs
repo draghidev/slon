@@ -88,4 +88,19 @@ public class CloseSignalTests
         parent.Dispose();
     }
 
+    [TestMethod]
+    public async Task DisposeAsync_RejectsNewLeasesAndWaitsForAdmittedLease()
+    {
+        var signal = CloseSignal.CreateRoot();
+        var lease = signal.TryAcquire();
+        Assert.IsTrue(lease.IsAcquired);
+
+        var dispose = signal.DisposeAsync();
+        Assert.IsFalse(dispose.IsCompleted);
+        Assert.IsFalse(signal.TryAcquire().IsAcquired);
+
+        lease.Dispose();
+        await dispose;
+    }
+
 }

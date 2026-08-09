@@ -93,9 +93,6 @@ sealed partial class PgClientProtocol
         internal void Terminate(Exception exception)
             => _ = _innerPipeline!.CompleteAsync(exception);
 
-        // Abort scope I/O without aborting the pooled protocol.
-        public void AbortScope() => _scopeClose.Abort();
-
         // Release the child registration before the protocol disposes its close signal.
         public void Dispose() => _scopeClose.Dispose();
     }

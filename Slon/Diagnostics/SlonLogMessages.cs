@@ -47,4 +47,8 @@ static partial class SlonLogMessages
         "Best-effort transaction rollback during disposal failed.")]
     public static partial void TransactionDisposeRollbackFailed(
         ILogger logger, Exception exception);
+
+    [LoggerMessage(10, LogLevel.Trace,
+        "Sending PostgreSQL Terminate during graceful connection shutdown failed; closing the transport directly.")]
+    public static partial void TerminateWriteFailed(ILogger logger, Exception exception);
 }

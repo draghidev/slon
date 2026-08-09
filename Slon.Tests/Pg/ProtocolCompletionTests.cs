@@ -102,9 +102,8 @@ public class ProtocolCompletionTests : ConnectionCreatingTest
         await completion;
 
         // Terminal callers observe the same completion without touching disposed close signals,
-        // including a late forceful escalation and the scope-abort surface.
+        // including a late forceful escalation.
         Assert.AreSame(completion, protocol.CompleteAsync(new InvalidOperationException("late")));
-        protocol.AbortActiveScope();
         await protocol.DisposeAsync();
     }
 
@@ -223,36 +222,6 @@ public class ProtocolCompletionTests : ConnectionCreatingTest
                 ex = ex.InnerException;
             return ex;
         }
-    }
-
-    [TestMethod]
-    public async Task FailProtocol_PendingReadRetainsCanonicalCause_ButFlowIsCollateral()
-    {
-        var options = PgTestPool.NewOptions();
-        var transport = new ControlledEofTransport(Handshake());
-        var protocol = PgClientProtocol.Create(new PgClientProtocolOptions(options));
-        await protocol.StartAsync(options, transport);
-
-        var flow = new CommandFlow(async: true, Command.Create("select 1"));
-        Assert.IsTrue(protocol.TryQueue(flow));
-        var e = flow.GetAsyncEnumerator();
-        var move = e.MoveNextAsync().AsTask();
-        await transport.ReadParked;
-
-        var violation = new PgProtocolException("synthetic framing violation");
-        protocol.FailProtocol(violation);
-        var canonicalClose = protocol.FlowControl.ClosedException;
-        Assert.IsNotNull(canonicalClose);
-        Assert.AreSame(violation, canonicalClose.InnerException);
-
-        transport.CompleteServerOutput();
-
-        var observed = await Assert.ThrowsExactlyAsync<PgCollateralException>(
-            () => move);
-        Assert.AreEqual(PgCollateralKind.ProtocolFailure, observed.Kind);
-        Assert.AreSame(violation, observed.InnerException,
-            "a synthesized unexpected-EOF failure must not displace the FailProtocol reason");
-        await protocol.Completion;
     }
 
     [TestMethod]

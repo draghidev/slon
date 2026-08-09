@@ -1,3 +1,5 @@
+using System.Diagnostics;
+
 namespace Slon.Pg.Protocol;
 
 // Owns the close reason and the two-phase cancellation (stopping then abort) as one object, so the
@@ -14,7 +16,7 @@ namespace Slon.Pg.Protocol;
 // parent's) and chains Reason to the parent, so a parent trip cascades into the child and the child
 // resolves the parent's reason. A child can also be tripped independently (scope-only teardown) without
 // touching the parent. The child disposes only its own CTSes, never the parent's.
-sealed class CloseSignal : IDisposable
+sealed class CloseSignal : IDisposable, IAsyncDisposable
 {
     PgClientClosedException? _reason;
     readonly CancellationTokenSource _stoppingCts;
@@ -24,6 +26,12 @@ sealed class CloseSignal : IDisposable
     readonly CloseSignal? _parent;
     readonly CancellationTokenRegistration _parentStoppingRegistration;
     readonly CancellationTokenRegistration _parentAbortRegistration;
+    // Disposal closes admission first, then waits for callers already admitted to Abort before
+    // releasing the CTSes they use. A successful increment rechecks admission so the close-vs-acquire
+    // race either returns a real lease or immediately rolls it back.
+    int _leasesOpen = 1;
+    int _leaseCount;
+    TaskCompletionSource? _leasesDrained;
 
     CloseSignal(
         CancellationTokenSource stoppingCts,
@@ -110,13 +118,56 @@ sealed class CloseSignal : IDisposable
         _abortCts.Cancel();
     }
 
+    public Lease TryAcquire()
+    {
+        if (Volatile.Read(ref _leasesOpen) == 0)
+            return default;
+        Interlocked.Increment(ref _leaseCount);
+        if (Volatile.Read(ref _leasesOpen) != 0)
+            return new(this);
+        ReleaseLease();
+        return default;
+    }
+
+    void ReleaseLease()
+    {
+        if (Interlocked.Decrement(ref _leaseCount) == 0)
+            Volatile.Read(ref _leasesDrained)?.TrySetResult();
+    }
+
+    public readonly struct Lease : IDisposable
+    {
+        readonly CloseSignal? _owner;
+
+        internal Lease(CloseSignal owner) => _owner = owner;
+        public bool IsAcquired => _owner is not null;
+        public void Dispose() => _owner?.ReleaseLease();
+    }
+
     // Disposes only its own CTSes (a linked child's CTSes hold a registration on the parent's tokens;
     // disposing them releases that registration). Never disposes the parent.
-    public void Dispose()
+    public async ValueTask DisposeAsync()
     {
+        var wasOpen = Interlocked.Exchange(ref _leasesOpen, 0);
+        Debug.Assert(wasOpen != 0, "CloseSignal has a single disposal owner.");
+        if (Volatile.Read(ref _leaseCount) > 0)
+        {
+            var waiter = Volatile.Read(ref _leasesDrained);
+            if (waiter is null)
+            {
+                var created = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                waiter = Interlocked.CompareExchange(ref _leasesDrained, created, null) ?? created;
+            }
+            // A final release may have raced waiter publication and observed null.
+            if (Volatile.Read(ref _leaseCount) == 0)
+                waiter.TrySetResult();
+            await waiter.Task.ConfigureAwait(false);
+        }
         _parentStoppingRegistration.Dispose();
         _parentAbortRegistration.Dispose();
         _stoppingCts.Dispose();
         _abortCts.Dispose();
     }
+
+    public void Dispose() => DisposeAsync().AsTask().GetAwaiter().GetResult();
 }
