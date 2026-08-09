@@ -5,7 +5,7 @@ namespace Slon.Pg.Protocol.Flows;
 // Substitute item returned by PgClientProtocol.Control.TryRecoverItemFailure to resync the wire
 // after a flow fails (decode, write, or execute fault). Inherits the failed flow's outstanding RFQ
 // obligation, pads any torn outgoing frame, then runs the resync move (realigning Sync when needed +
-// a ROLLBACK to close any open transaction; see WriteResync), flushing it with the failed flow's
+// a ROLLBACK to close any open transaction; see WriteResyncAsync), flushing it with the failed flow's
 // buffered work and draining the resulting RFQs (inherited + the resync move's, 0-2).
 // Recovery of an ExclusiveAccessFlow appends its checked session reset to the same write batch.
 //
@@ -21,6 +21,13 @@ namespace Slon.Pg.Protocol.Flows;
 // implemented, so the wire can't be in copy-mode at recovery time.
 sealed class ResyncRecoveryFlow : PgClientFlow
 {
+    // Normal large parameter writes remain worth salvaging: padding is streamed in bounded chunks,
+    // so its declared size no longer implies equivalent client memory. This cap only rejects an
+    // implausibly large/corrupt frame whose wire repair would monopolize the connection indefinitely.
+    internal const int MaxRecoveryPaddingBytes = 256 * 1024 * 1024;
+    // Keep recovery resumable without turning the 256 MiB salvage ceiling into thousands of
+    // flush/await rounds. The writer may subdivide this bounded window into normal segments.
+    const int RecoveryPaddingChunkBytes = 4 * 1024 * 1024;
     int _drainCount;
     ValueTask _outstandingTrailing;
     bool _outstandingIsRead;
@@ -75,7 +82,7 @@ sealed class ResyncRecoveryFlow : PgClientFlow
         recovery._canWriteSync = canWriteSync;
         recovery._canWrite = canWrite;
         recovery._scopeResetCommand = failedFlow is ExclusiveAccessFlow ? control.ScopeResetCommand : null;
-        // drainCount = inheritedRfqCount + the resync move's RFQs (WriteResync): the realigning Sync
+        // drainCount = inheritedRfqCount + the resync move's RFQs (WriteResyncAsync): the realigning Sync
         // when canWriteSync, the always-written ROLLBACK when canWrite, and the reset query when the
         // failed item was an exclusive scope.
         recovery._drainCount = inheritedRfqCount + (canWriteSync ? 1 : 0) + (canWrite ? 1 : 0)
@@ -101,7 +108,7 @@ sealed class ResyncRecoveryFlow : PgClientFlow
 
     protected override ValueTask<FlowTasks> ExecuteAuto(Context context)
     {
-        // Resync with WriteResync: pad any torn frame, then BEGIN (mid extended-query only) + ROLLBACK to
+        // Resync with WriteResyncAsync: pad any torn frame, then BEGIN (mid extended-query only) + ROLLBACK to
         // discard whatever the failed flow left uncommitted. Mid extended-query its executed commands sit
         // in an OPEN implicit block that PG holds to the Sync (NOT per-statement commit), so a BEGIN
         // upgrades that block to explicit and the ROLLBACK unwinds it; otherwise the ROLLBACK just closes
@@ -132,9 +139,9 @@ sealed class ResyncRecoveryFlow : PgClientFlow
         if (_outstandingIsRead || _outstandingTrailing.IsCompletedSuccessfully)
         {
             var encoder = context.GetEncoder();
-            WriteResync(encoder);
-            var flushTask = encoder.FlushAsync();
-            return new(new FlowTasks(trailingExecutionTask: flushTask, pipelineTask: DrainPhase()));
+            return new(new FlowTasks(
+                trailingExecutionTask: StartWriteResync(encoder),
+                pipelineTask: DrainPhase()));
         }
 
         return new(new FlowTasks(trailingExecutionTask: TrailingPhase(), pipelineTask: DrainPhase()));
@@ -149,8 +156,7 @@ sealed class ResyncRecoveryFlow : PgClientFlow
             // tail, so GetEncoder's gate accepts our writes here, sequential with the now-completed
             // trailing and single-producer-preserved.
             var encoder = context.GetEncoder();
-            WriteResync(encoder);
-            await encoder.FlushAsync().ConfigureAwait(false);
+            await StartWriteResync(encoder).ConfigureAwait(false);
         }
 
         async ValueTask DrainPhase()
@@ -187,6 +193,17 @@ sealed class ResyncRecoveryFlow : PgClientFlow
         }
     }
 
+    ValueTask StartWriteResync(PgEncoder encoder)
+    {
+        if (IsAsync)
+            return WriteResyncAsync(encoder);
+
+        ValueTask task;
+        using (encoder.BeginResumableScope())
+            task = WriteResyncAsync(encoder);
+        return task.IsCompleted ? task : encoder.RunResumableTask(task);
+    }
+
     // Realign the wire and discard whatever the failed flow left uncommitted (taken whenever the write
     // window is open):
     //   1. PadCurrentMessage - complete any torn outgoing frame so the server exits at a framing boundary.
@@ -204,9 +221,25 @@ sealed class ResyncRecoveryFlow : PgClientFlow
     //   4. For an exclusive flow, append the session reset after ROLLBACK. It needs no response-dependent
     //      write, so DrainPhase can consume its additional RFQ and preserve any reset error.
     // BEGIN/ROLLBACK notices and CommandCompletes are non-RFQ and discarded by DrainPhase (counts RFQs).
-    void WriteResync(PgEncoder encoder)
+    async ValueTask WriteResyncAsync(PgEncoder encoder)
     {
-        encoder.PadCurrentMessage();
+        var paddingLength = encoder.CurrentMessagePaddingLength;
+        if (paddingLength > MaxRecoveryPaddingBytes)
+            throw new PgProtocolException(
+                $"Recovering the PostgreSQL wire would require padding {paddingLength} bytes, " +
+                $"exceeding the {MaxRecoveryPaddingBytes}-byte safety limit.");
+
+        // A torn streamed message may be much larger than the writer's normal buffer. Pad and
+        // physically flush it in bounded pieces so recovery never materializes the entire missing
+        // body synchronously. FlushResumable bypasses ordinary pipeline deferral: each chunk must
+        // leave before the next one is produced.
+        while (paddingLength > 0)
+        {
+            var padded = encoder.PadCurrentMessage(Math.Min(paddingLength, RecoveryPaddingChunkBytes));
+            paddingLength -= padded;
+            if (paddingLength > 0)
+                await encoder.FlushResumable().ConfigureAwait(false);
+        }
         if (_canWriteSync)
         {
             // BEGIN must be in the extended stream before the realigning Sync. A simple Query is itself
@@ -220,5 +253,6 @@ sealed class ResyncRecoveryFlow : PgClientFlow
         // Closes the now-explicit (or already-explicit) transaction; a no-op-with-notice when Idle.
         encoder.WriteQuery("ROLLBACK -- Slon connection recovery");
         ExclusiveAccessFlow.WriteScopeReset(encoder, _scopeResetCommand);
+        await encoder.FlushResumable().ConfigureAwait(false);
     }
 }

@@ -145,12 +145,21 @@ sealed class ProtocolWritePipe(IOutputWriter writer, Encoding clientEncoding, Ac
     // own Execute - the zero-padded body can parse as a valid Bind whose corrupted parameter
     // would silently corrupt data. Recovery's job is to inject Sync and drain RFQs, not to
     // continue any pipelined work; the unexecuted portal dies at Sync.
-    internal int CompleteCurrentMessageWithPadding()
+    internal int CurrentMessagePaddingLength
     {
-        if (_messageLength is null)
-            return 0;
-        var unflushed = checked((int)_bufferingWriter.UnflushedBytes);
-        var remaining = _messageLength.Value - (unflushed + _messageBytesFlushed);
+        get
+        {
+            if (_messageLength is null)
+                return 0;
+            var unflushed = checked((int)_bufferingWriter.UnflushedBytes);
+            return Math.Max(0, _messageLength.Value - (unflushed + _messageBytesFlushed));
+        }
+    }
+
+    internal int CompleteCurrentMessageWithPadding(int maxBytes = int.MaxValue)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(maxBytes);
+        var remaining = Math.Min(CurrentMessagePaddingLength, maxBytes);
         if (remaining <= 0)
             return 0;
         var padded = remaining;

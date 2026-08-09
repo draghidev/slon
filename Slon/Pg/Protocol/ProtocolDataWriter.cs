@@ -92,7 +92,9 @@ sealed class ProtocolDataWriter : IOutputWriter
     internal void StartMessage(byte type, int bodyLength) => _pipe.StartMessage(type, bodyLength);
     internal void StartMessage(int totalLength) => _pipe.StartMessage(totalLength);
 
-    internal int CompleteCurrentMessageWithPadding() => _pipe.CompleteCurrentMessageWithPadding();
+    internal int CurrentMessagePaddingLength => _pipe.CurrentMessagePaddingLength;
+    internal int CompleteCurrentMessageWithPadding(int maxBytes = int.MaxValue)
+        => _pipe.CompleteCurrentMessageWithPadding(maxBytes);
 
     // TODO make a cut-off from where we start streaming the string.
     public ValueTask WriteStringWithNullTerminatorAsync(string value, Encoding encoding, int? encodedLength = null, CancellationToken cancellationToken = default)

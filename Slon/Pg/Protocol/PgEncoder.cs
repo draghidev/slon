@@ -343,7 +343,9 @@ readonly struct PgEncoder
     // written (0 = nothing in flight or message was already complete). Callers (ResyncRecoveryFlow)
     // pair this with a subsequent WriteSync + flush so the server discards the padded message
     // garbage as an ERROR and resyncs on the Sync's RFQ.
-    internal int PadCurrentMessage() => _writer.CompleteCurrentMessageWithPadding();
+    internal int CurrentMessagePaddingLength => _writer.CurrentMessagePaddingLength;
+    internal int PadCurrentMessage(int maxBytes = int.MaxValue)
+        => _writer.CompleteCurrentMessageWithPadding(maxBytes);
 
     public void WriteClose(EncodedString name = default, bool portalName = false)
     {

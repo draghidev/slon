@@ -151,6 +151,24 @@ public class ProtocolDataWriterMessageBudgetTests
     }
 
     [TestMethod]
+    public void Padding_CanBeEmittedInBoundedChunksAcrossFlushes()
+    {
+        var (writer, sink) = NewWriter();
+        writer.StartMessage(totalLength: 12);
+        writer.WriteRaw(new byte[2]);
+
+        Assert.AreEqual(10, writer.CurrentMessagePaddingLength);
+        Assert.AreEqual(4, writer.CompleteCurrentMessageWithPadding(4));
+        writer.Flush();
+        Assert.AreEqual(6, writer.CurrentMessagePaddingLength);
+        Assert.AreEqual(6, writer.CompleteCurrentMessageWithPadding(10));
+        writer.Flush();
+
+        Assert.AreEqual(0, writer.CurrentMessagePaddingLength);
+        Assert.AreEqual(12, sink.ToArray().Length);
+    }
+
+    [TestMethod]
     public void ParameterWriterState_IsCachedPerTokenBearingShell()
     {
         var (writer, _) = NewWriter();
