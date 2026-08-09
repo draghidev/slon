@@ -447,9 +447,57 @@ public class CommandUserCancellationTests : ConnectionCreatingTest
 
         await Assert.ThrowsExactlyAsync<TimeoutException>(
             async () => await moveNext);
-        await Assert.ThrowsExactlyAsync<TimeoutException>(async () => await enumerator.DisposeAsync());
+        await enumerator.DisposeAsync();
         await WaitUntilAsync(() => !protocol.HasPendingCancellation);
         await PgTestPool.RunAsync(protocol, "select 1");
+    }
+
+    [TestMethod]
+    public async Task ServerCancel_ReadTimeoutCancelsEveryRemainingCommandWindow()
+    {
+        await using var firstBlocker = await PgAdvisoryLock.AcquireAsync();
+        await using var secondBlocker = await PgAdvisoryLock.AcquireAsync();
+        var sendSecondRequest = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var options = PgTestPool.NewOptions();
+        var sender = PgTestPool.CreateCancelSender(options);
+        var attempts = 0;
+        await using var protocol = await PgTestPool.NewIsolatedAsync(o =>
+        {
+            o.HeartbeatInterval = TimeSpan.FromHours(1);
+            o.CancelRequestDelay = TimeSpan.FromHours(1);
+            o.CancelSender = async (processId, secretKey, token) =>
+            {
+                if (Interlocked.Increment(ref attempts) == 2)
+                    await sendSecondRequest.Task;
+                return await sender(processId, secretKey, token);
+            };
+        });
+
+        try
+        {
+            var flow = new CommandFlow(async: true,
+                firstBlocker.WaitCommand with { WithSync = true, Timeout = TimeSpan.FromSeconds(100) },
+                secondBlocker.WaitCommand);
+            Assert.IsTrue(protocol.TryQueue(flow));
+            var enumerator = flow.GetAsyncEnumerator();
+            var moveNext = enumerator.MoveNextAsync().AsTask();
+
+            await firstBlocker.WaitUntilContendedAsync(protocol.FlowControl.BackendProcessId);
+            await protocol.Heartbeat(TimeSpan.FromSeconds(100));
+            await Assert.ThrowsExactlyAsync<TimeoutException>(async () => await moveNext);
+
+            await secondBlocker.WaitUntilContendedAsync(protocol.FlowControl.BackendProcessId);
+            sendSecondRequest.TrySetResult();
+            await enumerator.DisposeAsync();
+            await WaitUntilAsync(() => !protocol.HasPendingCancellation);
+            Assert.AreEqual(2, Volatile.Read(ref attempts));
+            Assert.IsFalse(protocol.HasPendingCancellation);
+            await PgTestPool.RunAsync(protocol, "select 1");
+        }
+        finally
+        {
+            sendSecondRequest.TrySetResult();
+        }
     }
 
     [TestMethod]

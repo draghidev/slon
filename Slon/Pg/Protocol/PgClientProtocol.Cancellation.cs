@@ -113,10 +113,10 @@ sealed partial class PgClientProtocol
                     && existing.Window == window)
                 {
                     existing.Delivery ??= delivery;
-                    if (timing is PgClientFlow.BackendCancellationTiming.Immediate)
+                    if (timing is not PgClientFlow.BackendCancellationTiming.AfterGrace)
                     {
                         existing.RemainingDelayTicks = 0;
-                        existing.RequiresCancellationReadFrontier = false;
+                        existing.RequiresCancellationReadFrontier = timing is not PgClientFlow.BackendCancellationTiming.Immediate;
                     }
                     dispatch = TryBeginCancellationDispatchLocked(existing);
                     intent = existing;
@@ -128,9 +128,9 @@ sealed partial class PgClientProtocol
             {
                 intent = new(instigator, control, window);
                 intent.Delivery = delivery;
-                intent.RemainingDelayTicks = timing is PgClientFlow.BackendCancellationTiming.Immediate
+                intent.RemainingDelayTicks = timing is not PgClientFlow.BackendCancellationTiming.AfterGrace
                     ? 0 : GetCancelRequestDelayTicks();
-                intent.RequiresCancellationReadFrontier = timing is PgClientFlow.BackendCancellationTiming.AfterGrace;
+                intent.RequiresCancellationReadFrontier = timing is not PgClientFlow.BackendCancellationTiming.Immediate;
                 if (_cancellationTail is null)
                     _cancellationHead = intent;
                 else

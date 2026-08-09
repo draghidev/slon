@@ -20,6 +20,7 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
     protected internal enum BackendCancellationTiming : byte
     {
         AfterGrace,
+        AtReadFrontier,
         Immediate
     }
 
@@ -428,6 +429,8 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
         /// The per-flow terminal verdict. Internal protocol condemnation retains the canonical
         /// close cause separately and presents affected siblings with a collateral exception.
         public Exception FlowTerminationException => _executionControl.FlowTerminationException;
+
+        internal int OutstandingRfqCount => _executionControl.RfqCount;
 
         public ref readonly TState GetProtocolStatic<TState>()
             => ref _executionControl.GetProtocolStatic<TState>();
