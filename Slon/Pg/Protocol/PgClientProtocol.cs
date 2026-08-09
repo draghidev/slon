@@ -73,7 +73,7 @@ sealed class PgClientProtocolOptions
     public Encoding DefaultClientEncoding { get; set; }
     public TimeSpan FlowActivationTimeout { get; set; }
     public TimeSpan HeartbeatInterval { get; set; } = Heartbeat.DefaultInterval;
-    public TimeSpan ReadTimeout { get; set; } = Timeout.InfiniteTimeSpan;
+    public TimeSpan ReadTimeout { get; set; } = PgClientOptions.DefaultReadTimeout;
     // Allocation-free grace before starting a backend CancelRequest. Heartbeat supplies the clock.
     public TimeSpan CancelRequestDelay { get; set; }
     public ScopeResetOptions ScopeReset { get; set; } = new();

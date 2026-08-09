@@ -10,6 +10,8 @@ namespace Slon.Pg;
 
 sealed class PgClientOptions
 {
+    internal static readonly TimeSpan DefaultReadTimeout = TimeSpan.FromSeconds(30);
+
     internal TimeSpan HeartbeatInterval { get; init; } = Heartbeat.DefaultInterval;
     // Time-based subsampling on top of the heartbeat. Pushes batch up to this interval before a
     // maintenance flow is scheduled. Setting this larger than HeartbeatInterval grows batches at
@@ -26,7 +28,7 @@ sealed class PgClientOptions
     internal PostgreSqlIntegratedSecurityOptions? IntegratedSecurity { get; init; }
     internal ILoggerFactory LoggerFactory { get; init; } = NullLoggerFactory.Instance;
 
-    public TimeSpan ReadTimeout { get; init; } = Timeout.InfiniteTimeSpan; // TimeSpan.FromSeconds(2);
+    public TimeSpan ReadTimeout { get; init; } = DefaultReadTimeout;
     public TimeSpan WriteTimeout { get; init; } = TimeSpan.FromSeconds(10);
 
     public TimeSpan ConnectionTimeout { get; init; } = Timeout.InfiniteTimeSpan;
