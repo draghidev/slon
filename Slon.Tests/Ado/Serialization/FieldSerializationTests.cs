@@ -125,6 +125,7 @@ public class FieldSerializationTests
 
         Assert.IsTrue(await reader.ReadAsync());
         Assert.ThrowsExactly<ObjectDisposedException>(() => stream.ReadByte());
+        Assert.IsFalse(await reader.ReadAsync());
     }
 
     [TestMethod]

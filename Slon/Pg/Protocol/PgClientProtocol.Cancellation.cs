@@ -113,9 +113,10 @@ sealed partial class PgClientProtocol
                     && existing.Window == window)
                 {
                     existing.Delivery ??= delivery;
-                    if (timing is not PgClientFlow.BackendCancellationTiming.AfterGrace)
+                    var delayTicks = GetCancellationDelayTicks(timing, instigator);
+                    if (delayTicks < existing.RemainingDelayTicks)
                     {
-                        existing.RemainingDelayTicks = 0;
+                        existing.RemainingDelayTicks = delayTicks;
                         existing.RequiresCancellationReadFrontier = timing is not PgClientFlow.BackendCancellationTiming.Immediate;
                     }
                     dispatch = TryBeginCancellationDispatchLocked(existing);
@@ -128,8 +129,7 @@ sealed partial class PgClientProtocol
             {
                 intent = new(instigator, control, window);
                 intent.Delivery = delivery;
-                intent.RemainingDelayTicks = timing is not PgClientFlow.BackendCancellationTiming.AfterGrace
-                    ? 0 : GetCancelRequestDelayTicks();
+                intent.RemainingDelayTicks = GetCancellationDelayTicks(timing, instigator);
                 intent.RequiresCancellationReadFrontier = timing is not PgClientFlow.BackendCancellationTiming.Immediate;
                 if (_cancellationTail is null)
                     _cancellationHead = intent;
@@ -211,6 +211,16 @@ sealed partial class PgClientProtocol
         => _options.CancelRequestDelay == Timeout.InfiniteTimeSpan
             ? long.MaxValue
             : Math.Max(0, _options.CancelRequestDelay.Ticks);
+
+    long GetCancellationDelayTicks(PgClientFlow.BackendCancellationTiming timing, PgClientFlow instigator)
+    {
+        if (timing is not PgClientFlow.BackendCancellationTiming.AfterGrace)
+            return 0;
+        var delay = instigator.BackendCancellationGracePeriod;
+        return delay is null ? GetCancelRequestDelayTicks()
+            : delay == Timeout.InfiniteTimeSpan ? long.MaxValue
+            : Math.Max(0, delay.Value.Ticks);
+    }
 
     void OnCancellationHeartbeat(TimeSpan elapsed)
     {

@@ -103,7 +103,7 @@ sealed partial class CommandFlow
     {
         if (IsBodyTerminated)
             return false;
-        if (WaitForDrainOnDispose) MarkConsumerWaitForDrain(); else MarkConsumerGone();
+        MarkTerminalConsumerGone();
         _callerInteractionCore.ResumeBody(runContinuationsAsynchronously: true);
         _callerInteractionCore.WakeBody();
         return true;
@@ -322,23 +322,11 @@ sealed partial class CommandFlow
                 return;
             }
 
-            // A synchronous consumer drives the autonomous drain through the same rendezvous.
-            flow.MarkConsumerGone();
-            try
-            {
-                while (MoveNext())
-                    Current.Dispose();
-            }
-            catch (PgClientClosedException)
-            {
-                // Disposal absorbs the consumer-facing close. If the body remains live, close still does
-                // not release this synchronous caller's drive obligation.
-                if (!flow.IsBodyTerminated)
-                {
-                    DriveBodyToTermination(flow);
-                    flow.AwaitDrainOnDisposeSynchronously();
-                }
-            }
+            // Cancellation graduates a synchronous body to the dedicated driver. The disposer no
+            // longer pumps the same body concurrently; it only waits for tenure release when requested.
+            flow.MarkSyncConsumerGone();
+            if (flow.WaitForDrainOnDispose)
+                flow.AwaitDrainOnDisposeSynchronously();
 
             static void DriveBodyToTermination(CommandFlow flow)
             {

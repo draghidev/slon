@@ -352,6 +352,7 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
     // the heartbeat's generation-agnostic timeout completer.
     protected virtual bool EnableActivationTimeout => false;
     protected virtual TimeSpan? PendingTimeout => null;
+    internal virtual TimeSpan? BackendCancellationGracePeriod => null;
 
     protected virtual void OnHeartbeat(TimeSpan interval) {}
     protected virtual void OnAbort(Exception exception) {}

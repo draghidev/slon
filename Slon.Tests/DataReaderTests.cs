@@ -56,6 +56,7 @@ public class DataReaderTests
         Assert.IsTrue(await reader.ReadAsync(CancellationToken.None));
         Assert.AreEqual(SecondLength, reader.GetString(0).Length);
         Assert.AreEqual(43, reader.GetInt32(1));
+        Assert.IsFalse(await reader.ReadAsync(CancellationToken.None));
     }
 
     [TestMethod]

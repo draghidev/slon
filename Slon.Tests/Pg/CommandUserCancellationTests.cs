@@ -419,6 +419,43 @@ public class CommandUserCancellationTests : ConnectionCreatingTest
     }
 
     [TestMethod]
+    public async Task ConsumerDispose_UsesItsOwnGraceBeforeSideChannelAttempt()
+    {
+        await using var blocker = await PgAdvisoryLock.AcquireAsync();
+        var attempted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var attempts = 0;
+        await using var protocol = await PgTestPool.NewIsolatedAsync(o =>
+        {
+            o.HeartbeatInterval = TimeSpan.FromHours(1);
+            o.CancelRequestDelay = TimeSpan.Zero;
+            o.CancelSender = (_, _, _) =>
+            {
+                Interlocked.Increment(ref attempts);
+                attempted.TrySetResult();
+                return new(CancelRequestState.Sent);
+            };
+        });
+
+        var flow = new CommandFlow(async: true, blocker.WaitCommand);
+        Assert.IsTrue(protocol.TryQueue(flow));
+        var enumerator = flow.GetAsyncEnumerator();
+        var moveNext = enumerator.MoveNextAsync().AsTask();
+
+        await blocker.WaitUntilContendedAsync(protocol.FlowControl.BackendProcessId);
+        var dispose = enumerator.DisposeAsync().AsTask();
+        await protocol.Heartbeat(TimeSpan.FromMilliseconds(999));
+        Assert.AreEqual(0, Volatile.Read(ref attempts));
+        await protocol.Heartbeat(TimeSpan.FromMilliseconds(1));
+        await attempted.Task;
+        Assert.AreEqual(1, Volatile.Read(ref attempts));
+
+        await blocker.ReleaseAsync();
+        await dispose;
+        await WaitUntilAsync(() => !protocol.HasPendingCancellation);
+        await PgTestPool.RunAsync(protocol, "select 1");
+    }
+
+    [TestMethod]
     public async Task ServerCancel_ReadTimeoutBypassesCallerCancellationGrace()
     {
         await using var blocker = await PgAdvisoryLock.AcquireAsync();
@@ -492,6 +529,49 @@ public class CommandUserCancellationTests : ConnectionCreatingTest
             await WaitUntilAsync(() => !protocol.HasPendingCancellation);
             Assert.AreEqual(2, Volatile.Read(ref attempts));
             Assert.IsFalse(protocol.HasPendingCancellation);
+            await PgTestPool.RunAsync(protocol, "select 1");
+        }
+        finally
+        {
+            sendSecondRequest.TrySetResult();
+        }
+    }
+
+    [TestMethod]
+    public async Task ServerCancel_DisposeCancelsEveryRemainingCommandWindow()
+    {
+        await using var firstBlocker = await PgAdvisoryLock.AcquireAsync();
+        await using var secondBlocker = await PgAdvisoryLock.AcquireAsync();
+        var sendSecondRequest = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var options = PgTestPool.NewOptions();
+        var sender = PgTestPool.CreateCancelSender(options);
+        var attempts = 0;
+        await using var protocol = await PgTestPool.NewIsolatedAsync(o =>
+            o.CancelSender = async (processId, secretKey, token) =>
+            {
+                if (Interlocked.Increment(ref attempts) == 2)
+                    await sendSecondRequest.Task;
+                return await sender(processId, secretKey, token);
+            });
+
+        try
+        {
+            var flow = new CommandFlow(async: true,
+                Command.Create("select 1") with { WithSync = true },
+                firstBlocker.WaitCommand with { WithSync = true },
+                secondBlocker.WaitCommand);
+            Assert.IsTrue(protocol.TryQueue(flow));
+            var enumerator = flow.GetAsyncEnumerator();
+            Assert.IsTrue(await enumerator.MoveNextAsync());
+            await firstBlocker.WaitUntilContendedAsync(protocol.FlowControl.BackendProcessId);
+
+            var disposeTask = enumerator.DisposeAsync().AsTask();
+            await secondBlocker.WaitUntilContendedAsync(protocol.FlowControl.BackendProcessId);
+            sendSecondRequest.TrySetResult();
+            await disposeTask;
+
+            await WaitUntilAsync(() => !protocol.HasPendingCancellation);
+            Assert.AreEqual(2, Volatile.Read(ref attempts));
             await PgTestPool.RunAsync(protocol, "select 1");
         }
         finally
