@@ -56,8 +56,9 @@ public sealed record SlonDataSourceOptions
     public Func<SlonConnection, CancellationToken, ValueTask>? AsyncConnectionInitializer { get; init; }
 
     /// <summary>
-    /// CommandTimeout affects the first IO read after writing out a command.
-    /// Default is infinite, where behavior purely relies on read and write timeouts of the underlying protocol.
+    /// A command's PendingTimeout initially follows CommandTimeout and bounds datasource admission and
+    /// response-order waiting. Once executing, CommandTimeout affects the first IO read after writing
+    /// each command.
     /// </summary>
     public TimeSpan CommandTimeout { get; init; } = DefaultCommandTimeout;
     public int AutoPreparationMinimumUses { get; init; } = 5;
@@ -672,13 +673,14 @@ public sealed class SlonDataSource : DbDataSource
 
     // The multiplexed path lets the pool select a wire before materializing connection-local command
     // state. A rejected candidate rolls that attempt back and reuses the still-unqueued flow shell.
-    internal CommandFlow EnqueueCommands<TState>(Func<PgConnection, TState, CommandFlowOptions> createOptions, TState state)
+    internal CommandFlow EnqueueCommands<TState>(Func<PgConnection, TState, CommandFlowOptions> createOptions,
+        TState state, TimeSpan pendingTimeout)
     {
         var flow = CommandFlow.CreateUninitialized();
         var schedule = new CommandScheduleState<TState>(createOptions, state, flow, async: false);
         try
         {
-            _connectionPool.Get(static (ctx, s) => s.TrySchedule(ctx), schedule, ConnectionTimeout);
+            _connectionPool.Get(static (ctx, s) => s.TrySchedule(ctx), schedule, pendingTimeout);
             return flow;
         }
         catch
@@ -688,13 +690,16 @@ public sealed class SlonDataSource : DbDataSource
         }
     }
 
-    internal async ValueTask<CommandFlow> EnqueueCommandsAsync<TState>(Func<PgConnection, TState, CommandFlowOptions> createOptions, TState state, CancellationToken cancellationToken)
+    internal async ValueTask<CommandFlow> EnqueueCommandsAsync<TState>(
+        Func<PgConnection, TState, CommandFlowOptions> createOptions, TState state, TimeSpan pendingTimeout,
+        CancellationToken cancellationToken)
     {
         var flow = CommandFlow.CreateUninitialized();
         var schedule = new CommandScheduleState<TState>(createOptions, state, flow, async: true);
         try
         {
-            await _connectionPool.GetAsync(static (ctx, s) => s.TrySchedule(ctx), schedule, ConnectionTimeout, cancellationToken).ConfigureAwait(false);
+            await _connectionPool.GetAsync(static (ctx, s) => s.TrySchedule(ctx), schedule, pendingTimeout,
+                cancellationToken).ConfigureAwait(false);
             return flow;
         }
         catch

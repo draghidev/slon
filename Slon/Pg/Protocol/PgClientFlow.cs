@@ -265,10 +265,11 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
     }
 
     // Interactive flows (CommandFlow) override this to opt in to the activation timeout, which models
-    // a caller's patience (ConnectionTimeout). Background flows have no caller, so by default they
+    // caller patience. Background flows have no caller, so by default they
     // wait indefinitely for activation rather than busy-looping queue/timeout/re-arm, and stay off
     // the heartbeat's generation-agnostic timeout completer.
     protected virtual bool EnableActivationTimeout => false;
+    protected virtual TimeSpan? PendingTimeout => null;
 
     /// Requests PostgreSQL backend cancellation for this flow on its bound protocol control.
     /// The protocol retains any request exposure that can outlive the flow.
@@ -664,7 +665,9 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
             flow._boundControl = control;
             // Only interactive flows arm the activation timeout. Infinite means the heartbeat's
             // timeout branch never fires for this flow (see OnHeartbeat).
-            flow._remainingActivationTimeout = flow.EnableActivationTimeout ? activationTimeout : Timeout.InfiniteTimeSpan;
+            flow._remainingActivationTimeout = flow.EnableActivationTimeout
+                ? flow.PendingTimeout ?? activationTimeout
+                : Timeout.InfiniteTimeSpan;
         }
 
         // Tokens are routed from Control (protocol-owned). No per-flow storage.

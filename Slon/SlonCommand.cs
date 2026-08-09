@@ -189,6 +189,18 @@ public sealed class SlonCommand: DbCommand
         set => _batchCore.Timeout = TimeSpan.FromSeconds(value);
     }
 
+    /// <summary>
+    /// Gets or sets how long the command may wait for the driver to begin consuming its response.
+    /// For datasource commands, this includes waiting for an eligible pooled connection and, when
+    /// pipelined, waiting for the responses of earlier operations after this command has been written.
+    /// The default follows <see cref="CommandTimeout"/> until explicitly set. Zero means no timeout.
+    /// </summary>
+    public TimeSpan PendingTimeout
+    {
+        get => _batchCore.PendingTimeout;
+        set => _batchCore.PendingTimeout = value;
+    }
+
     /// <inheritdoc/>
     public override CommandType CommandType
     {

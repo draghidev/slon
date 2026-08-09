@@ -30,6 +30,27 @@ public class HeartbeatTests
     }
 
     [TestMethod]
+    public async Task BackloggedFlow_PendingTimeoutOverridesProtocolActivationDefault()
+    {
+        var protocol = PgClientProtocol.Create(new PgClientProtocolOptions(PgTestPool.NewOptions()));
+        var source = PgClientFlowSource.Create(protocol, protocol.FlowControl);
+        var flow = new CommandFlow(async: true, new CommandFlowOptions
+        {
+            Commands = new(Command.Create("select 1")),
+            PendingTimeout = TimeSpan.FromSeconds(2)
+        });
+        var control = flow.GetExecutionControl(protocol.FlowControl);
+
+        source.Enqueue(flow);
+        control.Bind(TimeSpan.FromMinutes(1));
+        var activation = control.GetDecoderTask(CancellationToken.None);
+
+        source.OnActivationHeartbeat(TimeSpan.FromSeconds(2));
+
+        await Assert.ThrowsExactlyAsync<TimeoutException>(async () => await activation);
+    }
+
+    [TestMethod]
     public void RegisterAfterDispose_IsRejected()
     {
         var heartbeat = new Heartbeat(TimeSpan.FromHours(1));

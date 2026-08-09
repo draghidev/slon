@@ -242,6 +242,18 @@ public sealed class SlonBatch : DbBatch
         set => _batchCore.Timeout = TimeSpan.FromSeconds(value);
     }
 
+    /// <summary>
+    /// Gets or sets how long the batch may wait for the driver to begin consuming its response.
+    /// For datasource batches, this includes waiting for an eligible pooled connection and, when
+    /// pipelined, waiting for the responses of earlier operations after this batch has been written.
+    /// The default follows <see cref="Timeout"/> until explicitly set. Zero means no timeout.
+    /// </summary>
+    public TimeSpan PendingTimeout
+    {
+        get => _batchCore.PendingTimeout;
+        set => _batchCore.PendingTimeout = value;
+    }
+
     /// <summary>Gets or sets the <see cref="T:Slon.SlonConnection" /> used by this <see cref="T:Slon.SlonBatch" />.</summary>
     /// <returns>The connection to the data source.</returns>
     public new SlonConnection? Connection

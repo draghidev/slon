@@ -70,10 +70,11 @@ readonly struct MultiplexedEnqueueArgs<TCommand> where TCommand : IAdoCommand
     public readonly CommandTracker Tracker;
     public readonly PgSerializerOptions SerializerOptions;
     public readonly ParameterWriterStrategy ParameterWriterStrategy;
+    public readonly TimeSpan PendingTimeout;
 
     public MultiplexedEnqueueArgs(FieldRef<AdoBatchCore<TCommand>> fieldRef, DbParameterCollection? parameters,
         CommandBehavior behavior, CommandTracker tracker, PgSerializerOptions serializerOptions,
-        ParameterWriterStrategy parameterWriterStrategy)
+        ParameterWriterStrategy parameterWriterStrategy, TimeSpan pendingTimeout)
     {
         FieldRef = fieldRef;
         Parameters = parameters;
@@ -81,6 +82,7 @@ readonly struct MultiplexedEnqueueArgs<TCommand> where TCommand : IAdoCommand
         Tracker = tracker;
         SerializerOptions = serializerOptions;
         ParameterWriterStrategy = parameterWriterStrategy;
+        PendingTimeout = pendingTimeout;
     }
 }
 
@@ -101,6 +103,7 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
     bool _disposed;
     bool _explicitlyPrepared;
     TimeSpan _timeout;
+    TimeSpan? _pendingTimeout;
     bool _enableErrorBarriers;
     CommandFlow? _activeFlow;
     Action<CommandResult, object?>? _onCommandResultAction;
@@ -139,6 +142,19 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
         }
     }
 
+    public TimeSpan PendingTimeout
+    {
+        get => _pendingTimeout ?? _timeout;
+        set
+        {
+            ThrowIfDisposed();
+            if (value < TimeSpan.Zero && value != System.Threading.Timeout.InfiniteTimeSpan)
+                throw new ArgumentOutOfRangeException(nameof(value),
+                    "Value must be non-negative or Timeout.InfiniteTimeSpan.");
+            _pendingTimeout = value;
+        }
+    }
+
     /// <summary>Whether to place an error barrier between every command in this batch. The default value is <see langword="false" />.</summary>
     public bool EnableErrorBarriers
     {
@@ -160,6 +176,7 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
         _disposed = other._disposed;
         _explicitlyPrepared = other._explicitlyPrepared;
         _timeout = other._timeout;
+        _pendingTimeout = other._pendingTimeout;
         _enableErrorBarriers = other._enableErrorBarriers;
         if (IsReadOnly)
         {
@@ -258,7 +275,7 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
     CommandFlowOptions CreateCommandFlowOptions(ReadOnlySpan<DbParameterCollection?> parametersSpan,
         CommandBehavior behavior, SlonConnection? connection = null, CommandTracker? tracker = null,
         PgConnection? pgConnection = null, PgSerializerOptions? serializerOptions = null,
-        ParameterWriterStrategy? parameterWriterStrategy = null)
+        ParameterWriterStrategy? parameterWriterStrategy = null, TimeSpan? pendingTimeout = null)
     {
         if (_commands.Count is 0)
             ThrowHelper.ThrowInvalidOperation("No commands were added to the batch.");
@@ -451,7 +468,8 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
                 ObserverState = observerState,
                 Commands = commandArray is null ? new(result.Command) : new(commandArray, commandCount, isPooled: true),
                 SerializerOptions = serializerOptions ?? connection?.DbDataSource.GetDbDependencies().SerializerOptions,
-                ParameterWriterStrategy = parameterWriterStrategy ?? SerializerParameterWriterStrategy.Instance
+                ParameterWriterStrategy = parameterWriterStrategy ?? SerializerParameterWriterStrategy.Instance,
+                PendingTimeout = pendingTimeout
             };
         }
         catch
@@ -489,15 +507,17 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
         if (TryGetDataSource(out var dataSource, out var connection))
         {
             ThrowIfHasCloseConnection(behavior);
+            var pendingTimeout = PendingTimeout;
             var dependencies = dataSource.GetDbDependencies();
             return dataSource.EnqueueCommands(
                 static (pgConnection, args) => args.FieldRef.Invoke().CreateCommandFlowOptions(
                     [args.Parameters], args.Behavior, tracker: args.Tracker, pgConnection: pgConnection,
                     serializerOptions: args.SerializerOptions,
-                    parameterWriterStrategy: args.ParameterWriterStrategy),
+                    parameterWriterStrategy: args.ParameterWriterStrategy,
+                    pendingTimeout: args.PendingTimeout),
                 new MultiplexedEnqueueArgs<TCommand>(_fieldRef, parameters, behavior,
                     dependencies.CommandsTracker, dependencies.SerializerOptions,
-                    dependencies.ParameterWriterStrategy));
+                    dependencies.ParameterWriterStrategy, pendingTimeout), pendingTimeout);
         }
 
         connection ??= ThrowConnectionNotInitialized();
@@ -519,7 +539,7 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
     ValueTask<CommandFlow> EnqueueAsync(DbParameterCollection? parameters, CommandBehavior behavior, CancellationToken cancellationToken)
     {
         if (TryGetDataSource(out var dataSource, out var connection))
-            return DataSourceCore(_fieldRef, dataSource, parameters, behavior, cancellationToken);
+            return DataSourceCore(_fieldRef, dataSource, parameters, behavior, PendingTimeout, cancellationToken);
 
         connection ??= ThrowConnectionNotInitialized();
         var connectionDependencies = connection.DbDataSource.GetDbDependencies();
@@ -540,7 +560,9 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
             closeConnection: HasCloseConnection(behavior),
             cancellationToken);
 
-        static async ValueTask<CommandFlow> DataSourceCore(FieldRef<AdoBatchCore<TCommand>> fieldRef, SlonDataSource dataSource, DbParameterCollection? parameters, CommandBehavior behavior, CancellationToken cancellationToken)
+        static async ValueTask<CommandFlow> DataSourceCore(FieldRef<AdoBatchCore<TCommand>> fieldRef,
+            SlonDataSource dataSource, DbParameterCollection? parameters, CommandBehavior behavior,
+            TimeSpan pendingTimeout, CancellationToken cancellationToken)
         {
             fieldRef.Invoke().ThrowIfHasCloseConnection(behavior);
             var dependencies = await dataSource.GetDbDependenciesAsync(cancellationToken).ConfigureAwait(false);
@@ -548,11 +570,12 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
                 static (pgConnection, args) => args.FieldRef.Invoke().CreateCommandFlowOptions(
                     [args.Parameters], args.Behavior, tracker: args.Tracker, pgConnection: pgConnection,
                     serializerOptions: args.SerializerOptions,
-                    parameterWriterStrategy: args.ParameterWriterStrategy),
+                    parameterWriterStrategy: args.ParameterWriterStrategy,
+                    pendingTimeout: args.PendingTimeout),
                 new MultiplexedEnqueueArgs<TCommand>(fieldRef, parameters, behavior,
                     dependencies.CommandsTracker, dependencies.SerializerOptions,
-                    dependencies.ParameterWriterStrategy),
-                cancellationToken).ConfigureAwait(false);
+                    dependencies.ParameterWriterStrategy, pendingTimeout),
+                pendingTimeout, cancellationToken).ConfigureAwait(false);
         }
     }
 

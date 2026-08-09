@@ -23,6 +23,8 @@ readonly struct CommandFlowOptions
     // while this flow continues against the immutable revision it resolved with.
     public PgSerializerOptions? SerializerOptions { get; init; }
     public ParameterWriterStrategy? ParameterWriterStrategy { get; init; }
+    // Optional per-flow override for time spent waiting in the protocol backlog.
+    public TimeSpan? PendingTimeout { get; init; }
 }
 
 sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSource<FlowCallerInteractionCoreResult>, IValueTaskSource
@@ -120,8 +122,9 @@ sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
         _callerInteractionCore.Initialize();
     }
 
-    // Interactive: a command carries a caller's patience (ConnectionTimeout), so arm the activation timeout.
+    // Interactive commands carry caller patience, so arm the activation timeout.
     protected override bool EnableActivationTimeout => true;
+    protected override TimeSpan? PendingTimeout => _options.PendingTimeout;
 
     internal static CommandFlow CreateUninitialized() => new();
 
@@ -142,7 +145,8 @@ sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
         {
             Commands = options.Commands,
             SerializerOptions = options.SerializerOptions,
-            ParameterWriterStrategy = options.ParameterWriterStrategy
+            ParameterWriterStrategy = options.ParameterWriterStrategy,
+            PendingTimeout = options.PendingTimeout
         };
         options.Observer?.OnStarted(this, options.ObserverState);
         // Arm before publication: teardown may complete the source concurrently even before enumeration.
