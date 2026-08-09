@@ -1,4 +1,5 @@
 using Slon.Pg.Protocol;
+using Microsoft.Extensions.Time.Testing;
 
 namespace Slon.Tests;
 
@@ -127,6 +128,57 @@ public class AdoErrorSurfacingTests
             Assert.ThrowsExactly<PostgresException>(() => reader.Dispose());
         }
         AssertUsable();
+    }
+
+    [TestMethod]
+    public async Task ReaderDispose_FailedSuccessor_ReleasesScopeBeforeDatasourceSuccessor_Stress()
+    {
+        var iters = Pg.StressEnv.Iterations(fallback: 8, cap: 8_000);
+        var time = new FakeTimeProvider();
+        using var dataSource = AdoTestPool.NewIsolatedDataSource(
+            options => options with
+            {
+                MaxPoolSize = 1,
+                ConnectionTimeout = Timeout.InfiniteTimeSpan,
+                TimeProvider = time
+            });
+        var workers = Math.Min(4, iters);
+        var tasks = new Task[workers];
+        for (var worker = 0; worker < workers; worker++)
+        {
+            var start = worker;
+            tasks[worker] = Task.Factory.StartNew(() =>
+            {
+                for (var i = start; i < iters; i += workers)
+                {
+                    using (var connection = dataSource.OpenConnection())
+                    using (var batch = CreateReaderBatch(connection))
+                    {
+                        var reader = batch.ExecuteReader();
+                        Assert.IsTrue(reader.Read(), $"iter {i}: first row was not delivered");
+                        if ((i & 1) == 0)
+                        {
+                            Assert.ThrowsExactly<PostgresException>(reader.Dispose,
+                                $"iter {i}: disposal did not surface the unread successor error");
+                        }
+                        else
+                        {
+                            Assert.IsTrue(reader.NextResult(), $"iter {i}: failed successor was not exposed");
+                            Assert.ThrowsExactly<PostgresException>(() => reader.Read(),
+                                $"iter {i}: reading the failed successor did not surface its error");
+                            reader.Dispose();
+                        }
+                    }
+
+                    using var command = new SlonCommand(dataSource, "select 1")
+                    {
+                        PendingTimeout = Timeout.InfiniteTimeSpan
+                    };
+                    Assert.AreEqual(0, command.ExecuteNonQuery(), $"iter {i}: datasource successor failed");
+                }
+            }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+        }
+        await Task.WhenAll(tasks);
     }
 
     [TestMethod]

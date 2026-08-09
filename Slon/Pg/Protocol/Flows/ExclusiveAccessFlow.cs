@@ -12,11 +12,14 @@ sealed class ExclusiveAccessFlow : PgClientFlow
         internal override void OnCompleted(PgClientFlow completed, Exception? exception, object? state)
         {
             var flow = (ExclusiveAccessFlow)completed;
-            if (exception is PgClientClosedException closed)
+            if (!Volatile.Read(ref flow._acquired) && !flow._consumerGone.Task.IsCompleted)
             {
-                flow._handoffReady.TrySetException(closed);
+                flow._handoffReady.TrySetException(exception
+                    ?? new InvalidOperationException("The exclusive scope retired before acquiring the protocol."));
                 flow._scopeEnded.TrySetResult();
             }
+            else if (exception is PgClientClosedException)
+                flow._scopeEnded.TrySetResult();
             ((PgClientProtocol.ExclusiveScopeState)state!).ReleaseFlow(flow);
         }
     }
@@ -150,10 +153,10 @@ sealed class ExclusiveAccessFlow : PgClientFlow
     internal async ValueTask CompleteScopeAsync(long tenure)
     {
         EnsureTenure(tenure);
+        // Register before inner completion can wake the hosting body and retire this flow.
+        var completion = WaitForComplete();
         // Gracefully drain submitted subflows before releasing the outer flow.
         await _completeInner(null).ConfigureAwait(false);
-        // Capture completion before retirement can release and reset the reusable flow.
-        var completion = WaitForComplete();
         _scopeEnded.TrySetResult();
         // Completion follows teardown, making the flow safe to reuse on return.
         await completion.ConfigureAwait(false);
