@@ -208,8 +208,11 @@ public sealed partial class SlonConnection : IAdoConnection
     // The data-source open paths (SlonDataSource.OpenConnection*) SetProxy directly rather than going
     // through OpenCore/OpenAsyncCore, so they acquire the lease's exclusive scope through these. A
     // SlonConnection holds an exclusive scope for its whole lease however it was opened.
-    internal void AcquireExclusiveScope() => EnsureConnected().AcquireExclusiveScope();
-    internal ValueTask AcquireExclusiveScopeAsync(CancellationToken cancellationToken) => EnsureConnected().AcquireExclusiveScopeAsync(cancellationToken);
+    internal void AcquireExclusiveScope(bool longRunning = false)
+        => EnsureConnected().AcquireExclusiveScope(longRunning);
+    internal ValueTask AcquireExclusiveScopeAsync(CancellationToken cancellationToken,
+        bool longRunning = false)
+        => EnsureConnected().AcquireExclusiveScopeAsync(cancellationToken, longRunning);
 
     // The exclusive scope is held for the lease, so the wire is serial: BEGIN opens a transaction on it
     // that this connection's later commands run inside (PG auto-enrolls them on the wire's open block),
@@ -280,7 +283,7 @@ public sealed partial class SlonConnection : IAdoConnection
             await cmd.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
 
-    void OpenCore()
+    void OpenCore(bool longRunning = false)
     {
         ThrowIfDisposed();
         if (_state is not (ConnectionState.Closed or ConnectionState.Broken))
@@ -289,11 +292,14 @@ public sealed partial class SlonConnection : IAdoConnection
         _state = ConnectionState.Connecting;
         try
         {
-            SetProxy(DbDataSource.GetProxy(this, DbDataSource.ConnectionTimeout));
+            SetProxy(longRunning
+                ? DbDataSource.GetLongRunningProxy(this, DbDataSource.ConnectionTimeout)
+                : DbDataSource.GetProxy(this, DbDataSource.ConnectionTimeout));
             // SlonConnection holds an exclusive scope for its whole lease: its commands run serially on one
             // wire (safe default - Slon can't parse SQL to spot session state). The data-source command path
             // never Opens, so it stays multiplexed.
-            EnsureConnected().AcquireExclusiveScope();
+            if (!longRunning)
+                EnsureConnected().AcquireExclusiveScope();
         }
         catch
         {
@@ -302,7 +308,7 @@ public sealed partial class SlonConnection : IAdoConnection
         }
     }
 
-    async Task OpenAsyncCore(CancellationToken cancellationToken = default)
+    async Task OpenAsyncCore(CancellationToken cancellationToken = default, bool longRunning = false)
     {
         ThrowIfDisposed();
         if (_state is not (ConnectionState.Closed or ConnectionState.Broken))
@@ -312,8 +318,13 @@ public sealed partial class SlonConnection : IAdoConnection
         try
         {
 
-            SetProxy(await DbDataSource.GetProxyAsync(this, DbDataSource.ConnectionTimeout, cancellationToken).ConfigureAwait(false));
-            await EnsureConnected().AcquireExclusiveScopeAsync(cancellationToken).ConfigureAwait(false);
+            SetProxy(longRunning
+                ? await DbDataSource.GetLongRunningProxyAsync(
+                    this, DbDataSource.ConnectionTimeout, cancellationToken).ConfigureAwait(false)
+                : await DbDataSource.GetProxyAsync(
+                    this, DbDataSource.ConnectionTimeout, cancellationToken).ConfigureAwait(false));
+            if (!longRunning)
+                await EnsureConnected().AcquireExclusiveScopeAsync(cancellationToken).ConfigureAwait(false);
         }
         catch
         {
@@ -551,8 +562,24 @@ public sealed partial class SlonConnection : DbConnection
     /// <inheritdoc />
     public override void Open() => OpenCore();
 
+    /// <summary>Opens the connection, optionally excluding its physical connection from datasource admission.</summary>
+    /// <param name="longRunning">
+    /// <see langword="true"/> when newly arriving datasource operations must not be scheduled behind
+    /// this connection until it is closed.
+    /// </param>
+    public void Open(bool longRunning) => OpenCore(longRunning);
+
     /// <inheritdoc />
     public override Task OpenAsync(CancellationToken cancellationToken) => OpenAsyncCore(cancellationToken);
+
+    /// <summary>Opens the connection asynchronously, optionally excluding its physical connection from datasource admission.</summary>
+    /// <param name="longRunning">
+    /// <see langword="true"/> when newly arriving datasource operations must not be scheduled behind
+    /// this connection until it is closed.
+    /// </param>
+    /// <param name="cancellationToken">A token for cancelling the open operation.</param>
+    public Task OpenAsync(bool longRunning, CancellationToken cancellationToken = default)
+        => OpenAsyncCore(cancellationToken, longRunning);
 
     /// <inheritdoc />
     public override void ChangeDatabase(string databaseName)

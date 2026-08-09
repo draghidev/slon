@@ -29,6 +29,7 @@ sealed class ExclusiveAccessFlow : PgClientFlow
     // Acquired only after activation, when the inner executor is started.
     PgClientFlowSource? _innerSource;
     bool _acquired;
+    long _tenure;
     TimeSpan _activationTimeout;
     TaskCompletionSource _handoffReady = new(TaskCreationOptions.RunContinuationsAsynchronously);
     TaskCompletionSource _scopeEnded = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -56,6 +57,7 @@ sealed class ExclusiveAccessFlow : PgClientFlow
     // The inner pipeline starts only after this scope wins activation.
     internal void PrepareScope(bool async, TimeSpan activationTimeout)
     {
+        Interlocked.Increment(ref _tenure);
         _innerSource = null;
         _acquired = false;
         _activationTimeout = activationTimeout;
@@ -86,10 +88,19 @@ sealed class ExclusiveAccessFlow : PgClientFlow
     /// access before submitting any subflow. Faults if the flow is torn down before activation.
     public Task HandoffReady => _handoffReady.Task;
 
+    internal ExclusiveScopeLease CreateLease() => new(this, Volatile.Read(ref _tenure));
+
+    void EnsureTenure(long tenure)
+    {
+        if (tenure != Volatile.Read(ref _tenure))
+            throw new InvalidOperationException("The exclusive-scope lease no longer owns this scope tenure.");
+    }
+
     /// Acquires exclusive access. Cancellation before handoff detaches the caller; the issued flow still
     /// takes its turn and retires. Cancellation after handoff does not revoke ownership.
-    internal async Task WaitForHandoffAsync(CancellationToken cancellationToken)
+    internal async Task WaitForHandoffAsync(long tenure, CancellationToken cancellationToken)
     {
+        EnsureTenure(tenure);
         if (!cancellationToken.CanBeCanceled)
         {
             await _handoffReady.Task.ConfigureAwait(false);
@@ -109,8 +120,9 @@ sealed class ExclusiveAccessFlow : PgClientFlow
     }
 
     /// Queues a subflow in FIFO order. Synchronous subflows recursively hand execution to the caller.
-    public T Queue<T>(T subflow, CancellationToken cancellationToken = default) where T : PgClientFlow
+    internal T Queue<T>(long tenure, T subflow, CancellationToken cancellationToken = default) where T : PgClientFlow
     {
+        EnsureTenure(tenure);
         // Queue is valid only after handoff has acquired the source.
         var innerSource = _innerSource ?? throw new InvalidOperationException("Cannot submit a subflow before the scope is acquired (await HandoffReady first).");
         if (cancellationToken.CanBeCanceled)
@@ -135,8 +147,9 @@ sealed class ExclusiveAccessFlow : PgClientFlow
     }
 
     /// End the exclusive scope: drain its pipeline and await session reset plus outer retirement.
-    public async ValueTask CompleteScopeAsync()
+    internal async ValueTask CompleteScopeAsync(long tenure)
     {
+        EnsureTenure(tenure);
         // Gracefully drain submitted subflows before releasing the outer flow.
         await _completeInner(null).ConfigureAwait(false);
         // Capture completion before retirement can release and reset the reusable flow.

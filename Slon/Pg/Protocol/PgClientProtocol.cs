@@ -123,6 +123,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
     ExclusiveScopeState? _exclusiveScope;
     readonly Lock _syncRoot = new();
     ProtocolStatus _status = ProtocolStatus.Created;
+    int _admissionBlocked;
     int _queryProtocolEstablished;
     // Track draining count so overlapping recovery starts/ends don't signal ready too early.
     // Any concurrent CompleteAsync (which also transitions to draining) is respected the same way.
@@ -162,13 +163,14 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
     internal bool IsCompleted => Status is ProtocolStatus.Completed;
     // Draining immediately vetoes new pool placement, before terminal completion.
     internal bool IsDraining => Status is ProtocolStatus.Draining or ProtocolStatus.Completed;
-    internal bool IsSchedulable => Status is ProtocolStatus.Ready;
+    internal bool IsSchedulable
+        => Status is ProtocolStatus.Ready && Volatile.Read(ref _admissionBlocked) == 0;
 
     internal bool TryBeginPruning()
     {
         lock (_syncRoot)
         {
-            if (_status is not ProtocolStatus.Ready || Outstanding != 0)
+            if (_status is not ProtocolStatus.Ready || _admissionBlocked != 0 || Outstanding != 0)
                 return false;
 
             SetStatus(ProtocolStatus.Draining);
@@ -441,7 +443,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
             }
         }
 
-        if (becameReady)
+        if (becameReady && IsSchedulable)
             _poolConnectionAvailabilitySignal?.Invoke(false);
     }
 
@@ -453,6 +455,28 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
                 return;
             _drainingCount++;
             SetStatus(ProtocolStatus.Draining);
+        }
+    }
+
+    internal void ReleaseAdmissionBarrier()
+    {
+        var signal = false;
+        lock (_syncRoot)
+        {
+            Debug.Assert(_admissionBlocked == 1);
+            _admissionBlocked = 0;
+            signal = _status is ProtocolStatus.Ready;
+        }
+
+        if (signal)
+        {
+            try { _poolConnectionAvailabilitySignal?.Invoke(IsIdle); }
+            catch (Exception ex)
+            {
+                SlonLogMessages.UnobservedCallbackException(
+                    _logger, ex, "the pool availability callback");
+                FailProtocol(ex);
+            }
         }
     }
 
@@ -475,12 +499,15 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
 
     public bool TryQueue(PgClientFlow flow, bool mustPipeline = false, CancellationToken cancellationToken = default)
     {
+        var enqueueOptions = mustPipeline
+            ? FlowEnqueueOptions.RequireExistingPipeline
+            : FlowEnqueueOptions.None;
         // Bind the caller token before enqueue so the eager write reads it (published with the flow
         // by the enqueue). Only when cancelable - the common no-token submit pays no field write.
         if (cancellationToken.CanBeCanceled)
             flow.BindCallerToken(cancellationToken);
 
-        if (mustPipeline)
+        if ((enqueueOptions & FlowEnqueueOptions.RequireExistingPipeline) != 0)
         {
             if (!TryQueueFlow(flow, static protocol => protocol.PipelineDepth > 0, this))
                 return false;
@@ -508,13 +535,17 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         bool handoff;
         lock (_syncRoot)
         {
-            if (_status is not ProtocolStatus.Ready || (mustPipeline && _pipeline.Depth == 0))
+            if (_status is not ProtocolStatus.Ready || _admissionBlocked != 0 ||
+                (mustPipeline && _pipeline.Depth == 0))
             {
                 flow = null;
                 return false;
             }
 
             flow = materialize(state);
+            flow.SetEnqueueOptions(mustPipeline
+                ? FlowEnqueueOptions.RequireExistingPipeline
+                : FlowEnqueueOptions.None);
             if (cancellationToken.CanBeCanceled)
                 flow.BindCallerToken(cancellationToken);
             handoff = flow.NeedsSyncHandoff;
@@ -540,9 +571,9 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
     // Begin an exclusive-access scope: the user-driven sibling of the startup handshake. Builds (or
     // reuses) a nested pipeline (poolFacing:false, so no pool-unit signaling). A recoverable inner
     // failure resyncs the shared wire but terminates this private pipeline instead of restoring admission.
-    // and queues the cached ExclusiveAccessFlow on the outer pipeline. The returned flow is the scope
-    // handle: await HandoffReady to acquire, Submit subflows, CompleteScopeAsync to release. One scope
-    // at a time per connection.
+    // and queues the cached ExclusiveAccessFlow on the outer pipeline. A per-acquisition lease is returned:
+    // await HandoffReady to acquire, submit subflows, CompleteScopeAsync to release. One scope at a time
+    // per connection.
     //
     // An ADO connection IS an exclusive scope (the protocol underneath is pooled and outlives the
     // connection), so connection-dispose is scope teardown, not protocol teardown. A linked CloseSignal
@@ -551,21 +582,42 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
     // alongside the flyweight and reused across scopes.
     // Low-level queue half used by handoff/race tests. Ordinary callers use the acquired-scope
     // methods below so the queue/ownership split does not leak through their control flow.
-    internal ExclusiveAccessFlow QueueExclusiveScope(bool async)
+    internal ExclusiveScopeLease QueueExclusiveScope(bool async, bool longRunning = false)
     {
-        ExclusiveAccessFlow flow;
+        var options = longRunning ? FlowEnqueueOptions.BlockAdmission : FlowEnqueueOptions.None;
+        if (!TryQueueExclusiveScope(async, options, out var flow))
+            ThrowHelper.ThrowInvalidOperation("Protocol is unavailable.");
+        return flow;
+    }
+
+    internal bool TryQueueExclusiveScope(bool async, FlowEnqueueOptions options,
+        [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out ExclusiveScopeLease? scope)
+    {
+        ExclusiveAccessFlow? flow;
         PgClientFlowSource.EnqueueResult enqueue = default;
         bool handoff;
         lock (_syncRoot)
         {
-            if (_status is not ProtocolStatus.Ready)
-                ThrowHelper.ThrowInvalidOperation("Protocol is unavailable.");
+            if (_status is not ProtocolStatus.Ready || _admissionBlocked != 0 ||
+                ((options & FlowEnqueueOptions.RequireExistingPipeline) != 0 && _pipeline.Depth == 0))
+            {
+                scope = null;
+                return false;
+            }
 
             // Creation and enqueue share the shutdown admission lock: a rejected begin never touches
             // the close signal, while an admitted flow is owned by the pipeline drain.
             _exclusiveScope ??= ExclusiveScopeState.Create(this);
             flow = _exclusiveScope.RentFlow();
             flow.PrepareScope(async, _options.FlowActivationTimeout);
+            flow.SetEnqueueOptions(options);
+            scope = flow.CreateLease();
+
+            if ((options & FlowEnqueueOptions.BlockAdmission) != 0)
+            {
+                Debug.Assert(_admissionBlocked == 0);
+                _admissionBlocked = 1;
+            }
 
             handoff = flow.NeedsSyncHandoff;
             if (!handoff)
@@ -583,20 +635,20 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         control.Bind(_options.FlowActivationTimeout);
         if (_scoringEnabled && control.StallsPipeline)
             Interlocked.Increment(ref _pipelineStalls);
-        return flow;
+        return true;
     }
 
-    internal ExclusiveAccessFlow BeginExclusiveScope()
+    internal ExclusiveScopeLease BeginExclusiveScope(bool longRunning = false)
     {
-        var scope = QueueExclusiveScope(async: false);
+        var scope = QueueExclusiveScope(async: false, longRunning);
         scope.WaitForHandoffAsync(CancellationToken.None).GetAwaiter().GetResult();
         return scope;
     }
 
-    internal async ValueTask<ExclusiveAccessFlow> BeginExclusiveScopeAsync(
-        CancellationToken cancellationToken = default)
+    internal async ValueTask<ExclusiveScopeLease> BeginExclusiveScopeAsync(
+        CancellationToken cancellationToken = default, bool longRunning = false)
     {
-        var scope = QueueExclusiveScope(async: true);
+        var scope = QueueExclusiveScope(async: true, longRunning);
         await scope.WaitForHandoffAsync(cancellationToken).ConfigureAwait(false);
         return scope;
     }
@@ -613,12 +665,14 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         PgClientFlowSource.EnqueueResult enqueue = default;
         lock (_syncRoot)
         {
-            if (_status != requiredStatus)
+            if (_status != requiredStatus ||
+                (requiredStatus is ProtocolStatus.Ready && _admissionBlocked != 0))
                 return false;
 
             if (predicate?.Invoke(state) == false)
                 return false;
 
+            flow.SetEnqueueOptions(FlowEnqueueOptions.None);
             AssignCancellationBoundary(FlowControl, flow);
 
             // Both modes write the SPSC storage, so the enqueue must serialize with concurrent
@@ -1580,6 +1634,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
 
         internal void RecoveryStarted() => protocol.SignalDraining();
         internal void RecoveryCompleted() => protocol.SignalReady();
+        internal void ReleaseAdmissionBarrier() => protocol.ReleaseAdmissionBarrier();
 
         internal void OnReleasing(PgClientFlow flow, int remainingDepth)
         {
@@ -1612,7 +1667,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
                 // reclaims this connection is throwing, the integration is broken and the pipeline won't
                 // get cleaned up naturally, so tear down via FailProtocol (fire-and-forget self-evict;
                 // the pool picks it up through the status flag).
-                if (poolFacing)
+                if (poolFacing && protocol.IsSchedulable)
                 {
                     try { protocol._poolConnectionAvailabilitySignal?.Invoke(true); }
                     catch (Exception ex)

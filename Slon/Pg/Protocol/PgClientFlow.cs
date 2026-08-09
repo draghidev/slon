@@ -4,6 +4,14 @@ using System.Threading.Tasks.Sources;
 
 namespace Slon.Pg.Protocol;
 
+[Flags]
+enum FlowEnqueueOptions : byte
+{
+    None = 0,
+    RequireExistingPipeline = 1,
+    BlockAdmission = 2
+}
+
 abstract class PgClientFlowObserver
 {
     internal virtual void OnCompleting(PgClientFlow flow, Exception? exception, object? state) { }
@@ -20,6 +28,14 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
 
     PgClientProtocol.Control? _pendingActivationControl;
     PgClientProtocol.Control? _boundControl;
+    FlowEnqueueOptions _enqueueOptions;
+
+    internal bool OwnsAdmissionBarrier => (_enqueueOptions & FlowEnqueueOptions.BlockAdmission) != 0;
+    internal void SetEnqueueOptions(FlowEnqueueOptions options)
+    {
+        Debug.Assert(_enqueueOptions is FlowEnqueueOptions.None);
+        _enqueueOptions = options;
+    }
 
     /// Pairs this flow with its protocol control for a queued activation dispatch. The flow
     /// itself is the IThreadPoolWorkItem: an immutable (flow, control) pairing per queued
@@ -259,6 +275,7 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
         _cancellationWindow = 0;
         _lastMessageInducesRfq = false;
         _boundControl = null;
+        _enqueueOptions = FlowEnqueueOptions.None;
         _observer = null;
         _observerState = null;
         OnReset();
@@ -774,6 +791,8 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
             if (flow._completed)
                 return;
             flow._completed = true;
+            if (flow.OwnsAdmissionBarrier)
+                control.ReleaseAdmissionBarrier();
             flow._activationCancellationTokenRegistration.Dispose();
             var observer = flow._observer;
             var observerState = flow._observerState;

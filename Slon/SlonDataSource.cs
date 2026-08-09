@@ -767,6 +767,18 @@ public sealed class SlonDataSource : DbDataSource
         return connection;
     }
 
+    /// <summary>Opens a connection, optionally excluding it from datasource command admission.</summary>
+    /// <param name="longRunning">
+    /// <see langword="true"/> when newly arriving datasource operations must not be scheduled behind
+    /// the returned connection during its tenure.
+    /// </param>
+    public SlonConnection OpenConnection(bool longRunning)
+    {
+        var connection = CreateConnection();
+        connection.Open(longRunning);
+        return connection;
+    }
+
 
     protected override async ValueTask<DbConnection> OpenDbConnectionAsync(CancellationToken cancellationToken = default)
     {
@@ -780,6 +792,20 @@ public sealed class SlonDataSource : DbDataSource
         var connection = CreateConnection();
         connection.SetProxy(await GetProxyAsync(connection, ConnectionTimeout, cancellationToken).ConfigureAwait(false));
         await connection.AcquireExclusiveScopeAsync(cancellationToken).ConfigureAwait(false);
+        return connection;
+    }
+
+    /// <summary>Opens a connection asynchronously, optionally excluding it from datasource command admission.</summary>
+    /// <param name="longRunning">
+    /// <see langword="true"/> when newly arriving datasource operations must not be scheduled behind
+    /// the returned connection during its tenure.
+    /// </param>
+    /// <param name="cancellationToken">A token for cancelling the open operation.</param>
+    public async ValueTask<SlonConnection> OpenConnectionAsync(bool longRunning,
+        CancellationToken cancellationToken = default)
+    {
+        var connection = CreateConnection();
+        await connection.OpenAsync(longRunning, cancellationToken).ConfigureAwait(false);
         return connection;
     }
 
@@ -867,5 +893,41 @@ public sealed class SlonDataSource : DbDataSource
     {
         await EnsureInitializedAsync(timeout, cancellationToken).ConfigureAwait(false);
         return CreateProxy(await _connectionPool.GetAsync(timeout, cancellationToken).ConfigureAwait(false), connection);
+    }
+
+    internal AdoConnectionProxy GetLongRunningProxy(IAdoConnection connection, TimeSpan timeout)
+    {
+        EnsureInitialized(timeout);
+        var state = new LongRunningProxyScheduleState(this, connection, async: false);
+        _connectionPool.Get(static (candidate, state) => state.TrySchedule(candidate), state, timeout);
+        state.Proxy!.WaitForExclusiveScope();
+        return state.Proxy;
+    }
+
+    internal async ValueTask<AdoConnectionProxy> GetLongRunningProxyAsync(IAdoConnection connection,
+        TimeSpan timeout, CancellationToken cancellationToken)
+    {
+        await EnsureInitializedAsync(timeout, cancellationToken).ConfigureAwait(false);
+        var state = new LongRunningProxyScheduleState(this, connection, async: true);
+        await _connectionPool.GetAsync(static (candidate, state) => state.TrySchedule(candidate),
+            state, timeout, cancellationToken).ConfigureAwait(false);
+        await state.Proxy!.WaitForExclusiveScopeAsync(cancellationToken).ConfigureAwait(false);
+        return state.Proxy;
+    }
+
+    sealed class LongRunningProxyScheduleState(
+        SlonDataSource dataSource, IAdoConnection connection, bool async)
+    {
+        public AdoConnectionProxy? Proxy { get; private set; }
+
+        public bool TrySchedule(ConnectionCandidate<PgConnection> candidate)
+        {
+            var proxy = dataSource.CreateProxy(candidate.Connection, connection);
+            if (!proxy.TryQueueExclusiveScope(
+                    async, longRunning: true, mustPipeline: !candidate.IsIdleCandidate))
+                return false;
+            Proxy = proxy;
+            return true;
+        }
     }
 }

@@ -25,7 +25,7 @@ sealed class AdoConnectionProxy : IDisposable, IAsyncDisposable
     // which commands carry session state (SET / LISTEN / temp tables / BEGIN...). Null on the data-source
     // path (transient per-command proxy, which never Opens, so it stays multiplexed). Routing keys on this
     // being non-null, so the connection/data-source split needs no separate flag.
-    ExclusiveAccessFlow? _exclusiveFlow;
+    ExclusiveScopeLease? _exclusiveFlow;
 
     internal AdoConnectionProxy(SlonDataSource dataSource, PgConnection pgConnection, IAdoConnection connection)
     {
@@ -162,15 +162,34 @@ sealed class AdoConnectionProxy : IDisposable, IAsyncDisposable
     // mode matches the caller: a sync acquire (async: false) is driven to activation by THIS thread via the
     // source handoff (WaitForExecutor), so the caller drives the scope + its subflows end-to-end on one
     // thread; an async acquire is executor-driven. From here every command on this proxy routes as a subflow.
-    public void AcquireExclusiveScope()
+    public void AcquireExclusiveScope(bool longRunning = false)
     {
-        _exclusiveFlow = _pgConnection.Protocol.BeginExclusiveScope();
+        _exclusiveFlow = _pgConnection.Protocol.BeginExclusiveScope(longRunning);
     }
 
-    public async ValueTask AcquireExclusiveScopeAsync(CancellationToken cancellationToken = default)
+    public async ValueTask AcquireExclusiveScopeAsync(CancellationToken cancellationToken = default,
+        bool longRunning = false)
     {
-        _exclusiveFlow = await _pgConnection.Protocol.BeginExclusiveScopeAsync(cancellationToken).ConfigureAwait(false);
+        _exclusiveFlow = await _pgConnection.Protocol.BeginExclusiveScopeAsync(
+            cancellationToken, longRunning).ConfigureAwait(false);
     }
+
+    internal bool TryQueueExclusiveScope(bool async, bool longRunning, bool mustPipeline)
+    {
+        var options = (longRunning ? FlowEnqueueOptions.BlockAdmission : FlowEnqueueOptions.None) |
+            (mustPipeline ? FlowEnqueueOptions.RequireExistingPipeline : FlowEnqueueOptions.None);
+        if (!_pgConnection.Protocol.TryQueueExclusiveScope(
+                async, options, out var flow))
+            return false;
+        _exclusiveFlow = flow;
+        return true;
+    }
+
+    internal void WaitForExclusiveScope()
+        => _exclusiveFlow!.WaitForHandoffAsync(CancellationToken.None).GetAwaiter().GetResult();
+
+    internal ValueTask WaitForExclusiveScopeAsync(CancellationToken cancellationToken)
+        => new(_exclusiveFlow!.WaitForHandoffAsync(cancellationToken));
 
     public void EndExclusiveScope()
     {

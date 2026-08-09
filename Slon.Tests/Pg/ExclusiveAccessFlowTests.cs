@@ -53,6 +53,47 @@ public class ExclusiveAccessFlowTests : ConnectionCreatingTest
     }
 
     [TestMethod]
+    public async Task LongRunningScope_RejectsOuterAdmissionUntilReleased()
+    {
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
+        var scope = protocol.QueueExclusiveScope(async: true, longRunning: true);
+        var rejected = new CommandFlow(async: true, Command.Create("select 1"));
+
+        Assert.IsFalse(protocol.IsSchedulable);
+        Assert.IsFalse(protocol.TryQueue(rejected),
+            "ordinary outer work must not queue behind a long-running scope");
+        rejected.DiscardUnqueued();
+        var materialized = false;
+        Assert.IsFalse(protocol.TryQueue(
+            _ =>
+            {
+                materialized = true;
+                return new CommandFlow(async: true, Command.Create("select 1"));
+            }, 0, out CommandFlow? _));
+        Assert.IsFalse(materialized,
+            "connection-local command state must not materialize after the barrier wins admission");
+
+        await scope.HandoffReady;
+        await DrainAsync(scope.Queue(new CommandFlow(async: true, Command.Create("select 1"))));
+        await scope.CompleteScopeAsync();
+
+        Assert.IsTrue(protocol.IsSchedulable);
+        await DrainAsync(protocol.Queue(new CommandFlow(async: true, Command.Create("select 1"))));
+    }
+
+    [TestMethod]
+    public async Task OrdinaryScope_RemainsSchedulableForOuterPipelining()
+    {
+        var protocol = await PgTestPool.GetProtocolAsync();
+        var scope = protocol.QueueExclusiveScope(async: true);
+
+        Assert.IsTrue(protocol.IsSchedulable);
+
+        await scope.HandoffReady;
+        await scope.CompleteScopeAsync();
+    }
+
+    [TestMethod]
     public async Task Scope_FlyweightReuse_AcrossScopes()
     {
         var protocol = await PgTestPool.GetProtocolAsync();
@@ -63,6 +104,27 @@ public class ExclusiveAccessFlowTests : ConnectionCreatingTest
             await DrainAsync(scope.Queue(new CommandFlow(async: true, Command.Create("select 1"))));
             await scope.CompleteScopeAsync();
         }
+    }
+
+    [TestMethod]
+    public async Task ReleasedScope_RejectsOperationsThroughPriorLease()
+    {
+        var protocol = await PgTestPool.GetProtocolAsync();
+        var prior = protocol.QueueExclusiveScope(async: true);
+        await prior.HandoffReady;
+        await prior.CompleteScopeAsync();
+
+        var current = protocol.QueueExclusiveScope(async: true);
+        await current.HandoffReady;
+
+        var unqueued = new CommandFlow(async: true, Command.Create("select 1"));
+        Assert.ThrowsExactly<InvalidOperationException>(() => prior.Queue(unqueued));
+        unqueued.DiscardUnqueued();
+        await Assert.ThrowsExactlyAsync<InvalidOperationException>(
+            () => prior.CompleteScopeAsync().AsTask());
+
+        await DrainAsync(current.Queue(new CommandFlow(async: true, Command.Create("select 1"))));
+        await current.CompleteScopeAsync();
     }
 
     [TestMethod]
@@ -228,8 +290,7 @@ public class ExclusiveAccessFlowTests : ConnectionCreatingTest
                 // Pump collision capture: record the premise the deterministic-repro attempts keep
                 // missing (see the amplifier test below).
                 Assert.Fail("flush-promise collision: " +
-                    $"[unflushed={protocol.UnflushedBytes} scope: pending={scope.IsPending} started={scope.IsStarted} completed={scope.IsCompleted} " +
-                    $"protocol: draining={protocol.IsDraining} completed={protocol.IsCompleted}]\n" +
+                    $"[unflushed={protocol.UnflushedBytes} protocol: draining={protocol.IsDraining} completed={protocol.IsCompleted}]\n" +
                     $"{ProtocolDiag.Gauges(protocol)}\nsource: {ProtocolDiag.SourceState(protocol)}\n{ex}");
             }
 
