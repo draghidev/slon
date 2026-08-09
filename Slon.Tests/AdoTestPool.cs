@@ -19,7 +19,6 @@ static class AdoTestPool
         Password = "postgres123",
         Database = "postgres",
         MaxPoolSize = PgTestPool.MaxConnections,
-        HeartbeatInterval = TimeSpan.FromSeconds(1),
         MaintenanceInterval = TimeSpan.FromSeconds(1),
     };
 

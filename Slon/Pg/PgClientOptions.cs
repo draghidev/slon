@@ -4,12 +4,13 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Draghi.Pipelining;
 using Slon.Pg.Protocol;
+using Slon.Threading;
 
 namespace Slon.Pg;
 
 sealed class PgClientOptions
 {
-    internal TimeSpan HeartbeatInterval { get; init; } = TimeSpan.FromSeconds(1);
+    internal TimeSpan HeartbeatInterval { get; init; } = Heartbeat.DefaultInterval;
     // Time-based subsampling on top of the heartbeat. Pushes batch up to this interval before a
     // maintenance flow is scheduled. Setting this larger than HeartbeatInterval grows batches at
     // the cost of cleanup latency.

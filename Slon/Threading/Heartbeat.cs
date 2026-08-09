@@ -5,6 +5,8 @@ using Microsoft.Extensions.Logging.Abstractions;
 
 sealed class Heartbeat : IDisposable
 {
+    internal static readonly TimeSpan DefaultInterval = TimeSpan.FromMilliseconds(250);
+
     // Threshold for flagging a tick as drifted. 1.5x the requested interval matches the
     // ecosystem norm (PeriodicTimer / Tokio's Delay MissedTickBehavior) - small drift below
     // this is normal scheduler jitter, above it indicates real backpressure on the timer

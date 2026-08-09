@@ -72,7 +72,7 @@ sealed class PgClientProtocolOptions
     public PipelineScheduler? ActivationScheduler { get; set; }
     public Encoding DefaultClientEncoding { get; set; }
     public TimeSpan FlowActivationTimeout { get; set; }
-    public TimeSpan HeartbeatInterval { get; set; } = TimeSpan.FromSeconds(1);
+    public TimeSpan HeartbeatInterval { get; set; } = Heartbeat.DefaultInterval;
     public TimeSpan ReadTimeout { get; set; } = Timeout.InfiniteTimeSpan;
     // Allocation-free grace before starting a backend CancelRequest. Heartbeat supplies the clock.
     public TimeSpan CancelRequestDelay { get; set; }

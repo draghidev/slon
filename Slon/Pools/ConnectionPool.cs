@@ -22,7 +22,7 @@ sealed class ConnectionPoolOptions
     /// Interval over which the minimum idle capacity is sampled.
     public TimeSpan ConnectionPruningInterval { get; set; } = TimeSpan.FromSeconds(10);
     public TimeProvider TimeProvider { get; set; } = TimeProvider.System;
-    public TimeSpan HeartbeatInterval { get; set; } = TimeSpan.FromSeconds(1);
+    public TimeSpan HeartbeatInterval { get; set; } = Heartbeat.DefaultInterval;
     public ILoggerFactory LoggerFactory { get; set; } = NullLoggerFactory.Instance;
     public string? MetricsName { get; set; }
 }

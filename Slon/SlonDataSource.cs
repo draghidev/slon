@@ -11,6 +11,7 @@ using Slon.Pg.Serialization;
 using Slon.Pools;
 using Slon.Transport;
 using Draghi.Pipelining;
+using Slon.Threading;
 
 namespace Slon;
 
@@ -93,7 +94,7 @@ public sealed record SlonDataSourceOptions
 
     // Internal, tests need to override these to drive maintenance flows on a tight loop. Public
     // surface would require thinking through "what's a sensible knob for end users."
-    internal TimeSpan HeartbeatInterval { get; init; } = TimeSpan.FromSeconds(1);
+    internal TimeSpan HeartbeatInterval { get; init; } = Heartbeat.DefaultInterval;
     internal TimeSpan MaintenanceInterval { get; init; } = TimeSpan.FromSeconds(1);
     internal PipelineScheduler? ExecutionScheduler { get; init; }
 
