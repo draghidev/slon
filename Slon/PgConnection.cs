@@ -304,14 +304,14 @@ sealed class PgConnection : IPoolConnection<PgConnection>
 
     public bool TryQueue<TState, TFlow>(Func<PgConnection, TState, TFlow> materialize, TState state,
         [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out TFlow? flow,
-        CancellationToken cancellationToken = default, bool mustPipeline = false)
+        CancellationToken cancellationToken = default, FlowEnqueueOptions options = FlowEnqueueOptions.None)
         where TFlow : PgClientFlow
         => _protocol.TryQueue(
             static args => args.Materialize(args.Connection, args.State),
             (Materialize: materialize, Connection: this, State: state),
             out flow,
             cancellationToken,
-            mustPipeline);
+            options);
 
     public void PushMaintenance(MaintenanceWork work)
     {

@@ -252,7 +252,8 @@ public class PgClientRequestBenchmark : ClientBenchmark
                 var count = 0;
                 while (reader.TryRead(out var flow))
                 {
-                    if (conn is not null && conn.Protocol.TryQueue(flow, mustPipeline: true))
+                    if (conn is not null && conn.Protocol.TryQueue(
+                            flow, FlowEnqueueOptions.RequireExistingPipeline))
                     {
                         count = ++count % 8;
                         if (count is 0)
@@ -260,7 +261,8 @@ public class PgClientRequestBenchmark : ClientBenchmark
                         continue;
                     }
                     conn = await pool.GetAsync(
-                        static (ctx, flow) => ctx.Connection.Protocol.TryQueue(flow, mustPipeline: !ctx.IsIdleCandidate),
+                        static (ctx, flow) => ctx.Connection.Protocol.TryQueue(flow,
+                            ctx.IsIdleCandidate ? FlowEnqueueOptions.None : FlowEnqueueOptions.RequireExistingPipeline),
                         flow, TimeSpan.FromSeconds(30), CancellationToken.None).ConfigureAwait(false);
                     count = 1;
                 }

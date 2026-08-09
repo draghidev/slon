@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using Draghi.Pipelining;
 using Draghi.Pipelining.Internal;
@@ -16,8 +17,17 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
     // control: the one Control every flow in this source is bound to (the protocol's FlowControl for the
     // outer source, the scope's inner control for a nested source). Stored so the source can pull a flow's
     // handoff MRES through ExecutionControl rather than off a bare flow ref.
-    public static PgClientFlowSource Create(PgClientProtocol protocol, PgClientProtocol.Control control, PipelineScheduler? executionScheduler = null)
-        => new(new State(protocol, control, executionScheduler ?? PipelineScheduler.ThreadPool));
+    public static PgClientFlowSource Create(PgClientProtocol protocol, PgClientProtocol.Control control,
+        PipelineScheduler? executionScheduler = null, int maxInFlight = 0)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(maxInFlight);
+        return new(new State(protocol, control, executionScheduler ?? PipelineScheduler.ThreadPool, maxInFlight));
+    }
+
+    internal bool HasCapacity => _state.HasCapacity;
+    internal bool TryAcquireCapacity(out bool capacityOwned) => _state.TryAcquireCapacity(out capacityOwned);
+    internal void ReleaseUnboundCapacity() => _state.ReleaseCapacity();
+    internal bool ReleaseCapacity() => _state.ReleaseCapacity();
 
     /// Enqueues an async-mode flow. The caller dispatches via the returned <see cref="EnqueueResult"/>.
     /// During a sync-flow handoff, the item is queued but the dispatch is a no-op. The executor will
@@ -148,6 +158,8 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
         // source pulls the handoff MRES through it rather than off a bare flow ref (HandoffEvent is
         // protected on PgClientFlow).
         readonly PgClientProtocol.Control _control;
+        readonly int _maxInFlight;
+        int _inFlight;
 
         internal BacklogEnumerator GetBacklogEnumerator() => new(HeldSyncFlow, ref _storage);
 
@@ -158,12 +170,52 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
                 backlog.Current.GetExecutionControl(_control).OnActivationHeartbeat(period);
         }
 
-        public State(PgClientProtocol protocol, PgClientProtocol.Control control, PipelineScheduler scheduler)
+        public State(PgClientProtocol protocol, PgClientProtocol.Control control, PipelineScheduler scheduler,
+            int maxInFlight)
         {
             _protocol = protocol;
             _control = control;
             WakeEvent = new(runContinuationsAsynchronously: true, scheduler);
             WakeDriver = new(this, WakeEvent);
+            _maxInFlight = maxInFlight;
+        }
+
+        internal bool HasCapacity
+            => _maxInFlight is 0 || Volatile.Read(ref _inFlight) < _maxInFlight;
+
+        internal bool TryAcquireCapacity(out bool capacityOwned)
+        {
+            // Zero is deliberately the allocation- and atomic-free path. A finite source owns the
+            // assignment boundary: accepted operations occupy capacity while queued, dispatched, and
+            // recovering; work rejected here remains outside this wire and can be placed elsewhere.
+            if (_maxInFlight is 0)
+            {
+                capacityOwned = false;
+                return true;
+            }
+
+            var count = Volatile.Read(ref _inFlight);
+            while (count < _maxInFlight)
+            {
+                var observed = Interlocked.CompareExchange(ref _inFlight, count + 1, count);
+                if (observed == count)
+                {
+                    capacityOwned = true;
+                    return true;
+                }
+                count = observed;
+            }
+            capacityOwned = false;
+            return false;
+        }
+
+        internal bool ReleaseCapacity()
+        {
+            if (_maxInFlight is 0)
+                return false;
+            var count = Interlocked.Decrement(ref _inFlight);
+            Debug.Assert(count >= 0);
+            return count == _maxInFlight - 1;
         }
 
         internal bool NeedsFlushArm

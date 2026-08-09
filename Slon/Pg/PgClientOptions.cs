@@ -31,6 +31,7 @@ sealed class PgClientOptions
 
     internal ScopeResetOptions ScopeReset { get; init; } = new();
     internal int DataRowStreamingThreshold { get; init; } = BackendMessageBatch.Segmenter.DefaultDataRowStreamingThreshold;
+    internal int MaxInFlightFlowsPerWire { get; init; }
 
     // Hardcoded to UTF8 until a use for another encoding comes up.
     internal Encoding Encoding => Encoding.UTF8;

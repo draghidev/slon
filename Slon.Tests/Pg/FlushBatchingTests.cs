@@ -87,7 +87,7 @@ public class FlushBatchingTests
             try
             {
                 for (var i = 0; i < N; i++)
-                    Assert.IsTrue(p.TryQueue(Cmd(), mustPipeline: true));
+                    Assert.IsTrue(p.TryQueue(Cmd(), FlowEnqueueOptions.RequireExistingPipeline));
             }
             finally { scheduler.Resume(); }
             await WaitForBytes(t, baseBytes + N * perCmd);
@@ -115,7 +115,7 @@ public class FlushBatchingTests
             try
             {
                 await Task.WhenAll(Enumerable.Range(0, N).Select(_ => Task.Run(
-                    () => Assert.IsTrue(p.TryQueue(Cmd(), mustPipeline: true)))));
+                    () => Assert.IsTrue(p.TryQueue(Cmd(), FlowEnqueueOptions.RequireExistingPipeline)))));
             }
             finally { scheduler.Resume(); }
             await WaitForBytes(t, baseBytes + N * perCmd);
@@ -205,8 +205,8 @@ public class FlushBatchingTests
             var baseFlush = t.Counter.FlushCount;
             var racedEnqueue = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
             t.Counter.RunBeforeNextNonEmptyFlush(
-                () => racedEnqueue.TrySetResult(p.TryQueue(Cmd(), mustPipeline: true)));
-            Assert.IsTrue(p.TryQueue(Cmd(), mustPipeline: true));
+                () => racedEnqueue.TrySetResult(p.TryQueue(Cmd(), FlowEnqueueOptions.RequireExistingPipeline)));
+            Assert.IsTrue(p.TryQueue(Cmd(), FlowEnqueueOptions.RequireExistingPipeline));
             Assert.IsTrue(await racedEnqueue.Task);
             await WaitForBytes(t, baseBytes + 2 * perCmd);
             Assert.AreEqual(2, t.Counter.FlushCount - baseFlush);

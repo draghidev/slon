@@ -4,14 +4,6 @@ using System.Threading.Tasks.Sources;
 
 namespace Slon.Pg.Protocol;
 
-[Flags]
-enum FlowEnqueueOptions : byte
-{
-    None = 0,
-    RequireExistingPipeline = 1,
-    BlockAdmission = 2
-}
-
 abstract class PgClientFlowObserver
 {
     internal virtual void OnCompleting(PgClientFlow flow, Exception? exception, object? state) { }
@@ -29,6 +21,7 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
     PgClientProtocol.Control? _pendingActivationControl;
     PgClientProtocol.Control? _boundControl;
     FlowEnqueueOptions _enqueueOptions;
+    bool _ownsWireCapacity;
 
     internal bool OwnsAdmissionBarrier => (_enqueueOptions & FlowEnqueueOptions.BlockAdmission) != 0;
     internal void SetEnqueueOptions(FlowEnqueueOptions options)
@@ -36,6 +29,8 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
         Debug.Assert(_enqueueOptions is FlowEnqueueOptions.None);
         _enqueueOptions = options;
     }
+
+    internal void MarkWireCapacityOwned() => _ownsWireCapacity = true;
 
     /// Pairs this flow with its protocol control for a queued activation dispatch. The flow
     /// itself is the IThreadPoolWorkItem: an immutable (flow, control) pairing per queued
@@ -276,6 +271,7 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
         _lastMessageInducesRfq = false;
         _boundControl = null;
         _enqueueOptions = FlowEnqueueOptions.None;
+        _ownsWireCapacity = false;
         _observer = null;
         _observerState = null;
         OnReset();
@@ -801,6 +797,8 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
             {
                 control.FailProtocolFromCallback(ex, "a flow release hook");
             }
+            if (flow._ownsWireCapacity)
+                control.ReleaseWireCapacity();
             // State transitions which must be visible with the terminal result belong here.
             try { observer?.OnCompleting(flow, exception, observerState); }
             catch (Exception ex)

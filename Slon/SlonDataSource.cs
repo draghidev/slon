@@ -33,6 +33,12 @@ public sealed record SlonDataSourceOptions
     public TimeSpan CancellationTimeout { get; init; } = TimeSpan.FromSeconds(10);
     public int MinPoolSize { get; init; } = 1;
     public int MaxPoolSize { get; init; } = 10;
+    /// <summary>
+    /// Limits datasource operations assigned to one physical PostgreSQL wire. Zero leaves assignment
+    /// uncapped. A finite value bounds the collateral failure exposure of one wire; later operations
+    /// remain in the pool backlog until another wire can accept them.
+    /// </summary>
+    public int MaxInFlightOperationsPerWire { get; init; }
     /// <summary>Receives sparse driver diagnostics. Logging is disabled by default.</summary>
     public ILoggerFactory LoggerFactory { get; init; } = NullLoggerFactory.Instance;
     /// Duration over which the pool observes unused capacity before pruning it.
@@ -105,6 +111,7 @@ public sealed record SlonDataSourceOptions
         MaintenanceInterval = MaintenanceInterval,
         ScopeReset = ScopeReset.Snapshot(),
         DataRowStreamingThreshold = DataRowStreamingThreshold,
+        MaxInFlightFlowsPerWire = MaxInFlightOperationsPerWire,
     };
 
     internal bool Validate()
@@ -117,6 +124,7 @@ public sealed record SlonDataSourceOptions
         if ((ConnectionInitializer is null) != (AsyncConnectionInitializer is null))
             throw new ArgumentException(
                 "Synchronous and asynchronous connection initializers must be configured together.");
+        ArgumentOutOfRangeException.ThrowIfNegative(MaxInFlightOperationsPerWire);
         for (var i = 0; i < TypeLoadingSchemas.Count; i++)
             ArgumentException.ThrowIfNullOrWhiteSpace(TypeLoadingSchemas[i], nameof(TypeLoadingSchemas));
         Ssl.Validate();
@@ -709,17 +717,21 @@ public sealed class SlonDataSource : DbDataSource
         }
     }
 
-    readonly struct CommandScheduleState<TState>(Func<PgConnection, TState, CommandFlowOptions> createOptions, TState state, CommandFlow flow, bool async)
+    readonly struct CommandScheduleState<TState>(Func<PgConnection, TState, CommandFlowOptions> createOptions,
+        TState state, CommandFlow flow, bool async)
     {
         public bool TrySchedule(ConnectionCandidate<PgConnection> context)
         {
+            var enqueueOptions = context.IsIdleCandidate
+                ? FlowEnqueueOptions.None
+                : FlowEnqueueOptions.RequireExistingPipeline;
             return context.Connection.TryQueue(
                 static (connection, args) => args.Flow.Initialize(
                     args.Async, args.CreateOptions(connection, args.State)),
                 (CreateOptions: createOptions, State: state, Flow: flow, Async: async),
                 out _,
                 context.CancellationToken,
-                mustPipeline: !context.IsIdleCandidate);
+                enqueueOptions);
         }
     }
 
@@ -923,8 +935,11 @@ public sealed class SlonDataSource : DbDataSource
         public bool TrySchedule(ConnectionCandidate<PgConnection> candidate)
         {
             var proxy = dataSource.CreateProxy(candidate.Connection, connection);
-            if (!proxy.TryQueueExclusiveScope(
-                    async, longRunning: true, mustPipeline: !candidate.IsIdleCandidate))
+            var enqueueOptions = FlowEnqueueOptions.BlockAdmission |
+                (candidate.IsIdleCandidate
+                    ? FlowEnqueueOptions.None
+                    : FlowEnqueueOptions.RequireExistingPipeline);
+            if (!proxy.TryQueueExclusiveScope(async, enqueueOptions))
                 return false;
             Proxy = proxy;
             return true;

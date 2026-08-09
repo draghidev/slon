@@ -174,10 +174,8 @@ sealed class AdoConnectionProxy : IDisposable, IAsyncDisposable
             cancellationToken, longRunning).ConfigureAwait(false);
     }
 
-    internal bool TryQueueExclusiveScope(bool async, bool longRunning, bool mustPipeline)
+    internal bool TryQueueExclusiveScope(bool async, FlowEnqueueOptions options)
     {
-        var options = (longRunning ? FlowEnqueueOptions.BlockAdmission : FlowEnqueueOptions.None) |
-            (mustPipeline ? FlowEnqueueOptions.RequireExistingPipeline : FlowEnqueueOptions.None);
         if (!_pgConnection.Protocol.TryQueueExclusiveScope(
                 async, options, out var flow))
             return false;

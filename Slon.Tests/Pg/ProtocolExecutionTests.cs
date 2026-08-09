@@ -177,6 +177,34 @@ public class ProtocolExecutionTests
     // Fix: HandoffAcked gate on TryTakeHandoff. The executor cannot pick up HandoffSlot until
     // the sync caller has cleared WaitForParked and is about to SetResult inline.
     [ConnectionCreatingTestMethod]
+    public async Task WireCapacity_IsReturnedAtFlowRetirement()
+    {
+        await using var protocol = await PgTestPool.NewIsolatedAsync(
+            options => options.MaxInFlightFlowsPerWire = 1);
+        await using var blocker = await PgAdvisoryLock.AcquireAsync();
+
+        var first = new CommandFlow(async: true,
+            Command.Create("select 1") with { WithSync = true }, blocker.WaitCommand);
+        Assert.IsTrue(protocol.TryQueue(first));
+        Assert.IsFalse(protocol.IsSchedulable);
+
+        var second = new CommandFlow(async: true, Command.Create("select 2"));
+        Assert.IsFalse(protocol.TryQueue(second));
+
+        var firstResults = first.GetAsyncEnumerator();
+        var firstDrain = DrainAsync(firstResults);
+        await blocker.ReleaseAsync();
+        await firstDrain;
+        await firstResults.DisposeAsync();
+
+        Assert.IsTrue(protocol.IsSchedulable);
+        Assert.IsTrue(protocol.TryQueue(second));
+        var secondResults = second.GetAsyncEnumerator();
+        await DrainAsync(secondResults);
+        await secondResults.DisposeAsync();
+    }
+
+    [ConnectionCreatingTestMethod]
     public async Task SyncWhileAsyncInFlight_SameProtocol_BothComplete()
     {
         await using var protocol = await PgTestPool.NewIsolatedAsync();

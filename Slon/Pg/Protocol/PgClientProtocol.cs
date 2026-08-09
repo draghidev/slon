@@ -26,6 +26,14 @@ enum ProtocolStatus
     Completed
 }
 
+[Flags]
+enum FlowEnqueueOptions : byte
+{
+    None = 0,
+    RequireExistingPipeline = 1,
+    BlockAdmission = 2
+}
+
 interface IProtocolStatic<T>
 {
     ref readonly T Value { get; }
@@ -46,6 +54,7 @@ sealed class PgClientProtocolOptions
         FlowActivationTimeout = options.ConnectionTimeout;
         ScopeReset = options.ScopeReset.Snapshot();
         DataRowStreamingThreshold = options.DataRowStreamingThreshold;
+        MaxInFlightFlowsPerWire = options.MaxInFlightFlowsPerWire;
         LoggerFactory = options.LoggerFactory;
     }
 
@@ -67,6 +76,7 @@ sealed class PgClientProtocolOptions
     public TimeSpan CancelRequestDelay { get; set; }
     public ScopeResetOptions ScopeReset { get; set; } = new();
     public int DataRowStreamingThreshold { get; set; } = BackendMessageBatch.Segmenter.DefaultDataRowStreamingThreshold;
+    internal int MaxInFlightFlowsPerWire { get; set; }
     public ILoggerFactory LoggerFactory { get; set; } = NullLoggerFactory.Instance;
     // Datasource bootstrap supplies this. A standalone raw protocol can omit backend identity and
     // operate with the explicit lower-level compatibility capabilities instead.
@@ -164,7 +174,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
     // Draining immediately vetoes new pool placement, before terminal completion.
     internal bool IsDraining => Status is ProtocolStatus.Draining or ProtocolStatus.Completed;
     internal bool IsSchedulable
-        => Status is ProtocolStatus.Ready && Volatile.Read(ref _admissionBlocked) == 0;
+        => Status is ProtocolStatus.Ready && Volatile.Read(ref _admissionBlocked) == 0 && _source.HasCapacity;
 
     internal bool TryBeginPruning()
     {
@@ -388,7 +398,8 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
 
     async ValueTask StartAsync(StartupFlow flow, ValueTask<PgClientFlow> flowCompletion, CancellationToken cancellationToken = default)
     {
-        _source = PgClientFlowSource.Create(this, FlowControl, _options.ExecutionScheduler);
+        _source = PgClientFlowSource.Create(
+            this, FlowControl, _options.ExecutionScheduler, _options.MaxInFlightFlowsPerWire);
         _pipeline = Pipeline.Create<PgClientFlow, Policy, PgClientFlowSource, PgClientFlowSource.Enumerator>(new Policy(this, FlowControl), _source);
         FlowControl.BindSource(_source);
         FlowControl.BindPipeline(_pipeline);
@@ -465,7 +476,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         {
             Debug.Assert(_admissionBlocked == 1);
             _admissionBlocked = 0;
-            signal = _status is ProtocolStatus.Ready;
+            signal = IsSchedulable;
         }
 
         if (signal)
@@ -477,6 +488,20 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
                     _logger, ex, "the pool availability callback");
                 FailProtocol(ex);
             }
+        }
+    }
+
+    void ReleaseWireCapacity()
+    {
+        if (!_source.ReleaseCapacity() || !IsSchedulable)
+            return;
+
+        try { _poolConnectionAvailabilitySignal?.Invoke(IsIdle); }
+        catch (Exception ex)
+        {
+            SlonLogMessages.UnobservedCallbackException(
+                _logger, ex, "the pool availability callback");
+            FailProtocol(ex);
         }
     }
 
@@ -497,17 +522,15 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         return flow;
     }
 
-    public bool TryQueue(PgClientFlow flow, bool mustPipeline = false, CancellationToken cancellationToken = default)
+    public bool TryQueue(PgClientFlow flow, FlowEnqueueOptions options = FlowEnqueueOptions.None,
+        CancellationToken cancellationToken = default)
     {
-        var enqueueOptions = mustPipeline
-            ? FlowEnqueueOptions.RequireExistingPipeline
-            : FlowEnqueueOptions.None;
         // Bind the caller token before enqueue so the eager write reads it (published with the flow
         // by the enqueue). Only when cancelable - the common no-token submit pays no field write.
         if (cancellationToken.CanBeCanceled)
             flow.BindCallerToken(cancellationToken);
 
-        if ((enqueueOptions & FlowEnqueueOptions.RequireExistingPipeline) != 0)
+        if ((options & FlowEnqueueOptions.RequireExistingPipeline) != 0)
         {
             if (!TryQueueFlow(flow, static protocol => protocol.PipelineDepth > 0, this))
                 return false;
@@ -528,24 +551,34 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
 
     internal bool TryQueue<TState, TFlow>(Func<TState, TFlow> materialize, TState state,
         [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out TFlow? flow,
-        CancellationToken cancellationToken = default, bool mustPipeline = false)
+        CancellationToken cancellationToken = default, FlowEnqueueOptions options = FlowEnqueueOptions.None)
         where TFlow : PgClientFlow
     {
         PgClientFlowSource.EnqueueResult enqueue = default;
         bool handoff;
+        bool capacityOwned;
         lock (_syncRoot)
         {
             if (_status is not ProtocolStatus.Ready || _admissionBlocked != 0 ||
-                (mustPipeline && _pipeline.Depth == 0))
+                ((options & FlowEnqueueOptions.RequireExistingPipeline) != 0 && _pipeline.Depth == 0) ||
+                !_source.TryAcquireCapacity(out capacityOwned))
             {
                 flow = null;
                 return false;
             }
 
-            flow = materialize(state);
-            flow.SetEnqueueOptions(mustPipeline
-                ? FlowEnqueueOptions.RequireExistingPipeline
-                : FlowEnqueueOptions.None);
+            try
+            {
+                flow = materialize(state);
+            }
+            catch
+            {
+                _source.ReleaseUnboundCapacity();
+                throw;
+            }
+            if (capacityOwned)
+                flow.MarkWireCapacityOwned();
+            flow.SetEnqueueOptions(options);
             if (cancellationToken.CanBeCanceled)
                 flow.BindCallerToken(cancellationToken);
             handoff = flow.NeedsSyncHandoff;
@@ -596,22 +629,34 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         ExclusiveAccessFlow? flow;
         PgClientFlowSource.EnqueueResult enqueue = default;
         bool handoff;
+        bool capacityOwned;
         lock (_syncRoot)
         {
             if (_status is not ProtocolStatus.Ready || _admissionBlocked != 0 ||
-                ((options & FlowEnqueueOptions.RequireExistingPipeline) != 0 && _pipeline.Depth == 0))
+                ((options & FlowEnqueueOptions.RequireExistingPipeline) != 0 && _pipeline.Depth == 0) ||
+                !_source.TryAcquireCapacity(out capacityOwned))
             {
                 scope = null;
                 return false;
             }
 
-            // Creation and enqueue share the shutdown admission lock: a rejected begin never touches
-            // the close signal, while an admitted flow is owned by the pipeline drain.
-            _exclusiveScope ??= ExclusiveScopeState.Create(this);
-            flow = _exclusiveScope.RentFlow();
-            flow.PrepareScope(async, _options.FlowActivationTimeout);
-            flow.SetEnqueueOptions(options);
-            scope = flow.CreateLease();
+            try
+            {
+                // Creation and enqueue share the shutdown admission lock: a rejected begin never touches
+                // the close signal, while an admitted flow is owned by the pipeline drain.
+                _exclusiveScope ??= ExclusiveScopeState.Create(this);
+                flow = _exclusiveScope.RentFlow();
+                flow.PrepareScope(async, _options.FlowActivationTimeout);
+                flow.SetEnqueueOptions(options);
+                if (capacityOwned)
+                    flow.MarkWireCapacityOwned();
+                scope = flow.CreateLease();
+            }
+            catch
+            {
+                _source.ReleaseUnboundCapacity();
+                throw;
+            }
 
             if ((options & FlowEnqueueOptions.BlockAdmission) != 0)
             {
@@ -663,6 +708,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         // handoff; self-driven flows take it as part of admission.
         var handoff = flow.NeedsSyncHandoff;
         PgClientFlowSource.EnqueueResult enqueue = default;
+        var capacityOwned = false;
         lock (_syncRoot)
         {
             if (_status != requiredStatus ||
@@ -672,7 +718,13 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
             if (predicate?.Invoke(state) == false)
                 return false;
 
+            if (requiredStatus is ProtocolStatus.Ready &&
+                !_source.TryAcquireCapacity(out capacityOwned))
+                return false;
+
             flow.SetEnqueueOptions(FlowEnqueueOptions.None);
+            if (capacityOwned)
+                flow.MarkWireCapacityOwned();
             AssignCancellationBoundary(FlowControl, flow);
 
             // Both modes write the SPSC storage, so the enqueue must serialize with concurrent
@@ -1635,6 +1687,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         internal void RecoveryStarted() => protocol.SignalDraining();
         internal void RecoveryCompleted() => protocol.SignalReady();
         internal void ReleaseAdmissionBarrier() => protocol.ReleaseAdmissionBarrier();
+        internal void ReleaseWireCapacity() => protocol.ReleaseWireCapacity();
 
         internal void OnReleasing(PgClientFlow flow, int remainingDepth)
         {
