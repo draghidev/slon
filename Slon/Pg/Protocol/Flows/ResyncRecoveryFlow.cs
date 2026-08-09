@@ -72,7 +72,7 @@ sealed class ResyncRecoveryFlow : PgClientFlow
         bool canWriteSync,
         bool canWrite)
     {
-        var recovery = new ResyncRecoveryFlow { IsAsync = failedFlow.IsAsyncAtBind };
+        var recovery = new ResyncRecoveryFlow { IsAsync = failedFlow.IsAsyncAtDispatch };
         recovery.GetExecutionControl(control).TransferInheritedRfqCount(inheritedRfqCount);
         recovery._control = control;
         recovery.FailedFlow = failedFlow;

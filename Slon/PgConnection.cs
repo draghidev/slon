@@ -40,6 +40,10 @@ sealed class CloseStatement(EncodedString name) : MaintenanceWork
 // ADO-owned session state around the protocol. Prepared presence and maintenance survive pool leases.
 sealed class PgConnection : IPoolConnection<PgConnection>
 {
+    internal sealed class FlowBindingContext(PgConnection connection) : PgClientFlowBindingContext
+    {
+        internal PgConnection Connection { get; } = connection;
+    }
     readonly PgClientProtocol _protocol;
     readonly CommandTracker? _tracker;
     readonly ILogger _logger;
@@ -75,6 +79,7 @@ sealed class PgConnection : IPoolConnection<PgConnection>
         _tracker = tracker;
         _maintenanceInterval = maintenanceInterval;
         _logger = logger;
+        _protocol.SetFlowBindingContext(new FlowBindingContext(this));
     }
 
     // Armed only after wiring succeeds, so release never races resource installation. On a
@@ -92,6 +97,8 @@ sealed class PgConnection : IPoolConnection<PgConnection>
         var conn = new PgConnection(protocol, tracker, clientOptions.MaintenanceInterval,
             clientOptions.LoggerFactory.CreateLogger("Slon.Pg.Connection"));
         conn._poolContext = poolContext;
+        if (poolContext is not null)
+            protocol.SetFlowMigration(conn.TryMigrateFlow);
         protocol.Start(clientOptions, transport,
             poolContext is null ? NoopAvailability : conn.SignalAvailabilityIfStarted,
             timeout, upgradeTransport);
@@ -118,6 +125,8 @@ sealed class PgConnection : IPoolConnection<PgConnection>
         var conn = new PgConnection(protocol, tracker, clientOptions.MaintenanceInterval,
             clientOptions.LoggerFactory.CreateLogger("Slon.Pg.Connection"));
         conn._poolContext = poolContext;
+        if (poolContext is not null)
+            protocol.SetFlowMigration(conn.TryMigrateFlow);
         await protocol.StartAsync(clientOptions, transport,
             poolContext is null ? NoopAvailability : conn.SignalAvailabilityIfStarted,
             cancellationToken, upgradeTransport).ConfigureAwait(false);
@@ -302,16 +311,41 @@ sealed class PgConnection : IPoolConnection<PgConnection>
     public bool TryQueue(PgClientFlow flow, CancellationToken cancellationToken = default)
         => _protocol.TryQueue(flow, cancellationToken: cancellationToken);
 
-    public bool TryQueue<TState, TFlow>(Func<PgConnection, TState, TFlow> materialize, TState state,
-        [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out TFlow? flow,
-        CancellationToken cancellationToken = default, FlowEnqueueOptions options = FlowEnqueueOptions.None)
-        where TFlow : PgClientFlow
-        => _protocol.TryQueue(
-            static args => args.Materialize(args.Connection, args.State),
-            (Materialize: materialize, Connection: this, State: state),
-            out flow,
-            cancellationToken,
-            options);
+    bool TryMigrateFlow(FlowMigration migration)
+    {
+        if (_poolContext is not { } poolContext)
+            return false;
+        poolContext.TrackDetached(MigrateFlowAsync(poolContext, migration));
+        return true;
+    }
+
+    static async Task MigrateFlowAsync(ConnectionPoolContext<PgConnection> poolContext,
+        FlowMigration migration)
+    {
+        try
+        {
+            var timeout = migration.GetRemainingTimeout();
+            await poolContext.GetAsync(
+                static (candidate, item) => TryScheduleMigrated(candidate, item), migration,
+                timeout, migration.CancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            migration.Fail(ex);
+        }
+    }
+
+    static bool TryScheduleMigrated(ConnectionCandidate<PgConnection> candidate, FlowMigration migration)
+    {
+        var flow = migration.PreparePlacement();
+        var options = FlowEnqueueOptions.AllowMigration |
+            (candidate.IsIdleCandidate
+                ? FlowEnqueueOptions.None
+                : FlowEnqueueOptions.RequireExistingPipeline);
+        return migration.CompletePlacement(
+            candidate.Connection.Protocol.TryQueue(flow, options, candidate.CancellationToken));
+    }
 
     public void PushMaintenance(MaintenanceWork work)
     {

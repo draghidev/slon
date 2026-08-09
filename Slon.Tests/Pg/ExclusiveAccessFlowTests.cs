@@ -19,6 +19,20 @@ namespace Slon.Tests.Pg;
 [TestClass]
 public class ExclusiveAccessFlowTests : ConnectionCreatingTest
 {
+    [TestMethod]
+    public async Task BindingFailure_FaultsFlowWithoutCondemningWire()
+    {
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
+        protocol.SetFlowBindingContext(new BindingProbeContext("wire"));
+        var strategy = new BindingProbeStrategy(fail: true);
+        var flow = protocol.Queue(new CommandFlow(
+            async: true, new CommandFlowBinding { Strategy = strategy }));
+
+        await Assert.ThrowsExactlyAsync<InvalidOperationException>(async () => await DrainAsync(flow));
+        Assert.AreEqual(1, strategy.BindCount);
+
+        await DrainAsync(protocol.Queue(new CommandFlow(async: true, Command.Create("select 1"))));
+    }
     static async Task DrainAsync(CommandFlow flow)
     {
         var e = flow.GetAsyncEnumerator();
@@ -56,6 +70,7 @@ public class ExclusiveAccessFlowTests : ConnectionCreatingTest
     public async Task LongRunningScope_RejectsOuterAdmissionUntilReleased()
     {
         await using var protocol = await PgTestPool.NewIsolatedAsync();
+        protocol.SetFlowBindingContext(new BindingProbeContext("wire"));
         var scope = protocol.QueueExclusiveScope(async: true, longRunning: true);
         var rejected = new CommandFlow(async: true, Command.Create("select 1"));
 
@@ -63,22 +78,21 @@ public class ExclusiveAccessFlowTests : ConnectionCreatingTest
         Assert.IsFalse(protocol.TryQueue(rejected),
             "ordinary outer work must not queue behind a long-running scope");
         rejected.DiscardUnqueued();
-        var materialized = false;
-        Assert.IsFalse(protocol.TryQueue(
-            _ =>
-            {
-                materialized = true;
-                return new CommandFlow(async: true, Command.Create("select 1"));
-            }, 0, out CommandFlow? _));
-        Assert.IsFalse(materialized,
-            "connection-local command state must not materialize after the barrier wins admission");
+        var bindStrategy = new BindingProbeStrategy();
+        var bindProbe = new CommandFlow(async: true, new CommandFlowBinding { Strategy = bindStrategy });
+        Assert.IsFalse(protocol.TryQueue(bindProbe));
+        Assert.AreEqual(0, bindStrategy.BindCount,
+            "connection-local command state must not bind after the barrier wins admission");
 
         await scope.HandoffReady;
         await DrainAsync(scope.Queue(new CommandFlow(async: true, Command.Create("select 1"))));
         await scope.CompleteScopeAsync();
 
         Assert.IsTrue(protocol.IsSchedulable);
-        await DrainAsync(protocol.Queue(new CommandFlow(async: true, Command.Create("select 1"))));
+        Assert.IsTrue(protocol.TryQueue(bindProbe));
+        await DrainAsync(bindProbe);
+        Assert.AreEqual(1, bindStrategy.BindCount,
+            "the portable flow must bind exactly once when its later placement reaches dispatch");
     }
 
     [TestMethod]

@@ -273,7 +273,8 @@ public class RecoveryTests : ConnectionCreatingTest
             AfterWrites?.Invoke();
 
             if (RequestCancellation)
-                RequestBackendCancellation();
+                context.RequestBackendCancellation(this, CancellationWindow,
+                    BackendCancellationTiming.AfterGrace, delivery: null);
 
             if (_phase is FaultPhase.PreReturn)
                 throw Failure;
@@ -635,7 +636,7 @@ public class RecoveryTests : ConnectionCreatingTest
             await RunAsync(protocol, "select 1");
     }
 
-    // The recovery flow's async mode is inherited from the failed flow's IsAsyncAtBind. An
+    // The recovery flow's async mode is inherited from the failed flow's IsAsyncAtDispatch. An
     // async-failed flow yields an async recovery, so the drain decode does not block the
     // executor on a sync path. Verified end-to-end: async failure followed by an async flow
     // succeeds without deadlock.

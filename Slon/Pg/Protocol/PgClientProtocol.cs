@@ -2,6 +2,7 @@ using System.Buffers;
 using System.Buffers.Binary;
 using System.Collections.Immutable;
 using System.Diagnostics;
+using Slon.Runtime;
 using System.Runtime.CompilerServices;
 using System.Security.Authentication;
 using System.Text;
@@ -9,7 +10,6 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Slon.Pipelines;
 using Slon.Runtime.CompilerServices;
-using Slon.Runtime;
 using Slon.Threading;
 using Draghi.Pipelining;
 using Slon.Buffers;
@@ -31,7 +31,8 @@ enum FlowEnqueueOptions : byte
 {
     None = 0,
     RequireExistingPipeline = 1,
-    BlockAdmission = 2
+    BlockAdmission = 2,
+    AllowMigration = 4
 }
 
 interface IProtocolStatic<T>
@@ -55,6 +56,7 @@ sealed class PgClientProtocolOptions
         ScopeReset = options.ScopeReset.Snapshot();
         DataRowStreamingThreshold = options.DataRowStreamingThreshold;
         MaxInFlightFlowsPerWire = options.MaxInFlightFlowsPerWire;
+        ExecutionScheduler = options.ExecutionScheduler;
         LoggerFactory = options.LoggerFactory;
     }
 
@@ -129,6 +131,8 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
     readonly CloseSignal _close;
     Pipeline<PgClientFlow, Policy, PgClientFlowSource, PgClientFlowSource.Enumerator> _pipeline = null!;
     PgClientFlowSource _source;
+    PgClientFlowBindingContext? _flowBindingContext;
+    Func<FlowMigration, bool>? _flowMigration;
     // Reused exclusive-scope state. The outer pipeline admits only one such scope at a time.
     ExclusiveScopeState? _exclusiveScope;
     readonly Lock _syncRoot = new();
@@ -175,6 +179,20 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
     internal bool IsDraining => Status is ProtocolStatus.Draining or ProtocolStatus.Completed;
     internal bool IsSchedulable
         => Status is ProtocolStatus.Ready && Volatile.Read(ref _admissionBlocked) == 0 && _source.HasCapacity;
+
+    internal void SetFlowBindingContext(PgClientFlowBindingContext context)
+    {
+        ArgumentNullException.ThrowIfNull(context);
+        if (Interlocked.CompareExchange(ref _flowBindingContext, context, null) is not null)
+            ThrowHelper.ThrowInvalidOperation("The protocol flow binding context was already configured.");
+    }
+
+    internal void SetFlowMigration(Func<FlowMigration, bool> migration)
+    {
+        ArgumentNullException.ThrowIfNull(migration);
+        if (Interlocked.CompareExchange(ref _flowMigration, migration, null) is not null)
+            ThrowHelper.ThrowInvalidOperation("The protocol inert-flow migration handler was already configured.");
+    }
 
     internal bool TryBeginPruning()
     {
@@ -532,72 +550,18 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
 
         if ((options & FlowEnqueueOptions.RequireExistingPipeline) != 0)
         {
-            if (!TryQueueFlow(flow, static protocol => protocol.PipelineDepth > 0, this))
+            if (!TryQueueFlow(flow, options, static protocol => protocol.PipelineDepth > 0, this))
                 return false;
         }
-        else if (!TryQueueFlow(flow, null, (object?)null))
+        else if (!TryQueueFlow(flow, options, null, (object?)null))
             return false;
 
-        // Bind
         var control = flow.GetExecutionControl(FlowControl);
-        control.Bind(_options.FlowActivationTimeout);
         if (flow.NeedsSyncHandoff && flow.DefersSyncHandoff)
             _source.SignalExecutor();
         if (_scoringEnabled && control.StallsPipeline)
             Interlocked.Increment(ref _pipelineStalls);
 
-        return true;
-    }
-
-    internal bool TryQueue<TState, TFlow>(Func<TState, TFlow> materialize, TState state,
-        [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out TFlow? flow,
-        CancellationToken cancellationToken = default, FlowEnqueueOptions options = FlowEnqueueOptions.None)
-        where TFlow : PgClientFlow
-    {
-        PgClientFlowSource.EnqueueResult enqueue = default;
-        bool handoff;
-        bool capacityOwned;
-        lock (_syncRoot)
-        {
-            if (_status is not ProtocolStatus.Ready || _admissionBlocked != 0 ||
-                ((options & FlowEnqueueOptions.RequireExistingPipeline) != 0 && _pipeline.Depth == 0) ||
-                !_source.TryAcquireCapacity(out capacityOwned))
-            {
-                flow = null;
-                return false;
-            }
-
-            try
-            {
-                flow = materialize(state);
-            }
-            catch
-            {
-                _source.ReleaseUnboundCapacity();
-                throw;
-            }
-            if (capacityOwned)
-                flow.MarkWireCapacityOwned();
-            flow.SetEnqueueOptions(options);
-            if (cancellationToken.CanBeCanceled)
-                flow.BindCallerToken(cancellationToken);
-            handoff = flow.NeedsSyncHandoff;
-            if (!handoff)
-                enqueue = _source.Enqueue(flow, inlineEligible: _pipeline.Depth == 0 && _source.Backlog == 0);
-            else
-                _source.EnqueueSyncWaiter(flow);
-        }
-
-        var control = flow.GetExecutionControl(FlowControl);
-        control.Bind(_options.FlowActivationTimeout);
-        if (!handoff)
-            enqueue.Execute(runContinuationsAsynchronously: false);
-        else if (flow.DefersSyncHandoff)
-            _source.SignalExecutor();
-        else
-            _source.WaitForExecutor(flow);
-        if (_scoringEnabled && control.StallsPipeline)
-            Interlocked.Increment(ref _pipelineStalls);
         return true;
     }
 
@@ -666,9 +630,9 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
 
             handoff = flow.NeedsSyncHandoff;
             if (!handoff)
-                enqueue = _source.Enqueue(flow);
+                enqueue = _source.Enqueue(flow, activationTimeout: _options.FlowActivationTimeout);
             else
-                _source.EnqueueSyncWaiter(flow);
+                _source.EnqueueSyncWaiter(flow, _options.FlowActivationTimeout);
         }
 
         if (!handoff)
@@ -677,7 +641,6 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
             _source.WaitForExecutor(flow);
 
         var control = flow.GetExecutionControl(FlowControl);
-        control.Bind(_options.FlowActivationTimeout);
         if (_scoringEnabled && control.StallsPipeline)
             Interlocked.Increment(ref _pipelineStalls);
         return true;
@@ -698,11 +661,14 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         return scope;
     }
 
-    bool TryQueueFlow<TState>(PgClientFlow flow, Func<TState, bool>? predicate = null, TState state = default!)
-        => TryQueueFlow(flow, ProtocolStatus.Ready, predicate, state);
+    bool TryQueueFlow<TState>(PgClientFlow flow, FlowEnqueueOptions options,
+        Func<TState, bool>? predicate = null, TState state = default!)
+        => TryQueueFlow(flow, ProtocolStatus.Ready, options, predicate, state);
 
-    bool TryQueueFlow(PgClientFlow flow, ProtocolStatus requiredStatus) => TryQueueFlow<bool>(flow, requiredStatus);
-    bool TryQueueFlow<TState>(PgClientFlow flow, ProtocolStatus requiredStatus, Func<TState, bool>? predicate = null, TState state = default!)
+    bool TryQueueFlow(PgClientFlow flow, ProtocolStatus requiredStatus)
+        => TryQueueFlow<bool>(flow, requiredStatus, FlowEnqueueOptions.None);
+    bool TryQueueFlow<TState>(PgClientFlow flow, ProtocolStatus requiredStatus,
+        FlowEnqueueOptions options, Func<TState, bool>? predicate = null, TState state = default!)
     {
         // A handoff-capable sync flow is held at its FIFO turn. Consumer-driven flows defer the
         // handoff; self-driven flows take it as part of admission.
@@ -722,19 +688,29 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
                 !_source.TryAcquireCapacity(out capacityOwned))
                 return false;
 
-            flow.SetEnqueueOptions(FlowEnqueueOptions.None);
-            if (capacityOwned)
-                flow.MarkWireCapacityOwned();
-            AssignCancellationBoundary(FlowControl, flow);
+            try
+            {
+                flow.SetEnqueueOptions(options);
+                if (capacityOwned)
+                    flow.MarkWireCapacityOwned();
+                AssignCancellationBoundary(FlowControl, flow);
+            }
+            catch
+            {
+                if (capacityOwned)
+                    _source.ReleaseUnboundCapacity();
+                throw;
+            }
 
             // Both modes write the SPSC storage, so the enqueue must serialize with concurrent
             // same-protocol producers (single-producer contract). The sync flow goes in at its real FIFO
             // position; any blocking handoff happens outside the lock. Depth is counted at dispatch
             // (executor-single-writer), so producers do not update it.
             if (!handoff)
-                enqueue = _source.Enqueue(flow, inlineEligible: _pipeline.Depth == 0 && _source.Backlog == 0);
+                enqueue = _source.Enqueue(flow, inlineEligible: _pipeline.Depth == 0 && _source.Backlog == 0,
+                    activationTimeout: _options.FlowActivationTimeout);
             else
-                _source.EnqueueSyncWaiter(flow);
+                _source.EnqueueSyncWaiter(flow, _options.FlowActivationTimeout);
         }
         if (!handoff)
             enqueue.Execute(runContinuationsAsynchronously: false);
@@ -947,7 +923,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
             Exception flowTermination = Volatile.Read(ref _collateralException) is { } collateral
                 ? collateral
                 : closedException;
-            _source.DrainInertItems(flow => flow.GetExecutionControl(FlowControl).FailUnstarted(flowTermination));
+            _source.DrainInertItems(flow => DisposeInertFlow(flow, flowTermination));
             await completeTask.ConfigureAwait(false);
             cleanShutdown = !FlowControl.AbortToken.IsCancellationRequested;
         }
@@ -1019,6 +995,29 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
                 }
             }
         }
+    }
+
+    void DisposeInertFlow(PgClientFlow flow, Exception flowTermination)
+    {
+        var control = flow.GetExecutionControl(FlowControl);
+        if (flow.AllowsMigration &&
+            (!control.IsDecoderSettled || control.AbortToken.IsCancellationRequested) &&
+            _flowMigration is { } migrate)
+        {
+            var migration = new FlowMigration(flow, control, _options.TimeProvider);
+            control.DetachForMigration(_source);
+            try
+            {
+                if (migrate(migration))
+                    return;
+            }
+            catch (Exception ex)
+            {
+                migration.Fail(ex);
+                return;
+            }
+        }
+        control.FailUnstarted(flowTermination);
     }
 
     internal ValueTask Heartbeat(TimeSpan period)
@@ -1195,8 +1194,22 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public ValueTask<PipelineItemResult> ExecuteItemAsync(PgClientFlow item, bool pipelineTaskRecovery, CancellationToken cancellationToken)
         {
-            item.GetExecutionControl(_control).Start();
-
+            var itemControl = item.GetExecutionControl(_control);
+            try
+            {
+                // The source owns an inert, portable flow until this dispatch. Bind only after dequeue:
+                // shutdown may move anything still in the source to another wire, where connection-local
+                // command state must be recomputed against that wire's context. Bind publishes execution
+                // ownership only after that fallible preparation succeeds.
+                itemControl.Bind(_control.FlowBindingContext);
+            }
+            catch (Exception ex)
+            {
+                // Binding has not touched the wire. Deliver the local failure to the caller, and leave
+                // the item unstarted so recovery does not inject protocol work for it.
+                itemControl.FailBeforeStart(ex);
+                throw;
+            }
             // The pooled execute promise is SINGLE-PUMPED: the executor pump serializes its dispatches,
             // so one ExecuteCore releases the promise before the next Starts, and reusing one instance is
             // safe. Pipeline-task recovery can run
@@ -1256,7 +1269,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
             // Inline-activate when the framework allows it (preferAsync=false) or the flow is sync:
             // sync flows park on a kernel wait-handle signal, bounded cost, safe under the advancer
             // latch. Async flows can attach arbitrary await continuations, so they go through TP.
-            if (preferAsync && item.IsAsyncAtBind)
+            if (preferAsync && item.IsAsyncAtDispatch)
             {
                 // The flow itself is the work item: an immutable (flow, control) pairing per queued
                 // activation, zero-alloc. A single cached mutable work item was a lost-update box -
@@ -1284,6 +1297,14 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
             // never consulted here).
             Debug.Assert(failedItem is not ResyncRecoveryFlow,
                 "Recovery item routed back into TryRecoverItemFailure - recovery-on-recovery must not exist.");
+
+            // Connection-local binding occurs at dispatch but before Start. A bind failure has not
+            // touched the wire and therefore needs caller fault delivery, not protocol recovery.
+            if (!failedItem.IsStarted)
+            {
+                recoveryItem = null;
+                return false;
+            }
 
             // Startup has not established a reusable query-protocol wire. Authentication may still own
             // the server state machine, where injecting Sync is neither a valid nor useful recovery.
@@ -1412,11 +1433,11 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
 
         PgClientFlowSource _source;
         public void BindSource(PgClientFlowSource source) => _source = source;
+        internal PgClientFlowBindingContext? FlowBindingContext => protocol._flowBindingContext;
         public bool HasQueuedFlow => _source.Backlog != 0;
         public bool IsInlineDrive => _source.IsInlineDrive;
         public long UnflushedBytes => protocol.UnflushedBytes;
         public ValueTask FlushAsync(CancellationToken cancellationToken) => protocol.FlushAsync(cancellationToken);
-        internal void WaitForSyncHandoff(PgClientFlow flow) => _source.WaitForExecutor(flow);
         // Cancellation needs a proof-quality idle level; the slot reads are deliberately stale-tolerant.
         bool _isIdle = true;
         public bool IsIdle => Volatile.Read(ref _isIdle);

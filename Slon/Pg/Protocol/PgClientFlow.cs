@@ -10,6 +10,11 @@ abstract class PgClientFlowObserver
     internal virtual void OnCompleted(PgClientFlow flow, Exception? exception, object? state) { }
 }
 
+// Per-wire composition supplied by the owner above the raw protocol. The protocol treats this as
+// an opaque bind token: portable flows interpret the concrete context only when dispatch removes
+// them from the migratable source backlog, while standalone low-level flows remain initialized.
+abstract class PgClientFlowBindingContext;
+
 abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgClientFlow>, IThreadPoolWorkItem
 {
     protected internal enum BackendCancellationTiming : byte
@@ -19,11 +24,13 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
     }
 
     PgClientProtocol.Control? _pendingActivationControl;
-    PgClientProtocol.Control? _boundControl;
+    PgClientFlowSource.State? _placementSource;
+    int _placementWasDetached;
     FlowEnqueueOptions _enqueueOptions;
     bool _ownsWireCapacity;
 
     internal bool OwnsAdmissionBarrier => (_enqueueOptions & FlowEnqueueOptions.BlockAdmission) != 0;
+    internal bool AllowsMigration => (_enqueueOptions & FlowEnqueueOptions.AllowMigration) != 0;
     internal void SetEnqueueOptions(FlowEnqueueOptions options)
     {
         Debug.Assert(_enqueueOptions is FlowEnqueueOptions.None);
@@ -31,6 +38,43 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
     }
 
     internal void MarkWireCapacityOwned() => _ownsWireCapacity = true;
+
+    void AttachPlacementSource(PgClientFlowSource.State source)
+    {
+        if (!AllowsMigration)
+        {
+            Debug.Assert(_placementSource is null);
+            _placementSource = source;
+            return;
+        }
+
+        if (Interlocked.CompareExchange(ref _placementSource, source, null) is not null)
+            ThrowHelper.ThrowInvalidOperation("The flow is already assigned to a protocol source.");
+        // Initial placement leaves the edge clean. Replacement placement wakes a synchronous
+        // consumer which may be waiting between the retired source and this one.
+        if (Interlocked.Exchange(ref _placementWasDetached, 0) != 0)
+            HandoffEvent?.Set();
+    }
+
+    void DetachPlacementSource(PgClientFlowSource.State source)
+    {
+        Volatile.Write(ref _placementWasDetached, 1);
+        if (!ReferenceEquals(Interlocked.CompareExchange(ref _placementSource, null, source), source))
+            ThrowHelper.ThrowInvalidOperation("The flow is not assigned to the expected protocol source.");
+    }
+
+    void CompletePlacement()
+    {
+        // Placement terminality is published by Release before this edge. A sync consumer may have
+        // consumed an earlier source-stopping wake, so terminal placement owns the final notification.
+        if (Interlocked.Exchange(ref _placementSource, null) is not null)
+            HandoffEvent?.Set();
+    }
+
+    internal void UpdatePendingTimeout(TimeSpan remaining)
+        => _remainingActivationTimeout = remaining;
+
+    internal virtual void Bind(PgClientFlowBindingContext? context) { }
 
     /// Pairs this flow with its protocol control for a queued activation dispatch. The flow
     /// itself is the IThreadPoolWorkItem: an immutable (flow, control) pairing per queued
@@ -61,11 +105,14 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
     internal int CancellationWindow => Volatile.Read(ref _cancellationWindow);
     bool _lastMessageInducesRfq;
     // We store the IsAsync value at bind time so the protocol can keep track of pipeline stalls correctly.
-    bool _isAsyncAtBind;
+    bool _isAsyncAtDispatch;
     // Tri-state int (0 = unset, 1 = true, 2 = false) instead of bool? so reads / writes can be
     // ordered via Volatile.Read / Volatile.Write. The flow body and the consumer (via MoveNext's
     // sync<->async flip) can race on this; without ordering the post-wake-protocol body can read
     // a stale value and take the wrong I/O path.
+    const int ModeUnset = 0;
+    const int ModeAsync = 1;
+    const int ModeSync = 2;
     int _isAsyncState;
 
     // Flow lifecycle state. Reads happen on the consumer thread after the executor has settled,
@@ -88,6 +135,7 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
     Slon.Threading.Tasks.Sources.ManualResetValueTaskSourceCore<PgDecoder> _activationTaskSource;
     CancellationTokenRegistration _activationCancellationTokenRegistration;
     TimeSpan _remainingActivationTimeout;
+    bool _pendingTimeoutStarted;
 
     PgClientFlowObserver? _observer;
     object? _observerState;
@@ -104,37 +152,31 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
         // Volatile.Read: the consumer thread can flip _isAsyncState (sync->async) concurrently with
         // the body reading it. Without the fence a post-wake check could see a stale value and take
         // the sync I/O path on a now-async flow, blocking on I/O that never completes sync.
-        get => Volatile.Read(ref _isAsyncState) == 1;
-        set => Volatile.Write(ref _isAsyncState, value ? 1 : 2);
+        get => Volatile.Read(ref _isAsyncState) == ModeAsync;
+        set => Volatile.Write(ref _isAsyncState, value ? ModeAsync : ModeSync);
     }
 
 
-    // The bind-time async snapshot, stable across the flow's tenure (unlike IsAsync, which a body
-    // may mutate). The policy uses it to decide inline vs TP activation, and the executor's
+    // The dispatch-mode snapshot, stable across the flow's tenure (unlike IsAsync, which a body may
+    // mutate). Autonomous sync flows use sync I/O while still dispatching on the executor. The policy
+    // uses it to decide inline vs TP activation, and the executor's
     // HeadIsSyncHandoff peek to fake-miss sync flows for caller takeover.
-    internal bool IsAsyncAtBind => _isAsyncAtBind;
+    internal bool IsAsyncAtDispatch => _isAsyncAtDispatch;
 
-    // Capture the routing async-mode as the stable snapshot at ENQUEUE, before the flow is published
-    // to the executor's pull. Bind sets the same field, but for a sync flow Bind runs only AFTER its
-    // blocking takeover - too late for the executor's pre-dispatch HeadIsSyncHandoff peek, which would
-    // then read the mutable IsAsync and could mistake a sync flow for async. Set with the value the
-    // enqueue already read so the peek and the routing agree.
-    internal void CaptureAsyncRoutingSnapshot(bool isAsync) => _isAsyncAtBind = isAsync;
-
-    // Pre-bind read of IsAsync for the enqueue path: the protocol routes sync flows through an
+    // Pre-start read of IsAsync for the enqueue path: the protocol routes sync flows through an
     // inline wake-signal dispatch so the producer's thread takes over the executor for that flow.
-    // Asserts the flow set its mode before queueing (same precondition Bind enforces).
+    // Asserts the flow set its mode before queueing (the same precondition Start enforces).
     internal bool IsAsyncForEnqueue
     {
         get
         {
             var state = Volatile.Read(ref _isAsyncState);
-            if (state == 0)
+            if (state == ModeUnset)
             {
                 ThrowHelper.ThrowInvalidOperation("IsAsync was not set by flow before it was queued.");
                 return default;
             }
-            return state == 1;
+            return state == ModeAsync;
         }
     }
 
@@ -150,8 +192,31 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
     // announces that its caller is ready to take the source pump and waits for this flow's turn.
     internal void WaitForSyncHandoff()
     {
-        var control = _boundControl ?? throw new InvalidOperationException("The flow has not been bound to a protocol.");
-        control.WaitForSyncHandoff(this);
+        var waitEvent = HandoffEvent
+            ?? throw new InvalidOperationException("A synchronous caller handoff requires a wait event.");
+        while (!IsCompleted)
+        {
+            var source = Volatile.Read(ref _placementSource);
+            if (source is null)
+            {
+                waitEvent.Reset();
+                if (Volatile.Read(ref _placementSource) is null && !IsCompleted)
+                    waitEvent.Wait();
+                // Attachment is a level change, not the source handoff edge. Clear its wake before
+                // asking the newly observed source to publish/claim the actual handoff.
+                waitEvent.Reset();
+                continue;
+            }
+
+            if (source.WaitForExecutor(this))
+                return;
+
+            // Source completion is not a handoff. Its inert drain will either fault this placement
+            // or detach it for migration; wait for that level change before consulting a source again.
+            waitEvent.Reset();
+            if (ReferenceEquals(source, Volatile.Read(ref _placementSource)) && !IsCompleted)
+                waitEvent.Wait();
+        }
     }
 
     /// <param name="supportsDeferredFlush">
@@ -182,6 +247,7 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
     // honor it. No-op for flows without a caller; the queue binds only a cancelable token, so the
     // common no-token submit pays no field write.
     internal virtual void BindCallerToken(CancellationToken cancellationToken) { }
+    internal virtual CancellationToken MigrationCancellationToken => CancellationToken.None;
 
     public bool IsCompleted => _completed;
     internal bool IsStarted => _started && !_completed;
@@ -269,7 +335,9 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
         _rfqCount = 0;
         _cancellationWindow = 0;
         _lastMessageInducesRfq = false;
-        _boundControl = null;
+        _placementSource = null;
+        _pendingTimeoutStarted = false;
+        _placementWasDetached = 0;
         _enqueueOptions = FlowEnqueueOptions.None;
         _ownsWireCapacity = false;
         _observer = null;
@@ -283,17 +351,6 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
     // the heartbeat's generation-agnostic timeout completer.
     protected virtual bool EnableActivationTimeout => false;
     protected virtual TimeSpan? PendingTimeout => null;
-
-    /// Requests PostgreSQL backend cancellation for this flow on its bound protocol control.
-    /// The protocol retains any request exposure that can outlive the flow.
-    protected void RequestBackendCancellation(BackendCancellationTiming timing = BackendCancellationTiming.AfterGrace,
-        TaskCompletionSource? delivery = null)
-    {
-        var control = _boundControl;
-        if (control is null)
-            return;
-        control.RequestServerCancellation(this, Volatile.Read(ref _cancellationWindow), timing, delivery);
-    }
 
     protected virtual void OnHeartbeat(TimeSpan interval) {}
     protected virtual void OnAbort(Exception exception) {}
@@ -380,6 +437,10 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
 
         internal ValueTask WaitForCancellationAttempt()
             => _executionControl.WaitForCancellationAttempt();
+
+        internal void RequestBackendCancellation(PgClientFlow instigator, int window,
+            BackendCancellationTiming timing, TaskCompletionSource? delivery)
+            => _executionControl.RequestServerCancellation(instigator, window, timing, delivery);
 
         /// Returns an awaitable for the decoder. Activation is a cross-flow rendezvous completed by
         /// another flow's thread, so GetResult throws if not yet completed - async bodies await,
@@ -530,7 +591,7 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
     {
         internal PgClientFlow Flow => flow;
 
-        public bool SupportsDeferredFlush => flow is { _supportsDeferredFlush: true, _isAsyncAtBind: true };
+        public bool SupportsDeferredFlush => flow is { _supportsDeferredFlush: true, _isAsyncAtDispatch: true };
         public bool StallsPipeline => !SupportsDeferredFlush;
         public bool IsAsync => flow.IsAsync;
         public bool HasQueuedFlow => control.HasQueuedFlow;
@@ -665,28 +726,40 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
             }
         }
 
-        public void Bind(TimeSpan activationTimeout)
+        /// Starts this logical operation's pending tenure immediately before source publication.
+        /// Migration preserves the remaining budget and therefore must not restart it on a replacement source.
+        public void Start(PgClientFlowSource.State source, TimeSpan activationTimeout, bool dispatchAsync)
         {
             var state = Volatile.Read(ref flow._isAsyncState);
-            if (state == 0)
+            if (state == ModeUnset)
             {
                 ThrowHelper.ThrowInvalidOperation("IsAsync was not set by flow before it was queued.");
                 return;
             }
 
-            flow._isAsyncAtBind = state == 1;
-            flow._boundControl = control;
+            flow._isAsyncAtDispatch = dispatchAsync;
+            if (!dispatchAsync)
+                flow.AttachPlacementSource(source);
             // Only interactive flows arm the activation timeout. Infinite means the heartbeat's
             // timeout branch never fires for this flow (see OnHeartbeat).
-            flow._remainingActivationTimeout = flow.EnableActivationTimeout
-                ? flow.PendingTimeout ?? activationTimeout
-                : Timeout.InfiniteTimeSpan;
+            if (!flow._pendingTimeoutStarted)
+            {
+                flow._remainingActivationTimeout = flow.EnableActivationTimeout
+                    ? flow.PendingTimeout ?? activationTimeout
+                    : Timeout.InfiniteTimeSpan;
+                flow._pendingTimeoutStarted = true;
+            }
         }
+
+        internal TimeSpan RemainingActivationTimeout => flow._remainingActivationTimeout;
 
         // Tokens are routed from Control (protocol-owned). No per-flow storage.
         public CancellationToken AbortToken => control.AbortToken;
         public CancellationToken StoppingToken => control.StoppingToken;
         internal ValueTask WaitForCancellationAttempt() => control.WaitForCancellationAttempt();
+        internal void RequestServerCancellation(PgClientFlow instigator, int window,
+            BackendCancellationTiming timing, TaskCompletionSource? delivery)
+            => control.RequestServerCancellation(instigator, window, timing, delivery);
         public bool IsProtocolClosed => control.ClosedException is not null;
         public PgClientClosedException? ClosedException => control.ClosedException;
         public Exception FlowTerminationException => control.FlowTerminationException;
@@ -773,11 +846,48 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
         {
             flow.OnStopping(exception);
             Release(exception);
+            flow.CompletePlacement();
         }
 
-        /// Framework lifecycle: marks the flow started. Called from the pipeline policy's
-        /// ExecuteItemAsync before the flow body runs.
-        public void Start() => flow._started = true;
+        /// Commits an inert flow to this wire. Connection-local binding remains fallible and runs
+        /// before execution ownership is published, so a binding failure never touches the wire.
+        public void Bind(PgClientFlowBindingContext? context)
+        {
+            flow.Bind(context);
+            Volatile.Write(ref flow._started, true);
+        }
+
+        /// Delivers a dispatch-time failure that happened before the flow touched the wire. The
+        /// framework still owns retirement; this only completes the caller-facing side.
+        public void FailBeforeStart(Exception exception) => flow.OnStopping(exception);
+
+        /// Releases this source's ownership without completing the caller-visible flow. The executor
+        /// has stopped before the inert drain, so an unstarted flow cannot concurrently activate.
+        public void DetachForMigration(PgClientFlowSource source)
+        {
+            Debug.Assert(!flow._started && !flow._completed);
+            // No body has awaited activation yet, so there is no activation-cycle registration to
+            // dismantle and reconstruct on the replacement source.
+            Debug.Assert(flow._activationCancellationTokenRegistration == default);
+            // Forceful shutdown may have propagated the retired wire's abort into this inert flow
+            // before the source drain transferred it. No body can have observed the pre-start gate;
+            // reset that wire-local verdict so replacement dispatch can activate the same operation.
+            if (IsDecoderSettled)
+            {
+                Debug.Assert(control.AbortToken.IsCancellationRequested);
+                flow._activationTaskSource.Reset();
+            }
+            if (flow._placementSource is not null)
+                flow.DetachPlacementSource(source.SourceState);
+            if (flow.OwnsAdmissionBarrier)
+                control.ReleaseAdmissionBarrier();
+            flow._enqueueOptions = FlowEnqueueOptions.None;
+            if (flow._ownsWireCapacity)
+            {
+                flow._ownsWireCapacity = false;
+                control.ReleaseWireCapacity();
+            }
+        }
 
         /// Framework lifecycle: releases the flow after execution and trailing work have settled.
         /// Tenure-owned resources are released before the per-flow terminal signal publishes the

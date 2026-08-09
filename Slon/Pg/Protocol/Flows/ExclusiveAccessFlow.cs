@@ -127,17 +127,17 @@ sealed class ExclusiveAccessFlow : PgClientFlow
         var innerSource = _innerSource ?? throw new InvalidOperationException("Cannot submit a subflow before the scope is acquired (await HandoffReady first).");
         if (cancellationToken.CanBeCanceled)
             subflow.BindCallerToken(cancellationToken);
-        subflow.GetExecutionControl(_innerControl).Bind(_activationTimeout);
         _protocol.AssignCancellationBoundary(_innerControl, subflow);
         // Reserve handoff only for a synchronous caller already waiting to drive it.
         if (!subflow.NeedsSyncHandoff)
         {
             var inlineEligible = _state.IsPipelineEmpty(innerSource);
-            innerSource.Enqueue(subflow, inlineEligible).Execute(runContinuationsAsynchronously: false);
+            innerSource.Enqueue(subflow, inlineEligible, _activationTimeout)
+                .Execute(runContinuationsAsynchronously: false);
         }
         else
         {
-            innerSource.EnqueueSyncWaiter(subflow);
+            innerSource.EnqueueSyncWaiter(subflow, _activationTimeout);
             if (subflow.DefersSyncHandoff)
                 innerSource.SignalExecutor();
             else

@@ -16,6 +16,7 @@ readonly struct FieldRef<T>
     }
 
     public object Instance => _instance;
+    internal unsafe nint Getter => (nint)_getter;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public ref T Invoke()
@@ -28,4 +29,8 @@ readonly struct FieldRef<T>
 
     public static unsafe FieldRef<T> Create<TInstance>(delegate*<TInstance, ref T> getter, TInstance instance) where TInstance : class
         => new((delegate*<object, ref T>)getter, instance);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static unsafe ref T Invoke(object instance, nint getter)
+        => ref ((delegate*<object, ref T>)getter)(instance);
 }

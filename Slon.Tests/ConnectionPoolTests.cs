@@ -17,6 +17,21 @@ namespace Slon.Tests;
 [TestClass]
 public class ConnectionPoolTests
 {
+    [TestMethod]
+    public async Task DisposeAsync_JoinsDetachedWork()
+    {
+        var detached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var pool = new ConnectionPool<AdmissionConnection>(
+            new AdmissionConnectionFactory(), new() { MaxConnections = 1 });
+        pool.TrackDetached(detached.Task);
+
+        var disposal = pool.DisposeAsync().AsTask();
+        Assert.IsFalse(disposal.IsCompleted);
+
+        detached.SetResult();
+        await disposal;
+    }
+
     sealed class AdmissionConnection : IPoolConnection<AdmissionConnection>
     {
         readonly ConnectionPoolContext<AdmissionConnection> _poolContext;

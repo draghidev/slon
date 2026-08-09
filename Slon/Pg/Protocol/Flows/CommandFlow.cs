@@ -27,6 +27,22 @@ readonly struct CommandFlowOptions
     public TimeSpan? PendingTimeout { get; init; }
 }
 
+abstract class CommandFlowBindingStrategy
+{
+    internal abstract CommandFlowOptions Bind(
+        PgClientFlowBindingContext context, in CommandFlowBinding binding, TimeSpan? pendingTimeout);
+}
+
+readonly struct CommandFlowBinding
+{
+    internal CommandFlowBindingStrategy? Strategy { get; init; }
+    internal object? Owner { get; init; }
+    internal object? Parameters { get; init; }
+    internal object? Dependencies { get; init; }
+    internal nint Getter { get; init; }
+    internal int Behavior { get; init; }
+}
+
 sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSource<FlowCallerInteractionCoreResult>, IValueTaskSource
 {
     internal override bool DefersSyncHandoff => true;
@@ -40,6 +56,7 @@ sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
 
     // Flow state
     CommandFlowOptions _options;
+    readonly CommandFlowBinding _binding;
     FlowCallerInteractionCore<FlowCallerInteractionCoreResult> _callerInteractionCore;
     // Per-read caller token: overlaid by MoveNextAsync(ct) for a single read.
     CancellationToken _callerCancellationToken;
@@ -110,6 +127,7 @@ sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
     Slon.Threading.Tasks.Sources.ManualResetValueTaskSourceCore<bool> _executePipelinedCore;
     ValueTaskSourcePromise<bool>? _pipelinePromise;
     Context _context;
+    bool _contextPublished;
     ValueTask _task;
     // Consumer terminality, body terminality, and framework release are distinct phases. Start and
     // pre-start termination race during shutdown, so one atomic state owns that decision.
@@ -126,12 +144,27 @@ sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
     protected override bool EnableActivationTimeout => true;
     protected override TimeSpan? PendingTimeout => _options.PendingTimeout;
 
-    internal static CommandFlow CreateUninitialized() => new();
-
     public CommandFlow(bool async, params ReadOnlySpan<Command> commands) : this()
         => Initialize(async, commands);
     public CommandFlow(bool async, in CommandFlowOptions options) : this()
         => Initialize(async, options);
+
+    internal CommandFlow(bool async, in CommandFlowBinding binding, TimeSpan? pendingTimeout = null) : this()
+    {
+        IsAsync = async;
+        _binding = binding;
+        _options = new() { PendingTimeout = pendingTimeout };
+        _enumeratorMoveNextTaskSource.CanCompleteConcurrently = true;
+    }
+
+    internal override void Bind(PgClientFlowBindingContext? context)
+    {
+        if (_binding.Strategy is not { } strategy)
+            return;
+        if (context is null)
+            throw new InvalidOperationException("The command flow requires a wire binding context.");
+        Initialize(IsAsync, strategy.Bind(context, _binding, _options.PendingTimeout));
+    }
 
     public CommandFlow Initialize(bool async, params ReadOnlySpan<Command> commands)
         => Initialize(async, options: new() { Commands = new(commands) });
@@ -199,6 +232,7 @@ sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
 
     // Bind at submission because eager writing precedes the first MoveNextAsync.
     internal override void BindCallerToken(CancellationToken cancellationToken) => _flowCancellationToken = cancellationToken;
+    internal override CancellationToken MigrationCancellationToken => _flowCancellationToken;
 
     public Enumerator GetAsyncEnumerator(CancellationToken cancellationToken = default)
     {
@@ -237,6 +271,8 @@ sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
 
     FlowTasks ExecuteAutoCore(Context context)
     {
+        _context = context;
+        Volatile.Write(ref _contextPublished, true);
         if (_flowCancellationToken.IsCancellationRequested)
             RequestCancel(_flowCancellationToken, CancellationScope.RemainingFlow);
         else if (Volatile.Read(ref _cancelRequested))
@@ -315,7 +351,6 @@ sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
             }
         }
 
-        _context = context;
         _pipelinePromise = promise;
         // Static continuation: a bridge into framework state, so no captured scheduling context is needed.
         waiter.OnCompleted(static state =>
@@ -563,7 +598,7 @@ sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
                         }
                     }
                 }
-                else if (!_drainModeEntered && IsAsyncAtBind && !IsAsync)
+                else if (!_drainModeEntered && IsAsyncAtDispatch && !IsAsync)
                 {
                     // An async I/O wake raced a synchronous disposer before the body reached its handoff.
                     if (WaitForDrainOnDispose)
@@ -575,7 +610,7 @@ sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
                     else
                     {
                         // No disposer is waiting to drive; retain asynchronous background draining.
-                        IsAsync = IsAsyncAtBind;
+                        IsAsync = IsAsyncAtDispatch;
                     }
                 }
                 // Preserve the drive mode chosen on first drain entry.
@@ -798,6 +833,15 @@ sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
         _callerInteractionCore.WakeBody(useDedicatedDriver: !IsAsync && Volatile.Read(ref _cancelDelivery) is not null);
     }
 
+    void RequestBackendCancellation(BackendCancellationTiming timing = BackendCancellationTiming.AfterGrace,
+        TaskCompletionSource? delivery = null)
+    {
+        // Cancellation which wins before body entry remains latched in _cancelRequested and is
+        // replayed immediately after the execution context is published.
+        if (Volatile.Read(ref _contextPublished))
+            _context.RequestBackendCancellation(this, CancellationWindow, timing, delivery);
+    }
+
     protected override void OnCancellationWindowCompleted(int completedWindow, int remainingWindowCount)
     {
         if (remainingWindowCount != 0
@@ -961,6 +1005,7 @@ sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
         WaitForDrainOnDispose = true;
         // Dispatch state is per-tenure.
         _pipelinePromise = null;
+        _contextPublished = false;
         _context = default;
         _task = default;
         _bodyState = BodyNotStarted;

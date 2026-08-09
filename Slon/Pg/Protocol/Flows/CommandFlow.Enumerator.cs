@@ -142,7 +142,7 @@ sealed partial class CommandFlow
 
             // Queueing only established FIFO position. This is the first point at which the caller
             // is ready to take the source pump and drive the synchronous body.
-            if (!flow._consumerAdvanced && !flow.IsAsyncAtBind)
+            if (!flow._consumerAdvanced && !flow.IsAsyncAtDispatch)
                 flow.WaitForSyncHandoff();
 
             var takeOverAsyncGate = false;

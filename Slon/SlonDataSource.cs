@@ -10,6 +10,7 @@ using Slon.Pg.Types;
 using Slon.Pg.Serialization;
 using Slon.Pools;
 using Slon.Transport;
+using Draghi.Pipelining;
 
 namespace Slon;
 
@@ -94,6 +95,7 @@ public sealed record SlonDataSourceOptions
     // surface would require thinking through "what's a sensible knob for end users."
     internal TimeSpan HeartbeatInterval { get; init; } = TimeSpan.FromSeconds(1);
     internal TimeSpan MaintenanceInterval { get; init; } = TimeSpan.FromSeconds(1);
+    internal PipelineScheduler? ExecutionScheduler { get; init; }
 
     internal PgClientOptions ToPgClientOptions(OAuthTokenCache? oauthTokens = null,
         ILoggerFactory? loggerFactory = null) => new()
@@ -112,6 +114,7 @@ public sealed record SlonDataSourceOptions
         ScopeReset = ScopeReset.Snapshot(),
         DataRowStreamingThreshold = DataRowStreamingThreshold,
         MaxInFlightFlowsPerWire = MaxInFlightOperationsPerWire,
+        ExecutionScheduler = ExecutionScheduler,
     };
 
     internal bool Validate()
@@ -681,14 +684,11 @@ public sealed class SlonDataSource : DbDataSource
 
     // The multiplexed path lets the pool select a wire before materializing connection-local command
     // state. A rejected candidate rolls that attempt back and reuses the still-unqueued flow shell.
-    internal CommandFlow EnqueueCommands<TState>(Func<PgConnection, TState, CommandFlowOptions> createOptions,
-        TState state, TimeSpan pendingTimeout)
+    internal CommandFlow EnqueueCommands(CommandFlow flow, TimeSpan pendingTimeout)
     {
-        var flow = CommandFlow.CreateUninitialized();
-        var schedule = new CommandScheduleState<TState>(createOptions, state, flow, async: false);
         try
         {
-            _connectionPool.Get(static (ctx, s) => s.TrySchedule(ctx), schedule, pendingTimeout);
+            _connectionPool.Get(static (ctx, f) => TrySchedule(ctx, f), flow, pendingTimeout);
             return flow;
         }
         catch
@@ -698,15 +698,12 @@ public sealed class SlonDataSource : DbDataSource
         }
     }
 
-    internal async ValueTask<CommandFlow> EnqueueCommandsAsync<TState>(
-        Func<PgConnection, TState, CommandFlowOptions> createOptions, TState state, TimeSpan pendingTimeout,
-        CancellationToken cancellationToken)
+    internal async ValueTask<CommandFlow> EnqueueCommandsAsync(
+        CommandFlow flow, TimeSpan pendingTimeout, CancellationToken cancellationToken)
     {
-        var flow = CommandFlow.CreateUninitialized();
-        var schedule = new CommandScheduleState<TState>(createOptions, state, flow, async: true);
         try
         {
-            await _connectionPool.GetAsync(static (ctx, s) => s.TrySchedule(ctx), schedule, pendingTimeout,
+            await _connectionPool.GetAsync(static (ctx, f) => TrySchedule(ctx, f), flow, pendingTimeout,
                 cancellationToken).ConfigureAwait(false);
             return flow;
         }
@@ -717,22 +714,12 @@ public sealed class SlonDataSource : DbDataSource
         }
     }
 
-    readonly struct CommandScheduleState<TState>(Func<PgConnection, TState, CommandFlowOptions> createOptions,
-        TState state, CommandFlow flow, bool async)
+    static bool TrySchedule(ConnectionCandidate<PgConnection> context, CommandFlow flow)
     {
-        public bool TrySchedule(ConnectionCandidate<PgConnection> context)
-        {
-            var enqueueOptions = context.IsIdleCandidate
-                ? FlowEnqueueOptions.None
-                : FlowEnqueueOptions.RequireExistingPipeline;
-            return context.Connection.TryQueue(
-                static (connection, args) => args.Flow.Initialize(
-                    args.Async, args.CreateOptions(connection, args.State)),
-                (CreateOptions: createOptions, State: state, Flow: flow, Async: async),
-                out _,
-                context.CancellationToken,
-                enqueueOptions);
-        }
+        var enqueueOptions = context.IsIdleCandidate
+            ? FlowEnqueueOptions.AllowMigration
+            : FlowEnqueueOptions.AllowMigration | FlowEnqueueOptions.RequireExistingPipeline;
+        return context.Connection.Protocol.TryQueue(flow, enqueueOptions, context.CancellationToken);
     }
 
     public override string ConnectionString => _connectionString;

@@ -8,6 +8,19 @@ namespace Slon.Tests.Pg;
 [TestClass]
 public class FlowSourceTests
 {
+    sealed class ReleasingSyncFlow : PgClientFlow
+    {
+        public ManualResetEventSlim Handoff { get; } = new();
+
+        public ReleasingSyncFlow() => IsAsync = false;
+
+        protected override ManualResetEventSlim? HandoffEvent => Handoff;
+        protected override ValueTask<FlowTasks> ExecuteAuto(Context context) => new(new FlowTasks());
+        protected override void OnStopping(Exception exception) => Handoff.Set();
+        // Reproduce a waiter consuming the early OnStopping edge before terminal publication.
+        protected override void OnReleasing(Exception? exception) => Handoff.Reset();
+    }
+
     // In-memory, but exercises the source's spin/Mres wait points (PgClientFlowSource), which escalate to
     // Sleep(1) once the threadpool is saturated - so a blanket high count goes super-linear. Cap; the raw
     // value still flows under SLON_UNCAPPED=1 for a deliberate soak.
@@ -20,13 +33,27 @@ public class FlowSourceTests
     static bool _onInlineDriveStack;
 
     [TestMethod]
+    public void FailUnstarted_SignalsSyncHandoffAfterTerminalPublication()
+    {
+        var protocol = PgClientProtocol.Create(new PgClientProtocolOptions(PgTestPool.NewOptions()));
+        var source = PgClientFlowSource.Create(protocol, protocol.FlowControl);
+        var flow = new ReleasingSyncFlow();
+        source.EnqueueSyncWaiter(flow);
+
+        flow.GetExecutionControl(protocol.FlowControl).FailUnstarted(new IOException("source completed"));
+
+        Assert.IsTrue(flow.IsCompleted);
+        Assert.IsTrue(flow.Handoff.IsSet);
+    }
+
+    [TestMethod]
     public async Task IdleInlineDrive_IsBoundedToTheEnqueuingItem()
     {
         var protocol = PgClientProtocol.Create(new PgClientProtocolOptions(PgTestPool.NewOptions()));
         var source = PgClientFlowSource.Create(protocol, protocol.FlowControl);
         var enumerator = source.CreateEnumerator();
-        var first = CommandFlow.CreateUninitialized();
-        var second = CommandFlow.CreateUninitialized();
+        var first = new CommandFlow(async: true);
+        var second = new CommandFlow(async: true);
         var callerThread = Environment.CurrentManagedThreadId;
         var firstThread = 0;
         var secondOnInlineDriveStack = false;
@@ -83,7 +110,7 @@ public class FlowSourceTests
         var protocol = PgClientProtocol.Create(new PgClientProtocolOptions(PgTestPool.NewOptions()));
         var source = PgClientFlowSource.Create(protocol, protocol.FlowControl);
         var enumerator = source.CreateEnumerator();
-        var flow = CommandFlow.CreateUninitialized();
+        var flow = new CommandFlow(async: false);
         source.EnqueueSyncWaiter(flow);
 
         Assert.IsFalse(enumerator.TryGetNext(out _));
@@ -119,7 +146,7 @@ public class FlowSourceTests
             var index = new Dictionary<PgClientFlow, int>(ReferenceEqualityComparer.Instance);
             for (int k = 0; k < N; k++)
             {
-                flows[k] = CommandFlow.CreateUninitialized();
+                flows[k] = new CommandFlow(async: true);
                 index[flows[k]] = k;
             }
             var consume = new int[N];
@@ -196,7 +223,7 @@ public class FlowSourceTests
         var source = PgClientFlowSource.Create(protocol, protocol.FlowControl);
         var enumerator = source.CreateEnumerator();
 
-        var flow = CommandFlow.CreateUninitialized();
+        var flow = new CommandFlow(async: false);
         var consumed = 0;
         void Record(PgClientFlow? f)
         {
@@ -262,8 +289,8 @@ public class FlowSourceTests
         // FIFO: an async flow queued AHEAD of the sync waiter. At completion the sync head can't be held
         // until the async ahead of it is disposed - the async head is left for DrainInert, which can't
         // run until the executor resolves Completed, which HasSyncWaiter gates off. Same spin family.
-        var asyncFlow = CommandFlow.CreateUninitialized();
-        var syncFlow = CommandFlow.CreateUninitialized();
+        var asyncFlow = new CommandFlow(async: true);
+        var syncFlow = new CommandFlow(async: false);
         var consumed = new Dictionary<PgClientFlow, int>(ReferenceEqualityComparer.Instance)
         {
             [asyncFlow] = 0,

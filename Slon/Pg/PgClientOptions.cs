@@ -2,6 +2,7 @@ using System.Net;
 using System.Text;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
+using Draghi.Pipelining;
 using Slon.Pg.Protocol;
 
 namespace Slon.Pg;
@@ -32,6 +33,7 @@ sealed class PgClientOptions
     internal ScopeResetOptions ScopeReset { get; init; } = new();
     internal int DataRowStreamingThreshold { get; init; } = BackendMessageBatch.Segmenter.DefaultDataRowStreamingThreshold;
     internal int MaxInFlightFlowsPerWire { get; init; }
+    internal PipelineScheduler? ExecutionScheduler { get; init; }
 
     // Hardcoded to UTF8 until a use for another encoding comes up.
     internal Encoding Encoding => Encoding.UTF8;

@@ -60,6 +60,7 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
 
     readonly ConcurrentQueue<T> _idle = new();
     readonly ConnectionWaitQueue _waitQueue = new();
+    ConcurrentDictionary<Task, byte>? _detachedTasks;
     internal int WaiterCount => _waitQueue.Count;
 
     PoolMetricsSnapshot IPoolMetricsSource.GetMetricsSnapshot()
@@ -142,7 +143,7 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
         _heartbeat = new(options.HeartbeatInterval, _timeProvider, _logger);
         if (_idleSamples is not null)
             _heartbeat.Register(OnPoolHeartbeat);
-        _context = new ConnectionPoolContext<T>(
+        _context = new ConnectionPoolContext<T>(this,
             (connection, isIdle) =>
             {
                 if (isIdle)
@@ -824,6 +825,7 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
         {
             if (tasks is not null)
                 Task.WhenAll(tasks).GetAwaiter().GetResult();
+            WaitForDetachedTasksAsync().GetAwaiter().GetResult();
         }
         finally
         {
@@ -841,11 +843,38 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
         {
             if (tasks is not null)
                 await Task.WhenAll(tasks).ConfigureAwait(false);
+            await WaitForDetachedTasksAsync().ConfigureAwait(false);
         }
         finally
         {
             _heartbeat.Dispose();
         }
+    }
+
+    internal void TrackDetached(Task task)
+    {
+        var tasks = Volatile.Read(ref _detachedTasks);
+        if (tasks is null)
+        {
+            var created = new ConcurrentDictionary<Task, byte>();
+            tasks = Interlocked.CompareExchange(ref _detachedTasks, created, null) ?? created;
+        }
+        tasks.TryAdd(task, 0);
+        _ = RemoveWhenCompletedAsync(tasks, task);
+
+        static async Task RemoveWhenCompletedAsync(ConcurrentDictionary<Task, byte> tasks, Task tracked)
+        {
+            try { await tracked.ConfigureAwait(false); }
+            catch { }
+            finally { tasks.TryRemove(tracked, out _); }
+        }
+    }
+
+    async Task WaitForDetachedTasksAsync()
+    {
+        var tasks = Volatile.Read(ref _detachedTasks);
+        while (tasks is not null && !tasks.IsEmpty)
+            await Task.WhenAll(tasks.Keys).ConfigureAwait(false);
     }
 
     Task[]? DisposeCore(out bool ownsDisposal)

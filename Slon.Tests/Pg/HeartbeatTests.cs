@@ -18,8 +18,7 @@ public class HeartbeatTests
         var flow = new CommandFlow(async: true, Command.Create("select 1"));
         var control = flow.GetExecutionControl(protocol.FlowControl);
 
-        source.Enqueue(flow);
-        control.Bind(TimeSpan.FromSeconds(2));
+        source.Enqueue(flow, activationTimeout: TimeSpan.FromSeconds(2));
         var activation = control.GetDecoderTask(CancellationToken.None);
 
         source.OnActivationHeartbeat(TimeSpan.FromSeconds(1));
@@ -41,8 +40,7 @@ public class HeartbeatTests
         });
         var control = flow.GetExecutionControl(protocol.FlowControl);
 
-        source.Enqueue(flow);
-        control.Bind(TimeSpan.FromMinutes(1));
+        source.Enqueue(flow, activationTimeout: TimeSpan.FromMinutes(1));
         var activation = control.GetDecoderTask(CancellationToken.None);
 
         source.OnActivationHeartbeat(TimeSpan.FromSeconds(2));

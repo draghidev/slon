@@ -62,27 +62,27 @@ readonly struct EnqueueArgs<TCommand> where TCommand : IAdoCommand
     }
 }
 
-readonly struct MultiplexedEnqueueArgs<TCommand> where TCommand : IAdoCommand
+sealed class AdoCommandFlowBindingStrategy<TCommand> : CommandFlowBindingStrategy
+    where TCommand : IAdoCommand
 {
-    public readonly FieldRef<AdoBatchCore<TCommand>> FieldRef;
-    public readonly DbParameterCollection? Parameters;
-    public readonly CommandBehavior Behavior;
-    public readonly CommandTracker Tracker;
-    public readonly PgSerializerOptions SerializerOptions;
-    public readonly ParameterWriterStrategy ParameterWriterStrategy;
-    public readonly TimeSpan PendingTimeout;
+    internal static AdoCommandFlowBindingStrategy<TCommand> Instance { get; } = new();
 
-    public MultiplexedEnqueueArgs(FieldRef<AdoBatchCore<TCommand>> fieldRef, DbParameterCollection? parameters,
-        CommandBehavior behavior, CommandTracker tracker, PgSerializerOptions serializerOptions,
-        ParameterWriterStrategy parameterWriterStrategy, TimeSpan pendingTimeout)
+    AdoCommandFlowBindingStrategy() { }
+
+    internal override CommandFlowOptions Bind(
+        PgClientFlowBindingContext context, in CommandFlowBinding binding, TimeSpan? pendingTimeout)
     {
-        FieldRef = fieldRef;
-        Parameters = parameters;
-        Behavior = behavior;
-        Tracker = tracker;
-        SerializerOptions = serializerOptions;
-        ParameterWriterStrategy = parameterWriterStrategy;
-        PendingTimeout = pendingTimeout;
+        var connection = (context as PgConnection.FlowBindingContext)?.Connection
+            ?? throw new InvalidOperationException(
+                "An ADO datasource command requires a PgConnection flow binding context.");
+        var dependencies = (SlonDataSource.PgDbDependencies)binding.Dependencies!;
+        ref var core = ref FieldRef<AdoBatchCore<TCommand>>.Invoke(binding.Owner!, binding.Getter);
+        return core.CreateCommandFlowOptions(
+            [(DbParameterCollection?)binding.Parameters], (CommandBehavior)binding.Behavior,
+            tracker: dependencies.CommandsTracker, pgConnection: connection,
+            serializerOptions: dependencies.SerializerOptions,
+            parameterWriterStrategy: dependencies.ParameterWriterStrategy,
+            pendingTimeout: pendingTimeout);
     }
 }
 
@@ -272,7 +272,7 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
         return false;
     }
 
-    CommandFlowOptions CreateCommandFlowOptions(ReadOnlySpan<DbParameterCollection?> parametersSpan,
+    internal CommandFlowOptions CreateCommandFlowOptions(ReadOnlySpan<DbParameterCollection?> parametersSpan,
         CommandBehavior behavior, SlonConnection? connection = null, CommandTracker? tracker = null,
         PgConnection? pgConnection = null, PgSerializerOptions? serializerOptions = null,
         ParameterWriterStrategy? parameterWriterStrategy = null, TimeSpan? pendingTimeout = null)
@@ -509,15 +509,8 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
             ThrowIfHasCloseConnection(behavior);
             var pendingTimeout = PendingTimeout;
             var dependencies = dataSource.GetDbDependencies();
-            return dataSource.EnqueueCommands(
-                static (pgConnection, args) => args.FieldRef.Invoke().CreateCommandFlowOptions(
-                    [args.Parameters], args.Behavior, tracker: args.Tracker, pgConnection: pgConnection,
-                    serializerOptions: args.SerializerOptions,
-                    parameterWriterStrategy: args.ParameterWriterStrategy,
-                    pendingTimeout: args.PendingTimeout),
-                new MultiplexedEnqueueArgs<TCommand>(_fieldRef, parameters, behavior,
-                    dependencies.CommandsTracker, dependencies.SerializerOptions,
-                    dependencies.ParameterWriterStrategy, pendingTimeout), pendingTimeout);
+            var binding = CreateDataSourceBinding(parameters, behavior, dependencies);
+            return dataSource.EnqueueCommands(new CommandFlow(async: false, binding, pendingTimeout), pendingTimeout);
         }
 
         connection ??= ThrowConnectionNotInitialized();
@@ -566,18 +559,25 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
         {
             fieldRef.Invoke().ThrowIfHasCloseConnection(behavior);
             var dependencies = await dataSource.GetDbDependenciesAsync(cancellationToken).ConfigureAwait(false);
+            ref var core = ref fieldRef.Invoke();
+            var binding = core.CreateDataSourceBinding(parameters, behavior, dependencies);
             return await dataSource.EnqueueCommandsAsync(
-                static (pgConnection, args) => args.FieldRef.Invoke().CreateCommandFlowOptions(
-                    [args.Parameters], args.Behavior, tracker: args.Tracker, pgConnection: pgConnection,
-                    serializerOptions: args.SerializerOptions,
-                    parameterWriterStrategy: args.ParameterWriterStrategy,
-                    pendingTimeout: args.PendingTimeout),
-                new MultiplexedEnqueueArgs<TCommand>(fieldRef, parameters, behavior,
-                    dependencies.CommandsTracker, dependencies.SerializerOptions,
-                    dependencies.ParameterWriterStrategy, pendingTimeout),
-                pendingTimeout, cancellationToken).ConfigureAwait(false);
+                new CommandFlow(async: true, binding, pendingTimeout), pendingTimeout, cancellationToken)
+                .ConfigureAwait(false);
         }
     }
+
+    CommandFlowBinding CreateDataSourceBinding(DbParameterCollection? parameters, CommandBehavior behavior,
+        SlonDataSource.PgDbDependencies dependencies)
+        => new()
+        {
+            Strategy = AdoCommandFlowBindingStrategy<TCommand>.Instance,
+            Owner = _fieldRef.Instance,
+            Getter = _fieldRef.Getter,
+            Parameters = parameters,
+            Dependencies = dependencies,
+            Behavior = (int)behavior
+        };
 
     [DoesNotReturn]
     static SlonConnection ThrowConnectionNotInitialized()
