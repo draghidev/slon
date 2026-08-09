@@ -29,7 +29,7 @@ public class ExclusiveAccessFlowTests : ConnectionCreatingTest
     [TestMethod]
     public async Task Scope_RoundTrip_RunsCommandOnInnerPipeline()
     {
-        var protocol = await PgTestPool.GetProtocolAsync();
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
         var scope = protocol.QueueExclusiveScope(async: true);
         await scope.HandoffReady;   // acquired exclusive access; the flow owns the wire
 
@@ -42,7 +42,7 @@ public class ExclusiveAccessFlowTests : ConnectionCreatingTest
     [TestMethod]
     public async Task Scope_MultipleCommands_RunSequentially()
     {
-        var protocol = await PgTestPool.GetProtocolAsync();
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
         var scope = protocol.QueueExclusiveScope(async: true);
         await scope.HandoffReady;
 
@@ -84,7 +84,7 @@ public class ExclusiveAccessFlowTests : ConnectionCreatingTest
     [TestMethod]
     public async Task OrdinaryScope_RemainsSchedulableForOuterPipelining()
     {
-        var protocol = await PgTestPool.GetProtocolAsync();
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
         var scope = protocol.QueueExclusiveScope(async: true);
 
         Assert.IsTrue(protocol.IsSchedulable);
@@ -96,7 +96,7 @@ public class ExclusiveAccessFlowTests : ConnectionCreatingTest
     [TestMethod]
     public async Task Scope_FlyweightReuse_AcrossScopes()
     {
-        var protocol = await PgTestPool.GetProtocolAsync();
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
         for (int i = 0; i < 3; i++)
         {
             var scope = protocol.QueueExclusiveScope(async: true);
@@ -109,7 +109,7 @@ public class ExclusiveAccessFlowTests : ConnectionCreatingTest
     [TestMethod]
     public async Task ReleasedScope_RejectsOperationsThroughPriorLease()
     {
-        var protocol = await PgTestPool.GetProtocolAsync();
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
         var prior = protocol.QueueExclusiveScope(async: true);
         await prior.HandoffReady;
         await prior.CompleteScopeAsync();
@@ -210,7 +210,7 @@ public class ExclusiveAccessFlowTests : ConnectionCreatingTest
     [TestMethod]
     public async Task Scope_Release_WithOpenTransaction_FailsAndRecoversWire()
     {
-        var protocol = await PgTestPool.GetProtocolAsync();
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
         var scope = protocol.QueueExclusiveScope(async: true);
         await scope.HandoffReady;
 
@@ -332,7 +332,7 @@ public class ExclusiveAccessFlowTests : ConnectionCreatingTest
     public async Task SqlErrorSubflow_InScope_ResyncsAndScopeStaysUsable()
     {
         // Input-caused SQL error, scope stays usable (resyncs to RFQ), so use the shared pool.
-        var protocol = await PgTestPool.GetProtocolAsync();
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
         {
             var scope = protocol.QueueExclusiveScope(async: true);
             await scope.HandoffReady;
@@ -369,7 +369,7 @@ public class ExclusiveAccessFlowTests : ConnectionCreatingTest
     [TestMethod]
     public async Task PipelinedSubflows_InScope_InnerSourceEscalatesAndPipelines()
     {
-        var protocol = await PgTestPool.GetProtocolAsync();
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
         var scope = protocol.QueueExclusiveScope(async: true);
         await scope.HandoffReady;
 
@@ -396,7 +396,7 @@ public class ExclusiveAccessFlowTests : ConnectionCreatingTest
     [Ignore("Per-thread allocation oracle needs a quiet process; run solo when touching the exclusive-scope flyweight. A concurrent test's allocations pollute GC.GetAllocatedBytesForCurrentThread.")]
     public async Task Scope_RepeatedCycles_NoPerCycleScopeSignalAlloc()
     {
-        var protocol = await PgTestPool.GetProtocolAsync();
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
 
         async Task Cycle()
         {

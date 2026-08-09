@@ -55,7 +55,7 @@ public class ExclusiveAccessFlowStressTests
     [TestMethod]
     public async Task Stress_RepeatedScopes_Reuse()
     {
-        var protocol = await PgTestPool.GetProtocolAsync();
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
         for (int i = 0; i < Iterations; i++)
             await RunScopeAsync(protocol);
     }
@@ -65,7 +65,7 @@ public class ExclusiveAccessFlowStressTests
     [TestMethod]
     public async Task Stress_ManyCommands_WithinScope()
     {
-        var protocol = await PgTestPool.GetProtocolAsync();
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
         var iters = Math.Max(1, Iterations / 10);
         for (int i = 0; i < iters; i++)
             await RunManyCommandsScopeAsync(protocol);
@@ -76,7 +76,7 @@ public class ExclusiveAccessFlowStressTests
     [TestMethod]
     public async Task Stress_SyncSubflow_RecursiveHandoff()
     {
-        var protocol = await PgTestPool.GetProtocolAsync();
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
         var iters = Math.Max(1, Iterations / 2);
         for (int i = 0; i < iters; i++)
             await RunSyncSubflowScopeAsync(protocol);
@@ -86,11 +86,10 @@ public class ExclusiveAccessFlowStressTests
     [TestMethod]
     public async Task Stress_ConcurrentScopes_AcrossProtocols()
     {
-        var concurrency = Math.Min(PgTestPool.MaxConnections, 8);
+        var concurrency = Math.Min(PgTestPool.MaxConnections, PgTestPool.IsolatedConnectionLimit);
         var perThread = Math.Max(1, Iterations / concurrency);
-        var protocols = new PgClientProtocol[concurrency];
-        for (int i = 0; i < concurrency; i++)
-            protocols[i] = await PgTestPool.GetProtocolAsync();
+        await using var protocolSet = await PgTestPool.NewIsolatedProtocolsAsync(concurrency);
+        var protocols = protocolSet.Items;
         var tasks = new Task[concurrency];
         for (int i = 0; i < concurrency; i++)
         {

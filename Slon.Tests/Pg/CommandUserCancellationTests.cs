@@ -32,7 +32,7 @@ public class CommandUserCancellationTests : ConnectionCreatingTest
     [TestMethod]
     public async Task UserCt_PreFired_FirstMoveNextSurfacesOce()
     {
-        var protocol = await PgTestPool.GetProtocolAsync();
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
 
         var flow = new CommandFlow(async: true,
             Command.Create("select generate_series(1, 50)"),
@@ -54,7 +54,7 @@ public class CommandUserCancellationTests : ConnectionCreatingTest
     [TestMethod]
     public async Task UserCt_FiresAfterFirstResult_NextMoveNextSurfacesOce_ProtocolUsable()
     {
-        var protocol = await PgTestPool.GetProtocolAsync();
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
 
         var flow = new CommandFlow(async: true,
             Command.Create("select 'one'"),
@@ -82,7 +82,7 @@ public class CommandUserCancellationTests : ConnectionCreatingTest
     {
         await using var blocker = await PgAdvisoryLock.AcquireAsync();
 
-        var protocol = await PgTestPool.GetProtocolAsync();
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
 
         var flow = new CommandFlow(async: true,
             Command.Create("select 1") with { WithSync = true },

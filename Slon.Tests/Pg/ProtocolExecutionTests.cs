@@ -12,24 +12,24 @@ namespace Slon.Tests.Pg;
 [TestClass]
 public class ProtocolExecutionTests
 {
-    [TestMethod]
+    [ConnectionCreatingTestMethod]
     public async Task Sync_OnRawProtocol_Completes()
     {
-        var protocol = await PgTestPool.GetProtocolAsync();
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
         await PgTestPool.RunSync(protocol, "select 1");
     }
 
-    [TestMethod]
+    [ConnectionCreatingTestMethod]
     public async Task Async_OnRawProtocol_Completes()
     {
-        var protocol = await PgTestPool.GetProtocolAsync();
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
         await PgTestPool.RunAsync(protocol, "select 1");
     }
 
-    [TestMethod]
+    [ConnectionCreatingTestMethod]
     public async Task ExtendedBind_PerColumnResultFormatsAreHonored()
     {
-        var protocol = await PgTestPool.GetProtocolAsync();
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
         var command = Command.Create("select 42, 43") with
         {
             ResultFormats = [PgFormat.Binary, PgFormat.Text]
@@ -51,10 +51,10 @@ public class ProtocolExecutionTests
         await results.DisposeAsync();
     }
 
-    [TestMethod]
+    [ConnectionCreatingTestMethod]
     public async Task WideRowDescription_RemainsValidUntilResultTenureEnds()
     {
-        var protocol = await PgTestPool.GetProtocolAsync();
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
         var sql = "select " + string.Join(",", Enumerable.Range(0, 257).Select(static i => $"{i} as c{i}"));
         var flow = protocol.Queue(new CommandFlow(async: true, Command.Create(sql)));
         var results = flow.GetAsyncEnumerator();
@@ -80,11 +80,11 @@ public class ProtocolExecutionTests
     // select) AND the inner-scope Control (the BEGIN/COMMIT subflows), proving no per-Control duplication.
     // A transaction MUST be scoped in an exclusive flow (holding the wire); running BEGIN/COMMIT as
     // separate flows on the multiplexed protocol would poison the pipeline.
-    [TestMethod]
+    [ConnectionCreatingTestMethod]
     [DoNotParallelize]
     public async Task TransactionStatus_TrackedAcrossOuterFlowAndExclusiveScope()
     {
-        var protocol = await PgTestPool.GetProtocolAsync();
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
         var p = protocol;
 
         // Outer Control: an autocommit command's RFQ is Idle.
@@ -119,20 +119,20 @@ public class ProtocolExecutionTests
     // cycles: HandoffSlot / HandoffActive / SyncHead / SyncTail / ParkedMres / VTS Reset all
     // need to return to rest between iterations. A leak in any would deadlock or skip results
     // during the repeated cycles.
-    [TestMethod]
+    [ConnectionCreatingTestMethod]
     public async Task RepeatedSync_OnRawProtocol_Completes()
     {
-        var protocol = await PgTestPool.GetProtocolAsync();
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
         for (int i = 0; i < 64; i++)
             await PgTestPool.RunSync(protocol, "select 1");
     }
 
     // Many async flows in a tight loop. The post-handoff drain path doesn't apply here (no
     // sync producers), but the async-path VTS Reset / wake / GetResult cycle gets exercised.
-    [TestMethod]
+    [ConnectionCreatingTestMethod]
     public async Task RepeatedAsync_OnRawProtocol_Completes()
     {
-        var protocol = await PgTestPool.GetProtocolAsync();
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
         for (int i = 0; i < 64; i++)
             await PgTestPool.RunAsync(protocol, "select 1");
     }
@@ -141,10 +141,10 @@ public class ProtocolExecutionTests
     // engage/disengage cycle and the executor's transition between the inline takeover path
     // and the normal async-wake path. Any state mishandled across the boundary would surface
     // here as a hang or incorrect ordering.
-    [TestMethod]
+    [ConnectionCreatingTestMethod]
     public async Task AlternatingSyncAsync_OnRawProtocol_Completes()
     {
-        var protocol = await PgTestPool.GetProtocolAsync();
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
         for (int i = 0; i < 16; i++)
         {
             if ((i & 1) == 0)
@@ -158,10 +158,10 @@ public class ProtocolExecutionTests
     // of EnqueueSyncWithHandoff: the sync caller's WaitForParked has to actually block (no
     // ParkedMres set yet because the executor is mid-flight), then wake when the executor
     // drains and reaches its park point. No TP enqueue is emitted by the handoff itself.
-    [TestMethod]
+    [ConnectionCreatingTestMethod]
     public async Task SyncAfterAsync_SameProtocol_Completes()
     {
-        var protocol = await PgTestPool.GetProtocolAsync();
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
         await PgTestPool.RunAsync(protocol, "select 1");
         await PgTestPool.RunSync(protocol, "select 1");
     }
@@ -176,10 +176,10 @@ public class ProtocolExecutionTests
     //
     // Fix: HandoffAcked gate on TryTakeHandoff. The executor cannot pick up HandoffSlot until
     // the sync caller has cleared WaitForParked and is about to SetResult inline.
-    [TestMethod]
+    [ConnectionCreatingTestMethod]
     public async Task SyncWhileAsyncInFlight_SameProtocol_BothComplete()
     {
-        var protocol = await PgTestPool.GetProtocolAsync();
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
 
         await PgTestPool.RunAsync(protocol, "select 1"); // warm
 

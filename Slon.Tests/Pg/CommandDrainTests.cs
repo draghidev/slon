@@ -143,7 +143,7 @@ public class CommandDrainTests : ConnectionCreatingTest
     [DataRow(false, false, DisplayName = "sync flow, sync dispose")]
     public async Task NextCommandResult_DrainsCurrentCommandBodySide(bool flowAsync, bool useAsyncDispose)
     {
-        var protocol = await PgTestPool.GetProtocolAsync();
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
 
         var flow = new CommandFlow(flowAsync,
             Command.Create("select generate_series(1, 100)"),
@@ -167,7 +167,7 @@ public class CommandDrainTests : ConnectionCreatingTest
     [DataRow(false, false, DisplayName = "sync flow, sync dispose")]
     public async Task ConsumerDispose_MidBatch_BodyDrainsRemaining_ConnectionUsable(bool flowAsync, bool useAsyncDispose)
     {
-        var protocol = await PgTestPool.GetProtocolAsync();
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
 
         var flow = new CommandFlow(flowAsync,
             Command.Create("select generate_series(1, 50)"),
@@ -195,7 +195,7 @@ public class CommandDrainTests : ConnectionCreatingTest
     public async Task ConsumerDispose_MidBatch_SyncDispose_OpenBeforePark_Stress()
     {
         var iters = StressEnv.Iterations(fallback: 128, cap: 8_000);
-        var protocol = await PgTestPool.GetProtocolAsync();
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
         for (var i = 0; i < iters; i++)
         {
             var flow = new CommandFlow(async: true,

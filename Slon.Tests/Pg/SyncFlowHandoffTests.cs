@@ -18,7 +18,7 @@ namespace Slon.Tests.Pg;
 // asserted the same thing with a stricter, untoleranced bound on a global oracle, so it flaked
 // on the documented SocketAsyncEngine BCL noise (a TP thread injected during the window).
 [TestClass]
-public class SyncFlowHandoffTests : ConnectionCreatingTest
+public class SyncFlowHandoffTests
 {
     static int StressIterations => StressEnv.Iterations(fallback: 64, cap: 8_000);
 
@@ -36,7 +36,7 @@ public class SyncFlowHandoffTests : ConnectionCreatingTest
 
     static ref FlowCallerInteractionCore<ValueTuple> GetWakeCore(WakeHolder holder) => ref holder.Core;
 
-    [TestMethod]
+    [ConnectionCreatingTestMethod]
     public async Task ConcurrentSyncAndAsync_NoSharedPromiseCollision()
     {
         await using var protocol = await PgTestPool.NewIsolatedAsync();
@@ -70,7 +70,7 @@ public class SyncFlowHandoffTests : ConnectionCreatingTest
             Assert.Fail($"concurrent sync/async raised {failure}");
     }
 
-    [TestMethod]
+    [ConnectionCreatingTestMethod]
     public async Task PairedAsyncAndSync_NoSharedPromiseCollision()
     {
         await using var protocol = await PgTestPool.NewIsolatedAsync();
@@ -141,10 +141,10 @@ public class SyncFlowHandoffTests : ConnectionCreatingTest
     // returns on a different one. If this ever fires, something in the sync flow path is
     // doing implicit thread handoff against the contract. Drives the raw protocol so the
     // assertion attributes to PgClientFlowSource's rendezvous, not to anything above it.
-    [TestMethod]
+    [ConnectionCreatingTestMethod]
     public async Task ReturnsOnCallerThread()
     {
-        var protocol = await PgTestPool.GetProtocolAsync();
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
         await PgTestPool.RunSync(protocol, "select 1"); // warm
 
         var beforeId = Environment.CurrentManagedThreadId;
@@ -180,11 +180,11 @@ public class SyncFlowHandoffTests : ConnectionCreatingTest
     // Slon contributes zero TP work items to the sync flow path. The handoff rendezvous uses
     // a parked-MRES that the executor's IValueTaskSource.OnCompleted sets, so the sync caller's
     // thread blocks on what it would block on anyway, no TP enqueue.
-    [TestMethod]
+    [ConnectionCreatingTestMethod]
     [Ignore("Global TP-counter oracle (counts untracked dispatches) needs a quiet process; run solo when touching sync flow / idle handoff. Not replaceable by a local counter.")]
     public async Task IdlePipeline_DoesNotChurnThreadPool()
     {
-        var protocol = await PgTestPool.GetProtocolAsync();
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
         await PgTestPool.RunSync(protocol, "select 1"); // warm
 
         await Task.Delay(200);
@@ -205,10 +205,10 @@ public class SyncFlowHandoffTests : ConnectionCreatingTest
 
     // Per-iteration thread-id check across repeated handoff cycles. A per-call leak in the handoff
     // state or parked MRES either deadlocks or breaks the caller-thread guarantee.
-    [TestMethod]
+    [ConnectionCreatingTestMethod]
     public async Task RepeatedSync_StaysOnCallerThread()
     {
-        var protocol = await PgTestPool.GetProtocolAsync();
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
         var callerThread = Environment.CurrentManagedThreadId;
         for (int i = 0; i < StressIterations; i++)
         {
@@ -222,13 +222,12 @@ public class SyncFlowHandoffTests : ConnectionCreatingTest
     // distinct protocols never contend on the same source's waiter list. N parallel threads,
     // each driving sync flows on its own protocol; verifies no per-source state leaks across
     // protocols and that each handoff completes independently.
-    [TestMethod]
+    [ConnectionCreatingTestMethod(4)]
     public async Task ConcurrentSync_AcrossProtocols_AllComplete()
     {
-        var concurrency = Math.Min(PgTestPool.MaxConnections, 8);
-        var protocols = new PgClientProtocol[concurrency];
-        for (int i = 0; i < concurrency; i++)
-            protocols[i] = await PgTestPool.GetProtocolAsync();
+        var concurrency = Math.Min(PgTestPool.MaxConnections, PgTestPool.IsolatedConnectionLimit);
+        await using var protocolSet = await PgTestPool.NewIsolatedProtocolsAsync(concurrency);
+        var protocols = protocolSet.Items;
 
         for (int i = 0; i < concurrency; i++)
         {
@@ -272,10 +271,10 @@ public class SyncFlowHandoffTests : ConnectionCreatingTest
     // executor running a flow itself, or signalling the wrong caller's node - would surface as a
     // wrong-thread return or a deadlock. Distinct from ConcurrentSync_AcrossProtocols (which never
     // shares a source's wait-list).
-    [TestMethod]
+    [ConnectionCreatingTestMethod]
     public async Task ConcurrentSync_SameProtocol_EachReturnsOnItsOwnThread()
     {
-        var protocol = await PgTestPool.GetProtocolAsync();
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
         await PgTestPool.RunSync(protocol, "select 1"); // warm
 
         const int concurrency = 8;
@@ -336,10 +335,10 @@ public class SyncFlowHandoffTests : ConnectionCreatingTest
     // Recording the mode per queue index lets the test PROVE the queue order genuinely interleaved
     // sync and async (adjacent indices of differing modes), so a run that was effectively sequential
     // fails as inconclusive rather than passing vacuously.
-    [TestMethod]
+    [ConnectionCreatingTestMethod]
     public async Task MixedSyncAsync_SameProtocol_SyncReturnsOnOwnThreadAndAllComplete()
     {
-        var protocol = await PgTestPool.GetProtocolAsync();
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
         await PgTestPool.RunSync(protocol, "select 1"); // warm
 
         const int syncThreads = 4;
@@ -448,10 +447,10 @@ public class SyncFlowHandoffTests : ConnectionCreatingTest
     // still queued. Current design: the sync flow's priority HandoffSlot + skip-queue window run its
     // nextval BEFORE the earlier async ones, so its rank is lower than a0's/a1's - RED. Unified design:
     // FIFO, so its rank is higher - GREEN.
-    [TestMethod]
+    [ConnectionCreatingTestMethod]
     public async Task SyncFlow_DoesNotJumpAheadOfEarlierAsync_ExecutionOrderIsFifo()
     {
-        var protocol = await PgTestPool.GetProtocolAsync();
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
         await PgTestPool.RunSync(protocol, "create temp sequence exec_rank");
 
         const int blocks = 50;
@@ -502,10 +501,10 @@ public class SyncFlowHandoffTests : ConnectionCreatingTest
     // Run on the current design this is a probe: green = the HandoffSlot / SyncHead coordination is
     // sound (a misroute is not a live bug); a red would have found one. On the unified design it guards
     // the atomic node+flow append against a future edit that splits them.
-    [TestMethod]
+    [ConnectionCreatingTestMethod]
     public async Task ConcurrentSync_SameProtocol_EachThreadDrivesItsOwnFlow()
     {
-        var protocol = await PgTestPool.GetProtocolAsync();
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
         await PgTestPool.RunSync(protocol, "select 1"); // warm
 
         const int concurrency = 8;

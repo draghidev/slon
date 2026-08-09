@@ -23,7 +23,6 @@ public static class TestAssemblyHooks
     [AssemblyCleanup]
     public static async Task DrainAsync()
     {
-        await PgTestPool.DrainAsync();
         await AdoTestPool.DrainAsync();
     }
 }

@@ -27,7 +27,7 @@ public class QueuedFlowCompositionTests : ConnectionCreatingTest
     [DataRow(false, DisplayName = "sync")]
     public async Task OuterPipeline_QueueThenDrain(bool async)
     {
-        var protocol = await PgTestPool.GetProtocolAsync();
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
         var flows = new CommandFlow[8];
         for (var i = 0; i < flows.Length; i++)
             flows[i] = protocol.Queue(new CommandFlow(async, Command.Create("select 1")));
@@ -40,7 +40,7 @@ public class QueuedFlowCompositionTests : ConnectionCreatingTest
     [DataRow(false, DisplayName = "sync")]
     public async Task MultiCommandFlows_QueueThenDrain(bool async)
     {
-        var protocol = await PgTestPool.GetProtocolAsync();
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
         var flows = new CommandFlow[6];
         for (var i = 0; i < flows.Length; i++)
             flows[i] = protocol.Queue(new CommandFlow(async,
@@ -52,7 +52,7 @@ public class QueuedFlowCompositionTests : ConnectionCreatingTest
     [TestMethod]
     public async Task ExclusiveScope_QueueThenDrain()
     {
-        var protocol = await PgTestPool.GetProtocolAsync();
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
         var scope = protocol.QueueExclusiveScope(async: true);
         await scope.HandoffReady;
         var flows = new CommandFlow[8];

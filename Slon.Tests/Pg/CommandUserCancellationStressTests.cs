@@ -52,9 +52,9 @@ public class CommandUserCancellationStressTests
     // shared-pool contract. Protocols publish themselves again when their work retires.
     static async Task RaceLoop(Func<PgClientProtocol, int, Task<CommandFlow.Enumerator>> body)
     {
-        var protocols = new PgClientProtocol[Math.Min(PgTestPool.MaxConnections, 8)];
-        for (var p = 0; p < protocols.Length; p++)
-            protocols[p] = await PgTestPool.GetProtocolAsync();
+        await using var protocolSet = await PgTestPool.NewIsolatedProtocolsAsync(
+            Math.Min(PgTestPool.MaxConnections, PgTestPool.IsolatedConnectionLimit));
+        var protocols = protocolSet.Items;
         // One worker per protocol, each draining a strided slice of the iteration space. The full Iters
         // attempt count is preserved while worker count follows available capacity.
         var workers = new Task[protocols.Length];
@@ -134,9 +134,9 @@ public class CommandUserCancellationStressTests
     [TestMethod]
     public async Task Pipelined_SubmitBound_PreFired_NoTenureCollision()
     {
-        var protocols = new PgClientProtocol[Math.Min(PgTestPool.MaxConnections, 8)];
-        for (var p = 0; p < protocols.Length; p++)
-            protocols[p] = await PgTestPool.GetProtocolAsync();
+        await using var protocolSet = await PgTestPool.NewIsolatedProtocolsAsync(
+            Math.Min(PgTestPool.MaxConnections, PgTestPool.IsolatedConnectionLimit));
+        var protocols = protocolSet.Items;
         // More pool capacity increases overlap; the total tenure attempts remain constant.
         var workers = new Task[protocols.Length];
         for (var p = 0; p < protocols.Length; p++)
@@ -237,7 +237,7 @@ public class CommandUserCancellationStressTests
     public async Task WaitForDrainOnDispose_DrainHitsError_ThrowsBarePgErrorException()
     {
         // An input-caused ErrorResponse leaves the session fine (drains to RFQ), so use the shared pool.
-        var protocol = await PgTestPool.GetProtocolAsync();
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
         // First command succeeds; the SECOND faults (undefined table). One trailing sync => one segment.
         var flow = new CommandFlow(async: true,
             Command.Create("select 1"),
@@ -258,7 +258,7 @@ public class CommandUserCancellationStressTests
     [TestMethod]
     public async Task WaitForDrainOnDispose_MultiSyncErrors_ThrowsAggregate()
     {
-        var protocol = await PgTestPool.GetProtocolAsync();
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
         var bad1 = Command.Create("select * from no_such_table_a") with { PreferSimple = true, WithSync = true };
         var bad2 = Command.Create("select * from no_such_table_b") with { PreferSimple = true, WithSync = true };
         var flow = new CommandFlow(async: true, Command.Create("select 1") with { PreferSimple = true, WithSync = true }, bad1, bad2);

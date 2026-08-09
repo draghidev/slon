@@ -7,10 +7,10 @@ namespace Slon.Tests.Pg;
 [TestClass]
 public class CommandResultEnumerationTests
 {
-    [TestMethod]
+    [ConnectionCreatingTestMethod]
     public async Task DescribeOnlyErrorSurfacesWhenInspectingTheResult()
     {
-        var protocol = await PgTestPool.GetProtocolAsync();
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
         var flow = protocol.Queue(new CommandFlow(async: true,
             Command.Create("THIS IS NOT SQL") with { DescribeOnly = true }));
         var enumerator = flow.GetAsyncEnumerator();
@@ -21,10 +21,10 @@ public class CommandResultEnumerationTests
         await enumerator.DisposeAsync();
     }
 
-    [TestMethod]
+    [ConnectionCreatingTestMethod]
     public async Task AsyncFlow_CanSwitchToSynchronousResultAdvancement()
     {
-        var protocol = await PgTestPool.GetProtocolAsync();
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
         var flow = protocol.Queue(new CommandFlow(async: true,
             Command.Create("select 1"), Command.Create("select 2")));
         var e = flow.GetAsyncEnumerator();
@@ -37,10 +37,10 @@ public class CommandResultEnumerationTests
         e.Dispose();
     }
 
-    [TestMethod]
+    [ConnectionCreatingTestMethod]
     public async Task SuppressedResults_AreDrainedButNotPublished()
     {
-        var protocol = await PgTestPool.GetProtocolAsync();
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
         var flow = protocol.Queue(new CommandFlow(async: true,
             Command.Create("select 1") with { SuppressEnumeration = true },
             Command.Create("select 2"),
@@ -58,10 +58,10 @@ public class CommandResultEnumerationTests
         await e.DisposeAsync();
     }
 
-    [TestMethod]
+    [ConnectionCreatingTestMethod]
     public async Task SuppressedResult_ErrorStillFaultsTheFlow()
     {
-        var protocol = await PgTestPool.GetProtocolAsync();
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
         var flow = protocol.Queue(new CommandFlow(async: true,
             Command.Create("select 1") with { WithSync = true },
             Command.Create("SLECT 2") with { SuppressEnumeration = true, WithSync = true },
@@ -74,12 +74,12 @@ public class CommandResultEnumerationTests
         await Assert.ThrowsExactlyAsync<PgErrorException>(async () => await e.DisposeAsync());
     }
 
-    [TestMethod]
+    [ConnectionCreatingTestMethod]
     [DataRow(true, DisplayName = "async")]
     [DataRow(false, DisplayName = "sync")]
     public async Task ErrorWithoutSync_SkipsCommandsThroughRfq(bool async)
     {
-        var protocol = await PgTestPool.GetProtocolAsync();
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
         var flow = protocol.Queue(new CommandFlow(async,
             Command.Create("SLECT 1"), Command.Create("select 2"), Command.Create("select 3")));
         var e = async ? flow.GetAsyncEnumerator() : flow.GetEnumerator();
@@ -97,12 +97,12 @@ public class CommandResultEnumerationTests
         await PgTestPool.RunAsync(protocol, "select 1");
     }
 
-    [TestMethod]
+    [ConnectionCreatingTestMethod]
     [DataRow(true, DisplayName = "async")]
     [DataRow(false, DisplayName = "sync")]
     public async Task ErrorWithoutSync_ResumesAfterInternalSync(bool async)
     {
-        var protocol = await PgTestPool.GetProtocolAsync();
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
         var flow = protocol.Queue(new CommandFlow(async,
             Command.Create("SLECT 1"),
             Command.Create("select 2") with { WithSync = true },

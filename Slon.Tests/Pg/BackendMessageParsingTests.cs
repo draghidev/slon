@@ -353,10 +353,10 @@ public class BackendMessageParsingTests
             PgClientProtocol.Control.ResolveClientEncoding("UTF-8", configuredDefault));
     }
 
-    [TestMethod]
+    [ConnectionCreatingTestMethod]
     public async Task BackendSyntaxError_SurfacesRenderedPgErrorException()
     {
-        var protocol = await PgTestPool.GetProtocolAsync();
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
         var flow = new CommandFlow(async: true, Command.Create("SLECT 1"));
         Assert.IsTrue(protocol.TryQueue(flow));
 
