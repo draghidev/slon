@@ -815,6 +815,160 @@ public class ConnectionPoolTests
     }
 
     [TestMethod]
+    [Ignore("Legacy wait queue regression; enable when the single-flight coordinator replaces it in Stage 4.")]
+    public async Task AvailabilityPublishedBeforeWaiters_DrivesCompatibleNewcomer()
+    {
+        await using var pool = new ConnectionPool<AdmissionConnection>(
+            new AdmissionConnectionFactory(), new() { MaxConnections = 1 });
+
+        var connection = await pool.GetAsync(default);
+        connection.EnterRecovery();
+        connection.CompleteRecovery();
+
+        using var cancellation = new CancellationTokenSource();
+        var idleOnly = pool.GetAsync(
+            static (candidate, _) => candidate.IsIdleCandidate,
+            state: 0,
+            timeout: default,
+            cancellationToken: cancellation.Token).AsTask();
+        await WaitUntilAsync(() => pool.WaiterCount == 1,
+            "the incompatible renter must park before the compatible newcomer arrives");
+
+        var accepting = pool.GetAsync(
+            static (_, _) => true,
+            state: 0,
+            timeout: default).AsTask();
+
+        Assert.AreSame(connection, await accepting.WaitAsync(TimeSpan.FromSeconds(1)),
+            "a newcomer must drive capacity which predates every queued waiter");
+        cancellation.Cancel();
+        await Assert.ThrowsExactlyAsync<TaskCanceledException>(() => idleOnly);
+    }
+
+    [TestMethod]
+    [Ignore("Legacy wait queue regression; enable when the single-flight coordinator replaces it in Stage 4.")]
+    public async Task ReturnedIdleCandidate_DoesNotHideLaterCompatibleToken()
+    {
+        await using var pool = new ConnectionPool<AdmissionConnection>(
+            new AdmissionConnectionFactory(), new() { MaxConnections = 2 });
+
+        var first = pool.Get(default);
+        first.EnterRecovery();
+        var second = pool.Get(default);
+        second.EnterRecovery();
+
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var release = new ManualResetEventSlim();
+        var rent = Task.Factory.StartNew(() => pool.Get(
+                static (candidate, state) =>
+                {
+                    if (ReferenceEquals(candidate.Connection, state.First))
+                    {
+                        state.Entered.TrySetResult();
+                        state.Release.Wait();
+                        return false;
+                    }
+                    return ReferenceEquals(candidate.Connection, state.Second);
+                },
+                (First: first, Second: second, Entered: entered, Release: release),
+                Timeout.InfiniteTimeSpan),
+            CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+
+        await WaitUntilAsync(() => pool.WaiterCount == 1,
+            "the renter must park before the first idle token is published");
+        first.CompleteRecovery();
+        first.RunInitialWorkToIdle();
+        await entered.Task;
+        second.CompleteRecovery();
+        second.RunInitialWorkToIdle();
+        release.Set();
+
+        Assert.AreSame(second, await rent.WaitAsync(TimeSpan.FromSeconds(1)),
+            "returning the first rejected token must not truncate the idle scan before the second token");
+    }
+
+    [TestMethod]
+    [Ignore("Legacy wait queue regression; enable when the single-flight coordinator replaces it in Stage 4.")]
+    public async Task LateCompatibleWaiter_IsDrivenAfterAwakenedWaiterRejectsMultiplexCandidate()
+    {
+        await AssertLateCompatibleWaiterIsDriven(static (_, state) =>
+        {
+            state.Entered.TrySetResult();
+            state.Release.Wait();
+            return false;
+        });
+    }
+
+    [TestMethod]
+    [Ignore("Legacy wait queue regression; enable when the single-flight coordinator replaces it in Stage 4.")]
+    public async Task LateCompatibleWaiter_IsDrivenAfterAwakenedWaiterThrows()
+    {
+        await AssertLateCompatibleWaiterIsDriven(static (_, state) =>
+        {
+            state.Entered.TrySetResult();
+            state.Release.Wait();
+            throw new InvalidOperationException("reject the restored multiplex candidate");
+        }, expectFirstFailure: true);
+    }
+
+    [TestMethod]
+    [Ignore("Legacy wait queue regression; enable when the single-flight coordinator replaces it in Stage 4.")]
+    public async Task LateCompatibleWaiter_IsDrivenAfterAwakenedWaiterConsumesMultiplexCandidate()
+    {
+        await AssertLateCompatibleWaiterIsDriven(static (_, state) =>
+        {
+            state.Entered.TrySetResult();
+            state.Release.Wait();
+            return true;
+        }, expectFirstSuccess: true);
+    }
+
+    static async Task AssertLateCompatibleWaiterIsDriven(
+        Func<ConnectionCandidate<AdmissionConnection>,
+            (TaskCompletionSource Entered, ManualResetEventSlim Release), bool> firstSchedule,
+        bool expectFirstFailure = false,
+        bool expectFirstSuccess = false)
+    {
+        await using var pool = new ConnectionPool<AdmissionConnection>(
+            new AdmissionConnectionFactory(), new() { MaxConnections = 1 });
+        var connection = await pool.GetAsync(default);
+        connection.EnterRecovery();
+
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var release = new ManualResetEventSlim();
+        using var cancellation = new CancellationTokenSource();
+        var first = pool.GetAsync(firstSchedule, (Entered: entered, Release: release), default,
+            cancellation.Token).AsTask();
+        await WaitUntilAsync(() => pool.WaiterCount == 1,
+            "the first waiter must park while the connection is recovering");
+
+        connection.CompleteRecovery();
+        await entered.Task;
+
+        var accepting = pool.GetAsync(
+            static (_, _) => true,
+            state: 0,
+            timeout: default).AsTask();
+        await WaitUntilAsync(() => pool.WaiterCount == 1,
+            "the compatible waiter must link while the first waiter owns the availability edge");
+        release.Set();
+
+        if (expectFirstFailure)
+            await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => first);
+        else if (expectFirstSuccess)
+            Assert.AreSame(connection, await first);
+
+        Assert.AreSame(connection, await accepting.WaitAsync(TimeSpan.FromSeconds(1)),
+            "settling the first attempt must drive the compatible successor");
+
+        if (!expectFirstFailure && !expectFirstSuccess)
+        {
+            cancellation.Cancel();
+            await Assert.ThrowsExactlyAsync<TaskCanceledException>(() => first);
+        }
+    }
+
+    [TestMethod]
     public async Task ReturnedIdleCandidate_RemainsVisiblePastRejectingSyncWaiter()
     {
         var pool = new ConnectionPool<AdmissionConnection>(
@@ -946,6 +1100,27 @@ public class ConnectionPoolTests
         queue.Pass(wake, idleAvailable: false);
         var passed = await follower.Task;
         queue.Consume(passed, idleAvailable: false);
+    }
+
+    [TestMethod]
+    [Ignore("Legacy wait queue regression; enable when the single-flight coordinator replaces it in Stage 4.")]
+    public async Task RetiringDetachedWake_DoesNotEraseOutstandingAvailability()
+    {
+        var queue = new ConnectionPool<AdmissionConnection>.ConnectionWaitQueue();
+        var first = queue.Enqueue();
+        var second = queue.Enqueue();
+        queue.Signal();
+        var firstWake = await first.Task;
+        queue.Signal();
+        var secondWake = await second.Task;
+        queue.Signal();
+
+        queue.Pass(firstWake, idleAvailable: false);
+        var follower = queue.Enqueue();
+        _ = queue.Requeue(secondWake, idleAvailable: false);
+
+        Assert.IsTrue(follower.Task.Wait(TimeSpan.FromSeconds(1)),
+            "retiring one detached wake must not erase an availability edge owed to a follower");
     }
 
     [TestMethod]
