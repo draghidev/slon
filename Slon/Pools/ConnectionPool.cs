@@ -305,7 +305,7 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
         {
             while (true)
             {
-                waiter = _waitQueue.Enqueue();
+                waiter ??= _waitQueue.Enqueue();
                 if (TryAcquire(waiter, ref wake, schedule, state, cancellationToken,
                     out var future, out var available))
                 {
@@ -330,16 +330,16 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
                         : await OpenConnectionAsync(future, schedule, state, deadline.GetRemaining(), cancellationToken).ConfigureAwait(false);
                 }
 
-                _waitQueue.Pass(wake);
+                waiter = _waitQueue.Requeue(wake, !_idle.IsEmpty);
                 wake = default;
             }
         }
         catch (Exception ex)
         {
             if (waiter is not null)
-                _waitQueue.Remove(waiter);
+                _waitQueue.Remove(waiter, !_idle.IsEmpty);
             if (wake.Remaining != 0)
-                _waitQueue.Pass(wake);
+                _waitQueue.Pass(wake, !_idle.IsEmpty);
 
             var token = CancellationToken.None;
             if (timeoutSource is not null)
@@ -372,7 +372,7 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
         {
             while (true)
             {
-                waiter = _waitQueue.Enqueue(synchronous: true);
+                waiter ??= _waitQueue.Enqueue(synchronous: true);
                 if (TryAcquire(waiter, ref wake, schedule, state, CancellationToken.None,
                     out var future, out var available))
                 {
@@ -403,16 +403,16 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
                         : OpenConnection(future, schedule, state, deadline.GetRemaining());
                 }
 
-                _waitQueue.Pass(wake);
+                waiter = _waitQueue.Requeue(wake, !_idle.IsEmpty, synchronous: true);
                 wake = default;
             }
         }
         catch
         {
             if (waiter is not null)
-                _waitQueue.Remove(waiter);
+                _waitQueue.Remove(waiter, !_idle.IsEmpty);
             if (wake.Remaining != 0)
-                _waitQueue.Pass(wake);
+                _waitQueue.Pass(wake, !_idle.IsEmpty);
             throw;
         }
         finally
@@ -425,7 +425,7 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
         Func<ConnectionCandidate<T>, TState, bool>? schedule, TState state, CancellationToken cancellationToken,
         out ConnectionFuture? future, out T? connection)
     {
-        if (waiter is { CanRescan: false })
+        if (waiter is not null && !waiter.TryTakeRescan())
         {
             future = null;
             connection = null;
@@ -436,12 +436,12 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
 
         if (wake.Remaining != 0)
         {
-            _waitQueue.Consume(wake);
+            _waitQueue.Consume(wake, !_idle.IsEmpty);
             wake = default;
         }
         else if (waiter is not null)
         {
-            _waitQueue.Remove(waiter);
+            _waitQueue.Remove(waiter, !_idle.IsEmpty);
         }
         return true;
     }
@@ -467,15 +467,20 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
                 }
                 catch
                 {
-                    if (!ReturnIdleToken(idle))
+                    if (ReturnIdleToken(idle))
+                        SignalAvailability();
+                    else
                         RecordIdleRemovalForPruning();
                     throw;
                 }
             }
 
-            if (!ReturnIdleToken(idle))
+            if (ReturnIdleToken(idle))
+                SignalAvailability();
+            else
                 RecordIdleRemovalForPruning();
-            // Do not consume our own re-publication in this synchronous drain.
+            // Do not dequeue the token we just returned in this synchronous scan. Its signal lets
+            // this waiter retry after parking, or hands the candidate to the next waiter.
             if (idle.IsIdle && idle.IsSchedulable)
                 break;
         }
@@ -1049,20 +1054,21 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
         public bool IsCompleted => Volatile.Read(ref _published);
     }
 
-    sealed class ConnectionWaitQueue
+    internal sealed class ConnectionWaitQueue
     {
         readonly Lock _lock = new();
         Waiter? _head;
         Waiter? _tail;
         int _count;
         int _activeWakes;
+        int _demand;
+        bool _signalPending;
         bool _disposed;
 
-        // Advisory rent-path gate, deliberately lock-free. Enqueue and CanRescan under the lock
-        // stay authoritative, and a stale read races a concurrent enqueue the same way the locked
-        // read did. Staleness can only route a caller onto the other path, never lose a wake.
+        // Advisory rent-path gate, deliberately lock-free. Publish queued and awakened demand as
+        // one level so a newcomer cannot observe a false zero while a waiter changes form.
         public bool HasDemand
-            => Volatile.Read(ref _count) != 0 || Volatile.Read(ref _activeWakes) != 0;
+            => Volatile.Read(ref _demand) != 0;
 
         public int Count
         {
@@ -1076,10 +1082,14 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
         public Waiter Enqueue(bool synchronous = false)
         {
             var waiter = new Waiter(synchronous);
+            Waiter? signaled = null;
+            Wake wake = default;
             lock (_lock)
             {
                 ObjectDisposedException.ThrowIf(_disposed, this);
                 waiter.CanRescan = _head is null && _activeWakes == 0;
+                if (waiter.CanRescan)
+                    _signalPending = false;
                 waiter.Previous = _tail;
                 if (_tail is null)
                     _head = waiter;
@@ -1087,7 +1097,21 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
                     _tail.Next = waiter;
                 _tail = waiter;
                 _count++;
+
+                // A prior waiter may have rejected an available candidate before this waiter
+                // existed. Reattach that retained edge to the FIFO now that it can be passed.
+                if (!waiter.CanRescan && _signalPending && _activeWakes == 0)
+                {
+                    signaled = _head!;
+                    wake = new Wake(_count);
+                    _activeWakes++;
+                    Unlink(signaled);
+                    _signalPending = false;
+                    signaled.Wake = wake;
+                }
+                PublishDemand();
             }
+            signaled?.Complete(wake);
             return waiter;
         }
 
@@ -1099,66 +1123,170 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
             {
                 waiter = _head;
                 if (waiter is null)
+                {
+                    if (_activeWakes != 0)
+                        _signalPending = true;
                     return;
+                }
 
                 var count = _count;
-                Unlink(waiter);
                 wake = new Wake(count);
                 _activeWakes++;
+                Unlink(waiter);
+                _signalPending = false;
                 waiter.Wake = wake;
+                PublishDemand();
             }
             waiter.Complete(wake);
         }
 
-        public void Pass(Wake wake)
+        public void Pass(Wake wake, bool idleAvailable = false)
         {
             Waiter? waiter;
             Wake next;
             lock (_lock)
             {
-                if (wake.Remaining <= 1 || (waiter = _head) is null)
+                waiter = _head;
+                if ((wake.Remaining > 1 || idleAvailable) && waiter is not null)
+                {
+                    Unlink(waiter);
+                    next = new Wake(Math.Max(1, wake.Remaining - 1));
+                    _signalPending = false;
+                    waiter.Wake = next;
+                }
+                else if (_signalPending && waiter is not null)
+                {
+                    Unlink(waiter);
+                    next = new Wake(1);
+                    _signalPending = false;
+                    waiter.Wake = next;
+                }
+                else
                 {
                     Debug.Assert(_activeWakes > 0);
                     _activeWakes--;
+                    _signalPending = false;
+                    PublishDemand();
                     return;
                 }
-
-                Unlink(waiter);
-                next = new Wake(wake.Remaining - 1);
-                waiter.Wake = next;
+                PublishDemand();
             }
             waiter.Complete(next);
         }
 
-        public void Consume(Wake wake)
+        // Converts the current wake ownership back into a queued wait without publishing a
+        // demand-free interval. A newcomer must not enter between those two forms of the same
+        // rent operation.
+        public Waiter Requeue(Wake wake, bool idleAvailable, bool synchronous = false)
+        {
+            var current = new Waiter(synchronous);
+            Waiter? waiter = null;
+            Wake next = default;
+            lock (_lock)
+            {
+                ObjectDisposedException.ThrowIf(_disposed, this);
+                Debug.Assert(_activeWakes > 0);
+
+                // Only a waiter which was already queued may inherit the availability this
+                // caller just rejected. Waking the caller's replacement for the same idle
+                // candidate would make an incompatible renter spin indefinitely.
+                var successor = _head;
+
+                current.Previous = _tail;
+                if (_tail is null)
+                    _head = current;
+                else
+                    _tail.Next = current;
+                _tail = current;
+                _count++;
+
+                if ((wake.Remaining > 1 || idleAvailable || _signalPending) && successor is not null)
+                {
+                    waiter = successor;
+                    Unlink(successor);
+                    next = new Wake(wake.Remaining > 1 ? wake.Remaining - 1 : 1);
+                    _signalPending = false;
+                    waiter.Wake = next;
+                }
+                else
+                {
+                    _activeWakes--;
+                    if (idleAvailable || _signalPending)
+                    {
+                        _signalPending = true;
+                    }
+                    else if (successor is null)
+                    {
+                        current.CanRescan = true;
+                    }
+                }
+                PublishDemand();
+            }
+            waiter?.Complete(next);
+            return current;
+        }
+
+        public void Consume(Wake wake, bool idleAvailable)
         {
             Debug.Assert(wake.Remaining != 0);
+            Waiter? waiter = null;
+            Wake next = default;
             lock (_lock)
             {
                 Debug.Assert(_activeWakes > 0);
-                _activeWakes--;
+                if ((_signalPending || idleAvailable) && (waiter = _head) is not null)
+                {
+                    Unlink(waiter);
+                    next = new Wake(1);
+                    _signalPending = false;
+                    waiter.Wake = next;
+                }
+                else
+                {
+                    _activeWakes--;
+                    _signalPending = false;
+                }
+                PublishDemand();
             }
+            waiter?.Complete(next);
         }
 
         // Removes a queued waiter or preserves a wake already detached for it.
-        public void Remove(Waiter waiter)
+        public void Remove(Waiter waiter, bool idleAvailable = false)
         {
-            if (TryRemove(waiter, out var wake))
+            var detached = TryRemove(waiter, out var wake, out var successor);
+            successor?.Complete(successor.Wake);
+            if (detached)
             {
-                Pass(wake);
+                Pass(wake, idleAvailable);
                 waiter.WaitForDetachedSignal();
             }
             waiter.Dispose();
         }
 
-        bool TryRemove(Waiter waiter, out Wake wake)
+        bool TryRemove(Waiter waiter, out Wake wake, out Waiter? successor)
         {
             lock (_lock)
             {
+                successor = null;
                 if (waiter.IsQueued)
                 {
+                    var wasHead = ReferenceEquals(waiter, _head);
                     Unlink(waiter);
-                    wake = default;
+                    if (wasHead && _activeWakes == 0 && _head is { } head)
+                    {
+                        wake = new(1);
+                        _activeWakes++;
+                        Unlink(head);
+                        _signalPending = false;
+                        head.Wake = wake;
+                        successor = head;
+                    }
+                    else
+                    {
+                        wake = default;
+                    }
+                    PublishDemand();
                     return false;
                 }
 
@@ -1180,7 +1308,9 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
                 catch (OperationCanceledException)
                 {
                 }
-                if (!TryRemove(waiter, out var wake))
+                var detached = TryRemove(waiter, out var wake, out var successor);
+                successor?.Complete(successor.Wake);
+                if (!detached)
                 {
                     waiter.ThrowIfFailed();
                     cancellationToken.ThrowIfCancellationRequested();
@@ -1207,6 +1337,7 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
                 var waiters = _head;
                 _head = _tail = null;
                 _count = 0;
+                PublishDemand();
                 // Publish failure before a timed sync waiter can observe detachment and dispose
                 // its signal. Async waiters complete asynchronously. Sync completion only sets the event.
                 while (waiters is not null)
@@ -1236,6 +1367,12 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
             _count--;
         }
 
+        void PublishDemand()
+        {
+            Debug.Assert(_lock.IsHeldByCurrentThread);
+            Volatile.Write(ref _demand, _count + _activeWakes);
+        }
+
         internal sealed class Waiter : IDisposable
         {
             readonly TaskCompletionSource<Wake>? _completion;
@@ -1257,6 +1394,13 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
             internal Wake Wake;
 
             public Task<Wake> Task => _completion!.Task;
+            internal bool TryTakeRescan()
+            {
+                if (!CanRescan)
+                    return false;
+                CanRescan = false;
+                return true;
+            }
             internal void Wait(CancellationToken cancellationToken) => _signal!.Wait(cancellationToken);
             internal void WaitForDetachedSignal() => _signal?.Wait();
             public void Dispose() => _signal?.Dispose();

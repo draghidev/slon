@@ -815,6 +815,30 @@ public class ConnectionPoolTests
     }
 
     [TestMethod]
+    public async Task ReturnedIdleCandidate_RemainsVisiblePastRejectingSyncWaiter()
+    {
+        var pool = new ConnectionPool<AdmissionConnection>(
+            new AdmissionConnectionFactory(), new() { MaxConnections = 1 });
+        var connection = pool.Get(default);
+        connection.RunInitialWorkToIdle();
+
+        var rejecting = Task.Factory.StartNew(() => pool.Get(
+                static (_, _) => false, state: 0, Timeout.InfiniteTimeSpan),
+            CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+        await WaitUntilAsync(() => pool.WaiterCount == 1,
+            "the rejecting waiter must park after returning the idle candidate");
+
+        var accepting = Task.Factory.StartNew(() => pool.Get(
+                static (_, _) => true, state: 0, Timeout.InfiniteTimeSpan),
+            CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+        Assert.AreSame(connection, await accepting,
+            "a returned idle token must remain discoverable past an incompatible waiter");
+
+        await pool.DisposeAsync();
+        await Assert.ThrowsExactlyAsync<ObjectDisposedException>(() => rejecting);
+    }
+
+    [TestMethod]
     public async Task CancelledWaiter_DoesNotConsumeLaterAvailability()
     {
         await using var pool = new ConnectionPool<AdmissionConnection>(
@@ -905,6 +929,207 @@ public class ConnectionPoolTests
 
         connection.RunInitialWorkToIdle();
         Assert.AreSame(connection, await newcomer);
+    }
+
+    [TestMethod]
+    public async Task SignalWithoutQueuedWaiter_IsPassedToLaterPublication()
+    {
+        var queue = new ConnectionPool<AdmissionConnection>.ConnectionWaitQueue();
+        var owner = queue.Enqueue();
+        queue.Signal();
+        var wake = await owner.Task;
+
+        queue.Signal();
+        var follower = queue.Enqueue();
+        Assert.IsFalse(follower.CanRescan);
+
+        queue.Pass(wake, idleAvailable: false);
+        var passed = await follower.Task;
+        queue.Consume(passed, idleAvailable: false);
+    }
+
+    [TestMethod]
+    public void CancellationAfterDetachment_PreservesOwnedWake()
+    {
+        var queue = new ConnectionPool<AdmissionConnection>.ConnectionWaitQueue();
+        var waiter = queue.Enqueue(synchronous: true);
+        queue.Signal();
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+
+        var wake = queue.Wait(waiter, cancellation.Token);
+
+        Assert.AreNotEqual(0, wake.Remaining,
+            "cancellation must not discard a wake already detached for this waiter");
+        queue.Consume(wake, idleAvailable: false);
+    }
+
+    [TestMethod]
+    public async Task RemovingDetachedWaiter_PassesWakeToQueuedFollower()
+    {
+        var queue = new ConnectionPool<AdmissionConnection>.ConnectionWaitQueue();
+        var removed = queue.Enqueue();
+        var follower = queue.Enqueue();
+        queue.Signal();
+        await removed.Task;
+
+        queue.Remove(removed);
+
+        var wake = await follower.Task;
+        queue.Consume(wake, idleAvailable: false);
+    }
+
+    [TestMethod]
+    public async Task RemovingQueuedHead_TransfersRescanRightToFollower()
+    {
+        var queue = new ConnectionPool<AdmissionConnection>.ConnectionWaitQueue();
+        var removed = queue.Enqueue();
+        var follower = queue.Enqueue();
+        Assert.IsTrue(removed.CanRescan);
+        Assert.IsFalse(follower.CanRescan);
+
+        queue.Remove(removed);
+
+        Assert.IsTrue(follower.Task.IsCompleted,
+            "removing the sole rescan owner must not leave its barred follower parked");
+        var wake = await follower.Task;
+        queue.Consume(wake, idleAvailable: false);
+    }
+
+    [TestMethod]
+    public async Task Dispose_FaultsQueuedWaiterWithoutRevokingDetachedWake()
+    {
+        var queue = new ConnectionPool<AdmissionConnection>.ConnectionWaitQueue();
+        var owner = queue.Enqueue();
+        var queued = queue.Enqueue();
+        queue.Signal();
+        var wake = await owner.Task;
+
+        queue.Dispose();
+
+        await Assert.ThrowsExactlyAsync<ObjectDisposedException>(async () => await queued.Task);
+        queue.Consume(wake, idleAvailable: false);
+    }
+
+    [TestMethod]
+    public async Task RequeueAfterDispose_RejectsWithoutRevokingDetachedWake()
+    {
+        var queue = new ConnectionPool<AdmissionConnection>.ConnectionWaitQueue();
+        var waiter = queue.Enqueue();
+        queue.Signal();
+        var wake = await waiter.Task;
+
+        queue.Dispose();
+
+        Assert.ThrowsExactly<ObjectDisposedException>(() => queue.Requeue(wake, idleAvailable: false));
+        queue.Pass(wake);
+    }
+
+    [TestMethod]
+    public async Task ExclusiveIdleRenters_ConcurrentSyncAsync_NeverLoseAvailability_Stress()
+    {
+        var iterations = Pg.StressEnv.Iterations(fallback: 32, cap: 200_000);
+        await using var pool = new ConnectionPool<AdmissionConnection>(
+            new AdmissionConnectionFactory(), new() { MaxConnections = 1 });
+        var connection = pool.Get(default);
+        connection.MarkBusy();
+        connection.RunInitialWorkToIdle();
+
+        const int workerCount = 4;
+        using var start = new ManualResetEventSlim();
+        var completed = 0;
+        var workers = new Task[workerCount];
+        for (var worker = 0; worker < workerCount; worker++)
+        {
+            var offset = worker;
+            workers[worker] = Task.Factory.StartNew(() =>
+            {
+                start.Wait();
+                for (var i = offset; i < iterations; i += workerCount)
+                {
+                    AdmissionConnection rented;
+                    if ((i & 1) == 0)
+                    {
+                        rented = pool.Get(
+                            static (candidate, _) => TryClaimIdle(candidate),
+                            state: 0,
+                            Timeout.InfiniteTimeSpan);
+                    }
+                    else
+                    {
+                        rented = pool.GetAsync(
+                                static (candidate, _) => TryClaimIdle(candidate),
+                                state: 0,
+                                timeout: default)
+                            .AsTask().GetAwaiter().GetResult();
+                    }
+
+                    if ((i & 7) == 0)
+                        Thread.Yield();
+                    rented.RunInitialWorkToIdle();
+                    Interlocked.Increment(ref completed);
+                }
+            }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+        }
+
+        start.Set();
+        await Task.WhenAll(workers);
+        Assert.AreEqual(iterations, Volatile.Read(ref completed));
+
+        static bool TryClaimIdle(ConnectionCandidate<AdmissionConnection> candidate)
+        {
+            if (!candidate.IsIdleCandidate)
+                return false;
+            candidate.Connection.MarkBusy();
+            return true;
+        }
+    }
+
+    [TestMethod]
+    public async Task AwakenedWaiter_ConcurrentNewcomer_NeverBarges_Stress()
+    {
+        var iterations = Pg.StressEnv.Iterations(fallback: 32, cap: 50_000);
+        await using var pool = new ConnectionPool<AdmissionConnection>(
+            new AdmissionConnectionFactory(allowPruning: false), new() { MaxConnections = 1 });
+        var connection = await Rent();
+        using var publish = new AutoResetEvent(false);
+        using var published = new AutoResetEvent(false);
+        var publisher = Task.Factory.StartNew(() =>
+        {
+            for (var i = 0; i < iterations; i++)
+            {
+                publish.WaitOne();
+                connection.RunInitialWorkToIdle();
+                published.Set();
+            }
+        }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+
+        for (var i = 0; i < iterations; i++)
+        {
+            var awakened = Rent().AsTask();
+            Assert.IsTrue(SpinWait.SpinUntil(() => pool.WaiterCount == 1, TimeSpan.FromSeconds(1)));
+
+            publish.Set();
+            var newcomer = Rent().AsTask();
+            published.WaitOne();
+
+            Assert.AreSame(connection, await awakened,
+                "a newcomer must not bypass the demand moving from queued to awakened");
+            Assert.IsFalse(newcomer.IsCompleted);
+            connection.RunInitialWorkToIdle();
+            Assert.AreSame(connection, await newcomer);
+        }
+
+        await publisher;
+
+        ValueTask<AdmissionConnection> Rent()
+            => pool.GetAsync(static (candidate, _) =>
+            {
+                if (!candidate.IsIdleCandidate)
+                    return false;
+                candidate.Connection.MarkBusy();
+                return true;
+            }, state: 0, timeout: default);
     }
 
     [TestMethod]
