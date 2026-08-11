@@ -815,7 +815,6 @@ public class ConnectionPoolTests
     }
 
     [TestMethod]
-    [Ignore("Legacy wait queue regression; enable when the single-flight coordinator replaces it in Stage 4.")]
     public async Task AvailabilityPublishedBeforeWaiters_DrivesCompatibleNewcomer()
     {
         await using var pool = new ConnectionPool<AdmissionConnection>(
@@ -846,7 +845,6 @@ public class ConnectionPoolTests
     }
 
     [TestMethod]
-    [Ignore("Legacy wait queue regression; enable when the single-flight coordinator replaces it in Stage 4.")]
     public async Task ReturnedIdleCandidate_DoesNotHideLaterCompatibleToken()
     {
         await using var pool = new ConnectionPool<AdmissionConnection>(
@@ -862,7 +860,7 @@ public class ConnectionPoolTests
         var rent = Task.Factory.StartNew(() => pool.Get(
                 static (candidate, state) =>
                 {
-                    if (ReferenceEquals(candidate.Connection, state.First))
+                    if (candidate.IsIdleCandidate && ReferenceEquals(candidate.Connection, state.First))
                     {
                         state.Entered.TrySetResult();
                         state.Release.Wait();
@@ -876,19 +874,22 @@ public class ConnectionPoolTests
 
         await WaitUntilAsync(() => pool.WaiterCount == 1,
             "the renter must park before the first idle token is published");
-        first.CompleteRecovery();
-        first.RunInitialWorkToIdle();
+        var firstPublication = Task.Factory.StartNew(() =>
+            {
+                first.CompleteRecovery();
+                first.RunInitialWorkToIdle();
+            }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
         await entered.Task;
         second.CompleteRecovery();
         second.RunInitialWorkToIdle();
         release.Set();
+        await firstPublication;
 
         Assert.AreSame(second, await rent.WaitAsync(TimeSpan.FromSeconds(1)),
             "returning the first rejected token must not truncate the idle scan before the second token");
     }
 
     [TestMethod]
-    [Ignore("Legacy wait queue regression; enable when the single-flight coordinator replaces it in Stage 4.")]
     public async Task LateCompatibleWaiter_IsDrivenAfterAwakenedWaiterRejectsMultiplexCandidate()
     {
         await AssertLateCompatibleWaiterIsDriven(static (_, state) =>
@@ -900,7 +901,6 @@ public class ConnectionPoolTests
     }
 
     [TestMethod]
-    [Ignore("Legacy wait queue regression; enable when the single-flight coordinator replaces it in Stage 4.")]
     public async Task LateCompatibleWaiter_IsDrivenAfterAwakenedWaiterThrows()
     {
         await AssertLateCompatibleWaiterIsDriven(static (_, state) =>
@@ -912,7 +912,6 @@ public class ConnectionPoolTests
     }
 
     [TestMethod]
-    [Ignore("Legacy wait queue regression; enable when the single-flight coordinator replaces it in Stage 4.")]
     public async Task LateCompatibleWaiter_IsDrivenAfterAwakenedWaiterConsumesMultiplexCandidate()
     {
         await AssertLateCompatibleWaiterIsDriven(static (_, state) =>
@@ -942,16 +941,18 @@ public class ConnectionPoolTests
         await WaitUntilAsync(() => pool.WaiterCount == 1,
             "the first waiter must park while the connection is recovering");
 
-        connection.CompleteRecovery();
+        var publication = Task.Factory.StartNew(connection.CompleteRecovery,
+            CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
         await entered.Task;
 
         var accepting = pool.GetAsync(
             static (_, _) => true,
             state: 0,
             timeout: default).AsTask();
-        await WaitUntilAsync(() => pool.WaiterCount == 1,
-            "the compatible waiter must link while the first waiter owns the availability edge");
+        await WaitUntilAsync(() => pool.WaiterCount == 2,
+            "the compatible waiter must link while the first waiter remains coordinator-owned in Trying");
         release.Set();
+        await publication;
 
         if (expectFirstFailure)
             await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => first);
@@ -1083,121 +1084,6 @@ public class ConnectionPoolTests
 
         connection.RunInitialWorkToIdle();
         Assert.AreSame(connection, await newcomer);
-    }
-
-    [TestMethod]
-    public async Task SignalWithoutQueuedWaiter_IsPassedToLaterPublication()
-    {
-        var queue = new ConnectionPool<AdmissionConnection>.ConnectionWaitQueue();
-        var owner = queue.Enqueue();
-        queue.Signal();
-        var wake = await owner.Task;
-
-        queue.Signal();
-        var follower = queue.Enqueue();
-        Assert.IsFalse(follower.CanRescan);
-
-        queue.Pass(wake, idleAvailable: false);
-        var passed = await follower.Task;
-        queue.Consume(passed, idleAvailable: false);
-    }
-
-    [TestMethod]
-    [Ignore("Legacy wait queue regression; enable when the single-flight coordinator replaces it in Stage 4.")]
-    public async Task RetiringDetachedWake_DoesNotEraseOutstandingAvailability()
-    {
-        var queue = new ConnectionPool<AdmissionConnection>.ConnectionWaitQueue();
-        var first = queue.Enqueue();
-        var second = queue.Enqueue();
-        queue.Signal();
-        var firstWake = await first.Task;
-        queue.Signal();
-        var secondWake = await second.Task;
-        queue.Signal();
-
-        queue.Pass(firstWake, idleAvailable: false);
-        var follower = queue.Enqueue();
-        _ = queue.Requeue(secondWake, idleAvailable: false);
-
-        Assert.IsTrue(follower.Task.Wait(TimeSpan.FromSeconds(1)),
-            "retiring one detached wake must not erase an availability edge owed to a follower");
-    }
-
-    [TestMethod]
-    public void CancellationAfterDetachment_PreservesOwnedWake()
-    {
-        var queue = new ConnectionPool<AdmissionConnection>.ConnectionWaitQueue();
-        var waiter = queue.Enqueue(synchronous: true);
-        queue.Signal();
-        using var cancellation = new CancellationTokenSource();
-        cancellation.Cancel();
-
-        var wake = queue.Wait(waiter, cancellation.Token);
-
-        Assert.AreNotEqual(0, wake.Remaining,
-            "cancellation must not discard a wake already detached for this waiter");
-        queue.Consume(wake, idleAvailable: false);
-    }
-
-    [TestMethod]
-    public async Task RemovingDetachedWaiter_PassesWakeToQueuedFollower()
-    {
-        var queue = new ConnectionPool<AdmissionConnection>.ConnectionWaitQueue();
-        var removed = queue.Enqueue();
-        var follower = queue.Enqueue();
-        queue.Signal();
-        await removed.Task;
-
-        queue.Remove(removed);
-
-        var wake = await follower.Task;
-        queue.Consume(wake, idleAvailable: false);
-    }
-
-    [TestMethod]
-    public async Task RemovingQueuedHead_TransfersRescanRightToFollower()
-    {
-        var queue = new ConnectionPool<AdmissionConnection>.ConnectionWaitQueue();
-        var removed = queue.Enqueue();
-        var follower = queue.Enqueue();
-        Assert.IsTrue(removed.CanRescan);
-        Assert.IsFalse(follower.CanRescan);
-
-        queue.Remove(removed);
-
-        Assert.IsTrue(follower.Task.IsCompleted,
-            "removing the sole rescan owner must not leave its barred follower parked");
-        var wake = await follower.Task;
-        queue.Consume(wake, idleAvailable: false);
-    }
-
-    [TestMethod]
-    public async Task Dispose_FaultsQueuedWaiterWithoutRevokingDetachedWake()
-    {
-        var queue = new ConnectionPool<AdmissionConnection>.ConnectionWaitQueue();
-        var owner = queue.Enqueue();
-        var queued = queue.Enqueue();
-        queue.Signal();
-        var wake = await owner.Task;
-
-        queue.Dispose();
-
-        await Assert.ThrowsExactlyAsync<ObjectDisposedException>(async () => await queued.Task);
-        queue.Consume(wake, idleAvailable: false);
-    }
-
-    [TestMethod]
-    public async Task RequeueAfterDispose_RejectsWithoutRevokingDetachedWake()
-    {
-        var queue = new ConnectionPool<AdmissionConnection>.ConnectionWaitQueue();
-        var waiter = queue.Enqueue();
-        queue.Signal();
-        var wake = await waiter.Task;
-
-        queue.Dispose();
-
-        Assert.ThrowsExactly<ObjectDisposedException>(() => queue.Requeue(wake, idleAvailable: false));
-        queue.Pass(wake);
     }
 
     [TestMethod]

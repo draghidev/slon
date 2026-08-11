@@ -3,6 +3,7 @@ using Slon.Threading;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
+using System.Runtime.ExceptionServices;
 using System.Collections.Concurrent;
 using static Slon.Pools.ConnectionPool;
 using Microsoft.Extensions.Logging;
@@ -59,9 +60,9 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
     readonly IPoolConnectionFactory<T> _factory;
 
     readonly ConcurrentQueue<T> _idle = new();
-    readonly ConnectionWaitQueue _waitQueue = new();
+    readonly AcquisitionCoordinator<Placement> _acquisitions = new();
     ConcurrentDictionary<Task, byte>? _detachedTasks;
-    internal int WaiterCount => _waitQueue.Count;
+    internal int WaiterCount => _acquisitions.Count;
 
     PoolMetricsSnapshot IPoolMetricsSource.GetMetricsSnapshot()
     {
@@ -81,7 +82,7 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
             if (connection.IsIdle)
                 idle++;
         }
-        return new(open, idle, _connections.Length, _waitQueue.Count);
+        return new(open, idle, _connections.Length, _acquisitions.Count);
     }
 
     readonly Heartbeat _heartbeat;
@@ -245,10 +246,11 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
         if (_idleSamples is not null)
             Interlocked.Increment(ref _pruningIdleCount);
         _idle.Enqueue(connection);
-        _waitQueue.Signal();
+        // Capacity must be visible before the packed-word bell linearizes this publication.
+        SignalAvailability();
     }
 
-    void SignalAvailability() => _waitQueue.Signal();
+    void SignalAvailability() => _acquisitions.NotifyAvailability();
 
     void RecordIdleRemovalForPruning()
     {
@@ -299,48 +301,21 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
     {
         var deadline = new Deadline(timeout, _timeProvider);
         var timeoutSource = RentTimeoutSource(deadline.GetRemaining(), _timeProvider, cancellationToken);
-        ConnectionWaitQueue.Waiter? waiter = null;
-        ConnectionWaitQueue.Wake wake = default;
+        var waitToken = timeoutSource?.Token ?? CancellationToken.None;
+        var waiter = _acquisitions.CreateWaiter(
+            static placement => placement.Pool.TryPlace(
+                placement.Schedule, placement.State, placement.CancellationToken),
+            new PlacementState<TState>(this, schedule, state, cancellationToken));
+        using var registration = _acquisitions.Enqueue(waiter, timeoutSource?.Token ?? cancellationToken);
         try
         {
-            while (true)
-            {
-                waiter ??= _waitQueue.Enqueue();
-                if (TryAcquire(waiter, ref wake, schedule, state, cancellationToken,
-                    out var future, out var available))
-                {
-                    waiter = null;
-                    await ReleaseTimeoutSource().ConfigureAwait(false);
-                    return future is null
-                        ? available!
-                        : await OpenConnectionAsync(future, schedule, state, deadline.GetRemaining(), cancellationToken).ConfigureAwait(false);
-                }
-
-                wake = await waiter.Task.WaitAsync(timeoutSource?.Token ?? cancellationToken).ConfigureAwait(false);
-                waiter = null;
-
-                // The signal carries no resource. Recheck pool state before handing the bounded
-                // pass to the next waiter.
-                if (TryAcquire(null, ref wake, schedule, state, cancellationToken,
-                    out future, out available))
-                {
-                    await ReleaseTimeoutSource().ConfigureAwait(false);
-                    return future is null
-                        ? available!
-                        : await OpenConnectionAsync(future, schedule, state, deadline.GetRemaining(), cancellationToken).ConfigureAwait(false);
-                }
-
-                waiter = _waitQueue.Requeue(wake, !_idle.IsEmpty);
-                wake = default;
-            }
+            var completion = await waiter.AsValueTask().ConfigureAwait(false);
+            await ReleaseTimeoutSource().ConfigureAwait(false);
+            return await ResolvePlacementAsync(completion, schedule, state, deadline, cancellationToken)
+                .ConfigureAwait(false);
         }
         catch (Exception ex)
         {
-            if (waiter is not null)
-                _waitQueue.Remove(waiter, !_idle.IsEmpty);
-            if (wake.Remaining != 0)
-                _waitQueue.Pass(wake, !_idle.IsEmpty);
-
             var token = CancellationToken.None;
             if (timeoutSource is not null)
             {
@@ -348,7 +323,7 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
                 await timeoutSource.DisposeAsync().ConfigureAwait(false);
             }
 
-            if (IsCancellationTokenException(ex, token))
+            if (IsCancellationTokenException(ex, token == CancellationToken.None ? waitToken : token))
                 ThrowSourceExhausted(ex);
 
             throw;
@@ -366,54 +341,20 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
     {
         var deadline = new Deadline(timeout, _timeProvider);
         var timeoutSource = RentTimeoutSource(deadline.GetRemaining(), _timeProvider);
-        ConnectionWaitQueue.Waiter? waiter = null;
-        ConnectionWaitQueue.Wake wake = default;
+        using var waiter = _acquisitions.CreateWaiter(
+            static placement => placement.Pool.TryPlace(
+                placement.Schedule, placement.State, CancellationToken.None),
+            new PlacementState<TState>(this, schedule, state, CancellationToken.None), synchronous: true);
+        using var registration = _acquisitions.Enqueue(waiter, timeoutSource?.Token ?? CancellationToken.None);
         try
         {
-            while (true)
-            {
-                waiter ??= _waitQueue.Enqueue(synchronous: true);
-                if (TryAcquire(waiter, ref wake, schedule, state, CancellationToken.None,
-                    out var future, out var available))
-                {
-                    waiter = null;
-                    return future is null
-                        ? available!
-                        : OpenConnection(future, schedule, state, deadline.GetRemaining());
-                }
-
-                var settling = waiter;
-                waiter = null;
-                try
-                {
-                    wake = _waitQueue.Wait(settling, timeoutSource?.Token ?? CancellationToken.None);
-                }
-                catch (OperationCanceledException ex) when (timeoutSource is not null &&
-                    IsCancellationTokenException(ex, timeoutSource.Token))
-                {
-                    ThrowSourceExhausted(ex);
-                    return default!;
-                }
-
-                if (TryAcquire(null, ref wake, schedule, state, CancellationToken.None,
-                    out future, out available))
-                {
-                    return future is null
-                        ? available!
-                        : OpenConnection(future, schedule, state, deadline.GetRemaining());
-                }
-
-                waiter = _waitQueue.Requeue(wake, !_idle.IsEmpty, synchronous: true);
-                wake = default;
-            }
+            return ResolvePlacement(waiter.Wait(), schedule, state, deadline);
         }
-        catch
+        catch (OperationCanceledException ex) when (timeoutSource is not null &&
+            IsCancellationTokenException(ex, timeoutSource.Token))
         {
-            if (waiter is not null)
-                _waitQueue.Remove(waiter, !_idle.IsEmpty);
-            if (wake.Remaining != 0)
-                _waitQueue.Pass(wake, !_idle.IsEmpty);
-            throw;
+            ThrowSourceExhausted(ex);
+            return default!;
         }
         finally
         {
@@ -421,33 +362,76 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
         }
     }
 
-    bool TryAcquire<TState>(ConnectionWaitQueue.Waiter? waiter, ref ConnectionWaitQueue.Wake wake,
-        Func<ConnectionCandidate<T>, TState, bool>? schedule, TState state, CancellationToken cancellationToken,
-        out ConnectionFuture? future, out T? connection)
+    PlacementAttempt<Placement> TryPlace<TState>(Func<ConnectionCandidate<T>, TState, bool>? schedule,
+        TState state, CancellationToken cancellationToken)
     {
-        if (waiter is not null && !waiter.TryTakeRescan())
-        {
-            future = null;
-            connection = null;
-            return false;
-        }
-        if (!TrySchedule(schedule, state, cancellationToken, out future, out connection) && future is null)
-            return false;
-
-        if (wake.Remaining != 0)
-        {
-            _waitQueue.Consume(wake, !_idle.IsEmpty);
-            wake = default;
-        }
-        else if (waiter is not null)
-        {
-            _waitQueue.Remove(waiter, !_idle.IsEmpty);
-        }
-        return true;
+        if (TrySchedule(schedule, state, cancellationToken, exhaustive: true, out var future, out var connection))
+            return PlacementAttempt<Placement>.Placed(new(connection!));
+        return future is null
+            ? PlacementAttempt<Placement>.Unavailable
+            : PlacementAttempt<Placement>.Placed(new(future));
     }
 
+    T ResolvePlacement<TState>(Completion<Placement> completion,
+        Func<ConnectionCandidate<T>, TState, bool>? schedule, TState state, Deadline deadline)
+    {
+        if (!completion.HasResult)
+            Throw(completion.Exception!);
+
+        var placement = completion.Result;
+        if (completion.Exception is { } termination)
+        {
+            SettleTerminatedPlacement(placement, termination);
+            Throw(termination);
+        }
+
+        return placement.Future is { } future
+            ? OpenConnection(future, schedule, state, deadline.GetRemaining())
+            : placement.Connection!;
+    }
+
+    async ValueTask<T> ResolvePlacementAsync<TState>(Completion<Placement> completion,
+        Func<ConnectionCandidate<T>, TState, bool>? schedule, TState state, Deadline deadline,
+        CancellationToken cancellationToken)
+    {
+        if (!completion.HasResult)
+            Throw(completion.Exception!);
+
+        var placement = completion.Result;
+        if (completion.Exception is { } termination)
+        {
+            SettleTerminatedPlacement(placement, termination);
+            Throw(termination);
+        }
+
+        return placement.Future is { } future
+            ? await OpenConnectionAsync(future, schedule, state, deadline.GetRemaining(), cancellationToken)
+                .ConfigureAwait(false)
+            : placement.Connection!;
+    }
+
+    void SettleTerminatedPlacement(Placement placement, Exception termination)
+    {
+        if (placement.Future is { } future)
+        {
+            SettleOpener(future, null);
+            return;
+        }
+
+        var connection = placement.Connection!;
+        // Successful scheduling may already have transferred retirement to placed work. Only an
+        // untouched idle claim is returned here; pool disposal owns all installed connections.
+        if (termination is not ObjectDisposedException && connection.IsIdle && connection.IsSchedulable)
+            PublishIdle(connection);
+    }
+
+    [DoesNotReturn]
+    static void Throw(Exception exception)
+        => ExceptionDispatchInfo.Capture(exception).Throw();
+
     bool TrySchedule<TState>(Func<ConnectionCandidate<T>, TState, bool>? schedule, TState state,
-        CancellationToken cancellationToken, out ConnectionFuture? future, [NotNullWhen(true)]out T? connection)
+        CancellationToken cancellationToken, bool exhaustive, out ConnectionFuture? future,
+        [NotNullWhen(true)]out T? connection)
     {
         // Prefer idle reuse, then growth, then multiplexing.
 
@@ -517,7 +501,7 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
                 }
 
                 // The idle queue is the sole idle rendezvous; the slot walk only samples busy work.
-                if (!conn.IsIdle && conn.IsSchedulable)
+                if (!exhaustive && !conn.IsIdle && conn.IsSchedulable)
                 {
                     if (busyFirst is null) busyFirst = conn;
                     else busySecond ??= conn;
@@ -529,6 +513,25 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
                 connection = default;
                 return false;
             }
+        }
+
+        if (exhaustive)
+        {
+            for (var i = startIndex; i < startIndex + connections.Length; i++)
+            {
+                ref var item = ref connections[i < connections.Length ? i : i - connections.Length];
+                if (TryGetConnection(ref item, out var candidate) && !candidate.IsIdle &&
+                    DoSchedule(new(candidate, cancellationToken, isIdleCandidate: false), schedule, state))
+                {
+                    future = null;
+                    connection = candidate;
+                    return true;
+                }
+            }
+
+            future = null;
+            connection = default;
+            return false;
         }
 
         // Selection reads are advisory, so try both sampled candidates before parking.
@@ -708,9 +711,9 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
 
         ThrowIfDisposed();
 
-        if (!_waitQueue.HasDemand)
+        if (!_acquisitions.HasDemand)
         {
-            if (TrySchedule(schedule, state, CancellationToken.None, out var future, out var conn))
+            if (TrySchedule(schedule, state, CancellationToken.None, exhaustive: false, out var future, out var conn))
                 return conn;
 
             if (future is not null)
@@ -726,9 +729,9 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
             {
                 ThrowIfDisposed();
 
-                if (!_waitQueue.HasDemand)
+                if (!_acquisitions.HasDemand)
                 {
-                    if (TrySchedule(schedule, state, CancellationToken.None, out var future, out var conn))
+                    if (TrySchedule(schedule, state, CancellationToken.None, exhaustive: false, out var future, out var conn))
                         return ReportAdmission(conn, waited: false, reportAdmissions);
 
                     if (future is not null)
@@ -757,9 +760,9 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
 
         var reportAdmissions = _metrics?.AdmissionsEnabled is true;
         var reportTimeouts = _metrics?.AdmissionTimeoutsEnabled is true;
-        if (!_waitQueue.HasDemand)
+        if (!_acquisitions.HasDemand)
         {
-            if (TrySchedule(schedule, state, cancellationToken, out var future, out var conn))
+            if (TrySchedule(schedule, state, cancellationToken, exhaustive: false, out var future, out var conn))
                 return new(ReportAdmission(conn, waited: false, reportAdmissions));
 
             if (future is not null)
@@ -912,7 +915,7 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
 
             Volatile.Write(ref _disposed, true);
             ownsDisposal = true;
-            _waitQueue.Dispose();
+            _acquisitions.Dispose();
             for (var i = 0; i < _connections.Length; i++)
             {
                 ref var connSlot = ref _connections[i];
@@ -1042,6 +1045,21 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
         static void ThrowObjectDisposed() => throw new ObjectDisposedException(nameof(ConnectionPool<T>));
     }
 
+    readonly record struct Placement
+    {
+        internal Placement(T connection) => Connection = connection;
+        internal Placement(ConnectionFuture future) => Future = future;
+
+        internal T? Connection { get; }
+        internal ConnectionFuture? Future { get; }
+    }
+
+    readonly record struct PlacementState<TState>(
+        ConnectionPool<T> Pool,
+        Func<ConnectionCandidate<T>, TState, bool>? Schedule,
+        TState State,
+        CancellationToken CancellationToken);
+
     sealed class ConnectionFuture
     {
         T? _conn;
@@ -1062,384 +1080,6 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
 
         public T? Result => Volatile.Read(ref _conn);
         public bool IsCompleted => Volatile.Read(ref _published);
-    }
-
-    internal sealed class ConnectionWaitQueue
-    {
-        readonly Lock _lock = new();
-        Waiter? _head;
-        Waiter? _tail;
-        int _count;
-        int _activeWakes;
-        int _demand;
-        bool _signalPending;
-        bool _disposed;
-
-        // Advisory rent-path gate, deliberately lock-free. Publish queued and awakened demand as
-        // one level so a newcomer cannot observe a false zero while a waiter changes form.
-        public bool HasDemand
-            => Volatile.Read(ref _demand) != 0;
-
-        public int Count
-        {
-            get
-            {
-                lock (_lock)
-                    return _count;
-            }
-        }
-
-        public Waiter Enqueue(bool synchronous = false)
-        {
-            var waiter = new Waiter(synchronous);
-            Waiter? signaled = null;
-            Wake wake = default;
-            lock (_lock)
-            {
-                ObjectDisposedException.ThrowIf(_disposed, this);
-                waiter.CanRescan = _head is null && _activeWakes == 0;
-                if (waiter.CanRescan)
-                    _signalPending = false;
-                waiter.Previous = _tail;
-                if (_tail is null)
-                    _head = waiter;
-                else
-                    _tail.Next = waiter;
-                _tail = waiter;
-                _count++;
-
-                // A prior waiter may have rejected an available candidate before this waiter
-                // existed. Reattach that retained edge to the FIFO now that it can be passed.
-                if (!waiter.CanRescan && _signalPending && _activeWakes == 0)
-                {
-                    signaled = _head!;
-                    wake = new Wake(_count);
-                    _activeWakes++;
-                    Unlink(signaled);
-                    _signalPending = false;
-                    signaled.Wake = wake;
-                }
-                PublishDemand();
-            }
-            signaled?.Complete(wake);
-            return waiter;
-        }
-
-        public void Signal()
-        {
-            Waiter? waiter;
-            Wake wake;
-            lock (_lock)
-            {
-                waiter = _head;
-                if (waiter is null)
-                {
-                    if (_activeWakes != 0)
-                        _signalPending = true;
-                    return;
-                }
-
-                var count = _count;
-                wake = new Wake(count);
-                _activeWakes++;
-                Unlink(waiter);
-                _signalPending = false;
-                waiter.Wake = wake;
-                PublishDemand();
-            }
-            waiter.Complete(wake);
-        }
-
-        public void Pass(Wake wake, bool idleAvailable = false)
-        {
-            Waiter? waiter;
-            Wake next;
-            lock (_lock)
-            {
-                waiter = _head;
-                if ((wake.Remaining > 1 || idleAvailable) && waiter is not null)
-                {
-                    Unlink(waiter);
-                    next = new Wake(Math.Max(1, wake.Remaining - 1));
-                    _signalPending = false;
-                    waiter.Wake = next;
-                }
-                else if (_signalPending && waiter is not null)
-                {
-                    Unlink(waiter);
-                    next = new Wake(1);
-                    _signalPending = false;
-                    waiter.Wake = next;
-                }
-                else
-                {
-                    Debug.Assert(_activeWakes > 0);
-                    _activeWakes--;
-                    _signalPending = false;
-                    PublishDemand();
-                    return;
-                }
-                PublishDemand();
-            }
-            waiter.Complete(next);
-        }
-
-        // Converts the current wake ownership back into a queued wait without publishing a
-        // demand-free interval. A newcomer must not enter between those two forms of the same
-        // rent operation.
-        public Waiter Requeue(Wake wake, bool idleAvailable, bool synchronous = false)
-        {
-            var current = new Waiter(synchronous);
-            Waiter? waiter = null;
-            Wake next = default;
-            lock (_lock)
-            {
-                ObjectDisposedException.ThrowIf(_disposed, this);
-                Debug.Assert(_activeWakes > 0);
-
-                // Only a waiter which was already queued may inherit the availability this
-                // caller just rejected. Waking the caller's replacement for the same idle
-                // candidate would make an incompatible renter spin indefinitely.
-                var successor = _head;
-
-                current.Previous = _tail;
-                if (_tail is null)
-                    _head = current;
-                else
-                    _tail.Next = current;
-                _tail = current;
-                _count++;
-
-                if ((wake.Remaining > 1 || idleAvailable || _signalPending) && successor is not null)
-                {
-                    waiter = successor;
-                    Unlink(successor);
-                    next = new Wake(wake.Remaining > 1 ? wake.Remaining - 1 : 1);
-                    _signalPending = false;
-                    waiter.Wake = next;
-                }
-                else
-                {
-                    _activeWakes--;
-                    if (idleAvailable || _signalPending)
-                    {
-                        _signalPending = true;
-                    }
-                    else if (successor is null)
-                    {
-                        current.CanRescan = true;
-                    }
-                }
-                PublishDemand();
-            }
-            waiter?.Complete(next);
-            return current;
-        }
-
-        public void Consume(Wake wake, bool idleAvailable)
-        {
-            Debug.Assert(wake.Remaining != 0);
-            Waiter? waiter = null;
-            Wake next = default;
-            lock (_lock)
-            {
-                Debug.Assert(_activeWakes > 0);
-                if ((_signalPending || idleAvailable) && (waiter = _head) is not null)
-                {
-                    Unlink(waiter);
-                    next = new Wake(1);
-                    _signalPending = false;
-                    waiter.Wake = next;
-                }
-                else
-                {
-                    _activeWakes--;
-                    _signalPending = false;
-                }
-                PublishDemand();
-            }
-            waiter?.Complete(next);
-        }
-
-        // Removes a queued waiter or preserves a wake already detached for it.
-        public void Remove(Waiter waiter, bool idleAvailable = false)
-        {
-            var detached = TryRemove(waiter, out var wake, out var successor);
-            successor?.Complete(successor.Wake);
-            if (detached)
-            {
-                Pass(wake, idleAvailable);
-                waiter.WaitForDetachedSignal();
-            }
-            waiter.Dispose();
-        }
-
-        bool TryRemove(Waiter waiter, out Wake wake, out Waiter? successor)
-        {
-            lock (_lock)
-            {
-                successor = null;
-                if (waiter.IsQueued)
-                {
-                    var wasHead = ReferenceEquals(waiter, _head);
-                    Unlink(waiter);
-                    if (wasHead && _activeWakes == 0 && _head is { } head)
-                    {
-                        wake = new(1);
-                        _activeWakes++;
-                        Unlink(head);
-                        _signalPending = false;
-                        head.Wake = wake;
-                        successor = head;
-                    }
-                    else
-                    {
-                        wake = default;
-                    }
-                    PublishDemand();
-                    return false;
-                }
-
-                wake = waiter.Wake;
-                return wake.Remaining != 0;
-            }
-        }
-
-        public Wake Wait(Waiter waiter, CancellationToken cancellationToken)
-        {
-            try
-            {
-                try
-                {
-                    waiter.Wait(cancellationToken);
-                    waiter.ThrowIfFailed();
-                    return waiter.Wake;
-                }
-                catch (OperationCanceledException)
-                {
-                }
-                var detached = TryRemove(waiter, out var wake, out var successor);
-                successor?.Complete(successor.Wake);
-                if (!detached)
-                {
-                    waiter.ThrowIfFailed();
-                    cancellationToken.ThrowIfCancellationRequested();
-                }
-
-                // Signaling detached the waiter just as cancellation fired.
-                waiter.Wait(CancellationToken.None);
-                waiter.ThrowIfFailed();
-                return wake;
-            }
-            finally
-            {
-                waiter.Dispose();
-            }
-        }
-
-        public void Dispose()
-        {
-            lock (_lock)
-            {
-                if (_disposed)
-                    return;
-                _disposed = true;
-                var waiters = _head;
-                _head = _tail = null;
-                _count = 0;
-                PublishDemand();
-                // Publish failure before a timed sync waiter can observe detachment and dispose
-                // its signal. Async waiters complete asynchronously. Sync completion only sets the event.
-                while (waiters is not null)
-                {
-                    var next = waiters.Next;
-                    waiters.Next = waiters.Previous = null;
-                    waiters.IsQueued = false;
-                    waiters.Fail();
-                    waiters = next;
-                }
-            }
-        }
-
-        void Unlink(Waiter waiter)
-        {
-            if (waiter.Previous is null)
-                _head = waiter.Next;
-            else
-                waiter.Previous.Next = waiter.Next;
-            if (waiter.Next is null)
-                _tail = waiter.Previous;
-            else
-                waiter.Next.Previous = waiter.Previous;
-
-            waiter.Next = waiter.Previous = null;
-            waiter.IsQueued = false;
-            _count--;
-        }
-
-        void PublishDemand()
-        {
-            Debug.Assert(_lock.IsHeldByCurrentThread);
-            Volatile.Write(ref _demand, _count + _activeWakes);
-        }
-
-        internal sealed class Waiter : IDisposable
-        {
-            readonly TaskCompletionSource<Wake>? _completion;
-            readonly ManualResetEventSlim? _signal;
-            Exception? _failure;
-
-            internal Waiter(bool synchronous)
-            {
-                if (synchronous)
-                    _signal = new();
-                else
-                    _completion = new(TaskCreationOptions.RunContinuationsAsynchronously);
-            }
-
-            internal Waiter? Previous;
-            internal Waiter? Next;
-            internal bool IsQueued = true;
-            internal bool CanRescan;
-            internal Wake Wake;
-
-            public Task<Wake> Task => _completion!.Task;
-            internal bool TryTakeRescan()
-            {
-                if (!CanRescan)
-                    return false;
-                CanRescan = false;
-                return true;
-            }
-            internal void Wait(CancellationToken cancellationToken) => _signal!.Wait(cancellationToken);
-            internal void WaitForDetachedSignal() => _signal?.Wait();
-            public void Dispose() => _signal?.Dispose();
-            internal void ThrowIfFailed()
-            {
-                if (_failure is { } failure)
-                    throw failure;
-            }
-            internal void Complete(Wake wake)
-            {
-                if (_completion is not null)
-                    _completion.TrySetResult(wake);
-                else
-                    _signal!.Set();
-            }
-            internal void Fail()
-            {
-                var failure = new ObjectDisposedException(nameof(ConnectionPool<T>));
-                if (_completion is not null)
-                    _completion.TrySetException(failure);
-                else
-                {
-                    _failure = failure;
-                    _signal!.Set();
-                }
-            }
-        }
-
-        internal readonly record struct Wake(int Remaining);
     }
 
 }

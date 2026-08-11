@@ -67,7 +67,7 @@ internal sealed class AcquisitionCoordinator<TResult> : IDisposable
             if (cancellationToken.IsCancellationRequested)
             {
                 waiter.State = WaiterState.Terminal;
-                waiter.Completion = Completion<TResult>.Failed(new OperationCanceledException(cancellationToken));
+                waiter.Completion = Completion<TResult>.Failed(waiter.CreateCancellationException(cancellationToken));
                 drive = false;
                 completeImmediately = true;
             }
@@ -121,7 +121,7 @@ internal sealed class AcquisitionCoordinator<TResult> : IDisposable
             if (waiter.State is WaiterState.Terminal)
                 return;
 
-            var exception = new OperationCanceledException(cancellationToken);
+            var exception = waiter.CreateCancellationException(cancellationToken);
             if (waiter.State is WaiterState.Trying)
             {
                 waiter.Cancellation = exception;
@@ -409,6 +409,11 @@ internal sealed class AcquisitionCoordinator<TResult> : IDisposable
         internal Completion<TResult> Completion;
 
         internal abstract PlacementAttempt<TResult> TryPlace();
+
+        internal OperationCanceledException CreateCancellationException(CancellationToken cancellationToken)
+            => _syncCompletion is null
+                ? new TaskCanceledException(null, null, cancellationToken)
+                : new OperationCanceledException(cancellationToken);
 
         internal ValueTask<Completion<TResult>> AsValueTask()
             => _syncCompletion is null
