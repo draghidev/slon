@@ -451,8 +451,19 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
     {
         // Prefer idle reuse, then growth, then multiplexing.
 
-        while (_idle.TryDequeue(out var idle))
+        // A rejected token returns at the tail. Walk at most one bounded cycle so later tokens
+        // remain visible without repeatedly presenting the first rejection to this renter.
+        var idleBudget = _connections.Length;
+        T? returnedSentinel = null;
+        while (idleBudget-- != 0 && _idle.TryDequeue(out var idle))
         {
+            if (ReferenceEquals(idle, returnedSentinel))
+            {
+                if (!ReturnIdleToken(idle))
+                    RecordIdleRemovalForPruning();
+                break;
+            }
+
             if (idle.IsIdle)
             {
                 try
@@ -476,13 +487,12 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
             }
 
             if (ReturnIdleToken(idle))
+            {
+                returnedSentinel ??= idle;
                 SignalAvailability();
+            }
             else
                 RecordIdleRemovalForPruning();
-            // Do not dequeue the token we just returned in this synchronous scan. Its signal lets
-            // this waiter retry after parking, or hands the candidate to the next waiter.
-            if (idle.IsIdle && idle.IsSchedulable)
-                break;
         }
 
         var connections = _connections;
