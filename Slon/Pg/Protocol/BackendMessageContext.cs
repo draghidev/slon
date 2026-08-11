@@ -13,6 +13,7 @@ sealed class BackendMessageContext
     BackendMessage _current;
     short _version;
     bool _hasPriorCancellationExposure;
+    bool _errorObserved;
     bool _bodyWindowAdvanced;
 
     // Peek slot: TryPeekNext advances the real batch cursor into here, so the header parse
@@ -182,14 +183,22 @@ sealed class BackendMessageContext
         return _hasPriorCancellationExposure;
     }
 
+    public bool TryObserveError(short token)
+    {
+        Validate(token);
+        if (_errorObserved)
+            return false;
+        _errorObserved = true;
+        return true;
+    }
+
     public bool TryMoveNext()
     {
-        _hasPriorCancellationExposure = false;
-        _bodyWindowAdvanced = false;
         if (_hasPeeked)
         {
             _hasPeeked = false;
             _currentMessageOffset = _peekedMessageOffset;
+            ResetMessageState();
             BackendMessage.Initialize(ref _current, _peekedHeader, _peekedBuffer, this, ++_version,
                 _peekedBuffer.Length >= _peekedHeader.MessageLength);
             return true;
@@ -198,9 +207,17 @@ sealed class BackendMessageContext
         if (!_remainingBatch.TryReadNextInPlace(out var header, out var buffer, out var bufferLength))
             return false;
         _currentMessageOffset = messageOffset;
+        ResetMessageState();
         BackendMessage.Initialize(ref _current, header, buffer, this, ++_version,
             bufferLength >= header.MessageLength);
         return true;
+
+        void ResetMessageState()
+        {
+            _hasPriorCancellationExposure = false;
+            _errorObserved = false;
+            _bodyWindowAdvanced = false;
+        }
     }
 
     public void RetireCurrentBatch()
@@ -217,6 +234,7 @@ sealed class BackendMessageContext
         _peekedMessageOffset = 0;
         _bodyWindowAdvanced = false;
         _hasPriorCancellationExposure = false;
+        _errorObserved = false;
         if (invalidateToken)
             _version++;
     }

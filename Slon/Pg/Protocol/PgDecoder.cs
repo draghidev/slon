@@ -604,12 +604,21 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
         if (message.Header.Type is not PgTypes.BackendType.ErrorResponse)
             return message;
 
+        // Current may be inspected repeatedly while parsing and completing a command. Cancellation
+        // acknowledgement is an arrival event: replaying it after the logical command window advances
+        // would let one ErrorResponse satisfy a successor window which still needs its own request.
+        if (!message.TryObserveError())
+            return message;
+
         var execution = CurrentExecutionControl;
         var flow = execution.Flow;
         if (_control.HasPriorCancellationExposure(flow, flow.CancellationWindow))
             message.MarkPriorCancellationExposure();
-        if (message.TryCreateError(out var error) && error.SqlState == PgErrorCodes.QueryCanceled)
-            _control.OnBackendCancellationObserved(flow, flow.CancellationWindow);
+        if (message.TryCreateError(out var error))
+        {
+            if (error.SqlState == PgErrorCodes.QueryCanceled)
+                _control.OnBackendCancellationObserved(flow, flow.CancellationWindow);
+        }
         return message;
     }
 

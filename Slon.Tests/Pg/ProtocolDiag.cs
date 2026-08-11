@@ -25,7 +25,8 @@ static class ProtocolDiag
             return $"{{{common}}}";
 
         var type = f.GetType();
-        object? F(string name) => type.GetField(name, All)!.GetValue(f);
+        object? F(string name) => FindField(type, name).GetValue(f);
+        object? B(string name) => typeof(PgClientFlow).GetField(name, All)!.GetValue(f);
         var core = F("_callerInteractionCore")!;
         var coreType = core.GetType();
         object? C(string name) => coreType.GetField(name, All)!.GetValue(core);
@@ -33,10 +34,12 @@ static class ProtocolDiag
         var gateType = gate.GetType();
         var version = gateType.GetProperty("Version", All)!.GetValue(gate)!;
         var status = gateType.GetMethod("GetStatus", All)!.Invoke(gate, [version]);
-        return $"{{{common},command={F("_commandIndex")},body={F("_bodyStarted")}," +
+        return $"{{{common},command={F("_commandIndex")},window={B("_cancellationWindow")},rfqs={B("_rfqCount")}," +
+               $"scope={F("_cancellationScope")},timing={F("_backendCancellationTiming")}/" +
+               $"{F("_subsequentBackendCancellationTiming")},context={F("_contextPublished")},body={F("_bodyState")}," +
                $"draining={F("_draining")},disposed={F("_consumerDisposed")}," +
                $"terminal={F("_enumeratorCompleted")},cancel={F("_cancelRequested")}," +
-               $"gate={status},wake={C("_wakeRequested")},wakeContinuation={C("_wakeContinuation") is not null}," +
+               $"gate={status},wake={C("_wakeRequested")},pendingContinuation={C("_pendingContinuation") is not null}," +
                $"progress={C("_progressSignaled")}}}";
     }
 
@@ -66,6 +69,68 @@ static class ProtocolDiag
             $"driving={D("_active")} redrive={D("_redrive")} " +
             $"parkedSyncHead={S("SyncHeadReserved")} held={S("HeldSyncFlow") is not null} " +
             $"takeoverPending={S("TakeoverPending")} takeoverActive={S("TakeoverActive")}";
+    }
+
+    internal static string CancellationState(PgClientProtocol protocol)
+    {
+        var type = typeof(PgClientProtocol);
+        var syncRoot = type.GetField("_syncRoot", All)!.GetValue(protocol)!;
+        lock (syncRoot)
+        {
+            var intents = DescribeChain(type.GetField("_cancellationHead", All)!.GetValue(protocol),
+                static item =>
+                {
+                    var t = item.GetType();
+                    object? F(string name) => t.GetField(name, All)!.GetValue(item);
+                    return $"window={F("Window")},dispatching={F("Dispatching")},attempts={F("Attempts")}," +
+                           $"frontierRequired={F("RequiresCancellationReadFrontier")},completed={F("InstigatorCompleted")}," +
+                           $"delay={F("RemainingDelayTicks")},exposure={F("Exposure") is not null}";
+                });
+            var exposures = DescribeChain(type.GetField("_exposureHead", All)!.GetValue(protocol),
+                static item =>
+                {
+                    var t = item.GetType();
+                    object? F(string name) => t.GetField(name, All)!.GetValue(item);
+                    return $"requested={F("RequestedWindow")},boundary={F("BoundaryWindow")}," +
+                           $"assigned={F("BoundaryFlow") is not null},pending={F("PendingDispatch")}," +
+                           $"acknowledged={F("Acknowledged")}";
+                });
+            return $"dispatching={type.GetField("_cancellationDispatching", All)!.GetValue(protocol)}, " +
+                   $"attemptGate={type.GetField("_cancellationAttempt", All)!.GetValue(protocol) is not null}, " +
+                   $"intents=[{intents}], exposures=[{exposures}]";
+        }
+    }
+
+    internal static string CancellationFlowState(CommandFlow flow)
+    {
+        var type = flow.GetType();
+        object? F(string name) => FindField(type, name).GetValue(flow);
+        return $"command={F("_commandIndex")},window={F("_cancellationWindow")},rfqs={F("_rfqCount")}," +
+               $"scope={F("_cancellationScope")},timing={F("_backendCancellationTiming")}/" +
+               $"{F("_subsequentBackendCancellationTiming")},context={F("_contextPublished")}," +
+               $"body={F("_bodyState")},draining={F("_draining")},disposed={F("_consumerDisposed")}," +
+               $"terminal={F("_enumeratorCompleted")},cancel={F("_cancelRequested")}";
+    }
+
+    static string DescribeChain(object? head, Func<object, string> describe)
+    {
+        var items = new List<string>();
+        for (var item = head; item is not null;)
+        {
+            items.Add(describe(item));
+            item = item.GetType().GetField("Next", All)!.GetValue(item);
+        }
+        return string.Join("; ", items);
+    }
+
+    static FieldInfo FindField(Type type, string name)
+    {
+        for (var current = type; current is not null; current = current.BaseType)
+        {
+            if (current.GetField(name, All) is { } field)
+                return field;
+        }
+        throw new MissingFieldException(type.FullName, name);
     }
 
 }

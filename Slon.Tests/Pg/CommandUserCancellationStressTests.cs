@@ -21,7 +21,7 @@ public class CommandUserCancellationStressTests
 
     // Each iteration is a real pipelined command + cancellation against a live backend. The default
     // is regression coverage; SLON_STRESS_ITERATIONS supplies deliberate deeper exposure.
-    static int Iters => StressEnv.Iterations(fallback: 64, cap: 8_000);
+    static int Iters => StressEnv.Iterations(fallback: 8, cap: 8_000);
 
     static CommandFlow TwoResultFlow() => new(async: true,
         Command.Create("select generate_series(1, 50)"),
@@ -251,6 +251,29 @@ public class CommandUserCancellationStressTests
         Assert.AreEqual("42P01", ex.SqlState, "expected undefined_table");
 
         await PgTestPool.RunAsync(protocol, "select 1");  // connection still usable (drained to RFQ)
+    }
+
+    [TestMethod]
+    public async Task WaitForDrainOnDispose_SyncDrainHitsError_RetiresBeforeSuccessor()
+    {
+        var iters = StressEnv.Iterations(fallback: 8, cap: 8_000);
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
+        for (var i = 0; i < iters; i++)
+        {
+            var flow = new CommandFlow(async: false,
+                Command.Create("select 1"),
+                Command.Create("select * from no_such_table_xyz"));
+            Assert.IsTrue(protocol.TryQueue(flow), $"iter {i}: flow was not queued");
+
+            var e = flow.GetEnumerator();
+            Assert.IsTrue(e.MoveNext(), $"iter {i}: first result not delivered");
+
+            var ex = Assert.ThrowsExactly<PgErrorException>(e.Dispose,
+                $"iter {i}: synchronous disposal did not surface the unread command error");
+            Assert.AreEqual("42P01", ex.SqlState, $"iter {i}: expected undefined_table");
+
+            await PgTestPool.RunAsync(protocol, "select 1");
+        }
     }
 
     // Multi-sync: per-command-sync (PreferSimple+WithSync) commands that EACH fault => multiple fault

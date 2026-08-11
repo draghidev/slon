@@ -102,26 +102,37 @@ sealed class PgAdvisoryLock : IAsyncDisposable
         _held = false;
     }
 
-    // Both polls are BOUNDED: PL/pgSQL observes cancels, not client death, so an unbounded loop
-    // abandoned by test teardown spins server-side forever, pinning this session's advisory lock
-    // and starving every later acquirer (observed as ten 8-hour spinner backends wedging a run).
-    // The raise ends the query; an orphaned session then exits at its next client read, releasing
-    // its locks. 20s is far beyond any test's contention window.
     public Task WaitUntilContendedAsync(int backendProcessId)
         => PgTestPool.RunAsync(_owner, $$"""
             do $$
-            declare i int := 0;
             begin
                 while not exists (
                     select 1 from pg_stat_activity
-                    where pid = {{backendProcessId}} and wait_event = 'advisory')
+                    where pid = {{backendProcessId}}
+                      and wait_event = 'advisory'
+                      and query like '%pg_advisory_xact_lock({{Key}})%')
                 loop
                     perform pg_stat_clear_snapshot();
                     perform pg_sleep(0.001);
-                    i := i + 1;
-                    if i > 20000 then
-                        raise exception 'advisory contention poll expired';
-                    end if;
+                end loop;
+            end $$
+            """);
+
+    // Cancellation may end this exact wait between pg_stat_activity samples. Once its query is
+    // visible as the backend's last completed query, waiting for live contention can no longer
+    // succeed and would only burn the fixture's 20-second safety bound.
+    public Task WaitUntilContendedOrCompletedAsync(int backendProcessId)
+        => PgTestPool.RunAsync(_owner, $$"""
+            do $$
+            begin
+                while not exists (
+                    select 1 from pg_stat_activity
+                    where pid = {{backendProcessId}}
+                      and query = 'select pg_advisory_xact_lock({{Key}})'
+                      and (wait_event = 'advisory' or state = 'idle'))
+                loop
+                    perform pg_stat_clear_snapshot();
+                    perform pg_sleep(0.001);
                 end loop;
             end $$
             """);
@@ -130,14 +141,33 @@ sealed class PgAdvisoryLock : IAsyncDisposable
         => (await ReadSingleValueAsync(_owner, $$"""
             select case when exists (
                 select 1 from pg_stat_activity
-                where pid = {{backendProcessId}} and wait_event = 'advisory')
+                where pid = {{backendProcessId}}
+                  and wait_event = 'advisory'
+                  and query like '%pg_advisory_xact_lock({{Key}})%')
                 then 'yes' else 'no' end
             """)) is "yes";
+
+    public async Task<string> DescribeAsync(int backendProcessId)
+        => await ReadSingleValueAsync(_owner, $$"""
+            select concat(
+                'key={{Key}}, holderOwnsKey=', exists (
+                    select 1 from pg_locks
+                    where pid = pg_backend_pid()
+                      and locktype = 'advisory'
+                      and granted
+                      and objsubid = 1
+                      and classid::bigint = {{Key >> 32}}
+                      and objid::bigint = {{Key & uint.MaxValue}}),
+                ', targetState=', coalesce(state, '<gone>'),
+                ', targetWait=', coalesce(wait_event, '<none>'),
+                ', targetQuery=', coalesce(query, '<none>'))
+            from (values (1)) seed(dummy)
+            left join pg_stat_activity on pid = {{backendProcessId}}
+            """) ?? "<no diagnostic row>";
 
     public Task WaitUntilContendedAsync()
         => PgTestPool.RunAsync(_owner, $$"""
             do $$
-            declare i int := 0;
             begin
                 while not exists (
                     select 1 from pg_stat_activity
@@ -145,10 +175,6 @@ sealed class PgAdvisoryLock : IAsyncDisposable
                 loop
                     perform pg_stat_clear_snapshot();
                     perform pg_sleep(0.001);
-                    i := i + 1;
-                    if i > 20000 then
-                        raise exception 'advisory contention poll expired';
-                    end if;
                 end loop;
             end $$
             """);
@@ -156,16 +182,11 @@ sealed class PgAdvisoryLock : IAsyncDisposable
     public Task WaitUntilBackendGoneAsync(int backendProcessId)
         => PgTestPool.RunAsync(_owner, $$"""
             do $$
-            declare i int := 0;
             begin
                 while exists (select 1 from pg_stat_activity where pid = {{backendProcessId}})
                 loop
                     perform pg_stat_clear_snapshot();
                     perform pg_sleep(0.001);
-                    i := i + 1;
-                    if i > 20000 then
-                        raise exception 'backend termination poll expired';
-                    end if;
                 end loop;
             end $$
             """);

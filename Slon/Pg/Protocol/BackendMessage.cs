@@ -324,6 +324,9 @@ readonly struct BackendMessage
     internal bool HasPriorCancellationExposure
         => _context.HasPriorCancellationExposure(_token);
 
+    internal bool TryObserveError()
+        => _context.TryObserveError(_token);
+
     // We have no buffer for header only messages.
     public bool Buffered => _buffered;
 }
