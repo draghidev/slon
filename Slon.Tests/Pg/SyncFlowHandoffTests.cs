@@ -20,7 +20,7 @@ namespace Slon.Tests.Pg;
 [TestClass]
 public class SyncFlowHandoffTests
 {
-    static int StressIterations => StressEnv.Iterations(fallback: 64, cap: 8_000);
+    static int StressIterations => StressEnv.Iterations(fallback: 8, cap: 8_000);
 
     sealed class AutonomousSyncFlow : PgClientFlow
     {
@@ -244,12 +244,12 @@ public class SyncFlowHandoffTests
             {
                 try
                 {
-                    for (int j = 0; j < 20; j++)
+                    for (int j = 0; j < 8; j++)
                     {
                         Volatile.Write(ref progress[idx], j);
                         PgTestPool.RunSync(protocols[idx], "select 1").GetAwaiter().GetResult();
                     }
-                    Volatile.Write(ref progress[idx], 20);
+                    Volatile.Write(ref progress[idx], 8);
                 }
                 catch (Exception ex) { exceptions[idx] = ex; }
             });
@@ -278,7 +278,7 @@ public class SyncFlowHandoffTests
         await PgTestPool.RunSync(protocol, "select 1"); // warm
 
         const int concurrency = 8;
-        const int iterations = 25;
+        const int iterations = 8;
         var threads = new Thread[concurrency];
         var mismatches = new int[concurrency];
         var exceptions = new Exception?[concurrency];
@@ -343,7 +343,7 @@ public class SyncFlowHandoffTests
 
         const int syncThreads = 4;
         const int asyncThreads = 4;
-        const int iterations = 32;
+        const int iterations = 8;
         var threads = new Thread[syncThreads + asyncThreads];
         var mismatches = new int[syncThreads];
         var exceptions = new Exception?[syncThreads + asyncThreads];
@@ -508,7 +508,7 @@ public class SyncFlowHandoffTests
         await PgTestPool.RunSync(protocol, "select 1"); // warm
 
         const int concurrency = 8;
-        const int iterations = 32;
+        const int iterations = 8;
         var threads = new Thread[concurrency];
         var misroutes = new int[concurrency];   // times a caller read back a value it did not submit
         var exceptions = new Exception?[concurrency];

@@ -52,6 +52,7 @@ sealed class PgClientProtocolOptions
         DefaultClientEncoding = options.Encoding;
         ReadTimeout = options.ReadTimeout;
         HeartbeatInterval = options.HeartbeatInterval;
+        TimeProvider = options.TimeProvider;
         FlowActivationTimeout = options.ConnectionTimeout;
         ScopeReset = options.ScopeReset.Snapshot();
         DataRowStreamingThreshold = options.DataRowStreamingThreshold;

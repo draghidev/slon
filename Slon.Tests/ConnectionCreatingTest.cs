@@ -30,7 +30,7 @@ public abstract class ConnectionCreatingTest
 
 static class ConnectionCreatingLane
 {
-    const int Capacity = 4;
+    const int Capacity = 6;
     static readonly SemaphoreSlim Permits = new(Capacity);
     static readonly SemaphoreSlim Acquisition = new(1);
 

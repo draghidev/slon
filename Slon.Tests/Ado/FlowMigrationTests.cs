@@ -19,9 +19,15 @@ public class FlowMigrationTests : ConnectionCreatingTest
 
     static async Task RunMigration(bool async)
     {
+        var time = new FakeTimeProvider();
         var scheduler = new PausableScheduler();
         await using var dataSource = AdoTestPool.NewIsolatedDataSource(
-            options => options with { PoolSize = 1, ExecutionScheduler = scheduler });
+            options => options with
+            {
+                PoolSize = 1,
+                ExecutionScheduler = scheduler,
+                TimeProvider = time
+            });
         var connection = await dataSource.OpenConnectionAsync(longRunning: false);
         try
         {

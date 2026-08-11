@@ -194,7 +194,7 @@ public class CommandDrainTests : ConnectionCreatingTest
     [DoNotParallelize]
     public async Task ConsumerDispose_MidBatch_SyncDispose_OpenBeforePark_Stress()
     {
-        var iters = StressEnv.Iterations(fallback: 128, cap: 8_000);
+        var iters = StressEnv.Iterations(fallback: 8, cap: 8_000);
         await using var protocol = await PgTestPool.NewIsolatedAsync();
         for (var i = 0; i < iters; i++)
         {

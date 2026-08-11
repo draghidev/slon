@@ -96,6 +96,7 @@ public sealed record SlonDataSourceOptions
     // surface would require thinking through "what's a sensible knob for end users."
     internal TimeSpan HeartbeatInterval { get; init; } = Heartbeat.DefaultInterval;
     internal TimeSpan MaintenanceInterval { get; init; } = TimeSpan.FromSeconds(1);
+    internal TimeProvider TimeProvider { get; init; } = TimeProvider.System;
     internal PipelineScheduler? ExecutionScheduler { get; init; }
 
     internal PgClientOptions ToPgClientOptions(OAuthTokenCache? oauthTokens = null,
@@ -112,6 +113,7 @@ public sealed record SlonDataSourceOptions
         LoggerFactory = loggerFactory ?? NullLoggerFactory.Instance,
         HeartbeatInterval = HeartbeatInterval,
         MaintenanceInterval = MaintenanceInterval,
+        TimeProvider = TimeProvider,
         ScopeReset = ScopeReset.Snapshot(),
         DataRowStreamingThreshold = DataRowStreamingThreshold,
         MaxInFlightFlowsPerWire = MaxInFlightOperationsPerWire,
@@ -321,6 +323,7 @@ public sealed class SlonDataSource : DbDataSource
                             ConnectionIdleLifetime = _options.ConnectionIdleLifetime,
                             ConnectionPruningInterval = _options.ConnectionPruningInterval,
                             HeartbeatInterval = _options.HeartbeatInterval,
+                            TimeProvider = _options.TimeProvider,
                             LoggerFactory = _loggerFactory,
                             MetricsName = Name,
                         });

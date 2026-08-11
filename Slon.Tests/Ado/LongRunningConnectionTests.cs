@@ -1,19 +1,19 @@
 namespace Slon.Tests;
 
+using Microsoft.Extensions.Time.Testing;
+
 [TestClass]
 public class LongRunningConnectionTests : ConnectionCreatingTest
 {
     [TestMethod]
     public async Task DataSourceCommand_IsNotScheduledBehindLongRunningConnection()
     {
+        var time = new FakeTimeProvider();
         await using var dataSource = AdoTestPool.NewIsolatedDataSource(
-            options => options with { PoolSize = 1 });
+            options => options with { PoolSize = 1, TimeProvider = time });
         var connection = await dataSource.OpenConnectionAsync(longRunning: true);
         try
         {
-            await using (var ownCommand = connection.CreateCommand("select 1"))
-                _ = await ownCommand.ExecuteNonQueryAsync();
-
             await using var dataSourceCommand = dataSource.CreateCommand("select 42");
             var pending = dataSourceCommand.ExecuteNonQueryAsync();
             await Task.Yield();

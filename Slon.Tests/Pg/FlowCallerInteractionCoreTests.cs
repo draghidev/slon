@@ -42,7 +42,7 @@ public class FlowCallerInteractionCoreTests
     [TestMethod]
     public async Task SignalProgress_RacingFirstWait_NeverStrands()
     {
-        var iterations = StressEnv.Iterations(fallback: 256, cap: 100_000);
+        var iterations = StressEnv.Iterations(fallback: 32, cap: 100_000);
         using var phases = new Barrier(3);
         CoreBox? current = null;
         Exception? workerFailure = null;

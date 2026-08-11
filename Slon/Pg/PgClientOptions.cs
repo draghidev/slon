@@ -13,6 +13,7 @@ sealed class PgClientOptions
     internal static readonly TimeSpan DefaultReadTimeout = TimeSpan.FromSeconds(30);
 
     internal TimeSpan HeartbeatInterval { get; init; } = Heartbeat.DefaultInterval;
+    internal TimeProvider TimeProvider { get; init; } = TimeProvider.System;
     // Time-based subsampling on top of the heartbeat. Pushes batch up to this interval before a
     // maintenance flow is scheduled. Setting this larger than HeartbeatInterval grows batches at
     // the cost of cleanup latency.

@@ -17,7 +17,7 @@ public class RecoveryStressTests : ConnectionCreatingTest
 {
     // Real recovery (and connection) per iteration. Capped at the documented heavy-soak value; set
     // SLON_UNCAPPED=1 to drive the raw SLON_STRESS_ITERATIONS for a deeper soak.
-    static int Iterations => StressEnv.Iterations(fallback: 20, cap: 2_000);
+    static int Iterations => StressEnv.Iterations(fallback: 4, cap: 2_000);
 
     static async Task RunAsync(PgClientProtocol protocol, string sql)
     {

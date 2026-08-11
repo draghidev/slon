@@ -86,8 +86,6 @@ public class AdoConnectionProxyTests : ConnectionCreatingTest
         var pg = await pool.GetAsync(default);
         var proxy = WrapInProxy(pg);
 
-        await RunAsyncOn(proxy, "select 1"); // warm
-
         await using var blocker = await PgAdvisoryLock.AcquireAsync();
         var slow = new CommandFlow(async: true,
             Command.Create("select 1") with { WithSync = true }, blocker.WaitCommand);

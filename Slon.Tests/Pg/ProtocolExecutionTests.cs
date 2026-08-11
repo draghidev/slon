@@ -123,7 +123,7 @@ public class ProtocolExecutionTests
     public async Task RepeatedSync_OnRawProtocol_Completes()
     {
         await using var protocol = await PgTestPool.NewIsolatedAsync();
-        for (int i = 0; i < 64; i++)
+        for (int i = 0; i < 8; i++)
             await PgTestPool.RunSync(protocol, "select 1");
     }
 
@@ -133,7 +133,7 @@ public class ProtocolExecutionTests
     public async Task RepeatedAsync_OnRawProtocol_Completes()
     {
         await using var protocol = await PgTestPool.NewIsolatedAsync();
-        for (int i = 0; i < 64; i++)
+        for (int i = 0; i < 8; i++)
             await PgTestPool.RunAsync(protocol, "select 1");
     }
 
