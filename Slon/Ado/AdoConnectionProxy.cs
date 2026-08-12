@@ -16,7 +16,7 @@ sealed class AdoConnectionProxy : IDisposable, IAsyncDisposable
 {
     readonly SlonDataSource? _dataSource;
     readonly CommandTracker _tracker;
-    readonly PgConnection _pgConnection;
+    PgConnection _pgConnection = null!;
     readonly IAdoConnection _connection;
 
     CommandFlow? _cachedFlow;
@@ -25,19 +25,22 @@ sealed class AdoConnectionProxy : IDisposable, IAsyncDisposable
     // which commands carry session state (SET / LISTEN / temp tables / BEGIN...). Null on the data-source
     // path (transient per-command proxy, which never Opens, so it stays multiplexed). Routing keys on this
     // being non-null, so the connection/data-source split needs no separate flag.
-    ExclusiveScopeLease? _exclusiveFlow;
+    ExclusiveScopeLease? _exclusiveScope;
 
-    internal AdoConnectionProxy(SlonDataSource dataSource, PgConnection pgConnection, IAdoConnection connection)
+    internal AdoConnectionProxy(SlonDataSource dataSource, IAdoConnection connection)
     {
         _dataSource = dataSource;
         _connection = connection;
-        _pgConnection = pgConnection;
         // Auto-prepare uses the workload-scope tracker directly. Explicit-prepare bookkeeping
         // lives on SlonConnection (per Policy A, survives Close-Open). PgConnection ↔ tracker
         // registration happens at PgConnection construction (in the factory), not here. Proxy
         // is per-lease, PgConnection-tracker binding is per-session.
         _tracker = dataSource.GetCommandTracker(initializedOnly: true);
     }
+
+    internal AdoConnectionProxy(SlonDataSource dataSource, PgConnection pgConnection, IAdoConnection connection)
+        : this(dataSource, connection)
+        => _pgConnection = pgConnection;
 
     internal AdoConnectionProxy(PgConnection pgConnection, IAdoConnection connection, bool autoPrepare, CommandTracker? tracker = null)
     {
@@ -64,7 +67,7 @@ sealed class AdoConnectionProxy : IDisposable, IAsyncDisposable
         return new CommandFlow(async, options);
         // Re-enabling this (and ReturnCommandFlow) pools CommandFlow, which arms the activation timeout.
         // PgClientFlow.Reset throws on that combination until generation-checked completion lands (the
-        // wrong-tenure heartbeat hazard).
+        // stale heartbeat callback hazard).
         // return Interlocked.Exchange(ref _cachedFlow, null) ?? new();
     }
 
@@ -141,7 +144,7 @@ sealed class AdoConnectionProxy : IDisposable, IAsyncDisposable
         // A SlonConnection holds an exclusive scope for its lease: route the command as a subflow into the
         // held scope's inner pipeline (serial on this one wire) instead of onto the multiplexed protocol
         // pipeline. The data-source path never acquires a scope, so it falls through to the direct enqueue.
-        if (_exclusiveFlow is { } scope)
+        if (_exclusiveScope is { } scope)
         {
             scope.Queue(flow);
             return true;
@@ -156,54 +159,41 @@ sealed class AdoConnectionProxy : IDisposable, IAsyncDisposable
         // TODO spin up a connection and write out cancel
     }
 
-    public bool InExclusiveScope => _exclusiveFlow is not null;
+    public bool InExclusiveScope => _exclusiveScope is not null;
 
-    // Acquire the connection's exclusive scope at Open and hold it for the whole lease. The scope flow's
-    // mode matches the caller: a sync acquire (async: false) is driven to activation by THIS thread via the
-    // source handoff (WaitForExecutor), so the caller drives the scope + its subflows end-to-end on one
-    // thread; an async acquire is executor-driven. From here every command on this proxy routes as a subflow.
-    public void AcquireExclusiveScope(bool longRunning = false)
+    internal bool TryStartExclusiveScope(PgConnection connection, bool async, FlowEnqueueOptions options)
     {
-        _exclusiveFlow = _pgConnection.Protocol.BeginExclusiveScope(longRunning);
-    }
-
-    public async ValueTask AcquireExclusiveScopeAsync(CancellationToken cancellationToken = default,
-        bool longRunning = false)
-    {
-        _exclusiveFlow = await _pgConnection.Protocol.BeginExclusiveScopeAsync(
-            cancellationToken, longRunning).ConfigureAwait(false);
-    }
-
-    internal bool TryQueueExclusiveScope(bool async, FlowEnqueueOptions options)
-    {
-        if (!_pgConnection.Protocol.TryQueueExclusiveScope(
-                async, options, out var flow))
+        if (_pgConnection is not null)
+            throw new InvalidOperationException("The proxy is already bound to a pooled connection.");
+        if (!connection.Protocol.TryQueueExclusiveScope(
+                async, options, out var scope))
             return false;
-        _exclusiveFlow = flow;
+        _pgConnection = connection;
+        _exclusiveScope = scope;
         return true;
     }
 
-    internal void WaitForExclusiveScope()
-        => _exclusiveFlow!.WaitForHandoffAsync(CancellationToken.None).GetAwaiter().GetResult();
+    internal void AcquireExclusiveScope()
+        => _exclusiveScope!.WaitForHandoffSynchronously();
 
-    internal ValueTask WaitForExclusiveScopeAsync(CancellationToken cancellationToken)
-        => new(_exclusiveFlow!.WaitForHandoffAsync(cancellationToken));
+    internal ValueTask AcquireExclusiveScopeAsync(CancellationToken cancellationToken)
+        => new(_exclusiveScope!.WaitForHandoffAsync(cancellationToken));
 
-    public void EndExclusiveScope()
+    public void ReleaseExclusiveScope()
     {
-        if (_exclusiveFlow is { } flow)
+        if (_exclusiveScope is { } scope)
         {
-            _exclusiveFlow = null;
-            flow.CompleteScopeAsync().AsTask().GetAwaiter().GetResult();
+            _exclusiveScope = null;
+            scope.CompleteScopeAsync().AsTask().GetAwaiter().GetResult();
         }
     }
 
-    public async ValueTask EndExclusiveScopeAsync()
+    public async ValueTask ReleaseExclusiveScopeAsync()
     {
-        if (_exclusiveFlow is { } flow)
+        if (_exclusiveScope is { } scope)
         {
-            _exclusiveFlow = null;
-            await flow.CompleteScopeAsync().ConfigureAwait(false);
+            _exclusiveScope = null;
+            await scope.CompleteScopeAsync().ConfigureAwait(false);
         }
     }
 

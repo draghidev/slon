@@ -205,6 +205,7 @@ sealed class EmptyProtocol<TMode> : IPoolConnection<EmptyProtocol<TMode>>
     readonly Lock _syncRoot = new();
     ProtocolStatus _status = ProtocolStatus.Created;
     int _drainingCount;
+    ConnectionPool<EmptyProtocol<TMode>>.Registration _poolRegistration;
 
     public EmptyProtocol(EmptyProtocolOptions? options, ConnectionPoolContext<EmptyProtocol<TMode>>? poolContext)
     {
@@ -270,9 +271,9 @@ sealed class EmptyProtocol<TMode> : IPoolConnection<EmptyProtocol<TMode>>
 
     // The benchmark protocol has no startup flow (it constructs immediately Ready), so there is
     // no suppressed idle publication for the pool's post-lease Start to unblock.
-    void IPoolConnection<EmptyProtocol<TMode>>.Start() { }
-    bool IPoolConnection<EmptyProtocol<TMode>>.TryBeginPruning() => false;
-
+    void IPoolConnection<EmptyProtocol<TMode>>.Start(
+        ConnectionPool<EmptyProtocol<TMode>>.Registration registration)
+        => _poolRegistration = registration;
     int IPoolConnection<EmptyProtocol<TMode>>.CompareTo(EmptyProtocol<TMode>? other)
     {
         // null instances are always better, they represent empty connection slots.
@@ -364,7 +365,7 @@ sealed class EmptyProtocol<TMode> : IPoolConnection<EmptyProtocol<TMode>>
             if (typeof(TMode) == typeof(PooledUserCompleted))
             {
                 if (remainingDepth is 0)
-                    protocol._poolContext?.SignalAvailability(protocol, isIdle: true);
+                    protocol._poolRegistration.SignalAvailability(isIdle: true);
             }
         }
     }

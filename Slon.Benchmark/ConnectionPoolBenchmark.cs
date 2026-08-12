@@ -8,7 +8,7 @@ namespace Slon.Benchmark;
 //   - GetAndRelease: hot path. Get a conn, mark it idle, repeat. Exercises the idle-channel
 //     fast path and the idle-signal pushback.
 //   - MultiplexBusy: stripe-walk path. Pre-setup drains the channel and marks all conns busy
-//     (depth > 0, IsIdle = false). Every Get falls through to the stripe walker, which is
+//     (depth > 0). Every Get falls through to the stripe walker, which is
 //     supposed to multiplex onto a non-idle conn.
 // Parameterized over MaxConnections + Concurrency for both.
 [MemoryDiagnoser]
@@ -135,18 +135,18 @@ sealed class FakeConnection : IPoolConnection<FakeConnection>
 {
     static readonly Task NeverCompletes = new TaskCompletionSource().Task;
     int _depth;
-    ConnectionPoolContext<FakeConnection>? _poolContext;
+    ConnectionPool<FakeConnection>.Registration _poolRegistration;
 
-    internal void SetPoolContext(ConnectionPoolContext<FakeConnection> context) => _poolContext = context;
     internal void IncrementDepth() => Interlocked.Increment(ref _depth);
     internal void DecrementDepth() => Interlocked.Decrement(ref _depth);
     internal void MarkIdleAndSignal()
     {
         // Idle = depth 0. Simulate work-done by firing the pool's idle callback.
         Volatile.Write(ref _depth, 0);
-        _poolContext?.SignalAvailability(this, isIdle: true);
+        _poolRegistration.SignalAvailability(isIdle: true);
     }
 
+    public int Outstanding => Volatile.Read(ref _depth);
     public bool IsIdle => Volatile.Read(ref _depth) is 0;
     public bool IsSchedulable => true;
     public Task Completion => NeverCompletes;
@@ -160,12 +160,12 @@ sealed class FakeConnection : IPoolConnection<FakeConnection>
         return l < r ? -1 : l == r ? 0 : 1;
     }
 
-    public bool TryBeginPruning() => false;
     public Task CompleteAsync(Exception? exception = null) => Task.CompletedTask;
 
     // The fake drives idle publication explicitly via MarkIdleAndSignal, so the startup
     // suppression gate Start() exists for has nothing to unblock here.
-    public void Start() { }
+    public void Start(ConnectionPool<FakeConnection>.Registration registration)
+        => _poolRegistration = registration;
 }
 
 sealed class FakeFactory : IPoolConnectionFactory<FakeConnection>
@@ -173,9 +173,6 @@ sealed class FakeFactory : IPoolConnectionFactory<FakeConnection>
     public FakeConnection Create(ConnectionPoolContext<FakeConnection> poolContext, TimeSpan timeout = default)
     {
         var conn = new FakeConnection();
-        conn.SetPoolContext(poolContext);
-        // Start idle so it lands in the pool's idle channel.
-        conn.MarkIdleAndSignal();
         return conn;
     }
 

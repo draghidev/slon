@@ -31,10 +31,28 @@ sealed class ConnectionPoolOptions
 sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSource
     where T : class, IPoolConnection<T>
 {
+    public readonly struct Registration
+    {
+        readonly ConnectionPool<T>? _pool;
+        readonly object? _tenure;
+        readonly T? _connection;
+
+        internal Registration(ConnectionPool<T> pool, object tenure, T connection)
+            => (_pool, _tenure, _connection) = (pool, tenure, connection);
+
+        /// Signals a scheduling edge through the pool slot that admitted this connection.
+        public void SignalAvailability(bool isIdle)
+        {
+            if (_pool is null || _tenure is null || _connection is null)
+                throw new InvalidOperationException("The pool registration is not initialized.");
+            _pool.SignalAvailability(_tenure, _connection, isIdle);
+        }
+    }
+
     bool _disposed;
     object SyncObj { get; } = new();
 
-    readonly object?[] _connections;
+    readonly ConnectionSlot[] _connections;
 
     /// Test diagnostic. This unsynchronized slot snapshot may be stale.
     internal string DescribeSlots()
@@ -42,14 +60,15 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
         var sb = new System.Text.StringBuilder();
         for (var i = 0; i < _connections.Length; i++)
         {
-            var value = Volatile.Read(ref _connections[i]);
+            var value = Volatile.Read(ref _connections[i].Item);
             sb.Append(i).Append('=');
             sb.Append(value switch
             {
                 null => "empty",
                 ConnectionFuture { IsCompleted: true } => "future-done",
                 ConnectionFuture => "future-pending",
-                T c => $"conn(idle={c.IsIdle} schedulable={c.IsSchedulable} completed={c.Completion.IsCompleted})",
+                T c => $"conn(idle={c.IsIdle} schedulable={c.IsSchedulable} " +
+                    $"completed={c.Completion.IsCompleted})",
                 _ => "?",
             }).Append(' ');
         }
@@ -58,8 +77,9 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
 
     readonly ConnectionPoolContext<T> _context;
     readonly IPoolConnectionFactory<T> _factory;
+    readonly Func<T, bool>? _tryBeginPruning;
 
-    readonly ConcurrentQueue<T> _idle = new();
+    readonly ConcurrentQueue<IdleToken> _idle = new();
     readonly AcquisitionCoordinator<Placement> _acquisitions = new();
     ConcurrentDictionary<Task, byte>? _detachedTasks;
     internal int WaiterCount => _acquisitions.Count;
@@ -70,7 +90,7 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
         var idle = 0;
         for (var i = 0; i < _connections.Length; i++)
         {
-            var connection = Volatile.Read(ref _connections[i]) switch
+            var connection = Volatile.Read(ref _connections[i].Item) switch
             {
                 T value => value,
                 ConnectionFuture { IsCompleted: true } future => future.Result,
@@ -97,7 +117,8 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
     int _pruningIdleCount;
     int _pruningIdleMinimum;
 
-    public ConnectionPool(IPoolConnectionFactory<T> factory, ConnectionPoolOptions options)
+    public ConnectionPool(IPoolConnectionFactory<T> factory, ConnectionPoolOptions options,
+        Func<T, bool>? tryBeginPruning = null)
     {
         ArgumentNullException.ThrowIfNull(options.LoggerFactory);
         var maxConnections = options.MaxConnections;
@@ -106,7 +127,8 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
         if ((uint)options.MinConnections > (uint)maxConnections)
             throw new ArgumentOutOfRangeException(nameof(options.MinConnections),
                 "Must be between zero and MaxConnections.");
-        var pruningEnabled = options.ConnectionIdleLifetime != Timeout.InfiniteTimeSpan &&
+        var pruningEnabled = tryBeginPruning is not null &&
+            options.ConnectionIdleLifetime != Timeout.InfiniteTimeSpan &&
             options.MinConnections < maxConnections;
         if (options.ConnectionIdleLifetime < TimeSpan.Zero &&
             options.ConnectionIdleLifetime != Timeout.InfiniteTimeSpan)
@@ -122,9 +144,10 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
             throw new ArgumentOutOfRangeException(nameof(options.ConnectionIdleLifetime),
                 "Must be at least ConnectionPruningInterval.");
 
-        _connections = new object?[maxConnections];
+        _connections = new ConnectionSlot[maxConnections];
 
         _factory = factory;
+        _tryBeginPruning = tryBeginPruning;
         _minConnections = options.MinConnections;
         _pruningInterval = options.ConnectionPruningInterval;
         if (pruningEnabled)
@@ -145,13 +168,6 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
         if (_idleSamples is not null)
             _heartbeat.Register(OnPoolHeartbeat);
         _context = new ConnectionPoolContext<T>(this,
-            (connection, isIdle) =>
-            {
-                if (isIdle)
-                    PublishIdle(connection);
-                else
-                    SignalAvailability();
-            },
             (conn, action)  => _heartbeat.Register(interval => action(conn, interval))
         );
         if (options.MetricsName is { } metricsName)
@@ -199,19 +215,25 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
         // Refused claims return their token. Bound the walk so retained-session connections
         // cannot make a pruning tick cycle forever.
         var candidates = _idle.Count;
-        while (candidates-- > 0 && count > 0 && _idle.TryDequeue(out var connection))
+        while (candidates-- > 0 && count > 0 && _idle.TryDequeue(out var token))
         {
-            if (connection.TryBeginPruning())
+            var connection = token.Connection;
+            if (!Owns(token.Registration, connection))
             {
+                RecordIdleRemovalForPruning();
+                continue;
+            }
+            _ = token.Registration.IdleTokenTenure.Claim();
+            if (_tryBeginPruning!(connection))
+            {
+                _ = token.Registration.IdleTokenTenure.Consume();
                 RecordIdleRemovalForPruning();
                 count--;
                 _ = CompletePrunedConnectionAsync(connection);
             }
             else
             {
-                if (ReturnIdleToken(connection))
-                    SignalAvailability();
-                else
+                if (!ReturnIdleToken(token, publish: true))
                     RecordIdleRemovalForPruning();
             }
         }
@@ -241,13 +263,33 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
         completion.ConfigureAwait(false).GetAwaiter().UnsafeOnCompleted(SignalAvailability);
     }
 
-    void PublishIdle(T connection)
+    void SignalAvailability(object registration, T connection, bool isIdle)
+    {
+        var tenure = GetTenure(registration, connection);
+        if (!Owns(tenure, connection))
+            return;
+        if (isIdle)
+            PublishIdle(tenure, connection);
+        else
+            SignalAvailability();
+    }
+
+    void PublishIdle(ConnectionFuture registration, T connection)
+        => _acquisitions.PublishAvailability(
+            static (state, generation) =>
+            {
+                ref var tenure = ref state.Registration.IdleTokenTenure;
+                tenure.PreparePublication(generation);
+                if (tenure.CommitPublication(generation))
+                    state.Pool.PublishIdleCore(state.Registration, state.Connection, generation);
+            },
+            (Pool: this, Registration: registration, Connection: connection));
+
+    void PublishIdleCore(ConnectionFuture registration, T connection, long generation)
     {
         if (_idleSamples is not null)
             Interlocked.Increment(ref _pruningIdleCount);
-        _idle.Enqueue(connection);
-        // Capacity must be visible before the packed-word bell linearizes this publication.
-        SignalAvailability();
+        _idle.Enqueue(new(registration, connection, generation));
     }
 
     void SignalAvailability() => _acquisitions.NotifyAvailability();
@@ -274,7 +316,8 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
         }
     }
 
-    bool DoSchedule<TState>(ConnectionCandidate<T> context, Func<ConnectionCandidate<T>, TState, bool>? schedule, TState state)
+    bool DoSchedule<TState>(ConnectionCandidate<T> context,
+        Func<ConnectionCandidate<T>, TState, bool> schedule, TState state)
     {
         ThrowIfDisposed();
 
@@ -282,29 +325,57 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
         if (!context.Connection.IsSchedulable)
             return false;
 
-        return schedule is not null && schedule(context, state);
+        // Returning true transfers retirement to the placed work. Returning false or throwing
+        // retains pool ownership, so a custom scheduler must not consume the candidate before
+        // either outcome. Callers with extensible setup must translate a post-transfer failure
+        // into a successful placement whose own completion carries that failure.
+        return schedule(context, state);
     }
 
-    bool ReturnIdleToken(T connection)
+    bool ReturnIdleToken(IdleToken token, bool publish = false)
     {
+        var connection = token.Connection;
+        var registration = token.Registration;
         // A dequeue owns the idle token until scheduling succeeds or the token is returned.
-        if (connection.IsIdle && connection.IsSchedulable)
+        if (Owns(registration, connection) && connection.IsIdle && connection.IsSchedulable)
         {
-            _idle.Enqueue(connection);
+            var publicationPending = registration.IdleTokenTenure.Return();
+            if (publish || publicationPending)
+            {
+                _acquisitions.PublishAvailability(
+                    static (state, generation) =>
+                    {
+                        ref var tenure = ref state.Token.Registration.IdleTokenTenure;
+                        tenure.PreparePublication(generation);
+                        _ = tenure.CommitPublication(generation);
+                        state.Pool._idle.Enqueue(new(
+                            state.Token.Registration, state.Token.Connection, generation));
+                    },
+                    (Pool: this, Token: token));
+            }
+            else
+                _idle.Enqueue(token);
             return true;
         }
+
+        // A completion may race this stale-token discard. Consume first, then recheck: a
+        // completion published before the consume was coalesced into this token, while one after
+        // it mints its own. The recheck closes the interval between those two cases.
+        _ = registration.IdleTokenTenure.Consume();
+        if (Owns(registration, connection) && connection.IsIdle && connection.IsSchedulable)
+            PublishIdle(registration, connection);
         return false;
     }
 
-    async ValueTask<T> WaitForAvailabilityAsync<TState>(Func<ConnectionCandidate<T>, TState, bool>? schedule, TState state,
+    async ValueTask<T> WaitForAvailabilityAsync<TState>(Func<ConnectionCandidate<T>, TState, bool> schedule, TState state,
         TimeSpan timeout, CancellationToken cancellationToken)
     {
         var deadline = new Deadline(timeout, _timeProvider);
         var timeoutSource = RentTimeoutSource(deadline.GetRemaining(), _timeProvider, cancellationToken);
         var waitToken = timeoutSource?.Token ?? CancellationToken.None;
         var waiter = _acquisitions.CreateWaiter(
-            static placement => placement.Pool.TryPlace(
-                placement.Schedule, placement.State, placement.CancellationToken),
+            static (placement, generation) => placement.Pool.TryPlace(
+                placement.Schedule, placement.State, placement.CancellationToken, generation),
             new PlacementState<TState>(this, schedule, state, cancellationToken));
         using var registration = _acquisitions.Enqueue(waiter, timeoutSource?.Token ?? cancellationToken);
         try
@@ -324,7 +395,11 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
             }
 
             if (IsCancellationTokenException(ex, token == CancellationToken.None ? waitToken : token))
+            {
+                if (cancellationToken.IsCancellationRequested)
+                    throw new TaskCanceledException(null, ex, cancellationToken);
                 ThrowSourceExhausted(ex);
+            }
 
             throw;
         }
@@ -337,13 +412,13 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
         }
     }
 
-    T WaitForAvailability<TState>(Func<ConnectionCandidate<T>, TState, bool>? schedule, TState state, TimeSpan timeout)
+    T WaitForAvailability<TState>(Func<ConnectionCandidate<T>, TState, bool> schedule, TState state, TimeSpan timeout)
     {
         var deadline = new Deadline(timeout, _timeProvider);
         var timeoutSource = RentTimeoutSource(deadline.GetRemaining(), _timeProvider);
-        using var waiter = _acquisitions.CreateWaiter(
-            static placement => placement.Pool.TryPlace(
-                placement.Schedule, placement.State, CancellationToken.None),
+        var waiter = _acquisitions.CreateWaiter(
+            static (placement, generation) => placement.Pool.TryPlace(
+                placement.Schedule, placement.State, CancellationToken.None, generation),
             new PlacementState<TState>(this, schedule, state, CancellationToken.None), synchronous: true);
         using var registration = _acquisitions.Enqueue(waiter, timeoutSource?.Token ?? CancellationToken.None);
         try
@@ -362,10 +437,11 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
         }
     }
 
-    PlacementAttempt<Placement> TryPlace<TState>(Func<ConnectionCandidate<T>, TState, bool>? schedule,
-        TState state, CancellationToken cancellationToken)
+    PlacementAttempt<Placement> TryPlace<TState>(Func<ConnectionCandidate<T>, TState, bool> schedule,
+        TState state, CancellationToken cancellationToken, long generation)
     {
-        if (TrySchedule(schedule, state, cancellationToken, exhaustive: true, out var future, out var connection))
+        if (TrySchedule(schedule, state, cancellationToken, exhaustive: true, generation,
+            out var future, out var connection, out _))
             return PlacementAttempt<Placement>.Placed(new(connection!));
         return future is null
             ? PlacementAttempt<Placement>.Unavailable
@@ -373,7 +449,7 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
     }
 
     T ResolvePlacement<TState>(Completion<Placement> completion,
-        Func<ConnectionCandidate<T>, TState, bool>? schedule, TState state, Deadline deadline)
+        Func<ConnectionCandidate<T>, TState, bool> schedule, TState state, Deadline deadline)
     {
         if (!completion.HasResult)
             Throw(completion.Exception!);
@@ -391,7 +467,7 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
     }
 
     async ValueTask<T> ResolvePlacementAsync<TState>(Completion<Placement> completion,
-        Func<ConnectionCandidate<T>, TState, bool>? schedule, TState state, Deadline deadline,
+        Func<ConnectionCandidate<T>, TState, bool> schedule, TState state, Deadline deadline,
         CancellationToken cancellationToken)
     {
         if (!completion.HasResult)
@@ -418,62 +494,93 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
             return;
         }
 
-        var connection = placement.Connection!;
-        // Successful scheduling may already have transferred retirement to placed work. Only an
-        // untouched idle claim is returned here; pool disposal owns all installed connections.
-        if (termination is not ObjectDisposedException && connection.IsIdle && connection.IsSchedulable)
-            PublishIdle(connection);
+        // A successful scheduler transferred retirement to its placed work. Deferred waiter
+        // termination therefore has no connection token to return.
     }
 
     [DoesNotReturn]
     static void Throw(Exception exception)
         => ExceptionDispatchInfo.Capture(exception).Throw();
 
-    bool TrySchedule<TState>(Func<ConnectionCandidate<T>, TState, bool>? schedule, TState state,
-        CancellationToken cancellationToken, bool exhaustive, out ConnectionFuture? future,
-        [NotNullWhen(true)]out T? connection)
+    bool TrySchedule<TState>(Func<ConnectionCandidate<T>, TState, bool> schedule, TState state,
+        CancellationToken cancellationToken, bool exhaustive, long maxIdleGeneration,
+        out ConnectionFuture? future,
+        [NotNullWhen(true)]out T? connection,
+        out bool consumedIdleToken)
     {
+        consumedIdleToken = false;
         // Prefer idle reuse, then growth, then multiplexing.
 
         // A rejected token returns at the tail. Walk at most one bounded cycle so later tokens
         // remain visible without repeatedly presenting the first rejection to this renter.
         var idleBudget = _connections.Length;
         T? returnedSentinel = null;
-        while (idleBudget-- != 0 && _idle.TryDequeue(out var idle))
+        while (idleBudget-- != 0 && _idle.TryDequeue(out var idleToken))
         {
+            var idle = idleToken.Connection;
+            var idleRegistration = idleToken.Registration;
+            if (!Owns(idleRegistration, idle))
+            {
+                RecordIdleRemovalForPruning();
+                continue;
+            }
+            ref var idleTokenTenure = ref idleRegistration.IdleTokenTenure;
+            var idleGeneration = idleTokenTenure.Claim();
             if (ReferenceEquals(idle, returnedSentinel))
             {
-                if (!ReturnIdleToken(idle))
+                if (!ReturnIdleToken(idleToken, publish: !exhaustive))
                     RecordIdleRemovalForPruning();
                 break;
             }
 
+            if (idleGeneration > maxIdleGeneration)
+            {
+                if (ReturnIdleToken(idleToken, publish: !exhaustive))
+                    returnedSentinel ??= idle;
+                else
+                    RecordIdleRemovalForPruning();
+                continue;
+            }
+
             if (idle.IsIdle)
             {
+                if (idleTokenTenure.Generation > maxIdleGeneration)
+                {
+                    if (ReturnIdleToken(idleToken, publish: !exhaustive))
+                        returnedSentinel ??= idle;
+                    else
+                        RecordIdleRemovalForPruning();
+                    continue;
+                }
+
                 try
                 {
                     if (DoSchedule(new(idle, cancellationToken), schedule, state))
                     {
+                        var publicationPending = idleTokenTenure.Consume();
                         RecordIdleRemovalForPruning();
+                        // A custom placement may complete synchronously while the dequeued token
+                        // is still outstanding. Its retirement publication was then coalesced;
+                        // replay it after consuming the old token.
+                        if (publicationPending && idle.IsIdle && idle.IsSchedulable)
+                            PublishIdle(idleRegistration, idle);
                         future = null;
                         connection = idle;
+                        consumedIdleToken = true;
                         return true;
                     }
                 }
                 catch
                 {
-                    if (ReturnIdleToken(idle))
-                        SignalAvailability();
-                    else
+                    if (!ReturnIdleToken(idleToken, publish: !exhaustive))
                         RecordIdleRemovalForPruning();
                     throw;
                 }
             }
 
-            if (ReturnIdleToken(idle))
+            if (ReturnIdleToken(idleToken, publish: !exhaustive))
             {
                 returnedSentinel ??= idle;
-                SignalAvailability();
             }
             else
                 RecordIdleRemovalForPruning();
@@ -490,11 +597,12 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
         T? busyFirst = null, busySecond = null;
         for (var i = startIndex; i < startIndex + connections.Length; i++)
         {
-            ref var item = ref connections[i < connections.Length ? i : i - connections.Length];
-            if (TryGetConnection(ref item, out var conn))
+            var slotIndex = i < connections.Length ? i : i - connections.Length;
+            ref var slot = ref connections[slotIndex];
+            if (TryGetConnection(ref slot, out var conn))
             {
                 // Completed slot, reclaim and open new in its place.
-                if (conn.Completion.IsCompleted && Interlocked.CompareExchange(ref item, future ??= new ConnectionFuture(), conn) == conn)
+                if (conn.Completion.IsCompleted && TryClaimSlot(ref slot, slotIndex, conn, ref future))
                 {
                     connection = default;
                     return false;
@@ -507,7 +615,7 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
                     else busySecond ??= conn;
                 }
             }
-            else if (Interlocked.CompareExchange(ref item, future ??= new ConnectionFuture(), conn) == conn)
+            else if (TryClaimSlot(ref slot, slotIndex, conn, ref future))
             {
                 // Empty slot, open new.
                 connection = default;
@@ -519,8 +627,8 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
         {
             for (var i = startIndex; i < startIndex + connections.Length; i++)
             {
-                ref var item = ref connections[i < connections.Length ? i : i - connections.Length];
-                if (TryGetConnection(ref item, out var candidate) && !candidate.IsIdle &&
+                ref var slot = ref connections[i < connections.Length ? i : i - connections.Length];
+                if (TryGetConnection(ref slot, out var candidate) && !candidate.IsIdle &&
                     DoSchedule(new(candidate, cancellationToken, isIdleCandidate: false), schedule, state))
                 {
                     future = null;
@@ -559,7 +667,8 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
     }
 
     // Must complete the future before exiting.
-    T OpenConnection<TState>(ConnectionFuture future, Func<ConnectionCandidate<T>, TState, bool>? schedule, TState state, TimeSpan timeout)
+    T OpenConnection<TState>(ConnectionFuture future, Func<ConnectionCandidate<T>, TState, bool> schedule,
+        TState state, TimeSpan timeout)
     {
         Debug.Assert(!future.IsCompleted);
 
@@ -586,12 +695,12 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
                 ThrowIfDisposed();
 
             // Admit before scheduling so synchronous completion can publish its idle edge.
-            conn.Start();
+            conn.Start(new(this, future, conn));
             admitted = true;
             ObserveCompletion(conn);
             scheduled = DoSchedule(new(conn, CancellationToken.None), schedule, state);
             if (!scheduled)
-                PublishIdle(conn);
+                PublishIdle(future, conn);
         }
         catch (Exception ex)
         {
@@ -606,7 +715,7 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
                 // Placement failure does not revoke pool ownership. Publish a connection on
                 // which the delegate made no progress.
                 if (conn!.IsIdle && conn.IsSchedulable)
-                    PublishIdle(conn);
+                    PublishIdle(future, conn);
             }
             throw;
         }
@@ -615,11 +724,13 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
             SettleOpener(future, admitted ? conn : null);
         }
 
-        return scheduled || schedule is null ? conn : throw new InvalidOperationException("Could not schedule work on a new connection.");
+        return scheduled ? conn : throw new InvalidOperationException("Could not schedule work on a new connection.");
     }
 
     // Must complete the future before exiting.
-    async ValueTask<T> OpenConnectionAsync<TState>(ConnectionFuture future, Func<ConnectionCandidate<T>, TState, bool>? schedule, TState state, TimeSpan timeout, CancellationToken cancellationToken)
+    async ValueTask<T> OpenConnectionAsync<TState>(ConnectionFuture future,
+        Func<ConnectionCandidate<T>, TState, bool> schedule, TState state, TimeSpan timeout,
+        CancellationToken cancellationToken)
     {
         Debug.Assert(!future.IsCompleted);
 
@@ -653,19 +764,21 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
             // The pending future already owns the slot. Check disposal before admitting the connection.
             lock (SyncObj)
                 ThrowIfDisposed();
-            conn.Start();
+            conn.Start(new(this, future, conn));
             admitted = true;
             ObserveCompletion(conn);
             scheduled = DoSchedule(new(conn, cancellationToken), schedule, state);
             if (!scheduled)
-                PublishIdle(conn);
+                PublishIdle(future, conn);
         }
         catch (Exception ex)
         {
             var wasTimeout = false;
+            var wasUserCancellation = false;
             if (timeoutSource is not null)
             {
                 wasTimeout = IsCancellationTokenException(ex, timeoutSource.Token);
+                wasUserCancellation = wasTimeout && cancellationToken.IsCancellationRequested;
                 await timeoutSource.DisposeAsync().ConfigureAwait(false);
             }
 
@@ -678,8 +791,10 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
             {
                 // See the synchronous path: keep an admitted, still-idle connection reachable.
                 if (conn!.IsIdle && conn.IsSchedulable)
-                    PublishIdle(conn);
+                    PublishIdle(future, conn);
             }
+            if (wasUserCancellation)
+                throw new TaskCanceledException(null, ex, cancellationToken);
             if (wasTimeout)
                 throw new TimeoutException("The operation has timed out.", ex);
 
@@ -690,19 +805,17 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
             SettleOpener(future, admitted ? conn : null);
         }
 
-        return scheduled || schedule is null ? conn : throw new InvalidOperationException("Could not schedule work on a new connection.");
+        return scheduled ? conn : throw new InvalidOperationException("Could not schedule work on a new connection.");
     }
 
-    // Publication transfers opener ownership. Wake after it becomes observable: an earlier
-    // connection signal may have raced while the slot still contained this future.
+    // Publication transfers opener ownership. Future visibility and its generation are fused:
+    // otherwise a later waiter can claim the slot between Complete and the availability bell.
     void SettleOpener(ConnectionFuture future, T? conn)
-    {
-        lock (SyncObj)
-            future.Complete(conn);
-        SignalAvailability();
-    }
+        => _acquisitions.PublishAvailability(
+            static (state, _) => state.Future.Complete(state.Connection),
+            (Future: future, Connection: conn), publishWhenDisposed: true);
 
-    T GetCore<TState>(Func<ConnectionCandidate<T>, TState, bool>? schedule, TState state, TimeSpan timeout)
+    T GetCore<TState>(Func<ConnectionCandidate<T>, TState, bool> schedule, TState state, TimeSpan timeout)
     {
         var reportAdmissions = _metrics?.AdmissionsEnabled is true;
         var reportTimeouts = _metrics?.AdmissionTimeoutsEnabled is true;
@@ -713,7 +826,8 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
 
         if (!_acquisitions.HasDemand)
         {
-            if (TrySchedule(schedule, state, CancellationToken.None, exhaustive: false, out var future, out var conn))
+            if (TrySchedule(schedule, state, CancellationToken.None, exhaustive: false,
+                long.MaxValue, out var future, out var conn, out _))
                 return conn;
 
             if (future is not null)
@@ -722,7 +836,7 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
 
         return WaitForAvailability(schedule, state, timeout);
 
-        T Observed(Func<ConnectionCandidate<T>, TState, bool>? schedule, TState state, TimeSpan timeout,
+        T Observed(Func<ConnectionCandidate<T>, TState, bool> schedule, TState state, TimeSpan timeout,
             bool reportAdmissions, bool reportTimeouts)
         {
             try
@@ -731,7 +845,8 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
 
                 if (!_acquisitions.HasDemand)
                 {
-                    if (TrySchedule(schedule, state, CancellationToken.None, exhaustive: false, out var future, out var conn))
+                    if (TrySchedule(schedule, state, CancellationToken.None, exhaustive: false,
+                        long.MaxValue, out var future, out var conn, out _))
                         return ReportAdmission(conn, waited: false, reportAdmissions);
 
                     if (future is not null)
@@ -748,13 +863,14 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
         }
     }
 
-    public T Get(TimeSpan timeout)
-        => GetCore(AlwaysTrue, null, timeout);
     public T Get<TState>(Func<ConnectionCandidate<T>, TState, bool> schedule, TState state, TimeSpan timeout)
         => GetCore(schedule, state, timeout);
 
-    static readonly Func<ConnectionCandidate<T>, object?, bool> AlwaysTrue = static (_, _) => true;
-    ValueTask<T> GetCoreAsync<TState>(Func<ConnectionCandidate<T>, TState, bool>? schedule, TState state, TimeSpan timeout, CancellationToken cancellationToken = default)
+    public UnqualifiedLease GetUnqualified(TimeSpan timeout)
+        => new(this, Get(static (_, _) => true, (object?)null, timeout));
+
+    ValueTask<T> GetCoreAsync<TState>(Func<ConnectionCandidate<T>, TState, bool> schedule, TState state,
+        TimeSpan timeout, CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
 
@@ -762,7 +878,8 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
         var reportTimeouts = _metrics?.AdmissionTimeoutsEnabled is true;
         if (!_acquisitions.HasDemand)
         {
-            if (TrySchedule(schedule, state, cancellationToken, exhaustive: false, out var future, out var conn))
+            if (TrySchedule(schedule, state, cancellationToken, exhaustive: false,
+                long.MaxValue, out var future, out var conn, out _))
                 return new(ReportAdmission(conn, waited: false, reportAdmissions));
 
             if (future is not null)
@@ -816,20 +933,59 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
         }
     }
 
-    public ValueTask<T> GetAsync(TimeSpan timeout, CancellationToken cancellationToken = default)
-        => GetCoreAsync(AlwaysTrue, null, timeout, cancellationToken);
-    public ValueTask<T> GetAsync<TState>(Func<ConnectionCandidate<T>, TState, bool>? schedule, TState state, TimeSpan timeout, CancellationToken cancellationToken = default)
+    public ValueTask<T> GetAsync<TState>(Func<ConnectionCandidate<T>, TState, bool> schedule, TState state,
+        TimeSpan timeout, CancellationToken cancellationToken = default)
         => GetCoreAsync(schedule, state, timeout, cancellationToken);
 
-    // Get normally transfers the idle token to work queued by its caller; that work returns the
-    // token when the connection becomes idle again. A caller that deliberately acquired without
-    // queuing anything must return that token explicitly.
-    internal void ReturnUnscheduled(T connection)
+    public ValueTask<UnqualifiedLease> GetUnqualifiedAsync(TimeSpan timeout,
+        CancellationToken cancellationToken = default)
+    {
+        var connection = GetAsync(static (_, _) => true, (object?)null, timeout, cancellationToken);
+        if (connection.IsCompletedSuccessfully)
+            return new ValueTask<UnqualifiedLease>(new UnqualifiedLease(this, connection.Result));
+        return Awaited(connection, this);
+
+        static async ValueTask<UnqualifiedLease> Awaited(
+            ValueTask<T> connection, ConnectionPool<T> pool)
+            => new(pool, await connection.ConfigureAwait(false));
+    }
+
+    public struct UnqualifiedLease : IDisposable
+    {
+        ConnectionPool<T>? _pool;
+        readonly T? _connection;
+
+        internal UnqualifiedLease(ConnectionPool<T> pool, T connection)
+            => (_pool, _connection) = (pool, connection);
+
+        public T Connection => _connection
+            ?? throw new InvalidOperationException("The unqualified lease is not initialized.");
+
+        public T Transfer()
+        {
+            if (_pool is null)
+                throw new InvalidOperationException("The unqualified lease has already been settled.");
+            _pool = null;
+            return Connection;
+        }
+
+        public void Dispose()
+        {
+            var pool = _pool;
+            if (pool is null)
+                return;
+            _pool = null;
+            pool.ReturnUnqualified(Connection);
+        }
+    }
+
+    void ReturnUnqualified(T connection)
     {
         ThrowIfDisposed();
         if (!connection.IsIdle || !connection.IsSchedulable)
-            throw new InvalidOperationException("Only an idle, schedulable connection can be returned without work.");
-        PublishIdle(connection);
+            throw new InvalidOperationException(
+                "Only an idle, schedulable connection can return an unqualified lease.");
+        PublishIdle(FindRegistration(connection), connection);
     }
 
     // Prefer DisposeAsync, so keep this explicitly implemented.
@@ -918,7 +1074,7 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
             _acquisitions.Dispose();
             for (var i = 0; i < _connections.Length; i++)
             {
-                ref var connSlot = ref _connections[i];
+                ref var connSlot = ref _connections[i].Item;
                 while (true)
                 {
                     var value = Volatile.Read(ref connSlot);
@@ -994,11 +1150,22 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
         }
     }
 
+    bool TryClaimSlot(ref ConnectionSlot slot, int slotIndex, T? observed, ref ConnectionFuture? future)
+    {
+        var candidate = future ??= new();
+        if (!ReferenceEquals(Interlocked.CompareExchange(ref slot.Item, candidate, observed), observed))
+            return false;
+
+        candidate.BindSlot(slotIndex);
+        Volatile.Write(ref slot.Registration, candidate);
+        return true;
+    }
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    static bool TryGetConnection(ref object? item, [NotNullWhen(true)]out T? connection)
+    static bool TryGetConnection(ref ConnectionSlot slot, [NotNullWhen(true)]out T? connection)
     {
         // A slot contains null, a connection, or an open-in-progress future.
-        var value = item;
+        var value = slot.Item;
         if (value is T conn)
         {
             connection = conn;
@@ -1010,7 +1177,7 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
         {
             // Do not overwrite a slot that advanced while this future was being observed.
             var result = future.Result;
-            if (ReferenceEquals(Interlocked.CompareExchange(ref item, result, future), future))
+            if (ReferenceEquals(Interlocked.CompareExchange(ref slot.Item, result, future), future))
             {
                 connection = result;
                 return connection is not null;
@@ -1020,6 +1187,55 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
         Debug.Assert(value is null or ConnectionFuture);
         connection = null;
         return false;
+    }
+
+    static bool TryGetConnection(ref ConnectionSlot slot, [NotNullWhen(true)]out T? connection,
+        [NotNullWhen(true)]out ConnectionFuture? registration)
+    {
+        if (!TryGetConnection(ref slot, out connection))
+        {
+            registration = null;
+            return false;
+        }
+
+        registration = Volatile.Read(ref slot.Registration)!;
+        Debug.Assert(registration is not null);
+        return true;
+    }
+
+    static ConnectionFuture GetTenure(object registration, T connection)
+    {
+        if (registration is not ConnectionFuture tenure)
+            throw new InvalidOperationException("The pool registration does not belong to this connection.");
+        // Complete publishes Result before IsCompleted. Acquire the publication flag first; reading
+        // Result before it could pair a stale null with the newly-published completed state.
+        if (tenure.IsCompleted && !ReferenceEquals(tenure.Result, connection))
+            throw new InvalidOperationException("The pool registration does not belong to this connection.");
+        return tenure;
+    }
+
+    bool Owns(ConnectionFuture registration, T connection)
+    {
+        var slotIndex = registration.SlotIndex;
+        if ((uint)slotIndex >= (uint)_connections.Length)
+            return false;
+        ref var slot = ref _connections[slotIndex];
+        if (!ReferenceEquals(Volatile.Read(ref slot.Registration), registration))
+            return false;
+        var item = Volatile.Read(ref slot.Item);
+        return ReferenceEquals(item, registration) || ReferenceEquals(item, connection);
+    }
+
+    ConnectionFuture FindRegistration(T connection)
+    {
+        for (var i = 0; i < _connections.Length; i++)
+        {
+            ref var slot = ref _connections[i];
+            if (TryGetConnection(ref slot, out var candidate, out var registration) &&
+                ReferenceEquals(candidate, connection))
+                return registration;
+        }
+        throw new InvalidOperationException("The connection no longer belongs to this pool.");
     }
 
     [ThreadStatic]
@@ -1054,9 +1270,17 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
         internal ConnectionFuture? Future { get; }
     }
 
+    struct ConnectionSlot
+    {
+        internal object? Item;
+        internal ConnectionFuture? Registration;
+    }
+
+    readonly record struct IdleToken(ConnectionFuture Registration, T Connection, long Generation);
+
     readonly record struct PlacementState<TState>(
         ConnectionPool<T> Pool,
-        Func<ConnectionCandidate<T>, TState, bool>? Schedule,
+        Func<ConnectionCandidate<T>, TState, bool> Schedule,
         TState State,
         CancellationToken CancellationToken);
 
@@ -1064,22 +1288,41 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
     {
         T? _conn;
         bool _published;
+        int _slotIndex = -1;
         TaskCompletionSource<T?>? _completion;
+        internal IdleTokenTenure IdleTokenTenure;
+
+        internal void BindSlot(int slotIndex)
+        {
+            Debug.Assert(_slotIndex is -1);
+            Volatile.Write(ref _slotIndex, slotIndex);
+        }
 
         public void Complete(T? conn)
         {
-            Debug.Assert(!_published, "A connection future must settle exactly once.");
-            _conn = conn;
-            Volatile.Write(ref _published, true);
-            _completion?.SetResult(conn);
+            TaskCompletionSource<T?>? completion;
+            lock (this)
+            {
+                Debug.Assert(!_published, "A connection future must settle exactly once.");
+                _conn = conn;
+                Volatile.Write(ref _published, true);
+                completion = _completion;
+            }
+            completion?.SetResult(conn);
         }
 
         // Allocated only when disposal overlaps an unpublished open.
         public Task<T?> GetCompletionTask()
-            => (_completion ??= new(TaskCreationOptions.RunContinuationsAsynchronously)).Task;
+        {
+            lock (this)
+                return _published
+                    ? Task.FromResult(_conn)
+                    : (_completion ??= new(TaskCreationOptions.RunContinuationsAsynchronously)).Task;
+        }
 
         public T? Result => Volatile.Read(ref _conn);
         public bool IsCompleted => Volatile.Read(ref _published);
+        internal int SlotIndex => Volatile.Read(ref _slotIndex);
     }
 
 }

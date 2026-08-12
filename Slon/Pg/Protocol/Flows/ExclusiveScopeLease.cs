@@ -17,6 +17,12 @@ sealed class ExclusiveScopeLease
 
     public Task HandoffReady { get; }
 
+    internal void WaitForHandoffSynchronously()
+    {
+        EnsureActive();
+        _flow.WaitForHandoffSynchronously(_tenure);
+    }
+
     internal Task WaitForHandoffAsync(CancellationToken cancellationToken)
     {
         EnsureActive();

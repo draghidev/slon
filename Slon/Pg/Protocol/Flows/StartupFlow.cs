@@ -72,7 +72,7 @@ sealed partial class StartupFlow : PgClientFlow
         await encoder.FlushAuto().ConfigureAwait(false);
 
         var decoder = await context.GetDecoderAuto().ConfigureAwait(false);
-        decoder.ReadTimeout = _startupTimeout;
+        decoder.UseReadTimeout(_startupTimeout);
         var message = await decoder.GetNextAuto().ConfigureAwait(false);
         var authType = ParseAuthMessage(message, out var reader);
         var requireChannelBinding = _options.Ssl.ChannelBinding is PostgreSqlChannelBinding.Require;

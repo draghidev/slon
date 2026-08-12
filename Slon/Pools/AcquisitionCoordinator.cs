@@ -21,6 +21,8 @@ internal sealed class AcquisitionCoordinator<TResult> : IDisposable
     readonly Lock _lock = new();
     Waiter? _head;
     Waiter? _tail;
+    Waiter? _cursor;
+    Waiter? _passTail;
     long _word;
     long _pass;
     long _totalExamined;
@@ -30,6 +32,7 @@ internal sealed class AcquisitionCoordinator<TResult> : IDisposable
     long _maxPlacementsPerDrive;
     long _maxInlineTicks;
     int _count;
+    bool _joinPending;
     bool _disposed;
 
     internal bool HasDemand => GetState(Volatile.Read(ref _word)) is not DriverState.Dormant;
@@ -52,6 +55,10 @@ internal sealed class AcquisitionCoordinator<TResult> : IDisposable
         TimeSpan.FromTicks(Volatile.Read(ref _maxInlineTicks)));
 
     internal Waiter<TState> CreateWaiter<TState>(
+        Func<TState, long, PlacementAttempt<TResult>> tryPlace, TState state, bool synchronous = false)
+        => new(tryPlace, state, synchronous);
+
+    internal UnversionedWaiter<TState> CreateWaiter<TState>(
         Func<TState, PlacementAttempt<TResult>> tryPlace, TState state, bool synchronous = false)
         => new(tryPlace, state, synchronous);
 
@@ -110,6 +117,40 @@ internal sealed class AcquisitionCoordinator<TResult> : IDisposable
                 Drive();
             return;
         }
+    }
+
+    // Identity-bearing capacity becomes visible in the same queue-lock section that advances the
+    // generation. A driver pass therefore cannot observe the capacity before its restart obligation.
+    // The callback runs under the coordinator lock and must remain cheap and must not re-enter it.
+    internal void PublishAvailability<TState>(Action<TState, long> publish, TState state,
+        bool publishWhenDisposed = false)
+    {
+        bool drive;
+        lock (_lock)
+        {
+            if (_disposed)
+            {
+                if (publishWhenDisposed)
+                    publish(state, GetGeneration(Volatile.Read(ref _word)));
+                return;
+            }
+            while (true)
+            {
+                var word = Interlocked.CompareExchange(ref _word, 0, 0);
+                var driverState = GetState(word);
+                var generation = NextGeneration(word);
+                var next = generation |
+                    (long)(driverState is DriverState.Armed ? DriverState.Driving : driverState);
+                if (Interlocked.CompareExchange(ref _word, next, word) != word)
+                    continue;
+                publish(state, generation);
+                drive = driverState is DriverState.Armed;
+                break;
+            }
+        }
+
+        if (drive)
+            Drive();
     }
 
     internal void Cancel(Waiter waiter, CancellationToken cancellationToken)
@@ -183,7 +224,12 @@ internal sealed class AcquisitionCoordinator<TResult> : IDisposable
         {
             var word = Interlocked.CompareExchange(ref _word, 0, 0);
             if (GetState(word) is DriverState.Driving)
+            {
+                // The pass tail is a snapshot. A newcomer joins the next pass instead of resetting
+                // current progress; otherwise a steady arrival stream could starve the old tail.
+                _joinPending = true;
                 return false;
+            }
             var next = GetGeneration(word) | (long)DriverState.Driving;
             if (Interlocked.CompareExchange(ref _word, next, word) == word)
                 return true;
@@ -209,15 +255,17 @@ internal sealed class AcquisitionCoordinator<TResult> : IDisposable
                 {
                     pass = ++_pass;
                     generation = GetGeneration(word);
+                    _cursor = _head;
+                    _passTail = _tail;
+                    _joinPending = false;
                 }
-
                 waiter = FindUntried(pass);
                 if (waiter is not null)
                 {
                     waiter.TriedPass = pass;
                     waiter.State = WaiterState.Trying;
                 }
-                else if (TryReleaseDriver(generation, out var retryGeneration))
+                else if (!_joinPending && TryReleaseDriver(generation, out _))
                 {
                     RecordDrive(examined, placements, generationRestarts, started);
                     return;
@@ -226,7 +274,10 @@ internal sealed class AcquisitionCoordinator<TResult> : IDisposable
                 {
                     generationRestarts++;
                     pass = ++_pass;
-                    generation = retryGeneration;
+                    generation = GetGeneration(Volatile.Read(ref _word));
+                    _cursor = _head;
+                    _passTail = _tail;
+                    _joinPending = false;
                     continue;
                 }
             }
@@ -235,7 +286,7 @@ internal sealed class AcquisitionCoordinator<TResult> : IDisposable
             try
             {
                 examined++;
-                attempt = waiter.TryPlace();
+                attempt = waiter.TryPlace(generation);
             }
             catch (Exception ex)
             {
@@ -338,8 +389,9 @@ internal sealed class AcquisitionCoordinator<TResult> : IDisposable
     Waiter? FindUntried(long pass)
     {
         Debug.Assert(_lock.IsHeldByCurrentThread);
-        for (var waiter = _head; waiter is not null; waiter = waiter.Next)
+        while (_cursor is { } waiter)
         {
+            _cursor = ReferenceEquals(waiter, _passTail) ? null : waiter.Next;
             if (waiter.State is WaiterState.Queued && waiter.TriedPass != pass)
                 return waiter;
         }
@@ -362,6 +414,14 @@ internal sealed class AcquisitionCoordinator<TResult> : IDisposable
     void Unlink(Waiter waiter)
     {
         Debug.Assert(_lock.IsHeldByCurrentThread);
+        if (ReferenceEquals(_passTail, waiter))
+        {
+            _passTail = waiter.Previous;
+            if (ReferenceEquals(_cursor, waiter))
+                _cursor = null;
+        }
+        else if (ReferenceEquals(_cursor, waiter))
+            _cursor = waiter.Next;
         if (waiter.Previous is null)
             _head = waiter.Next;
         else
@@ -386,7 +446,7 @@ internal sealed class AcquisitionCoordinator<TResult> : IDisposable
         Terminal
     }
 
-    internal abstract class Waiter : IValueTaskSource<Completion<TResult>>, IDisposable
+    internal abstract class Waiter : IValueTaskSource<Completion<TResult>>
     {
         ManualResetValueTaskSourceCore<Completion<TResult>> _asyncCompletion;
         readonly ManualResetEventSlim? _syncCompletion;
@@ -408,7 +468,7 @@ internal sealed class AcquisitionCoordinator<TResult> : IDisposable
         internal bool DisposeRequested;
         internal Completion<TResult> Completion;
 
-        internal abstract PlacementAttempt<TResult> TryPlace();
+        internal abstract PlacementAttempt<TResult> TryPlace(long generation);
 
         internal OperationCanceledException CreateCancellationException(CancellationToken cancellationToken)
             => _syncCompletion is null
@@ -422,8 +482,16 @@ internal sealed class AcquisitionCoordinator<TResult> : IDisposable
 
         internal Completion<TResult> Wait()
         {
-            _syncCompletion!.Wait();
-            return Completion;
+            var completionSource = _syncCompletion!;
+            completionSource.Wait();
+            // Wait may observe the signal before Set has finished touching its lazily-created
+            // kernel event. Taking the same lock closes that tail before disposal.
+            lock (completionSource)
+            {
+                var completion = Completion;
+                completionSource.Dispose();
+                return completion;
+            }
         }
 
         internal void Complete() => Complete(Completion);
@@ -432,8 +500,11 @@ internal sealed class AcquisitionCoordinator<TResult> : IDisposable
         {
             if (_syncCompletion is not null)
             {
-                Completion = completion;
-                _syncCompletion.Set();
+                lock (_syncCompletion)
+                {
+                    Completion = completion;
+                    _syncCompletion.Set();
+                }
             }
             else
                 _asyncCompletion.SetResult(completion);
@@ -444,19 +515,30 @@ internal sealed class AcquisitionCoordinator<TResult> : IDisposable
         public void OnCompleted(Action<object?> continuation, object? state, short token,
             ValueTaskSourceOnCompletedFlags flags)
             => _asyncCompletion.OnCompleted(continuation, state, token, flags);
-        public void Dispose() => _syncCompletion?.Dispose();
     }
 
     internal sealed class Waiter<TState> : Waiter
     {
-        readonly Func<TState, PlacementAttempt<TResult>> _tryPlace;
+        readonly Func<TState, long, PlacementAttempt<TResult>> _tryPlace;
         readonly TState _state;
 
-        internal Waiter(Func<TState, PlacementAttempt<TResult>> tryPlace, TState state, bool synchronous)
+        internal Waiter(Func<TState, long, PlacementAttempt<TResult>> tryPlace, TState state, bool synchronous)
             : base(synchronous)
             => (_tryPlace, _state) = (tryPlace, state);
 
-        internal override PlacementAttempt<TResult> TryPlace() => _tryPlace(_state);
+        internal override PlacementAttempt<TResult> TryPlace(long generation) => _tryPlace(_state, generation);
+    }
+
+    internal sealed class UnversionedWaiter<TState> : Waiter
+    {
+        readonly Func<TState, PlacementAttempt<TResult>> _tryPlace;
+        readonly TState _state;
+
+        internal UnversionedWaiter(Func<TState, PlacementAttempt<TResult>> tryPlace, TState state, bool synchronous)
+            : base(synchronous)
+            => (_tryPlace, _state) = (tryPlace, state);
+
+        internal override PlacementAttempt<TResult> TryPlace(long generation) => _tryPlace(_state);
     }
 
     internal readonly record struct DriverMetrics(

@@ -63,6 +63,7 @@ sealed class PgConnection : IPoolConnection<PgConnection>
     IDisposable? _selfHeartbeat;
     IDisposable? _poolHeartbeatRegistration;
     int _sessionLifetimeReleased;
+    ConnectionPool<PgConnection>.Registration _poolRegistration;
     // Session-wide explicit-prepare names remain unique across successive leases.
     int _explicitPrepareCounter;
 
@@ -100,7 +101,7 @@ sealed class PgConnection : IPoolConnection<PgConnection>
         if (poolContext is not null)
             protocol.SetFlowMigration(conn.TryMigrateFlow);
         protocol.Start(clientOptions, transport,
-            poolContext is null ? NoopAvailability : conn.SignalAvailabilityIfStarted,
+            conn.SignalAvailabilityIfStarted,
             timeout, upgradeTransport);
         onProtocolStarted?.Invoke();
         try
@@ -128,7 +129,7 @@ sealed class PgConnection : IPoolConnection<PgConnection>
         if (poolContext is not null)
             protocol.SetFlowMigration(conn.TryMigrateFlow);
         await protocol.StartAsync(clientOptions, transport,
-            poolContext is null ? NoopAvailability : conn.SignalAvailabilityIfStarted,
+            conn.SignalAvailabilityIfStarted,
             cancellationToken, upgradeTransport).ConfigureAwait(false);
         onProtocolStarted?.Invoke();
         try
@@ -149,15 +150,20 @@ sealed class PgConnection : IPoolConnection<PgConnection>
 
     void SignalAvailabilityIfStarted(bool isIdle)
     {
-        if (Volatile.Read(ref _isStarted) != 0)
-            _poolContext!.SignalAvailability(this, isIdle);
+        if (_poolContext is not null && Volatile.Read(ref _isStarted) != 0)
+            _poolRegistration.SignalAvailability(isIdle);
     }
 
-    // Enables depth-to-zero publication after installation and initial lease assignment.
-    public void Start() => Volatile.Write(ref _isStarted, 1);
-
-    // A non-null callback tells the protocol that this wrapper supplies heartbeat orchestration.
-    static readonly Action<bool> NoopAvailability = static _ => { };
+    // Enables depth-to-zero publication after installation. The unopened slot future still owns
+    // the connection here, so establish the initial idle level without minting or signaling a token;
+    // the placement immediately following Start owns that initial capacity.
+    void IPoolConnection<PgConnection>.Start(ConnectionPool<PgConnection>.Registration registration)
+    {
+        _poolRegistration = registration;
+        if (_protocol.Outstanding is not 0)
+            throw new InvalidOperationException("A newly admitted connection must be idle.");
+        Volatile.Write(ref _isStarted, 1);
+    }
 
     void WireHeartbeat(PgClientOptions options, ConnectionPoolContext<PgConnection>? poolContext)
     {
@@ -187,13 +193,11 @@ sealed class PgConnection : IPoolConnection<PgConnection>
     }
 
     // IPoolConnection<PgConnection>
-    public bool IsIdle => _protocol.IsIdle;
-    public bool IsSchedulable => _protocol.IsSchedulable;
+    bool IPoolConnection<PgConnection>.IsIdle => _protocol.Outstanding is 0;
+    bool IPoolConnection<PgConnection>.IsSchedulable => _protocol.IsSchedulable;
     public Task Completion => _protocol.Completion;
     public Exception? CompletionException => _protocol.CompletionException;
-    public int CompareTo(PgConnection? other) => _protocol.CompareTo(other?._protocol);
-    public bool TryBeginPruning() => _protocol.TryBeginPruning();
-
+    int IPoolConnection<PgConnection>.CompareTo(PgConnection? other) => _protocol.CompareTo(other?._protocol);
     public Task CompleteAsync(Exception? exception = null) => _protocol.CompleteAsync(exception);
     internal void ReportUnobservedCallback(Exception exception, string callback)
         => SlonLogMessages.UnobservedCallbackException(_logger, exception, callback);

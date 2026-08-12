@@ -1,17 +1,11 @@
 namespace Slon.Pools;
 
-sealed class ConnectionPoolContext<T>(ConnectionPool<T>? pool, Action<T, bool> signalAvailability,
+sealed class ConnectionPoolContext<T>(ConnectionPool<T>? pool,
     Func<T, Func<T, TimeSpan, ValueTask>, IDisposable> onHeartbeat)
     where T : class, IPoolConnection<T>
 {
-    internal ConnectionPoolContext(Action<T, bool> signalAvailability,
-        Func<T, Func<T, TimeSpan, ValueTask>, IDisposable> onHeartbeat)
-        : this(null, signalAvailability, onHeartbeat) { }
-
-    /// Signals that pool placement may now succeed. An idle signal also publishes the
-    /// connection's idle ownership token.
-    public void SignalAvailability(T connection, bool isIdle)
-        => signalAvailability(connection, isIdle);
+    internal ConnectionPoolContext(Func<T, Func<T, TimeSpan, ValueTask>, IDisposable> onHeartbeat)
+        : this(null, onHeartbeat) { }
 
     public IDisposable OnHeartbeat(Func<T, TimeSpan, ValueTask> action, T connection)
         => onHeartbeat(connection, action);

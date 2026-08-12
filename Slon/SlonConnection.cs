@@ -85,7 +85,7 @@ public sealed partial class SlonConnection : IAdoConnection
         try
         {
             if (_proxy.InExclusiveScope)
-                _proxy.EndExclusiveScope();
+                _proxy.ReleaseExclusiveScope();
 
             state = _state;
             _state = ConnectionState.Closed;
@@ -118,7 +118,7 @@ public sealed partial class SlonConnection : IAdoConnection
         try
         {
             if (_proxy.InExclusiveScope)
-                await _proxy.EndExclusiveScopeAsync().ConfigureAwait(false);
+                await _proxy.ReleaseExclusiveScopeAsync().ConfigureAwait(false);
 
             state = _state;
             _state = ConnectionState.Closed;
@@ -205,15 +205,6 @@ public sealed partial class SlonConnection : IAdoConnection
         return owned;
     }
 
-    // The data-source open paths (SlonDataSource.OpenConnection*) SetProxy directly rather than going
-    // through OpenCore/OpenAsyncCore, so they acquire the lease's exclusive scope through these. A
-    // SlonConnection holds an exclusive scope for its whole lease however it was opened.
-    internal void AcquireExclusiveScope(bool longRunning = false)
-        => EnsureConnected().AcquireExclusiveScope(longRunning);
-    internal ValueTask AcquireExclusiveScopeAsync(CancellationToken cancellationToken,
-        bool longRunning = false)
-        => EnsureConnected().AcquireExclusiveScopeAsync(cancellationToken, longRunning);
-
     // The exclusive scope is held for the lease, so the wire is serial: BEGIN opens a transaction on it
     // that this connection's later commands run inside (PG auto-enrolls them on the wire's open block),
     // until COMMIT/ROLLBACK closes it. Emitted as ordinary commands through the held scope.
@@ -295,11 +286,6 @@ public sealed partial class SlonConnection : IAdoConnection
             SetProxy(longRunning
                 ? DbDataSource.GetLongRunningProxy(this, DbDataSource.ConnectionTimeout)
                 : DbDataSource.GetProxy(this, DbDataSource.ConnectionTimeout));
-            // SlonConnection holds an exclusive scope for its whole lease: its commands run serially on one
-            // wire (safe default - Slon can't parse SQL to spot session state). The data-source command path
-            // never Opens, so it stays multiplexed.
-            if (!longRunning)
-                EnsureConnected().AcquireExclusiveScope();
         }
         catch
         {
@@ -323,8 +309,6 @@ public sealed partial class SlonConnection : IAdoConnection
                     this, DbDataSource.ConnectionTimeout, cancellationToken).ConfigureAwait(false)
                 : await DbDataSource.GetProxyAsync(
                     this, DbDataSource.ConnectionTimeout, cancellationToken).ConfigureAwait(false));
-            if (!longRunning)
-                await EnsureConnected().AcquireExclusiveScopeAsync(cancellationToken).ConfigureAwait(false);
         }
         catch
         {

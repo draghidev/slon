@@ -164,6 +164,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
     // Undispatched source work. Together with depth, this is the protocol's outstanding load.
     public int Backlog => _source.Backlog;
     public int Outstanding => _pipeline.Depth + _source.Backlog;
+
     ProtocolStatus Status
         => (ProtocolStatus)Volatile.Read(ref Unsafe.As<ProtocolStatus, int>(ref _status));
     void SetStatus(ProtocolStatus status)
@@ -173,8 +174,6 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
     internal long UnflushedBytes => _protocolDataWriter?.UnflushedBytes ?? 0;
     internal ValueTask FlushAsync(CancellationToken cancellationToken) => _protocolDataWriter.FlushAsync(cancellationToken);
 
-    // Pool-facing state. Idle includes undispatched backlog, not only pipeline depth.
-    internal bool IsIdle => Outstanding is 0;
     internal bool IsCompleted => Status is ProtocolStatus.Completed;
     // Draining immediately vetoes new pool placement, before terminal completion.
     internal bool IsDraining => Status is ProtocolStatus.Draining or ProtocolStatus.Completed;
@@ -474,7 +473,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         }
 
         if (becameReady && IsSchedulable)
-            _poolConnectionAvailabilitySignal?.Invoke(false);
+            _poolConnectionAvailabilitySignal?.Invoke(Outstanding is 0);
     }
 
     void SignalDraining()
@@ -500,7 +499,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
 
         if (signal)
         {
-            try { _poolConnectionAvailabilitySignal?.Invoke(IsIdle); }
+            try { _poolConnectionAvailabilitySignal?.Invoke(Outstanding is 0); }
             catch (Exception ex)
             {
                 SlonLogMessages.UnobservedCallbackException(
@@ -515,7 +514,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         if (!_source.ReleaseCapacity() || !IsSchedulable)
             return;
 
-        try { _poolConnectionAvailabilitySignal?.Invoke(IsIdle); }
+        try { _poolConnectionAvailabilitySignal?.Invoke(Outstanding is 0); }
         catch (Exception ex)
         {
             SlonLogMessages.UnobservedCallbackException(
@@ -557,11 +556,20 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         else if (!TryQueueFlow(flow, options, null, (object?)null))
             return false;
 
-        var control = flow.GetExecutionControl(FlowControl);
-        if (flow.NeedsSyncHandoff && flow.DefersSyncHandoff)
-            _source.SignalExecutor();
-        if (_scoringEnabled && control.StallsPipeline)
-            Interlocked.Increment(ref _pipelineStalls);
+        try
+        {
+            var control = flow.GetExecutionControl(FlowControl);
+            if (flow.NeedsSyncHandoff && flow.DefersSyncHandoff)
+                _source.SignalExecutor();
+            if (_scoringEnabled && control.StallsPipeline)
+                Interlocked.Increment(ref _pipelineStalls);
+        }
+        catch (Exception ex)
+        {
+            // TryQueueFlow already crossed the ownership boundary. Keep the committed result and
+            // terminate the protocol instead of exposing this as a failed placement.
+            FailProtocol(ex);
+        }
 
         return true;
     }
@@ -636,23 +644,33 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
                 _source.EnqueueSyncWaiter(flow, _options.FlowActivationTimeout);
         }
 
-        if (!handoff)
-            enqueue.Execute(runContinuationsAsynchronously: true);
-        else
-            _source.WaitForExecutor(flow);
+        try
+        {
+            if (!handoff)
+                enqueue.Execute(runContinuationsAsynchronously: true);
 
-        var control = flow.GetExecutionControl(FlowControl);
-        if (_scoringEnabled && control.StallsPipeline)
-            Interlocked.Increment(ref _pipelineStalls);
+            var control = flow.GetExecutionControl(FlowControl);
+            if (_scoringEnabled && control.StallsPipeline)
+                Interlocked.Increment(ref _pipelineStalls);
+        }
+        catch (Exception ex)
+        {
+            // The source owns the flow from the enqueue above. In particular, do not let a pool
+            // scheduler mistake a synchronous driver/callback failure for candidate rejection.
+            // Termination faults the committed scope and retires the candidate through that flow.
+            FailProtocol(ex);
+        }
         return true;
     }
 
     internal ExclusiveScopeLease BeginExclusiveScope(bool longRunning = false)
     {
         var scope = QueueExclusiveScope(async: false, longRunning);
-        scope.WaitForHandoffAsync(CancellationToken.None).GetAwaiter().GetResult();
+        scope.WaitForHandoffSynchronously();
         return scope;
     }
+
+    internal void DriveSyncHandoff(PgClientFlow flow) => _source.WaitForExecutor(flow);
 
     internal async ValueTask<ExclusiveScopeLease> BeginExclusiveScopeAsync(
         CancellationToken cancellationToken = default, bool longRunning = false)
@@ -713,10 +731,19 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
             else
                 _source.EnqueueSyncWaiter(flow, _options.FlowActivationTimeout);
         }
-        if (!handoff)
-            enqueue.Execute(runContinuationsAsynchronously: false);
-        else if (!flow.DefersSyncHandoff)
-            _source.WaitForExecutor(flow);
+        try
+        {
+            if (!handoff)
+                enqueue.Execute(runContinuationsAsynchronously: false);
+            else if (!flow.DefersSyncHandoff)
+                _source.WaitForExecutor(flow);
+        }
+        catch (Exception ex)
+        {
+            // Enqueue is the ownership boundary. Once crossed, report success to placement callers
+            // and let protocol termination fault and retire the committed flow.
+            FailProtocol(ex);
+        }
         return true;
     }
 
@@ -1123,7 +1150,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
             // BEFORE Release (user-visible terminal): Release fires the flow's completed observer,
             // which may Reset() and re-enqueue the SAME instance. If that next tenure's Activate lands
             // before OnReleasing's depth-0 CAS, the comparand matches the new activation (ABA) and
-            // severs a live binding. Ordering the release first closes this by causality. Recovery
+            // severs a live binding. Ordering OnReleasing first closes this by causality. Recovery
             // items take the hardened path (capture + try/finally) out-of-line to keep this inlineable.
             if (item is ResyncRecoveryFlow { FailedFlow: { } failedFlow } recovery)
             {
@@ -1139,6 +1166,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
             // an outer flow that left a transaction open is unscoped poison. Inner-scope / failed flows are
             // exempt (handled in GuardWireIdleOnHandoff).
             _control.GuardWireIdleOnHandoff(exception);
+            _control.OnReleased(remainingDepth);
         }
 
         [MethodImpl(MethodImplOptions.NoInlining)]
@@ -1189,6 +1217,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
                     _control.RecoveryCompleted();
 
                 failedFlow.GetExecutionControl(_control).Release(combined);
+                _control.OnReleased(remainingDepth);
             }
         }
 
@@ -1439,9 +1468,30 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         public bool IsInlineDrive => _source.IsInlineDrive;
         public long UnflushedBytes => protocol.UnflushedBytes;
         public ValueTask FlushAsync(CancellationToken cancellationToken) => protocol.FlushAsync(cancellationToken);
-        // Cancellation needs a proof-quality idle level; the slot reads are deliberately stale-tolerant.
-        bool _isIdle = true;
-        public bool IsIdle => Volatile.Read(ref _isIdle);
+        PgClientFlow? _cancellationActivatedFlow;
+        internal (PgClientFlow? Owner, int Window) CancellationActivation
+        {
+            get
+            {
+                var owner = Volatile.Read(ref _cancellationActivatedFlow);
+                return owner is { IsCompleted: false }
+                    ? (owner, owner.CancellationWindow)
+                    : (null, 0);
+            }
+        }
+        internal void PublishCancellationActivation(PgClientFlow flow)
+            => Volatile.Write(ref protocol.FlowControl._cancellationActivatedFlow, flow);
+        void SubstituteCancellationActivation(PgClientFlow from, PgClientFlow to)
+            => Interlocked.CompareExchange(
+                ref protocol.FlowControl._cancellationActivatedFlow, to, from);
+        void ClearCancellationActivation(PgClientFlow flow)
+        {
+            var outerOwner = protocol.FlowControl.ActivatedFlow;
+            if (ReferenceEquals(outerOwner, flow))
+                outerOwner = null;
+            Interlocked.CompareExchange(
+                ref protocol.FlowControl._cancellationActivatedFlow, outerOwner, flow);
+        }
         public ValueTask WaitForCancellationAttempt()
             => protocol.WaitForCancellationAttempt();
         public void RequestServerCancellation(PgClientFlow instigator, int window,
@@ -1683,7 +1733,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         // against a depth-0-cleared slot.
         internal void BindDecoder(PgClientFlow flow)
         {
-            Volatile.Write(ref _isIdle, false);
+            PublishCancellationActivation(flow);
             // Stamp the head flow's start tick at activation (this is the active reader). currentTick
             // minus it gives the head's running age for the load score.
             if (protocol._scoringEnabled)
@@ -1716,9 +1766,8 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         internal void OnReleasing(PgClientFlow flow, int remainingDepth)
         {
             protocol._serverParameterState.CommitFlow();
-            if (remainingDepth is 0)
-                Volatile.Write(ref _isIdle, true);
-            protocol.OnFlowReleased(this, flow, remainingDepth);
+            ClearCancellationActivation(flow);
+            protocol.OnFlowReleased(flow, poolFacing && remainingDepth is 0);
             // Scoring inputs maintained at retirement (the universal completion point, fires for every
             // flow including ones faulted before bind). Throughput: every retirement counts. Stalls: a
             // non-pipelined flow held the wire serialized from queue until its RFQ here (not just until
@@ -1732,28 +1781,34 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
                     Interlocked.Decrement(ref protocol._pipelineStalls);
             }
 
-            // At pipeline park (remainingDepth == 0) release the rooted read-state buffers and signal
-            // the pool's idle publication. The framework manages the ActivatedItem slot (cleared right after
-            // this), and the in-order Activate-before-Complete invariant means no successor Activate
-            // races this completion.
+            // At pipeline park release the rooted read-state buffers. Pool idle is published only
+            // after Release fires the reusable flow's terminal observer; depth zero here is not yet
+            // a pool-placement boundary.
             if (remainingDepth is 0)
-            {
                 _commandFlowReadState = new();
-                // Pool availability signaling runs in the advancer/retirement work-item context: a raw throw
-                // would crash that thread unobserved. But don't just swallow either - if the hook that
-                // reclaims this connection is throwing, the integration is broken and the pipeline won't
-                // get cleaned up naturally, so tear down via FailProtocol (fire-and-forget self-evict;
-                // the pool picks it up through the status flag).
-                if (poolFacing && protocol.IsSchedulable)
-                {
-                    try { protocol._poolConnectionAvailabilitySignal?.Invoke(true); }
-                    catch (Exception ex)
-                    {
-                        SlonLogMessages.UnobservedCallbackException(
-                            protocol._logger, ex, "the pool availability callback");
-                        protocol.FailProtocol(ex);
-                    }
-                }
+        }
+
+        internal void OnReleased(int remainingDepth)
+        {
+            if (!poolFacing || remainingDepth is not 0 || !protocol.IsSchedulable)
+                return;
+
+            if (protocol.Outstanding is not 0)
+                return;
+
+            if (protocol._poolConnectionAvailabilitySignal is { } signal)
+                SignalPoolAvailability(signal);
+        }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        void SignalPoolAvailability(Action<bool> signal)
+        {
+            try { signal(true); }
+            catch (Exception ex)
+            {
+                SlonLogMessages.UnobservedCallbackException(
+                    protocol._logger, ex, "the pool availability callback");
+                protocol.FailProtocol(ex);
             }
         }
 

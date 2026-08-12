@@ -52,8 +52,7 @@ public class ClientBenchmark
         EndPoint = EndPoint,
         Username = Username,
         Password = Password,
-        Database = Database,
-        PoolSize = Connections
+        Database = Database
     };
 
     internal static PgConnectionFactory CreateProtocolFactory()
@@ -69,9 +68,11 @@ public class ClientBenchmark
     {
         IPoolConnectionFactory<PgConnection> factory = CreateProtocolFactory();
         if (initializer is not null)
-            factory = new InitializingConnectionFactory<PgConnection>(factory, asyncInitializer: initializer);
+            factory = new InitializingConnectionFactory<PgConnection>(factory,
+                (connection, _) => initializer(connection, CancellationToken.None).GetAwaiter().GetResult(),
+                initializer);
 
-        return new(factory, new() { MaxConnections = poolSize ?? Options.PoolSize });
+        return new(factory, new() { MaxConnections = poolSize ?? Connections });
     }
 
     class Config : ManualConfig

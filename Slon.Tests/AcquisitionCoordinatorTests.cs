@@ -62,6 +62,133 @@ public class AcquisitionCoordinatorTests
     }
 
     [TestMethod]
+    public async Task BellDuringAttempt_RestartsFifoBeforeTryingNewFollower()
+    {
+        using var coordinator = new AcquisitionCoordinator<int>();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var release = new ManualResetEventSlim();
+        var attempts = new StrongBox<int>();
+        var winner = new StrongBox<int>();
+        var first = coordinator.CreateWaiter(
+            static state =>
+            {
+                var attempt = Interlocked.Increment(ref state.Attempts.Value);
+                if (attempt == 2)
+                {
+                    state.Coordinator.NotifyAvailability();
+                    state.Entered.TrySetResult();
+                    state.Release.Wait();
+                    return PlacementAttempt<int>.Unavailable;
+                }
+                if (attempt == 3 && Interlocked.CompareExchange(ref state.Winner.Value, 1, 0) == 0)
+                    return PlacementAttempt<int>.Placed(1);
+                return PlacementAttempt<int>.Unavailable;
+            },
+            (Coordinator: coordinator, Entered: entered, Release: release, Attempts: attempts, Winner: winner));
+        using var firstRegistration = coordinator.Enqueue(first);
+
+        var publication = Task.Factory.StartNew(coordinator.NotifyAvailability,
+            CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+        await entered.Task;
+
+        var second = coordinator.CreateWaiter(static winner =>
+            Interlocked.CompareExchange(ref winner.Value, 2, 0) == 0
+                ? PlacementAttempt<int>.Placed(2)
+                : PlacementAttempt<int>.Unavailable, winner);
+        using var secondRegistration = coordinator.Enqueue(second);
+        release.Set();
+        await publication;
+
+        Assert.AreEqual(1, (await first.AsValueTask()).Result,
+            "a new generation must restart selection at the FIFO head");
+        Assert.AreEqual(1, winner.Value);
+        Assert.IsFalse(second.AsValueTask().IsCompleted,
+            "a follower must not consume capacity published after the head's prior attempt");
+    }
+
+    [TestMethod]
+    public async Task JoinDuringPass_DoesNotRestartAheadOfExistingFollower()
+    {
+        using var coordinator = new AcquisitionCoordinator<int>();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var release = new ManualResetEventSlim();
+        var attempts = new StrongBox<int>();
+        var first = coordinator.CreateWaiter(
+            static state =>
+            {
+                var attempt = Interlocked.Increment(ref state.Attempts.Value);
+                if (attempt == 2)
+                {
+                    state.Entered.TrySetResult();
+                    state.Release.Wait();
+                }
+                else if (attempt == 3)
+                {
+                    var newcomer = state.Coordinator.CreateWaiter(
+                        static _ => PlacementAttempt<int>.Unavailable, state: 0);
+                    state.Coordinator.Enqueue(newcomer);
+                }
+                return PlacementAttempt<int>.Unavailable;
+            },
+            (Coordinator: coordinator, Entered: entered, Release: release, Attempts: attempts));
+        using var firstRegistration = coordinator.Enqueue(first);
+
+        var drive = Task.Factory.StartNew(coordinator.NotifyAvailability,
+            CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+        await entered.Task;
+        var attemptsSeenByFollower = new StrongBox<int>();
+        var follower = coordinator.CreateWaiter(static state =>
+        {
+            state.Seen.Value = state.Attempts.Value;
+            return PlacementAttempt<int>.Placed(2);
+        }, (Seen: attemptsSeenByFollower, Attempts: attempts));
+        using var followerRegistration = coordinator.Enqueue(follower);
+        release.Set();
+
+        Assert.AreEqual(2, (await follower.AsValueTask()).Result);
+        await drive;
+        Assert.AreEqual(3, attemptsSeenByFollower.Value,
+            "a join during the pass must not restart at the head before the existing follower");
+    }
+
+    [TestMethod]
+    public async Task GenerationChurn_DoesNotRestartFiniteSnapshot()
+    {
+        using var coordinator = new AcquisitionCoordinator<int>();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var release = new ManualResetEventSlim();
+        var attempts = new StrongBox<int>();
+        var first = coordinator.CreateWaiter(static state =>
+        {
+            var attempt = Interlocked.Increment(ref state.Attempts.Value);
+            if (attempt == 1)
+            {
+                state.Entered.TrySetResult();
+                state.Release.Wait();
+            }
+            if (attempt is 2 or 3)
+                state.Coordinator.NotifyAvailability();
+            return PlacementAttempt<int>.Unavailable;
+        }, (Coordinator: coordinator, Entered: entered, Release: release, Attempts: attempts));
+        var firstEnqueue = Task.Factory.StartNew(() => coordinator.Enqueue(first),
+            CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+        await entered.Task;
+        var attemptsSeenByFollower = new StrongBox<int>();
+        var follower = coordinator.CreateWaiter(static state =>
+        {
+            state.Seen.Value = state.Attempts.Value;
+            return PlacementAttempt<int>.Placed(2);
+        }, (Seen: attemptsSeenByFollower, Attempts: attempts));
+        using var followerRegistration = coordinator.Enqueue(follower);
+        release.Set();
+
+        Assert.AreEqual(2, (await follower.AsValueTask()).Result);
+        using var firstRegistration = await firstEnqueue;
+        Assert.AreEqual(2, attemptsSeenByFollower.Value,
+            "generation changes become a subsequent-pass obligation and must not reset current progress");
+    }
+
+    [TestMethod]
     public async Task FirstCompatibleWaiterWinsWithoutRemovingRejectedHead()
     {
         using var coordinator = new AcquisitionCoordinator<int>();
@@ -183,7 +310,7 @@ public class AcquisitionCoordinatorTests
     public void SynchronousWaiter_UsesSamePlacementResult()
     {
         using var coordinator = new AcquisitionCoordinator<int>();
-        using var waiter = coordinator.CreateWaiter(
+        var waiter = coordinator.CreateWaiter(
             static _ => PlacementAttempt<int>.Placed(42), state: 0, synchronous: true);
 
         using var registration = coordinator.Enqueue(waiter);

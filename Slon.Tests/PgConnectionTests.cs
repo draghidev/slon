@@ -41,8 +41,6 @@ public class PgConnectionTests : ConnectionCreatingTest
         var options = NewOptions();
         var transport = await SocketStreamConnection.ConnectAsync(options.EndPoint);
         var conn = await PgConnection.CreateAsync(new PgClientProtocolOptions(options), options, transport);
-        // No pool managing this conn. Mark in-service ourselves.
-        conn.Start();
         return conn;
     }
 
@@ -89,7 +87,6 @@ public class PgConnectionTests : ConnectionCreatingTest
         var transport = await SocketStreamConnection.ConnectAsync(options.EndPoint);
         await using var tracker = new CommandTracker(maxAuto: 1, autoMinimumUses: 1);
         var context = new ConnectionPoolContext<PgConnection>(
-            static (_, _) => { },
             static (_, _) => throw new InvalidOperationException("heartbeat wiring failed"));
 
         await Assert.ThrowsExactlyAsync<InvalidOperationException>(async () =>

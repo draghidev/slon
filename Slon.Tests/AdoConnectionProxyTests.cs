@@ -65,7 +65,7 @@ public class AdoConnectionProxyTests : ConnectionCreatingTest
     public async Task Sync_Completes()
     {
         await using var pool = NewPool();
-        var pg = await pool.GetAsync(default);
+        var pg = (await pool.GetUnqualifiedAsync(default)).Transfer();
         var proxy = WrapInProxy(pg);
         await RunSyncOn(proxy, "select 1");
     }
@@ -74,7 +74,7 @@ public class AdoConnectionProxyTests : ConnectionCreatingTest
     public async Task Async_Completes()
     {
         await using var pool = NewPool();
-        var pg = await pool.GetAsync(default);
+        var pg = (await pool.GetUnqualifiedAsync(default)).Transfer();
         var proxy = WrapInProxy(pg);
         await RunAsyncOn(proxy, "select 1");
     }
@@ -83,7 +83,7 @@ public class AdoConnectionProxyTests : ConnectionCreatingTest
     public async Task SyncWhileAsyncInFlight_SameProxy_BothComplete()
     {
         await using var pool = NewPool();
-        var pg = await pool.GetAsync(default);
+        var pg = (await pool.GetUnqualifiedAsync(default)).Transfer();
         var proxy = WrapInProxy(pg);
 
         await using var blocker = await PgAdvisoryLock.AcquireAsync();

@@ -122,6 +122,13 @@ sealed class ExclusiveAccessFlow : PgClientFlow
         cancellationToken.ThrowIfCancellationRequested();
     }
 
+    internal void WaitForHandoffSynchronously(long tenure)
+    {
+        EnsureTenure(tenure);
+        _protocol.DriveSyncHandoff(this);
+        _handoffReady.Task.GetAwaiter().GetResult();
+    }
+
     /// Queues a subflow in FIFO order. Synchronous subflows recursively hand execution to the caller.
     internal T Queue<T>(long tenure, T subflow, CancellationToken cancellationToken = default) where T : PgClientFlow
     {

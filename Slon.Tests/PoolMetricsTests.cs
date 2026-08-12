@@ -59,7 +59,7 @@ public sealed class PoolMetricsTests
         }))
         {
             await Assert.ThrowsExactlyAsync<InvalidOperationException>(
-                () => failingPool.GetAsync(default).AsTask());
+                () => failingPool.GetUnqualifiedAsync(default).AsTask());
         }
         Assert.AreEqual(1, listener.Sum("slon.pool.connection.create.failures", poolName));
 
@@ -83,11 +83,11 @@ public sealed class PoolMetricsTests
     sealed class MetricsConnectionFactory : IPoolConnectionFactory<MetricsConnection>
     {
         public MetricsConnection Create(ConnectionPoolContext<MetricsConnection> context, TimeSpan timeout = default)
-            => new(context);
+            => new();
 
         public ValueTask<MetricsConnection> CreateAsync(ConnectionPoolContext<MetricsConnection> context,
             CancellationToken cancellationToken = default)
-            => new(new MetricsConnection(context));
+            => new(new MetricsConnection());
     }
 
     sealed class FailingMetricsConnectionFactory : IPoolConnectionFactory<MetricsConnection>
@@ -100,22 +100,23 @@ public sealed class PoolMetricsTests
             => ValueTask.FromException<MetricsConnection>(new InvalidOperationException("creation failed"));
     }
 
-    sealed class MetricsConnection(ConnectionPoolContext<MetricsConnection> context) : IPoolConnection<MetricsConnection>
+    sealed class MetricsConnection : IPoolConnection<MetricsConnection>
     {
         readonly TaskCompletionSource _completion = new(TaskCreationOptions.RunContinuationsAsynchronously);
         int _idle = 1;
+        ConnectionPool<MetricsConnection>.Registration _poolRegistration;
 
         public bool IsIdle => Volatile.Read(ref _idle) != 0;
         public bool IsSchedulable => !_completion.Task.IsCompleted;
         public Task Completion => _completion.Task;
-        public void Start() { }
+        public void Start(ConnectionPool<MetricsConnection>.Registration registration)
+            => _poolRegistration = registration;
         public int CompareTo(MetricsConnection? other) => 0;
-        public bool TryBeginPruning() => false;
         public bool TryMakeBusy() => Interlocked.Exchange(ref _idle, 0) != 0;
         public void MakeIdle()
         {
             Volatile.Write(ref _idle, 1);
-            context.SignalAvailability(this, isIdle: true);
+            _poolRegistration.SignalAvailability(isIdle: true);
         }
         public Task CompleteAsync(Exception? exception = null)
         {

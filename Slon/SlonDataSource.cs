@@ -326,7 +326,7 @@ public sealed class SlonDataSource : DbDataSource
                             TimeProvider = _options.TimeProvider,
                             LoggerFactory = _loggerFactory,
                             MetricsName = Name,
-                        });
+                        }, static connection => connection.Protocol.TryBeginPruning());
 
                     var bootstrapResult = await CreateDbDeps(
                         async, timeout, clientOptions, transportFactory, commandTracker, pool,
@@ -397,16 +397,24 @@ public sealed class SlonDataSource : DbDataSource
                 tracker: commandTracker,
                 configureOptions: options => options.BackendProvider = _backendProvider);
             PgConnection? bootstrap = null;
+            ConnectionPool<PgConnection>.UnqualifiedLease bootstrapLease = default;
+            PgTypeCatalogFactoryContext? context = null;
             Exception? error = null;
             try
             {
-                bootstrap = pool is null
-                    ? async
+                if (pool is null)
+                {
+                    bootstrap = async
                         ? await bootstrapFactory.CreateAsync(shutdownToken).ConfigureAwait(false)
-                        : bootstrapFactory.Create(timeout)
-                    : async
-                        ? await pool.GetAsync(timeout, shutdownToken).ConfigureAwait(false)
-                        : pool.Get(timeout);
+                        : bootstrapFactory.Create(timeout);
+                }
+                else
+                {
+                    bootstrapLease = async
+                        ? await pool.GetUnqualifiedAsync(timeout, shutdownToken).ConfigureAwait(false)
+                        : pool.GetUnqualified(timeout);
+                    bootstrap = bootstrapLease.Connection;
+                }
 
                 var backendInfo = bootstrap.Protocol.FlowControl.BackendInfo;
                 var catalogFactory = _backendProvider.CreateTypeCatalogFactory(backendInfo);
@@ -429,7 +437,7 @@ public sealed class SlonDataSource : DbDataSource
                 dialectPluginSnapshot.CopyTo(plugins, pluginOffset);
                 _userTypeCatalogPlugins.CopyTo(plugins, pluginOffset + dialectPluginSnapshot.Length);
 
-                var context = new PgTypeCatalogFactoryContext(bootstrap.Protocol, shutdownToken);
+                context = new PgTypeCatalogFactoryContext(bootstrap.Protocol, shutdownToken);
                 PgTypeCatalog catalog;
                 if (async)
                 {
@@ -455,8 +463,8 @@ public sealed class SlonDataSource : DbDataSource
                 }
                 var dependencies = new PgDbDependencies(
                     backendInfo, catalog, commandTracker, DbDepsRevision++);
-                if (pool is not null && retainBootstrap && !context.FlowQueued)
-                    pool.ReturnUnscheduled(bootstrap);
+                if (pool is not null && (context.FlowQueued || !retainBootstrap))
+                    _ = bootstrapLease.Transfer();
                 return (dependencies, catalogFactory, plugins, pool is null ? null : bootstrap);
             }
             catch (Exception ex)
@@ -468,10 +476,30 @@ public sealed class SlonDataSource : DbDataSource
             {
                 if (bootstrap is not null && (pool is null || error is not null))
                 {
+                    if (pool is not null)
+                        _ = bootstrapLease.Transfer();
                     if (async)
                         await bootstrap.CompleteAsync(error).ConfigureAwait(false);
                     else
                         bootstrap.CompleteAsync(error).GetAwaiter().GetResult();
+                }
+                else if (bootstrap is not null && retainBootstrap && context is { FlowQueued: false })
+                {
+                    try
+                    {
+                        bootstrapLease.Dispose();
+                    }
+                    catch (Exception ex)
+                    {
+                        // The successful pool callback transferred the idle token to this bootstrap
+                        // operation. If it cannot republish that token, terminate the connection so
+                        // the placement is still settled on every exit.
+                        if (async)
+                            await bootstrap.CompleteAsync(ex).ConfigureAwait(false);
+                        else
+                            bootstrap.CompleteAsync(ex).GetAwaiter().GetResult();
+                        throw;
+                    }
                 }
             }
         }
@@ -664,9 +692,20 @@ public sealed class SlonDataSource : DbDataSource
             var context = new PgTypeCatalogFactoryContext(
                 candidate.Connection.Protocol, shutdownToken);
             BackendInfo = context.BackendInfo;
-            Load = async
-                ? factory.CreateAsync(context, plugins, shutdownToken)
-                : new(factory.Create(context, plugins));
+            try
+            {
+                Load = async
+                    ? factory.CreateAsync(context, plugins, shutdownToken)
+                    : new(factory.Create(context, plugins));
+            }
+            catch (Exception ex) when (context.FlowQueued)
+            {
+                // Queuing transfers candidate retirement to the flow. Preserve that ownership fact
+                // even when extensible synchronous setup throws after the transfer; the caller
+                // observes the failure from Load after pool placement has committed successfully.
+                Load = ValueTask.FromException<PgTypeCatalog>(ex);
+                return true;
+            }
 
             if (!context.FlowQueued)
             {
@@ -766,7 +805,6 @@ public sealed class SlonDataSource : DbDataSource
     {
         var connection = CreateConnection();
         connection.SetProxy(GetProxy(connection, ConnectionTimeout));
-        connection.AcquireExclusiveScope();
         return connection;
     }
 
@@ -787,14 +825,12 @@ public sealed class SlonDataSource : DbDataSource
     {
         var connection = CreateConnection();
         connection.SetProxy(await GetProxyAsync(connection, ConnectionTimeout, cancellationToken).ConfigureAwait(false));
-        await connection.AcquireExclusiveScopeAsync(cancellationToken).ConfigureAwait(false);
         return connection;
     }
     public new async ValueTask<SlonConnection> OpenConnectionAsync(CancellationToken cancellationToken)
     {
         var connection = CreateConnection();
         connection.SetProxy(await GetProxyAsync(connection, ConnectionTimeout, cancellationToken).ConfigureAwait(false));
-        await connection.AcquireExclusiveScopeAsync(cancellationToken).ConfigureAwait(false);
         return connection;
     }
 
@@ -889,51 +925,52 @@ public sealed class SlonDataSource : DbDataSource
     internal AdoConnectionProxy GetProxy(IAdoConnection connection, TimeSpan timeout)
     {
         EnsureInitialized(timeout);
-        return CreateProxy(_connectionPool.Get(timeout), connection);
+        return GetScopedProxy(connection, timeout, longRunning: false);
     }
 
     internal async ValueTask<AdoConnectionProxy> GetProxyAsync(IAdoConnection connection, TimeSpan timeout, CancellationToken cancellationToken = default)
     {
         await EnsureInitializedAsync(timeout, cancellationToken).ConfigureAwait(false);
-        return CreateProxy(await _connectionPool.GetAsync(timeout, cancellationToken).ConfigureAwait(false), connection);
+        return await GetScopedProxyAsync(connection, timeout, cancellationToken, longRunning: false).ConfigureAwait(false);
     }
 
     internal AdoConnectionProxy GetLongRunningProxy(IAdoConnection connection, TimeSpan timeout)
     {
         EnsureInitialized(timeout);
-        var state = new LongRunningProxyScheduleState(this, connection, async: false);
-        _connectionPool.Get(static (candidate, state) => state.TrySchedule(candidate), state, timeout);
-        state.Proxy!.WaitForExclusiveScope();
-        return state.Proxy;
+        return GetScopedProxy(connection, timeout, longRunning: true);
+    }
+
+    AdoConnectionProxy GetScopedProxy(IAdoConnection connection, TimeSpan timeout, bool longRunning)
+    {
+        var proxy = new AdoConnectionProxy(this, connection);
+        _connectionPool.Get(static (candidate, state) => TryStartExclusiveScope(candidate, state),
+            (Proxy: proxy, Async: false, LongRunning: longRunning), timeout);
+        proxy.AcquireExclusiveScope();
+        return proxy;
     }
 
     internal async ValueTask<AdoConnectionProxy> GetLongRunningProxyAsync(IAdoConnection connection,
         TimeSpan timeout, CancellationToken cancellationToken)
     {
         await EnsureInitializedAsync(timeout, cancellationToken).ConfigureAwait(false);
-        var state = new LongRunningProxyScheduleState(this, connection, async: true);
-        await _connectionPool.GetAsync(static (candidate, state) => state.TrySchedule(candidate),
-            state, timeout, cancellationToken).ConfigureAwait(false);
-        await state.Proxy!.WaitForExclusiveScopeAsync(cancellationToken).ConfigureAwait(false);
-        return state.Proxy;
+        return await GetScopedProxyAsync(connection, timeout, cancellationToken, longRunning: true).ConfigureAwait(false);
     }
 
-    sealed class LongRunningProxyScheduleState(
-        SlonDataSource dataSource, IAdoConnection connection, bool async)
+    async ValueTask<AdoConnectionProxy> GetScopedProxyAsync(IAdoConnection connection, TimeSpan timeout,
+        CancellationToken cancellationToken, bool longRunning)
     {
-        public AdoConnectionProxy? Proxy { get; private set; }
+        var proxy = new AdoConnectionProxy(this, connection);
+        await _connectionPool.GetAsync(static (candidate, state) => TryStartExclusiveScope(candidate, state),
+            (Proxy: proxy, Async: true, LongRunning: longRunning), timeout, cancellationToken).ConfigureAwait(false);
+        await proxy.AcquireExclusiveScopeAsync(cancellationToken).ConfigureAwait(false);
+        return proxy;
+    }
 
-        public bool TrySchedule(ConnectionCandidate<PgConnection> candidate)
-        {
-            var proxy = dataSource.CreateProxy(candidate.Connection, connection);
-            var enqueueOptions = FlowEnqueueOptions.BlockAdmission |
-                (candidate.IsIdleCandidate
-                    ? FlowEnqueueOptions.None
-                    : FlowEnqueueOptions.RequireExistingPipeline);
-            if (!proxy.TryQueueExclusiveScope(async, enqueueOptions))
-                return false;
-            Proxy = proxy;
-            return true;
-        }
+    static bool TryStartExclusiveScope(ConnectionCandidate<PgConnection> candidate,
+        (AdoConnectionProxy Proxy, bool Async, bool LongRunning) state)
+    {
+        var enqueueOptions = (state.LongRunning ? FlowEnqueueOptions.BlockAdmission : FlowEnqueueOptions.None) |
+            (candidate.IsIdleCandidate ? FlowEnqueueOptions.None : FlowEnqueueOptions.RequireExistingPipeline);
+        return state.Proxy.TryStartExclusiveScope(candidate.Connection, state.Async, enqueueOptions);
     }
 }

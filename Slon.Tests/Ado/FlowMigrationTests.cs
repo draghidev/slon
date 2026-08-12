@@ -117,7 +117,7 @@ public class FlowMigrationTests : ConnectionCreatingTest
         static bool MoveTo(PgClientProtocol protocol, FlowMigration migration)
         {
             var options = FlowEnqueueOptions.AllowMigration |
-                (protocol.IsIdle ? FlowEnqueueOptions.None : FlowEnqueueOptions.RequireExistingPipeline);
+                (protocol.Outstanding is 0 ? FlowEnqueueOptions.None : FlowEnqueueOptions.RequireExistingPipeline);
             return migration.CompletePlacement(protocol.TryQueue(migration.PreparePlacement(), options));
         }
     }
