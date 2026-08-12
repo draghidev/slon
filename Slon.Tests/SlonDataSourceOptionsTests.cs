@@ -85,4 +85,33 @@ public class SlonDataSourceOptionsTests
         Assert.ThrowsExactly<ArgumentException>(() => new SlonDataSource(syncOnly));
         Assert.ThrowsExactly<ArgumentException>(() => new SlonDataSource(asyncOnly));
     }
+
+    [TestMethod]
+    public void CancellationConvergenceTiming_MustBeFiniteAndOrdered()
+    {
+        var options = new SlonDataSourceOptions
+        {
+            EndPoint = TestEndPoint.Default,
+            Username = "postgres"
+        };
+
+        Assert.ThrowsExactly<ArgumentOutOfRangeException>(() =>
+            new SlonDataSource(options with { CancellationTimeout = Timeout.InfiniteTimeSpan }));
+        Assert.ThrowsExactly<ArgumentOutOfRangeException>(() =>
+            new SlonDataSource(options with { CancellationTimeout = TimeSpan.Zero }));
+        Assert.ThrowsExactly<ArgumentOutOfRangeException>(() =>
+            new SlonDataSource(options with { CancellationRetryInterval = TimeSpan.Zero }));
+        Assert.ThrowsExactly<ArgumentOutOfRangeException>(() =>
+            new SlonDataSource(options with
+            {
+                CancellationTimeout = TimeSpan.FromSeconds(1),
+                CancellationRetryInterval = TimeSpan.FromSeconds(1)
+            }));
+
+        using var dataSource = new SlonDataSource(options with
+        {
+            CancellationTimeout = TimeSpan.FromSeconds(2),
+            CancellationRetryInterval = TimeSpan.FromSeconds(1)
+        });
+    }
 }

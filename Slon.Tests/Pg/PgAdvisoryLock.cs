@@ -106,13 +106,16 @@ sealed class PgAdvisoryLock : IAsyncDisposable
         => PgTestPool.RunAsync(_owner, $$"""
             do $$
             begin
-                while not exists (
-                    select 1 from pg_stat_activity
-                    where pid = {{backendProcessId}}
-                      and wait_event = 'advisory'
-                      and query like '%pg_advisory_xact_lock({{Key}})%')
                 loop
                     perform pg_stat_clear_snapshot();
+                    if not exists (select 1 from pg_stat_activity where pid = {{backendProcessId}}) then
+                        raise exception 'Target backend {{backendProcessId}} disappeared';
+                    end if;
+                    exit when exists (
+                        select 1 from pg_stat_activity
+                        where pid = {{backendProcessId}}
+                          and wait_event = 'advisory'
+                          and query like '%pg_advisory_xact_lock({{Key}})%');
                     perform pg_sleep(0.001);
                 end loop;
             end $$
@@ -125,13 +128,16 @@ sealed class PgAdvisoryLock : IAsyncDisposable
         => PgTestPool.RunAsync(_owner, $$"""
             do $$
             begin
-                while not exists (
-                    select 1 from pg_stat_activity
-                    where pid = {{backendProcessId}}
-                      and query = 'select pg_advisory_xact_lock({{Key}})'
-                      and (wait_event = 'advisory' or state = 'idle'))
                 loop
                     perform pg_stat_clear_snapshot();
+                    if not exists (select 1 from pg_stat_activity where pid = {{backendProcessId}}) then
+                        raise exception 'Target backend {{backendProcessId}} disappeared';
+                    end if;
+                    exit when exists (
+                        select 1 from pg_stat_activity
+                        where pid = {{backendProcessId}}
+                          and query = 'select pg_advisory_xact_lock({{Key}})'
+                          and (wait_event = 'advisory' or state = 'idle'));
                     perform pg_sleep(0.001);
                 end loop;
             end $$

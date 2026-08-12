@@ -57,8 +57,9 @@ sealed class PgConnectionFactory : IPoolConnectionFactory<PgConnection>
         }
         catch (Exception ex)
         {
-            SlonLogMessages.CancellationRequestFailed(
-                _logger, ex, CancelRequestState.NotSent);
+            if (!cancellationToken.IsCancellationRequested)
+                SlonLogMessages.CancellationRequestFailed(
+                    _logger, ex, CancelRequestState.NotSent);
             if (transport is not null)
             {
                 transport.Abort();
@@ -71,13 +72,15 @@ sealed class PgConnectionFactory : IPoolConnectionFactory<PgConnection>
         var delivery = CancelRequestState.Sent;
         try
         {
-            await CancelRequest.SendAsync(transport, processId, secretKey, token).ConfigureAwait(false);
+            await PgClientProtocol.SendCancelRequestAsync(
+                transport, processId, secretKey, token).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
             sendError = ex;
             delivery = CancelRequestState.Unknown;
-            SlonLogMessages.CancellationRequestFailed(_logger, ex, delivery);
+            if (!cancellationToken.IsCancellationRequested)
+                SlonLogMessages.CancellationRequestFailed(_logger, ex, delivery);
         }
         finally
         {

@@ -20,8 +20,10 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
     readonly ProtocolReadPipe _pipe;
     readonly CancellationToken _abortToken;
     readonly TimeSpan _defaultReadTimeout;
+    readonly Action? _readTimeoutArmed;
     readonly Action<TimeSpan> _onHeartbeatAction;
     CancellationTokenSource _cancellationTokenSource;
+    TimeSpan _readTimeout;
 
     PgClientProtocol.Control _control = null!;
     const long ClaimedTimeoutTicks = long.MinValue;
@@ -79,18 +81,22 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
         }
     }
 
-    PgDecoder(ProtocolReadPipe pipe, CancellationToken abortToken, TimeSpan defaultReadTimeout)
+    PgDecoder(ProtocolReadPipe pipe, CancellationToken abortToken, TimeSpan defaultReadTimeout,
+        Action? readTimeoutArmed)
     {
         _pipe = pipe;
         _abortToken = abortToken;
         _defaultReadTimeout = defaultReadTimeout;
+        _readTimeout = defaultReadTimeout;
+        _readTimeoutArmed = readTimeoutArmed;
         _cancellationTokenSource = CancellationTokenSource.CreateLinkedTokenSource(abortToken);
         _onHeartbeatAction = OnHeartbeat;
         SetRemainingTimeout(Timeout.InfiniteTimeSpan);
     }
 
-    internal PgDecoder(PipeSegmentEnumerator<BackendMessageBatch.Segmenter, BackendMessageBatch> messageBatchEnumerator, CancellationToken abortToken, TimeSpan defaultReadTimeout)
-        : this(new ProtocolReadPipe(messageBatchEnumerator), abortToken, defaultReadTimeout)
+    internal PgDecoder(PipeSegmentEnumerator<BackendMessageBatch.Segmenter, BackendMessageBatch> messageBatchEnumerator,
+        CancellationToken abortToken, TimeSpan defaultReadTimeout, Action? readTimeoutArmed = null)
+        : this(new ProtocolReadPipe(messageBatchEnumerator), abortToken, defaultReadTimeout, readTimeoutArmed)
     {
     }
 
@@ -99,7 +105,13 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
 
     // Builds a scope-bound shell over the shared pipe with the scope's abort token.
     internal static PgDecoder CreateScopeShell(PgDecoder baseShell, CancellationToken abortToken, TimeSpan defaultReadTimeout)
-        => new(baseShell._pipe, abortToken, defaultReadTimeout);
+        => new(baseShell._pipe, abortToken, defaultReadTimeout, baseShell._readTimeoutArmed);
+
+    void ArmReadTimeout()
+    {
+        SetRemainingTimeout(_readTimeout);
+        _readTimeoutArmed?.Invoke();
+    }
 
     internal void Initialize(PgClientProtocol.Control control)
     {
@@ -111,13 +123,24 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
         // the new flow's reads.
         if (GetRemainingTimeout() != Timeout.InfiniteTimeSpan)
             SetRemainingTimeout(Timeout.InfiniteTimeSpan);
-        ReadTimeout = _defaultReadTimeout;
+        RestoreDefaultReadTimeout();
         if (!ReferenceEquals(_control, control))
             _control = control;
         _pipe.BindDecoder(this);
         // TODO we want a heartbeat setup directly through the protocol on construction.
         CurrentExecutionControl.RegisterDecoderOnHeartbeat(_onHeartbeatAction);
     }
+
+    /// <summary>
+    /// Selects the timeout for reads belonging to the current operation. The decoder restores the protocol
+    /// default when it observes ErrorResponse or ReadyForQuery, and whenever it is rebound to a flow. A flow
+    /// spanning multiple Sync groups must therefore select the timeout for each group.
+    /// </summary>
+    public void UseReadTimeout(TimeSpan timeout)
+        => _readTimeout = timeout;
+
+    void RestoreDefaultReadTimeout()
+        => _readTimeout = _defaultReadTimeout;
 
     internal bool TryContinueCurrentMessage(SequencePosition consumed, long consumedLength, out CurrentSegmentBuffer result)
         => _pipe.TryContinueCurrentMessage(consumed, consumedLength, out result);
@@ -140,7 +163,7 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
                 static (state, _) => ((CancellationTokenSource)state!).Cancel(), _cancellationTokenSource);
             try
             {
-                SetRemainingTimeout(ReadTimeout);
+                ArmReadTimeout();
                 timeoutSet = true;
                 return await _pipe.ContinueCurrentMessageAsync(
                     consumed, consumedLength, _cancellationTokenSource.Token).ConfigureAwait(false);
@@ -169,7 +192,7 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
         var timeoutSet = false;
         try
         {
-            SetRemainingTimeout(ReadTimeout);
+            ArmReadTimeout();
             timeoutSet = true;
             return _pipe.ContinueCurrentMessage(consumed, consumedLength, GetRemainingTimeout());
         }
@@ -208,7 +231,7 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
                 static (state, _) => ((CancellationTokenSource)state!).Cancel(), _cancellationTokenSource);
             try
             {
-                SetRemainingTimeout(ReadTimeout);
+                ArmReadTimeout();
                 timeoutSet = true;
                 return await _pipe.ExtendCurrentMessageAsync(
                     _cancellationTokenSource.Token).ConfigureAwait(false);
@@ -236,7 +259,7 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
         var timeoutSet = false;
         try
         {
-            SetRemainingTimeout(ReadTimeout);
+            ArmReadTimeout();
             timeoutSet = true;
             return _pipe.ExtendCurrentMessage(GetRemainingTimeout());
         }
@@ -289,9 +312,6 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
         }
     }
 
-    /// Applies not just to {Get,Move}Next but also {Get,Move}NextAsync, fully cancels I/O.
-    public TimeSpan ReadTimeout { get; set; }
-
     ValueTask<bool> IAsyncEnumerator<BackendMessage>.MoveNextAsync() => MoveNextAsync(CancellationToken.None);
 
     // Recycle a CTS cancelled by timeout or user-CT from the previous call. Abort is terminal,
@@ -328,7 +348,7 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
     }
 
     void LeaveCancellationReadFrontier(PgClientFlow flow)
-        => _control.LeaveCancellationReadFrontier();
+        => _control.LeaveCancellationReadFrontier(flow);
 
     internal void SetCancellationReadFrontier(PgClientFlow flow, int window)
     {
@@ -338,10 +358,15 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
         Interlocked.Exchange(ref _cancellationReadFrontierWindow, window);
     }
 
-    internal void ClearCancellationReadFrontier()
+    internal int ClearCancellationReadFrontier(PgClientFlow expectedFlow)
     {
-        Volatile.Write(ref _cancellationReadFrontierWindow, -1);
+        // Decoder frontier writers run on the single protocol reader. Validate ownership before
+        // clearing so a stale leave cannot erase a newer flow's frontier.
+        if (!ReferenceEquals(_cancellationReadFrontierFlow, expectedFlow))
+            return -1;
+        var window = Interlocked.Exchange(ref _cancellationReadFrontierWindow, -1);
         _cancellationReadFrontierFlow = null;
+        return window;
     }
 
     internal bool IsAtCancellationReadFrontier(PgClientFlow flow, int window)
@@ -459,7 +484,7 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
                         {
                             if (!timeoutSet)
                             {
-                                SetRemainingTimeout(ReadTimeout);
+                                ArmReadTimeout();
                                 timeoutSet = true;
                             }
                             var result = await pendingRead.ConfigureAwait(false);
@@ -487,7 +512,7 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
                         {
                             if (!timeoutSet)
                             {
-                                SetRemainingTimeout(ReadTimeout);
+                                ArmReadTimeout();
                                 timeoutSet = true;
                             }
                             var length = await pendingDirectRead.ConfigureAwait(false);
@@ -610,6 +635,11 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
         if (!message.TryObserveError())
             return message;
 
+        // ErrorResponse ends the current execution window. Any following read belongs to RFQ drain or
+        // recovery, so it must use the protocol timeout rather than the command-specific timeout. A later
+        // command installs its own timeout before reading its response.
+        RestoreDefaultReadTimeout();
+
         var execution = CurrentExecutionControl;
         var flow = execution.Flow;
         if (_control.HasPriorCancellationExposure(flow, flow.CancellationWindow))
@@ -634,6 +664,8 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
             while (_pipe.TryPeekNext(out var header))
             {
                 var handled = false;
+                if (header.Type is PgTypes.BackendType.ReadyForQuery)
+                    RestoreDefaultReadTimeout();
                 if (header.Type
                     is PgTypes.BackendType.ReadyForQuery
                     or PgTypes.BackendType.NoticeResponse
@@ -702,7 +734,7 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
                 {
                     if (!timeoutSet)
                     {
-                        SetRemainingTimeout(ReadTimeout);
+                        ArmReadTimeout();
                         timeoutSet = true;
                     }
 
@@ -738,7 +770,10 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
 
                 // HandleMessageAuto is always sync-completing (every branch returns a
                 // synchronously-constructed ValueTask). Reading .Result inline is safe.
-                if (CurrentExecutionControl.HandleMessageAuto(pipe.Current).Result)
+                var current = pipe.Current;
+                if (current.Header.Type is PgTypes.BackendType.ReadyForQuery)
+                    RestoreDefaultReadTimeout();
+                if (CurrentExecutionControl.HandleMessageAuto(current).Result)
                     continue;
 
                 return true;

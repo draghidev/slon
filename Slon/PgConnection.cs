@@ -173,7 +173,7 @@ sealed class PgConnection : IPoolConnection<PgConnection>
         }
         else
         {
-            var heartbeat = new Heartbeat(options.HeartbeatInterval, TimeProvider.System, _logger);
+            var heartbeat = new Heartbeat(options.HeartbeatInterval, options.TimeProvider, _logger);
             heartbeat.Register(OnHeartbeat);
             _selfHeartbeat = heartbeat;
         }

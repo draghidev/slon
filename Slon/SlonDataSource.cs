@@ -32,7 +32,14 @@ public sealed record SlonDataSourceOptions
     public PostgreSqlOAuthOptions? OAuth { get; init; }
     public PostgreSqlIntegratedSecurityOptions? IntegratedSecurity { get; init; }
     public TimeSpan ConnectionTimeout { get; init; } = TimeSpan.FromSeconds(10);
+    /// <summary>
+    /// Bounds cancellation convergence after a command has acquired a PostgreSQL wire. The bound
+    /// includes backend-cancellation grace and ends by aborting a wire that cannot reach a safe
+    /// ReadyForQuery or idle boundary.
+    /// </summary>
     public TimeSpan CancellationTimeout { get; init; } = TimeSpan.FromSeconds(10);
+    /// <summary>Delay before the one ambiguous backend-cancellation retry.</summary>
+    public TimeSpan CancellationRetryInterval { get; init; } = TimeSpan.FromSeconds(1);
     public int MinPoolSize { get; init; } = 1;
     public int MaxPoolSize { get; init; } = 10;
     /// <summary>
@@ -114,6 +121,8 @@ public sealed record SlonDataSourceOptions
         HeartbeatInterval = HeartbeatInterval,
         MaintenanceInterval = MaintenanceInterval,
         TimeProvider = TimeProvider,
+        CancellationTimeout = CancellationTimeout,
+        CancellationRetryInterval = CancellationRetryInterval,
         ScopeReset = ScopeReset.Snapshot(),
         DataRowStreamingThreshold = DataRowStreamingThreshold,
         MaxInFlightFlowsPerWire = MaxInFlightOperationsPerWire,
@@ -131,6 +140,14 @@ public sealed record SlonDataSourceOptions
             throw new ArgumentException(
                 "Synchronous and asynchronous connection initializers must be configured together.");
         ArgumentOutOfRangeException.ThrowIfNegative(MaxInFlightOperationsPerWire);
+        if (CancellationTimeout <= TimeSpan.Zero || CancellationTimeout == Timeout.InfiniteTimeSpan)
+            throw new ArgumentOutOfRangeException(nameof(CancellationTimeout),
+                "CancellationTimeout must be finite and positive.");
+        if (CancellationRetryInterval <= TimeSpan.Zero
+            || CancellationRetryInterval == Timeout.InfiniteTimeSpan
+            || CancellationRetryInterval >= CancellationTimeout)
+            throw new ArgumentOutOfRangeException(nameof(CancellationRetryInterval),
+                "CancellationRetryInterval must be finite, positive, and less than CancellationTimeout.");
         for (var i = 0; i < TypeLoadingSchemas.Count; i++)
             ArgumentException.ThrowIfNullOrWhiteSpace(TypeLoadingSchemas[i], nameof(TypeLoadingSchemas));
         Ssl.Validate();

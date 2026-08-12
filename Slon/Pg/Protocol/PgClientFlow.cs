@@ -17,13 +17,6 @@ abstract class PgClientFlowBindingContext;
 
 abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgClientFlow>, IThreadPoolWorkItem
 {
-    protected internal enum BackendCancellationTiming : byte
-    {
-        AfterGrace,
-        AtReadFrontier,
-        Immediate
-    }
-
     PgClientProtocol.Control? _pendingActivationControl;
     PgClientFlowSource.State? _placementSource;
     int _placementWasDetached;
@@ -322,8 +315,11 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
         // so a recycled instance can be wrong-tenure-completed by a stale timeout from the prior tenure.
         // The fix is a global monotonic placement stamp carried with the item and on the flow, validated
         // at the completer (tear-tolerant by uniqueness, no seqlock; failure reduces to a full int
-        // rollover, a fail-loud TimeoutException at worst). Until that lands, refuse to recycle a
-        // timeout-armed flow rather than let the race silently reappear.
+        // rollover, a fail-loud TimeoutException at worst). If cancellation-aware flows become reusable,
+        // that same reference-plus-stamp identity should be the cancellation coordinator's owner: a raw
+        // reference cannot distinguish retained attribution from a later tenure whose window restarts at
+        // zero. Until the stamp lands, refuse to recycle a timeout-armed flow rather than let the race
+        // silently reappear.
         if (EnableActivationTimeout)
             ThrowHelper.ThrowInvalidOperation("Cannot pool a flow with EnableActivationTimeout: a recycled instance can be wrong-tenure-completed by a stale activation timeout. Implement generation-checked completion first.");
         _started = false;
@@ -443,10 +439,14 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
             => _executionControl.WaitForCancellationAttempt();
 
         internal void RequestBackendCancellation(PgClientFlow instigator, int window,
-            BackendCancellationTiming timing, TaskCompletionSource? delivery)
-            => _executionControl.RequestServerCancellation(instigator, window, timing, delivery);
-        internal void OnBackendCancellationObserved(PgClientFlow instigator, int window)
-            => _executionControl.OnBackendCancellationObserved(instigator, window);
+            BackendCancellationTiming timing, TaskCompletionSource? delivery, object episodeKey, int scope,
+            BackendCancellationTiming subsequentTiming)
+            => _executionControl.RequestServerCancellation(instigator, window, timing, delivery,
+                episodeKey, scope, subsequentTiming);
+        internal void RequestBackendCancellation(PgClientFlow instigator, int window,
+            BackendCancellationTiming timing, TaskCompletionSource? delivery = null)
+            => RequestBackendCancellation(instigator, window, timing, delivery, new object(),
+                (int)Flows.CommandFlow.CancellationScope.CurrentWindow, timing);
 
         /// Returns an awaitable for the decoder. Activation is a cross-flow rendezvous completed by
         /// another flow's thread, so GetResult throws if not yet completed - async bodies await,
@@ -636,6 +636,8 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
                 case PgTypes.FrontendType.Sync:
                     flow._rfqCount = checked(flow._rfqCount + 1);
                     flow._lastMessageInducesRfq = true;
+                    control.AssignCancellationBoundary(flow,
+                        checked(flow._cancellationWindow + flow._rfqCount - 1));
                     break;
                 default:
                     flow._lastMessageInducesRfq = false;
@@ -685,7 +687,7 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
                 case PgTypes.BackendType.ReadyForQuery:
                     flow._rfqCount -= 1;
                     var completedWindow = flow._cancellationWindow++;
-                    control.OnFlowRfq(flow, backendMessage, completedWindow);
+                    control.OnFlowRfq(flow, backendMessage, completedWindow, flow._rfqCount);
                     flow.OnCancellationWindowCompleted(completedWindow, flow._rfqCount);
                     handled = false;
                     return true;
@@ -713,7 +715,7 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
                 case PgTypes.BackendType.ReadyForQuery:
                     flow._rfqCount -= 1;
                     var completedWindow = flow._cancellationWindow++;
-                    control.OnFlowRfq(flow, backendMessage, completedWindow);
+                    control.OnFlowRfq(flow, backendMessage, completedWindow, flow._rfqCount);
                     flow.OnCancellationWindowCompleted(completedWindow, flow._rfqCount);
                     goto default;
                 case PgTypes.BackendType.NoticeResponse:
@@ -764,10 +766,10 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
         public CancellationToken StoppingToken => control.StoppingToken;
         internal ValueTask WaitForCancellationAttempt() => control.WaitForCancellationAttempt();
         internal void RequestServerCancellation(PgClientFlow instigator, int window,
-            BackendCancellationTiming timing, TaskCompletionSource? delivery)
-            => control.RequestServerCancellation(instigator, window, timing, delivery);
-        internal void OnBackendCancellationObserved(PgClientFlow instigator, int window)
-            => control.OnBackendCancellationObserved(instigator, window);
+            BackendCancellationTiming timing, TaskCompletionSource? delivery, object episodeKey, int scope,
+            BackendCancellationTiming subsequentTiming)
+            => control.RequestServerCancellation(instigator, window, timing, delivery,
+                episodeKey, scope, subsequentTiming);
         public bool IsProtocolClosed => control.ClosedException is not null;
         public PgClientClosedException? ClosedException => control.ClosedException;
         public Exception FlowTerminationException => control.FlowTerminationException;

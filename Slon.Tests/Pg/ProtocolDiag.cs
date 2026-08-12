@@ -72,34 +72,7 @@ static class ProtocolDiag
     }
 
     internal static string CancellationState(PgClientProtocol protocol)
-    {
-        var type = typeof(PgClientProtocol);
-        var syncRoot = type.GetField("_syncRoot", All)!.GetValue(protocol)!;
-        lock (syncRoot)
-        {
-            var intents = DescribeChain(type.GetField("_cancellationHead", All)!.GetValue(protocol),
-                static item =>
-                {
-                    var t = item.GetType();
-                    object? F(string name) => t.GetField(name, All)!.GetValue(item);
-                    return $"window={F("Window")},dispatching={F("Dispatching")},attempts={F("Attempts")}," +
-                           $"frontierRequired={F("RequiresCancellationReadFrontier")},completed={F("InstigatorCompleted")}," +
-                           $"delay={F("RemainingDelayTicks")},exposure={F("Exposure") is not null}";
-                });
-            var exposures = DescribeChain(type.GetField("_exposureHead", All)!.GetValue(protocol),
-                static item =>
-                {
-                    var t = item.GetType();
-                    object? F(string name) => t.GetField(name, All)!.GetValue(item);
-                    return $"requested={F("RequestedWindow")},boundary={F("BoundaryWindow")}," +
-                           $"assigned={F("BoundaryFlow") is not null},pending={F("PendingDispatch")}," +
-                           $"acknowledged={F("Acknowledged")}";
-                });
-            return $"dispatching={type.GetField("_cancellationDispatching", All)!.GetValue(protocol)}, " +
-                   $"attemptGate={type.GetField("_cancellationAttempt", All)!.GetValue(protocol) is not null}, " +
-                   $"intents=[{intents}], exposures=[{exposures}]";
-        }
-    }
+        => protocol.DescribeCancellationState();
 
     internal static string CancellationFlowState(CommandFlow flow)
     {
@@ -110,17 +83,6 @@ static class ProtocolDiag
                $"{F("_subsequentBackendCancellationTiming")},context={F("_contextPublished")}," +
                $"body={F("_bodyState")},draining={F("_draining")},disposed={F("_consumerDisposed")}," +
                $"terminal={F("_enumeratorCompleted")},cancel={F("_cancelRequested")}";
-    }
-
-    static string DescribeChain(object? head, Func<object, string> describe)
-    {
-        var items = new List<string>();
-        for (var item = head; item is not null;)
-        {
-            items.Add(describe(item));
-            item = item.GetType().GetField("Next", All)!.GetValue(item);
-        }
-        return string.Join("; ", items);
     }
 
     static FieldInfo FindField(Type type, string name)

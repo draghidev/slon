@@ -1,96 +1,50 @@
-namespace Slon.Pg.Protocol;
+using System.Buffers.Binary;
+using Slon.Transport;
 
-enum CancelRequestState
-{
-    // The attempt ended after PostgreSQL accepted the request connection.
-    Sent,
-    // No request bytes could have reached PostgreSQL; retry is safe.
-    NotSent,
-    // The attempt ended, but request delivery cannot be excluded.
-    Unknown
-}
+namespace Slon.Pg.Protocol;
 
 sealed partial class PgClientProtocol
 {
-    CancellationIntent? _cancellationHead;
-    CancellationIntent? _cancellationTail;
-    CancellationExposure? _exposureHead;
-    CancellationExposure? _exposureTail;
-    bool _cancellationDispatching;
-    bool _hasCancellationIntents;
-    bool _hasCancellationExposures;
-    bool _hasUnassignedCancellationBoundary;
-    // Wire-wide admission latch. It confines growth of the exposed prefix while delivery is
-    // unresolved; bytes already written remain part of the cancellation exposure.
-    TaskCompletionSource? _cancellationAttempt;
+    const int CancelRequestMessageLength = sizeof(int) * 4;
+    const int CancelRequestCode = (1234 << 16) | 5678;
+
+    CancellationCoordinator<PgClientFlow>? _cancellation;
 
     internal bool HasPendingCancellation
-        => Volatile.Read(ref _hasCancellationIntents) || Volatile.Read(ref _hasCancellationExposures);
-    internal bool HasCancellationIntents => Volatile.Read(ref _hasCancellationIntents);
-    internal bool HasUnassignedCancellationBoundary => Volatile.Read(ref _hasUnassignedCancellationBoundary);
+        => Volatile.Read(ref _cancellation)?.HasPendingCancellation is true;
+    internal bool HasCancellationIntents
+        => Volatile.Read(ref _cancellation)?.HasCancellationIntents is true;
+    internal string DescribeCancellationState()
+        => Volatile.Read(ref _cancellation)?.DescribeState()
+           ?? "dispatching=False, intents=[], exposures=[]";
+
+    CancellationCoordinator<PgClientFlow> GetOrCreateCancellationCoordinatorLocked()
+    {
+        var coordinator = _cancellation;
+        if (coordinator is not null)
+            return coordinator;
+        Func<CancellationToken, ValueTask<CancelRequestState>>? request = null;
+        if (_options.CancelSender is not null && _backendProcessId != 0)
+            request = token => _options.CancelSender(_backendProcessId, _backendSecretKey, token);
+        coordinator = new(_options.TimeProvider, _options.CancellationTimeout,
+            _options.CancellationRetryInterval, _options.CancelRequestDelay, AbortToken,
+            request, FailProtocol,
+            _ => FlowControl.CancellationActivation,
+            (owner, window) => FlowControl.IsAtCancellationReadFrontier(owner, window),
+            static owner => owner.BackendCancellationGracePeriod,
+            (exception, state) => SlonLogMessages.CancellationRequestFailed(_logger, exception, state));
+        Volatile.Write(ref _cancellation, coordinator);
+        return coordinator;
+    }
 
     ValueTask WaitForCancellationAttempt()
+        => Volatile.Read(ref _cancellation)?.WaitForCancellationAttempt() ?? default;
+
+    internal void RequestServerCancellation(PgClientFlow instigator,
+        int window, BackendCancellationTiming timing, TaskCompletionSource? delivery,
+        object episodeKey, int scope, BackendCancellationTiming subsequentTiming)
     {
-        lock (_syncRoot)
-            return _cancellationAttempt is { } attempt ? new(attempt.Task) : default;
-    }
-
-    void ArmCancellationAttemptLocked()
-        => _cancellationAttempt ??= new(TaskCreationOptions.RunContinuationsAsynchronously);
-
-    void ReleaseCancellationAttemptLocked()
-    {
-        var attempt = _cancellationAttempt;
-        _cancellationAttempt = null;
-        attempt?.SetResult();
-    }
-
-    // One flow-window request. Once delivery may have occurred, any remaining wire-wide reach is
-    // represented by a CancellationExposure instead.
-    sealed class CancellationIntent(PgClientFlow instigator, Control control, int window)
-    {
-        internal readonly PgClientFlow Instigator = instigator;
-        internal readonly Control Control = control;
-        internal CancellationIntent? Next;
-        internal int Window = window;
-        internal bool Dispatching;
-        // Caller cancellation waits until buffered input has been consumed. Timeouts bypass this
-        // condition because their read cancellation has already established the failure boundary.
-        internal bool RequiresCancellationReadFrontier;
-        internal bool InstigatorCompleted;
-        internal byte Attempts;
-        internal long RemainingDelayTicks;
-        internal TaskCompletionSource? Delivery;
-        // Pre-registered reach for the current attempt.
-        internal CancellationExposure? Exposure;
-    }
-
-    // Possible wire-wide reach of a cancellation request. It may outlive its instigating flow
-    // until idle or an RFQ boundary proves that it cannot strike later work.
-    sealed class CancellationExposure(PgClientFlow instigator, Control control, int requestedWindow)
-    {
-        internal readonly PgClientFlow Instigator = instigator;
-        internal readonly Control Control = control;
-        internal readonly int RequestedWindow = requestedWindow;
-        internal CancellationExposure? Next;
-        internal PgClientFlow? BoundaryFlow;
-        internal int BoundaryWindow;
-        // The sender still owns settlement, so an idle sweep must not remove this exposure.
-        internal bool PendingDispatch;
-        internal bool Acknowledged;
-    }
-
-    internal void RequestServerCancellation(PgClientFlow instigator, Control control,
-        int window, PgClientFlow.BackendCancellationTiming timing, TaskCompletionSource? delivery = null)
-    {
-        if (_options.CancelSender is null || _backendProcessId is 0)
-        {
-            delivery?.TrySetResult();
-            return;
-        }
-
-        CancellationIntent? intent = null;
-        var dispatch = false;
+        CancellationCoordinator<PgClientFlow> coordinator;
         lock (_syncRoot)
         {
             if (_status is not ProtocolStatus.Ready || instigator.IsCompleted)
@@ -98,490 +52,98 @@ sealed partial class PgClientProtocol
                 delivery?.TrySetResult();
                 return;
             }
-            for (var existing = _cancellationHead; existing is not null; existing = existing.Next)
-            {
-                if (ReferenceEquals(existing.Instigator, instigator) && ReferenceEquals(existing.Control, control)
-                    && existing.Window == window)
-                {
-                    existing.Delivery ??= delivery;
-                    var delayTicks = GetCancellationDelayTicks(timing, instigator);
-                    if (delayTicks < existing.RemainingDelayTicks)
-                    {
-                        existing.RemainingDelayTicks = delayTicks;
-                        existing.RequiresCancellationReadFrontier = timing is not PgClientFlow.BackendCancellationTiming.Immediate;
-                    }
-                    dispatch = TryBeginCancellationDispatchLocked(existing);
-                    intent = existing;
-                    break;
-                }
-            }
-
-            if (intent is null)
-            {
-                intent = new(instigator, control, window);
-                intent.Delivery = delivery;
-                intent.RemainingDelayTicks = GetCancellationDelayTicks(timing, instigator);
-                intent.RequiresCancellationReadFrontier = timing is not PgClientFlow.BackendCancellationTiming.Immediate;
-                if (_cancellationTail is null)
-                    _cancellationHead = intent;
-                else
-                    _cancellationTail.Next = intent;
-                _cancellationTail = intent;
-                // Full-fence publication before TryBegin probes the read frontier. The reader
-                // atomically publishes its frontier before probing this level.
-                Interlocked.Exchange(ref _hasCancellationIntents, true);
-                dispatch = TryBeginCancellationDispatchLocked(intent);
-            }
+            coordinator = GetOrCreateCancellationCoordinatorLocked();
         }
-        if (dispatch)
-            _ = DispatchCancellationAsync(intent!);
+        coordinator.RequestCancellation(instigator, window, timing, delivery,
+            episodeKey, scope == (int)Flows.CommandFlow.CancellationScope.RemainingFlow,
+            subsequentTiming);
+        // Flow release publishes its coordinator down-edge before IsCompleted. Recheck after
+        // publishing the episode so either that down-edge or this observation retires it.
+        if (instigator.IsCompleted)
+            coordinator.OnOwnerReleased(instigator, FlowControl.CancellationActivation.Owner is null);
     }
 
-    bool TryBeginCancellationDispatchLocked(CancellationIntent intent)
-    {
-        if (_status is not ProtocolStatus.Ready || _cancellationDispatching || intent.Dispatching
-            || intent.InstigatorCompleted || intent.Attempts >= 2
-            || intent.RemainingDelayTicks > 0
-            || intent.RequiresCancellationReadFrontier && !IsAtCancellationReadFrontierLocked(intent)
-            || HasOwnCancellationExposureAtBoundaryLocked(intent)
-            || !ReferenceEquals(intent.Control.ActivatedFlow, intent.Instigator))
-            return false;
-        _cancellationDispatching = true;
-        intent.Dispatching = true;
-        intent.Attempts++;
-        ArmCancellationAttemptLocked();
-        // Register before sending so completion cannot erase the request's possible reach.
-        var exposure = new CancellationExposure(intent.Instigator, intent.Control, intent.Window) { PendingDispatch = true };
-        AppendCancellationExposureLocked(exposure);
-        intent.Exposure = exposure;
-        return true;
-    }
+    internal void OnCancellationReadFrontier()
+        => Volatile.Read(ref _cancellation)?.OnReadFrontier();
 
-    bool IsAtCancellationReadFrontierLocked(CancellationIntent intent)
-        => intent.Control.IsAtCancellationReadFrontier(intent.Instigator, intent.Window);
+    void LeaveCancellationReadFrontier(PgClientFlow flow)
+        => FlowControl.ClearCancellationReadFrontier(flow);
 
-    bool HasOwnCancellationExposureAtBoundaryLocked(CancellationIntent intent)
-    {
-        for (var exposure = _exposureHead; exposure is not null; exposure = exposure.Next)
-        {
-            if (ReferenceEquals(exposure.Instigator, intent.Instigator)
-                && ReferenceEquals(exposure.Control, intent.Control)
-                && ReferenceEquals(exposure.BoundaryFlow, intent.Instigator)
-                && exposure.BoundaryWindow == intent.Window)
-                return true;
-        }
-        return false;
-    }
-
-    internal void OnCancellationReadFrontier(Control control, PgClientFlow flow, int window)
-    {
-        CancellationIntent? dispatchIntent = null;
-        lock (_syncRoot)
-        {
-            if (!_cancellationDispatching)
-            {
-                for (var intent = _cancellationHead; intent is not null; intent = intent.Next)
-                {
-                    if (TryBeginCancellationDispatchLocked(intent))
-                    {
-                        dispatchIntent = intent;
-                        break;
-                    }
-                }
-            }
-        }
-        if (dispatchIntent is not null)
-            _ = DispatchCancellationAsync(dispatchIntent);
-    }
-
-    internal bool HasPriorCancellationExposure(Control control, PgClientFlow flow, int window)
-    {
-        if (!Volatile.Read(ref _hasCancellationExposures))
-            return false;
-        lock (_syncRoot)
-        {
-            for (var exposure = _exposureHead; exposure is not null; exposure = exposure.Next)
-            {
-                if (ReferenceEquals(exposure.Control, control)
-                    && ReferenceEquals(exposure.BoundaryFlow, flow)
-                    && exposure.BoundaryWindow == window
-                    && !ReferenceEquals(exposure.Instigator, flow))
-                    return true;
-            }
-        }
-        return false;
-    }
-
-    long GetCancelRequestDelayTicks()
-        => _options.CancelRequestDelay == Timeout.InfiniteTimeSpan
-            ? long.MaxValue
-            : Math.Max(0, _options.CancelRequestDelay.Ticks);
-
-    long GetCancellationDelayTicks(PgClientFlow.BackendCancellationTiming timing, PgClientFlow instigator)
-    {
-        if (timing is not PgClientFlow.BackendCancellationTiming.AfterGrace)
-            return 0;
-        var delay = instigator.BackendCancellationGracePeriod;
-        return delay is null ? GetCancelRequestDelayTicks()
-            : delay == Timeout.InfiniteTimeSpan ? long.MaxValue
-            : Math.Max(0, delay.Value.Ticks);
-    }
+    internal bool HasPriorCancellationExposure(PgClientFlow flow, int window)
+        => Volatile.Read(ref _cancellation)?.HasPriorExposure(flow, window) is true;
 
     void OnCancellationHeartbeat(TimeSpan elapsed)
+        => Volatile.Read(ref _cancellation)?.OnCancellationHeartbeat(elapsed);
+
+    void OnFlowActivated(PgClientFlow flow)
     {
-        if (!Volatile.Read(ref _hasCancellationIntents))
+        var coordinator = Volatile.Read(ref _cancellation);
+        if (coordinator is null)
             return;
-        CancellationIntent? dispatchIntent = null;
-        lock (_syncRoot)
+        if (flow.GetExecutionControl(FlowControl).RfqCount > 0)
+            coordinator.AssignBoundary(flow, flow.CancellationWindow);
+        coordinator.OnOwnerActivated();
+    }
+
+    internal void AssignCancellationBoundary(PgClientFlow flow, int window)
+        => Volatile.Read(ref _cancellation)?.AssignBoundary(flow, window);
+
+    internal void ResumeCancellationOwner(PgClientFlow flow)
+        => FlowControl.PublishCancellationActivation(flow);
+
+    void OnCancellationWindowCompleted(PgClientFlow flow,
+        int completedWindow, int remainingWindowCount)
+        => Volatile.Read(ref _cancellation)?.OnWindowCompleted(
+            flow, completedWindow, remainingWindowCount > 0);
+
+    internal bool OnBackendCancellationObserved(PgClientFlow flow, int window)
+        => Volatile.Read(ref _cancellation)?.OnCancellationObserved(flow, window) is true;
+
+    void OnFlowReleased(PgClientFlow flow, bool wireIsIdle)
+        => Volatile.Read(ref _cancellation)?.OnOwnerReleased(flow, wireIsIdle);
+
+    void OnFlowSubstituted(PgClientFlow from, PgClientFlow to)
+        => Volatile.Read(ref _cancellation)?.OnOwnerSubstituted(from, to, to.CancellationWindow);
+
+    // Called by forceful shutdown while holding _syncRoot.
+    void TerminateCancellationLocked()
+        => _cancellation?.Terminate();
+
+    /// Sends PostgreSQL's 16-byte side-channel cancellation message and waits for the server's FIN.
+    internal static async ValueTask SendCancelRequestAsync(TransportConnection transport,
+        int processId, int secretKey, CancellationToken cancellationToken = default)
+    {
+        // Unlike ordinary frontend messages, CancelRequest has no leading type byte. A fresh
+        // connection supplies the framing context.
+        var writer = transport.Writer;
+        var span = writer.GetSpan(CancelRequestMessageLength);
+        BinaryPrimitives.WriteInt32BigEndian(span, CancelRequestMessageLength);
+        BinaryPrimitives.WriteInt32BigEndian(span.Slice(sizeof(int)), CancelRequestCode);
+        BinaryPrimitives.WriteInt32BigEndian(span.Slice(sizeof(int) * 2), processId);
+        BinaryPrimitives.WriteInt32BigEndian(span.Slice(sizeof(int) * 3), secretKey);
+        writer.Advance(CancelRequestMessageLength);
+
+        var flushResult = await writer.FlushAsync(cancellationToken).ConfigureAwait(false);
+        if (flushResult.IsCanceled)
         {
-            if (_cancellationDispatching)
+            cancellationToken.ThrowIfCancellationRequested();
+            throw new OperationCanceledException();
+        }
+
+        // PostgreSQL sends no in-band acknowledgement. Closing the side connection is the only
+        // indication that it received and acted on the request.
+        var reader = transport.Reader;
+        while (true)
+        {
+            var readResult = await reader.ReadAsync(cancellationToken).ConfigureAwait(false);
+            if (readResult.IsCanceled)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                throw new OperationCanceledException();
+            }
+            reader.AdvanceTo(readResult.Buffer.End);
+            if (readResult.IsCompleted)
                 return;
-            for (var intent = _cancellationHead; intent is not null; intent = intent.Next)
-            {
-                if (intent.RemainingDelayTicks is > 0 and < long.MaxValue)
-                    intent.RemainingDelayTicks = Math.Max(0, intent.RemainingDelayTicks - elapsed.Ticks);
-                if (TryBeginCancellationDispatchLocked(intent))
-                {
-                    dispatchIntent = intent;
-                    break;
-                }
-            }
-        }
-        if (dispatchIntent is not null)
-            _ = DispatchCancellationAsync(dispatchIntent);
-    }
-
-    void OnFlowActivated(Control control, PgClientFlow flow)
-    {
-        if (!HasPendingCancellation)
-            return;
-        CancellationIntent? dispatchIntent = null;
-        lock (_syncRoot)
-        {
-            AssignCancellationBoundaryLocked(control, flow);
-            if (!_cancellationDispatching)
-            {
-                for (var intent = _cancellationHead; intent is not null; intent = intent.Next)
-                {
-                    if (ReferenceEquals(intent.Control, control) && ReferenceEquals(intent.Instigator, flow)
-                        && TryBeginCancellationDispatchLocked(intent))
-                    {
-                        dispatchIntent = intent;
-                        break;
-                    }
-                }
-            }
-        }
-        if (dispatchIntent is not null)
-            _ = DispatchCancellationAsync(dispatchIntent);
-    }
-
-    async Task DispatchCancellationAsync(CancellationIntent intent)
-    {
-        CancelRequestState state;
-        try
-        {
-            state = await _options.CancelSender!(_backendProcessId, _backendSecretKey, AbortToken).ConfigureAwait(false);
-        }
-        catch (Exception ex)
-        {
-            state = CancelRequestState.Unknown;
-            SlonLogMessages.CancellationRequestFailed(_logger, ex, state);
-        }
-
-        lock (_syncRoot)
-        {
-            // The attempt no longer needs to hold later writes.
-            ReleaseCancellationAttemptLocked();
-            intent.Dispatching = false;
-            _cancellationDispatching = false;
-            var exposure = intent.Exposure!;
-            intent.Exposure = null;
-            exposure.PendingDispatch = false;
-            if (exposure.Acknowledged)
-            {
-                RemoveCancellationExposureLocked(exposure);
-                RemoveCancellationIntentLocked(intent);
-                intent.Delivery?.TrySetResult();
-            }
-            else if (state is CancelRequestState.NotSent)
-            {
-                // Nothing reached the server.
-                RemoveCancellationExposureLocked(exposure);
-                if (intent.InstigatorCompleted || intent.Window < intent.Instigator.CancellationWindow)
-                    RemoveCancellationIntentLocked(intent);
-                else if (intent.Attempts >= 2)
-                    intent.Delivery?.TrySetResult();
-            }
-            else
-            {
-                if (intent.Control.IsIdle)
-                    RemoveCancellationExposureLocked(exposure);
-                else if (exposure.BoundaryFlow is null
-                    && intent.Control.ActivatedFlow is { IsCompleted: false } boundary)
-                {
-                    exposure.BoundaryFlow = boundary;
-                    exposure.BoundaryWindow = boundary.CancellationWindow;
-                }
-                RemoveCancellationIntentLocked(intent);
-                intent.Delivery?.TrySetResult();
-            }
-        }
-        TryDispatchNextCancellation();
-    }
-
-    void AppendCancellationExposureLocked(CancellationExposure exposure)
-    {
-        if (_exposureTail is null)
-            _exposureHead = exposure;
-        else
-            _exposureTail.Next = exposure;
-        _exposureTail = exposure;
-        Volatile.Write(ref _hasCancellationExposures, true);
-        if (exposure.BoundaryFlow is null)
-            Volatile.Write(ref _hasUnassignedCancellationBoundary, true);
-    }
-
-    void TryDispatchNextCancellation()
-    {
-        CancellationIntent? dispatchIntent = null;
-        lock (_syncRoot)
-        {
-            if (!_cancellationDispatching)
-            {
-                for (var intent = _cancellationHead; intent is not null; intent = intent.Next)
-                {
-                    if (TryBeginCancellationDispatchLocked(intent))
-                    {
-                        dispatchIntent = intent;
-                        break;
-                    }
-                }
-            }
-        }
-        if (dispatchIntent is not null)
-            _ = DispatchCancellationAsync(dispatchIntent);
-    }
-
-    internal void AssignCancellationBoundary(Control control, PgClientFlow flow)
-    {
-        if (!Volatile.Read(ref _hasUnassignedCancellationBoundary))
-            return;
-        lock (_syncRoot)
-        {
-            AssignCancellationBoundaryLocked(control, flow);
-        }
-    }
-
-    void AssignCancellationBoundaryLocked(Control control, PgClientFlow flow)
-    {
-        var anyUnassigned = false;
-        for (var exposure = _exposureHead; exposure is not null; exposure = exposure.Next)
-        {
-            if (exposure.BoundaryFlow is not null)
-                continue;
-            if (ReferenceEquals(exposure.Control, control))
-            {
-                exposure.BoundaryFlow = flow;
-                exposure.BoundaryWindow = flow.CancellationWindow;
-            }
-            else
-                anyUnassigned = true;
-        }
-        Volatile.Write(ref _hasUnassignedCancellationBoundary, anyUnassigned);
-    }
-
-    void OnCancellationWindowCompleted(Control control, PgClientFlow flow, int completedWindow)
-    {
-        if (!HasPendingCancellation)
-            return;
-        lock (_syncRoot)
-        {
-            var exposure = _exposureHead;
-            while (exposure is not null)
-            {
-                var next = exposure.Next;
-                if (ReferenceEquals(exposure.Control, control)
-                    && ReferenceEquals(exposure.BoundaryFlow, flow)
-                    && completedWindow >= exposure.BoundaryWindow
-                    && !exposure.PendingDispatch)
-                    RemoveCancellationExposureLocked(exposure);
-                exposure = next;
-            }
-
-            for (var intent = _cancellationHead; intent is not null; intent = intent.Next)
-            {
-                if (!ReferenceEquals(intent.Control, control) || !ReferenceEquals(intent.Instigator, flow)
-                    || completedWindow < intent.Window)
-                    continue;
-                if (!intent.Dispatching)
-                    RemoveCancellationIntentLocked(intent);
-                break;
-            }
-        }
-    }
-
-    internal void OnBackendCancellationObserved(Control control, PgClientFlow flow, int window)
-    {
-        if (!Volatile.Read(ref _hasCancellationExposures))
-            return;
-        var removed = false;
-        lock (_syncRoot)
-        {
-            for (var exposure = _exposureHead; exposure is not null; exposure = exposure.Next)
-            {
-                if (!ReferenceEquals(exposure.Control, control)
-                    || !ReferenceEquals(exposure.Instigator, flow)
-                    || exposure.RequestedWindow != window
-                    && (!ReferenceEquals(exposure.BoundaryFlow, flow) || exposure.BoundaryWindow != window))
-                    continue;
-                // A predecessor request may itself strike this successor window. In that case the
-                // retained intent for this window is satisfied, not newly dispatchable; sending it
-                // again could cancel the following window after this RFQ advances.
-                SatisfyCancellationIntentLocked(control, flow, window);
-                exposure.Acknowledged = true;
-                if (!exposure.PendingDispatch)
-                {
-                    RemoveCancellationExposureLocked(exposure);
-                    removed = true;
-                }
-                break;
-            }
-        }
-        if (removed)
-            TryDispatchNextCancellation();
-    }
-
-    void SatisfyCancellationIntentLocked(Control control, PgClientFlow flow, int window)
-    {
-        for (var intent = _cancellationHead; intent is not null; intent = intent.Next)
-        {
-            if (!ReferenceEquals(intent.Control, control) || !ReferenceEquals(intent.Instigator, flow)
-                || intent.Window != window)
-                continue;
-            RemoveCancellationIntentLocked(intent);
-            intent.Delivery?.TrySetResult();
-            return;
-        }
-    }
-
-    void OnFlowReleased(Control control, PgClientFlow flow, int remainingDepth)
-    {
-        if (!HasPendingCancellation)
-            return;
-        lock (_syncRoot)
-        {
-            var intent = _cancellationHead;
-            while (intent is not null)
-            {
-                var next = intent.Next;
-                if (ReferenceEquals(intent.Control, control) && ReferenceEquals(intent.Instigator, flow))
-                {
-                    intent.InstigatorCompleted = true;
-                    if (!intent.Dispatching)
-                        RemoveCancellationIntentLocked(intent);
-                }
-                intent = next;
-            }
-
-            var exposure = _exposureHead;
-            while (exposure is not null)
-            {
-                var next = exposure.Next;
-                if (ReferenceEquals(exposure.Control, control))
-                {
-                    if (remainingDepth is 0 && !exposure.PendingDispatch)
-                        RemoveCancellationExposureLocked(exposure);
-                    else if (ReferenceEquals(exposure.BoundaryFlow, flow))
-                    {
-                        exposure.BoundaryFlow = null;
-                        exposure.BoundaryWindow = 0;
-                        Volatile.Write(ref _hasUnassignedCancellationBoundary, true);
-                    }
-                }
-                exposure = next;
-            }
-        }
-    }
-
-    void OnFlowSubstituted(Control control, PgClientFlow from, PgClientFlow to)
-    {
-        if (!HasPendingCancellation)
-            return;
-        lock (_syncRoot)
-        {
-            var intent = _cancellationHead;
-            while (intent is not null)
-            {
-                var next = intent.Next;
-                if (ReferenceEquals(intent.Control, control) && ReferenceEquals(intent.Instigator, from))
-                {
-                    intent.InstigatorCompleted = true;
-                    if (!intent.Dispatching)
-                        RemoveCancellationIntentLocked(intent);
-                }
-                intent = next;
-            }
-
-            for (var exposure = _exposureHead; exposure is not null; exposure = exposure.Next)
-            {
-                if (ReferenceEquals(exposure.Control, control) && ReferenceEquals(exposure.BoundaryFlow, from))
-                {
-                    exposure.BoundaryFlow = to;
-                    exposure.BoundaryWindow = to.CancellationWindow;
-                }
-            }
-        }
-    }
-
-    void RemoveCancellationIntentLocked(CancellationIntent removed)
-    {
-        CancellationIntent? previous = null;
-        for (var current = _cancellationHead; current is not null; current = current.Next)
-        {
-            if (!ReferenceEquals(current, removed))
-            {
-                previous = current;
-                continue;
-            }
-            if (previous is null)
-                _cancellationHead = current.Next;
-            else
-                previous.Next = current.Next;
-            if (ReferenceEquals(_cancellationTail, current))
-                _cancellationTail = previous;
-            current.Next = null;
-            if (_cancellationHead is null)
-                Volatile.Write(ref _hasCancellationIntents, false);
-            return;
-        }
-    }
-
-    void RemoveCancellationExposureLocked(CancellationExposure removed)
-    {
-        CancellationExposure? previous = null;
-        for (var current = _exposureHead; current is not null; current = current.Next)
-        {
-            if (!ReferenceEquals(current, removed))
-            {
-                previous = current;
-                continue;
-            }
-            if (previous is null)
-                _exposureHead = current.Next;
-            else
-                previous.Next = current.Next;
-            if (ReferenceEquals(_exposureTail, current))
-                _exposureTail = previous;
-            current.Next = null;
-
-            var anyUnassigned = false;
-            for (var remaining = _exposureHead; remaining is not null; remaining = remaining.Next)
-                anyUnassigned |= remaining.BoundaryFlow is null;
-            Volatile.Write(ref _hasUnassignedCancellationBoundary, anyUnassigned);
-            if (_exposureHead is null)
-                Volatile.Write(ref _hasCancellationExposures, false);
-            return;
         }
     }
 }

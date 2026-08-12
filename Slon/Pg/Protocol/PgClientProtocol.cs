@@ -53,6 +53,8 @@ sealed class PgClientProtocolOptions
         ReadTimeout = options.ReadTimeout;
         HeartbeatInterval = options.HeartbeatInterval;
         TimeProvider = options.TimeProvider;
+        CancellationTimeout = options.CancellationTimeout;
+        CancellationRetryInterval = options.CancellationRetryInterval;
         FlowActivationTimeout = options.ConnectionTimeout;
         ScopeReset = options.ScopeReset.Snapshot();
         DataRowStreamingThreshold = options.DataRowStreamingThreshold;
@@ -77,6 +79,8 @@ sealed class PgClientProtocolOptions
     public TimeSpan ReadTimeout { get; set; } = PgClientOptions.DefaultReadTimeout;
     // Allocation-free grace before starting a backend CancelRequest. Heartbeat supplies the clock.
     public TimeSpan CancelRequestDelay { get; set; }
+    public TimeSpan CancellationTimeout { get; set; } = TimeSpan.FromSeconds(10);
+    public TimeSpan CancellationRetryInterval { get; set; } = TimeSpan.FromSeconds(1);
     public ScopeResetOptions ScopeReset { get; set; } = new();
     public int DataRowStreamingThreshold { get; set; } = BackendMessageBatch.Segmenter.DefaultDataRowStreamingThreshold;
     internal int MaxInFlightFlowsPerWire { get; set; }
@@ -91,6 +95,8 @@ sealed class PgClientProtocolOptions
     /// Sends a side-channel CancelRequest and classifies whether request bytes may have reached
     /// PostgreSQL. The attempt must have ended before it returns. Null disables server cancellation.
     public Func<int, int, CancellationToken, ValueTask<CancelRequestState>>? CancelSender { get; set; }
+    // Temporary certification seam. Remove once the cancellation read-timeout witnesses settle.
+    internal Action? ReadTimeoutArmed { get; set; }
 }
 
 sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
@@ -252,7 +258,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         _protocolDataWriter = new(_pipeWriter, PgClientOptions.PreStartupEncoding, connection.WaitWritable, AbortToken, FlowControl);
         _pipeSegmentEnumerator = new(connection.Reader,
             new(_options.DataRowStreamingThreshold), ownsReader: true);
-        _pgDecoder = new(_pipeSegmentEnumerator, AbortToken, _options.ReadTimeout);
+        _pgDecoder = new(_pipeSegmentEnumerator, AbortToken, _options.ReadTimeout, _options.ReadTimeoutArmed);
 
         // Scoring is a pool concern: only maintain its inputs when an orchestrator drives us.
         _scoringEnabled = onAvailability is not null;
@@ -712,7 +718,6 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
                 flow.SetEnqueueOptions(options);
                 if (capacityOwned)
                     flow.MarkWireCapacityOwned();
-                AssignCancellationBoundary(FlowControl, flow);
             }
             catch
             {
@@ -866,6 +871,9 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
             }
             completion = _completion;
 
+            if (forceful)
+                TerminateCancellationLocked();
+
             // The drain owner retains the close signal through RunShutdownAsync. A forceful loser
             // leases it only for the synchronous escalation below; terminal release waits for leases.
             if (forceful && !owner)
@@ -1013,6 +1021,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
                 try
                 {
                     _heartbeat?.Dispose();
+                    _cancellation?.Dispose();
                     _exclusiveScope?.Dispose();
                     await _close.DisposeAsync().ConfigureAwait(false);
                 }
@@ -1061,8 +1070,8 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
             _throughputPerTick = Alpha * completedThisTick + (1 - Alpha) * _throughputPerTick;
         }
 
-        PropagateFlowHeartbeat(period);
         OnCancellationHeartbeat(period);
+        PropagateFlowHeartbeat(period);
         return new();
     }
 
@@ -1495,23 +1504,31 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         public ValueTask WaitForCancellationAttempt()
             => protocol.WaitForCancellationAttempt();
         public void RequestServerCancellation(PgClientFlow instigator, int window,
-            PgClientFlow.BackendCancellationTiming timing, TaskCompletionSource? delivery = null)
-            => protocol.RequestServerCancellation(instigator, this, window, timing, delivery);
-        public void OnBackendCancellationObserved(PgClientFlow instigator, int window)
-            => protocol.OnBackendCancellationObserved(this, instigator, window);
+            BackendCancellationTiming timing, TaskCompletionSource? delivery,
+            object episodeKey, int scope, BackendCancellationTiming subsequentTiming)
+            => protocol.RequestServerCancellation(instigator, window, timing, delivery,
+                episodeKey, scope, subsequentTiming);
+        public bool OnBackendCancellationObserved(PgClientFlow instigator, int window)
+            => protocol.OnBackendCancellationObserved(instigator, window);
         public bool IsAtCancellationReadFrontier(PgClientFlow flow, int window)
-            => Decoder.IsAtCancellationReadFrontier(flow, window);
+            => protocol.FlowControl.Decoder.IsAtCancellationReadFrontier(flow, window);
+        internal int ClearCancellationReadFrontier(PgClientFlow flow)
+            => protocol.FlowControl.Decoder.ClearCancellationReadFrontier(flow);
         public void EnterCancellationReadFrontier(PgClientFlow flow, int window)
         {
-            Decoder.SetCancellationReadFrontier(flow, window);
+            protocol.FlowControl.Decoder.SetCancellationReadFrontier(flow, window);
             if (protocol.HasCancellationIntents)
-                protocol.OnCancellationReadFrontier(this, flow, window);
+                protocol.OnCancellationReadFrontier();
         }
-        public void LeaveCancellationReadFrontier() => Decoder.ClearCancellationReadFrontier();
+        public void LeaveCancellationReadFrontier(PgClientFlow flow)
+            => protocol.LeaveCancellationReadFrontier(flow);
         public bool HasPriorCancellationExposure(PgClientFlow flow, int window)
-            => protocol.HasPriorCancellationExposure(this, flow, window);
+            => protocol.HasPriorCancellationExposure(flow, window);
         public void OnFlowSubstituted(PgClientFlow from, PgClientFlow to)
-            => protocol.OnFlowSubstituted(this, from, to);
+        {
+            SubstituteCancellationActivation(from, to);
+            protocol.OnFlowSubstituted(from, to);
+        }
         internal string? ScopeResetCommand => protocol.ScopeResetCommand;
 
         // The scope's linked close signal, set once for an exclusive-scope inner Control; null for the
@@ -1689,10 +1706,11 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
 
         // Connection-wide transaction-state bookkeeping. Routes to the single protocol field (NOT a
         // per-Control copy) so inner-scope and outer flows keep one consistent view of the one wire.
-        public void OnFlowRfq(PgClientFlow flow, BackendMessage message, int completedWindow)
+        public void OnFlowRfq(PgClientFlow flow, BackendMessage message,
+            int completedWindow, int remainingWindowCount)
         {
             protocol._transactionStatus = ReadyForQueryMessage.Create(message).TransactionStatus;
-            protocol.OnCancellationWindowCompleted(this, flow, completedWindow);
+            protocol.OnCancellationWindowCompleted(flow, completedWindow, remainingWindowCount);
         }
 
         // Wire-handoff guard, called from Policy.CompleteItem when a flow retires. The OUTER multiplexed
@@ -1739,7 +1757,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
             if (protocol._scoringEnabled)
                 protocol._currentFlowStartTick = protocol._heartbeatTick;
             Decoder.Initialize(this);
-            protocol.OnFlowActivated(this, flow);
+            protocol.OnFlowActivated(flow);
         }
 
         // Wake the flow's body with the bound decoder. Resumes the body inline, so async flows run this
@@ -1760,6 +1778,8 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
 
         internal void RecoveryStarted() => protocol.SignalDraining();
         internal void RecoveryCompleted() => protocol.SignalReady();
+        internal void AssignCancellationBoundary(PgClientFlow flow, int window)
+            => protocol.AssignCancellationBoundary(flow, window);
         internal void ReleaseAdmissionBarrier() => protocol.ReleaseAdmissionBarrier();
         internal void ReleaseWireCapacity() => protocol.ReleaseWireCapacity();
 

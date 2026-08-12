@@ -39,6 +39,14 @@ public class CommandUserCancellationTests : ConnectionCreatingTest
         }
     }
 
+    sealed class SemanticDrainProbe : CommandFlowObserver
+    {
+        public TaskCompletionSource Started { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        internal override void OnSemanticDrainStarted(CommandFlow flow, object? state)
+            => Started.TrySetResult();
+    }
+
     // Token is already cancelled before MoveNextAsync is called: the first MoveNextAsync surfaces OCE.
     [TestMethod]
     public async Task UserCt_PreFired_FirstMoveNextSurfacesOce()
@@ -160,7 +168,9 @@ public class CommandUserCancellationTests : ConnectionCreatingTest
         await using var protocol = await PgTestPool.NewIsolatedAsync(
             o => o.CancelSender = async (processId, secretKey, token) =>
             {
-                await sender(processId, secretKey, token);
+                // This witness needs the physical request's completion, even when observing its
+                // strike asks the sender tenure to stop before the side connection has returned.
+                await sender(processId, secretKey, CancellationToken.None);
                 cancelDelivered.TrySetResult();
                 return CancelRequestState.Sent;
             });
@@ -243,12 +253,20 @@ public class CommandUserCancellationTests : ConnectionCreatingTest
     {
         await using var blocker = await PgAdvisoryLock.AcquireAsync();
         var attempts = 0;
+        var firstAttempt = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var attemptsExhausted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        await using var protocol = await PgTestPool.NewIsolatedAsync(o => o.CancelSender = (_, _, _) =>
+        await using var protocol = await PgTestPool.NewIsolatedAsync(o =>
         {
-            if (Interlocked.Increment(ref attempts) == 2)
-                attemptsExhausted.TrySetResult();
-            return new(CancelRequestState.NotSent);
+            o.CancellationRetryInterval = TimeSpan.FromMilliseconds(1);
+            o.CancelSender = (_, _, _) =>
+            {
+                var attempt = Interlocked.Increment(ref attempts);
+                if (attempt == 1)
+                    firstAttempt.TrySetResult();
+                else if (attempt == 2)
+                    attemptsExhausted.TrySetResult();
+                return new(CancelRequestState.NotSent);
+            };
         });
 
         using var cts = new CancellationTokenSource();
@@ -259,6 +277,14 @@ public class CommandUserCancellationTests : ConnectionCreatingTest
 
         await blocker.WaitUntilContendedAsync(protocol.FlowControl.BackendProcessId);
         cts.Cancel();
+        await firstAttempt.Task;
+        while (!attemptsExhausted.Task.IsCompleted)
+        {
+            // Retry pacing is heartbeat-driven. Advance the logical clock directly so this contract
+            // test does not inherit the production one-second interval as suite wall time.
+            await protocol.Heartbeat(TimeSpan.FromMilliseconds(1));
+            await Task.Yield();
+        }
         await attemptsExhausted.Task;
         Assert.IsFalse(protocol.Completion.IsCompleted);
         Assert.IsTrue(protocol.HasPendingCancellation);
@@ -338,7 +364,7 @@ public class CommandUserCancellationTests : ConnectionCreatingTest
         await blocker.WaitUntilContendedAsync(protocol.FlowControl.BackendProcessId);
         // Model cancellation arriving while the decoder is consuming an available batch: the
         // pending physical read is temporarily no longer an eligible cancellation frontier.
-        protocol.FlowControl.LeaveCancellationReadFrontier();
+        protocol.FlowControl.LeaveCancellationReadFrontier(flow);
         cts.Cancel();
         await Task.Yield();
         Assert.AreEqual(0, Volatile.Read(ref attempts));
@@ -350,6 +376,51 @@ public class CommandUserCancellationTests : ConnectionCreatingTest
         await blocker.ReleaseAsync();
         await Assert.ThrowsExactlyAsync<OperationCanceledException>(
             async () => await moveNext);
+        await enumerator.DisposeAsync();
+        await WaitUntilAsync(() => !protocol.HasPendingCancellation);
+        await PgTestPool.RunAsync(protocol, "select 1");
+    }
+
+    [TestMethod]
+    public async Task ServerCancel_RetryWaitsForFreshCancellationReadFrontier()
+    {
+        await using var blocker = await PgAdvisoryLock.AcquireAsync();
+        var firstAttempted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var secondAttempted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var attempts = 0;
+        await using var protocol = await PgTestPool.NewIsolatedAsync(o =>
+        {
+            o.CancellationRetryInterval = TimeSpan.FromMilliseconds(1);
+            o.CancelSender = (_, _, _) =>
+            {
+                var attempt = Interlocked.Increment(ref attempts);
+                (attempt == 1 ? firstAttempted : secondAttempted).TrySetResult();
+                return new(CancelRequestState.Sent);
+            };
+        });
+
+        using var cts = new CancellationTokenSource();
+        var flow = new CommandFlow(async: true, blocker.WaitCommand);
+        Assert.IsTrue(protocol.TryQueue(flow, cancellationToken: cts.Token));
+        var enumerator = flow.GetAsyncEnumerator(cts.Token);
+        var moveNext = enumerator.MoveNextAsync(cts.Token).AsTask();
+
+        await blocker.WaitUntilContendedAsync(protocol.FlowControl.BackendProcessId);
+        cts.Cancel();
+        await firstAttempted.Task;
+
+        // Buffered input ends the current cancellation-safe read wait. Retry pacing may expire,
+        // but that must not inherit the first attempt's eligibility.
+        protocol.FlowControl.LeaveCancellationReadFrontier(flow);
+        await protocol.Heartbeat(TimeSpan.FromMilliseconds(1));
+        Assert.AreEqual(1, Volatile.Read(ref attempts));
+
+        protocol.FlowControl.EnterCancellationReadFrontier(flow, flow.CancellationWindow);
+        await secondAttempted.Task;
+        Assert.AreEqual(2, Volatile.Read(ref attempts));
+
+        await blocker.ReleaseAsync();
+        await Assert.ThrowsExactlyAsync<OperationCanceledException>(async () => await moveNext);
         await enumerator.DisposeAsync();
         await WaitUntilAsync(() => !protocol.HasPendingCancellation);
         await PgTestPool.RunAsync(protocol, "select 1");
@@ -467,6 +538,92 @@ public class CommandUserCancellationTests : ConnectionCreatingTest
     }
 
     [TestMethod]
+    public async Task ServerCancel_ReadTimeoutAfterAmbiguousRetryAbortsWire()
+    {
+        var iterations = StressEnv.Iterations(fallback: 1, cap: 5_000);
+        for (var iteration = 0; iteration < iterations; iteration++)
+        {
+            try
+            {
+                await RunReadTimeoutAfterAmbiguousRetryAsync();
+            }
+            catch (Exception ex)
+            {
+                ex.Data["stressIteration"] = iteration;
+                throw;
+            }
+        }
+    }
+
+    static async Task RunReadTimeoutAfterAmbiguousRetryAsync()
+    {
+        await using var blocker = await PgAdvisoryLock.AcquireAsync();
+        var firstAttempted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var secondAttempted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var firstReadArmed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var drainReadArmed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var drainProbe = new SemanticDrainProbe();
+        var attempts = 0;
+        var observeReadArms = false;
+        await using var protocol = await PgTestPool.NewIsolatedAsync(o =>
+        {
+            o.HeartbeatInterval = TimeSpan.FromHours(1);
+            o.CancellationTimeout = TimeSpan.FromMinutes(10);
+            o.CancellationRetryInterval = TimeSpan.FromMinutes(2);
+            o.ReadTimeoutArmed = () =>
+            {
+                if (!Volatile.Read(ref observeReadArms))
+                    return;
+                (drainProbe.Started.Task.IsCompleted ? drainReadArmed : firstReadArmed).TrySetResult();
+            };
+            // Report possible delivery without sending: the statement remains blocked while the
+            // coordinator retains the same ambiguity as a real CancelRequest that missed its window.
+            o.CancelSender = (_, _, _) =>
+            {
+                if (Interlocked.Increment(ref attempts) == 1)
+                    firstAttempted.TrySetResult();
+                else
+                    secondAttempted.TrySetResult();
+                return new(CancelRequestState.Sent);
+            };
+        });
+
+        var flow = new CommandFlow(async: true, new CommandFlowOptions
+        {
+            Commands = new(blocker.WaitCommand with { Timeout = TimeSpan.FromSeconds(100) }),
+            Observer = drainProbe
+        });
+        Volatile.Write(ref observeReadArms, true);
+        Assert.IsTrue(protocol.TryQueue(flow));
+        var enumerator = flow.GetAsyncEnumerator();
+        _ = enumerator.MoveNextAsync().AsTask();
+
+        await firstReadArmed.Task;
+        await blocker.WaitUntilContendedAsync(protocol.FlowControl.BackendProcessId);
+        var dispose = enumerator.DisposeAsync().AsTask();
+        await protocol.Heartbeat(TimeSpan.FromSeconds(1));
+        await firstAttempted.Task;
+        await protocol.FlowControl.WaitForCancellationAttempt();
+
+        // Expiring the original read completes the consumer with its own timeout and starts a second
+        // ambiguous request. The body retains the wire obligation and enters semantic drain.
+        await protocol.Heartbeat(TimeSpan.FromSeconds(100));
+        await secondAttempted.Task;
+        await protocol.FlowControl.WaitForCancellationAttempt();
+        await drainProbe.Started.Task;
+        await drainReadArmed.Task;
+
+        // Enumeration is already complete, but this body-owned timeout must still escalate the same
+        // episode. Wait for the read's own arm, not merely drain entry: the heartbeat must follow the
+        // timeout tenure it is meant to expire. Two ambiguous requests leave no safe action but abort.
+        await protocol.Heartbeat(TimeSpan.FromSeconds(100));
+        await protocol.Completion;
+        await blocker.ReleaseAsync();
+        await Assert.ThrowsExactlyAsync<TimeoutException>(async () => await dispose);
+        Assert.AreEqual(2, Volatile.Read(ref attempts));
+    }
+
+    [TestMethod]
     public async Task ServerCancel_ReadTimeoutBypassesCallerCancellationGrace()
     {
         await using var blocker = await PgAdvisoryLock.AcquireAsync();
@@ -534,19 +691,18 @@ public class CommandUserCancellationTests : ConnectionCreatingTest
             await firstBlocker.WaitUntilContendedAsync(processId);
             await protocol.Heartbeat(TimeSpan.FromSeconds(100));
             await Assert.ThrowsExactlyAsync<TimeoutException>(async () => await moveNext);
-            var afterFirstWindow = $"{ProtocolDiag.CancellationState(protocol)} flow={ProtocolDiag.CancellationFlowState(flow)}";
-
             await secondBlocker.WaitUntilContendedOrCompletedAsync(processId);
-            var atSecondWindow = $"{ProtocolDiag.CancellationState(protocol)} flow={ProtocolDiag.CancellationFlowState(flow)}";
             sendSecondRequest.TrySetResult();
             await enumerator.DisposeAsync();
             await WaitUntilAsync(() => !protocol.HasPendingCancellation);
-            var lockState = $"first: {await firstBlocker.DescribeAsync(processId)}\n" +
-                            $"second: {await secondBlocker.DescribeAsync(processId)}";
-            AssertCancellationAttempts(Volatile.Read(ref attempts),
-                $"after first window: {afterFirstWindow}\nat second window: {atSecondWindow}\n" +
-                $"after settlement: {ProtocolDiag.CancellationState(protocol)} flow={ProtocolDiag.CancellationFlowState(flow)}\n" +
-                lockState);
+            var attemptCount = Volatile.Read(ref attempts);
+            if (attemptCount is not (1 or 2))
+            {
+                Assert.Fail($"attempts={attemptCount}, state={ProtocolDiag.CancellationState(protocol)}, " +
+                            $"flow={ProtocolDiag.CancellationFlowState(flow)}\n" +
+                            $"first: {await firstBlocker.DescribeAsync(processId)}\n" +
+                            $"second: {await secondBlocker.DescribeAsync(processId)}");
+            }
             Assert.IsFalse(protocol.HasPendingCancellation);
             Assert.IsFalse(await firstBlocker.IsContendedAsync(processId));
             Assert.IsFalse(await secondBlocker.IsContendedAsync(processId));
@@ -574,7 +730,9 @@ public class CommandUserCancellationTests : ConnectionCreatingTest
             o.CancelSender = async (processId, secretKey, token) =>
             {
                 var attempt = Interlocked.Increment(ref attempts);
-                var result = await sender(processId, secretKey, token);
+                // Once this send begins, the test models an irrevocable request whose settlement
+                // remains held after PostgreSQL has already acted on it.
+                var result = await sender(processId, secretKey, CancellationToken.None);
                 if (attempt == 1)
                     await settleFirstAttempt.Task;
                 return result;
@@ -599,16 +757,17 @@ public class CommandUserCancellationTests : ConnectionCreatingTest
             // task still owns settlement. Its exposure may already satisfy that successor, or settling
             // it may dispatch the successor's retained intent; either outcome must converge.
             await secondBlocker.WaitUntilContendedOrCompletedAsync(processId);
-            var atSecondWindow = $"{ProtocolDiag.CancellationState(protocol)} flow={ProtocolDiag.CancellationFlowState(flow)}";
             settleFirstAttempt.TrySetResult();
             await enumerator.DisposeAsync();
             await WaitUntilAsync(() => !protocol.HasPendingCancellation);
-            var lockState = $"first: {await firstBlocker.DescribeAsync(processId)}\n" +
-                            $"second: {await secondBlocker.DescribeAsync(processId)}";
-            AssertCancellationAttempts(Volatile.Read(ref attempts),
-                $"at second window: {atSecondWindow}\n" +
-                $"after settlement: {ProtocolDiag.CancellationState(protocol)} flow={ProtocolDiag.CancellationFlowState(flow)}\n" +
-                lockState);
+            var attemptCount = Volatile.Read(ref attempts);
+            if (attemptCount is not (1 or 2))
+            {
+                Assert.Fail($"attempts={attemptCount}, state={ProtocolDiag.CancellationState(protocol)}, " +
+                            $"flow={ProtocolDiag.CancellationFlowState(flow)}\n" +
+                            $"first: {await firstBlocker.DescribeAsync(processId)}\n" +
+                            $"second: {await secondBlocker.DescribeAsync(processId)}");
+            }
             await PgTestPool.RunAsync(protocol, "select 1");
         }
         finally
@@ -636,7 +795,9 @@ public class CommandUserCancellationTests : ConnectionCreatingTest
                 Interlocked.Increment(ref attempts);
                 senderEntered.TrySetResult();
                 await sendRequest.Task;
-                return await sender(processId, secretKey, token);
+                // Releasing the gate deliberately sends the predecessor request after its window
+                // completed; a later stop cannot recall those bytes.
+                return await sender(processId, secretKey, CancellationToken.None);
             };
         });
 
@@ -662,7 +823,8 @@ public class CommandUserCancellationTests : ConnectionCreatingTest
             sendRequest.TrySetResult();
             await enumerator.DisposeAsync();
 
-            Assert.AreEqual(1, Volatile.Read(ref attempts));
+            AssertCancellationAttempts(Volatile.Read(ref attempts),
+                "The predecessor exposure may absorb the successor strike before its own request dispatches.");
             await WaitUntilAsync(() => !protocol.HasPendingCancellation);
             await PgTestPool.RunAsync(protocol, "select 1");
         }
@@ -682,12 +844,14 @@ public class CommandUserCancellationTests : ConnectionCreatingTest
         var sender = PgTestPool.CreateCancelSender(options);
         var attempts = 0;
         await using var protocol = await PgTestPool.NewIsolatedAsync(o =>
+        {
             o.CancelSender = async (processId, secretKey, token) =>
             {
                 if (Interlocked.Increment(ref attempts) == 2)
                     await sendSecondRequest.Task;
                 return await sender(processId, secretKey, token);
-            });
+            };
+        });
 
         try
         {
@@ -703,17 +867,18 @@ public class CommandUserCancellationTests : ConnectionCreatingTest
 
             var disposeTask = enumerator.DisposeAsync().AsTask();
             await secondBlocker.WaitUntilContendedOrCompletedAsync(processId);
-            var atSecondWindow = $"{ProtocolDiag.CancellationState(protocol)} flow={ProtocolDiag.CancellationFlowState(flow)}";
             sendSecondRequest.TrySetResult();
             await disposeTask;
 
             await WaitUntilAsync(() => !protocol.HasPendingCancellation);
-            var lockState = $"first: {await firstBlocker.DescribeAsync(processId)}\n" +
-                            $"second: {await secondBlocker.DescribeAsync(processId)}";
-            AssertCancellationAttempts(Volatile.Read(ref attempts),
-                $"at second window: {atSecondWindow}\n" +
-                $"after settlement: {ProtocolDiag.CancellationState(protocol)} flow={ProtocolDiag.CancellationFlowState(flow)}\n" +
-                lockState);
+            var attemptCount = Volatile.Read(ref attempts);
+            if (attemptCount is not (1 or 2))
+            {
+                Assert.Fail($"attempts={attemptCount}, state={ProtocolDiag.CancellationState(protocol)}, " +
+                            $"flow={ProtocolDiag.CancellationFlowState(flow)}\n" +
+                            $"first: {await firstBlocker.DescribeAsync(processId)}\n" +
+                            $"second: {await secondBlocker.DescribeAsync(processId)}");
+            }
             Assert.IsFalse(await firstBlocker.IsContendedAsync(processId));
             Assert.IsFalse(await secondBlocker.IsContendedAsync(processId));
             await PgTestPool.RunAsync(protocol, "select 1");
@@ -854,7 +1019,9 @@ public class CommandUserCancellationTests : ConnectionCreatingTest
             {
                 senderEntered.TrySetResult();
                 await deliver.Task.WaitAsync(token);
-                await sender(processId, secretKey, token);
+                // Opening the gate models the request becoming physically irrevocable. A later
+                // RFQ may ask the sender tenure to stop, but cannot recall these bytes.
+                await sender(processId, secretKey, CancellationToken.None);
                 cancelDelivered.TrySetResult();
                 return CancelRequestState.Sent;
             });
@@ -920,11 +1087,14 @@ public class CommandUserCancellationTests : ConnectionCreatingTest
         var senderEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var deliver = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var delivered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        await using var protocol = await PgTestPool.NewIsolatedAsync(o => o.CancelSender = async (processId, secretKey, token) =>
+        await using var protocol = await PgTestPool.NewIsolatedAsync(o => o.CancelSender = async (
+            processId, secretKey, token) =>
         {
             senderEntered.TrySetResult();
-            await deliver.Task.WaitAsync(token);
-            var state = await sender(processId, secretKey, token);
+            // Model a request whose bytes are already irrevocable: the coordinator may request
+            // that this physical tenure stop, but it cannot recall the packet.
+            await deliver.Task;
+            var state = await sender(processId, secretKey, CancellationToken.None);
             delivered.TrySetResult();
             return state;
         });
@@ -1001,11 +1171,14 @@ public class CommandUserCancellationTests : ConnectionCreatingTest
         await using var secondBlocker = await PgAdvisoryLock.AcquireAsync();
         var attempts = 0;
         var secondAttempt = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        await using var protocol = await PgTestPool.NewIsolatedAsync(o => o.CancelSender = (_, _, _) =>
+        await using var protocol = await PgTestPool.NewIsolatedAsync(o =>
         {
-            if (Interlocked.Increment(ref attempts) == 2)
-                secondAttempt.TrySetResult();
-            return new(CancelRequestState.Sent);
+            o.CancelSender = (_, _, _) =>
+            {
+                if (Interlocked.Increment(ref attempts) == 2)
+                    secondAttempt.TrySetResult();
+                return new(CancelRequestState.Sent);
+            };
         });
 
         var flow = new CommandFlow(async: true,
@@ -1090,8 +1263,10 @@ public class CommandUserCancellationTests : ConnectionCreatingTest
         Assert.AreEqual(cts.Token, exception.CancellationToken);
         await enumerator.DisposeAsync();
 
-        await WaitUntilAsync(() => !protocol.HasPendingCancellation);
+        // The request can still strike the immediate successor outside the inner pipeline. Complete
+        // the scope so that bounded reach reaches its outer wire boundary before expecting retirement.
         await scope.CompleteScopeAsync();
+        await WaitUntilAsync(() => !protocol.HasPendingCancellation);
         await PgTestPool.RunAsync(protocol, "select 1");
     }
 
@@ -1113,6 +1288,7 @@ public class CommandUserCancellationTests : ConnectionCreatingTest
         var sender = PgTestPool.CreateCancelSender(options);
         var attempts = 0;
         await using var protocol = await PgTestPool.NewIsolatedAsync(o =>
+        {
             o.CancelSender = async (processId, secretKey, token) =>
             {
                 var attempt = Interlocked.Increment(ref attempts);
@@ -1129,7 +1305,8 @@ public class CommandUserCancellationTests : ConnectionCreatingTest
                         return CancelRequestState.NotSent;
                 }
                 return await sender(processId, secretKey, token);
-            });
+            };
+        });
 
         try
         {
@@ -1156,9 +1333,10 @@ public class CommandUserCancellationTests : ConnectionCreatingTest
             holdSecondAttempt.TrySetResult();
             await WaitUntilAsync(() => !protocol.HasPendingCancellation);
 
-            var diagnostics =
-                $"after settlement: {ProtocolDiag.CancellationState(protocol)} flow={ProtocolDiag.CancellationFlowState(flow)}";
-            Assert.AreEqual(2, Volatile.Read(ref attempts), diagnostics);
+            var attemptCount = Volatile.Read(ref attempts);
+            if (attemptCount != 2)
+                Assert.Fail($"attempts={attemptCount}, state={ProtocolDiag.CancellationState(protocol)}, " +
+                            $"flow={ProtocolDiag.CancellationFlowState(flow)}");
             Assert.IsFalse(await firstBlocker.IsContendedAsync(processId));
             Assert.IsFalse(await secondBlocker.IsContendedAsync(processId));
             await PgTestPool.RunAsync(protocol, "select 1");
@@ -1183,6 +1361,7 @@ public class CommandUserCancellationTests : ConnectionCreatingTest
         var abandonSecondAttempt = false;
         var attempts = 0;
         await using var protocol = await PgTestPool.NewIsolatedAsync(o =>
+        {
             o.CancelSender = async (processId, secretKey, token) =>
             {
                 var attempt = Interlocked.Increment(ref attempts);
@@ -1199,7 +1378,8 @@ public class CommandUserCancellationTests : ConnectionCreatingTest
                         return CancelRequestState.NotSent;
                 }
                 throw new InvalidOperationException("Unexpected cancellation attempt.");
-            });
+            };
+        });
 
         try
         {
@@ -1223,9 +1403,10 @@ public class CommandUserCancellationTests : ConnectionCreatingTest
             holdSecondAttempt.TrySetResult();
             await WaitUntilAsync(() => !protocol.HasPendingCancellation);
 
-            var diagnostics =
-                $"after settlement: {ProtocolDiag.CancellationState(protocol)} flow={ProtocolDiag.CancellationFlowState(flow)}";
-            Assert.AreEqual(2, Volatile.Read(ref attempts), diagnostics);
+            var attemptCount = Volatile.Read(ref attempts);
+            if (attemptCount != 2)
+                Assert.Fail($"attempts={attemptCount}, state={ProtocolDiag.CancellationState(protocol)}, " +
+                            $"flow={ProtocolDiag.CancellationFlowState(flow)}");
             Assert.IsFalse(await firstBlocker.IsContendedAsync(processId));
             Assert.IsFalse(await secondBlocker.IsContendedAsync(processId));
             await PgTestPool.RunAsync(protocol, "select 1");
@@ -1255,12 +1436,14 @@ public class CommandUserCancellationTests : ConnectionCreatingTest
             var sendSecondRequest = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             var attempts = 0;
             await using var protocol = await PgTestPool.NewIsolatedAsync(o =>
+            {
                 o.CancelSender = async (processId, secretKey, token) =>
                 {
                     if (Interlocked.Increment(ref attempts) == 2)
                         await sendSecondRequest.Task;
                     return await sender(processId, secretKey, token);
-                });
+                };
+            });
 
             try
             {
@@ -1276,17 +1459,20 @@ public class CommandUserCancellationTests : ConnectionCreatingTest
 
                 var disposeTask = enumerator.DisposeAsync().AsTask();
                 await secondBlocker.WaitUntilContendedOrCompletedAsync(processId);
-                var atSecondWindow = $"{ProtocolDiag.CancellationState(protocol)} flow={ProtocolDiag.CancellationFlowState(flow)}";
                 sendSecondRequest.TrySetResult();
                 await disposeTask;
 
                 await WaitUntilAsync(() => !protocol.HasPendingCancellation);
-                AssertCancellationAttempts(Volatile.Read(ref attempts),
-                    $"iteration {iteration}\n" +
-                    $"at second window: {atSecondWindow}\n" +
-                    $"after settlement: {ProtocolDiag.CancellationState(protocol)} flow={ProtocolDiag.CancellationFlowState(flow)}\n" +
-                    $"first: {await firstBlocker.DescribeAsync(processId)}\n" +
-                    $"second: {await secondBlocker.DescribeAsync(processId)}");
+                var attemptCount = Volatile.Read(ref attempts);
+                if (attemptCount is not (1 or 2))
+                {
+                    Assert.Fail($"iteration={iteration}, attempts={attemptCount}, " +
+                                $"state={ProtocolDiag.CancellationState(protocol)}, " +
+                                $"flow={ProtocolDiag.CancellationFlowState(flow)}\n" +
+                                $"first: {await firstBlocker.DescribeAsync(processId)}\n" +
+                                $"second: {await secondBlocker.DescribeAsync(processId)}");
+                }
+                await PgTestPool.RunAsync(protocol, "select 1");
             }
             finally
             {
@@ -1303,4 +1489,5 @@ public class CommandUserCancellationTests : ConnectionCreatingTest
 
     static Task DisposeBoundedAsync(IAsyncDisposable enumerator)
         => enumerator.DisposeAsync().AsTask();
+
 }

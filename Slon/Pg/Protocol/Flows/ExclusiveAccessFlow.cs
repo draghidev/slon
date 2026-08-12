@@ -137,7 +137,6 @@ sealed class ExclusiveAccessFlow : PgClientFlow
         var innerSource = _innerSource ?? throw new InvalidOperationException("Cannot submit a subflow before the scope is acquired (await HandoffReady first).");
         if (cancellationToken.CanBeCanceled)
             subflow.BindCallerToken(cancellationToken);
-        _protocol.AssignCancellationBoundary(_innerControl, subflow);
         // Reserve handoff only for a synchronous caller already waiting to drive it.
         if (!subflow.NeedsSyncHandoff)
         {
@@ -218,6 +217,9 @@ sealed class ExclusiveAccessFlow : PgClientFlow
             // An inner flow's CancelRequest is connection-wide. Do not extend its exposed prefix
             // with the outer scope reset while delivery is unresolved.
             await context.WaitForCancellationAttempt().ConfigureAwait(false);
+            // The cancellation coordinator is wire-wide. The inner owner has retired, so make this
+            // outer cleanup command the next attribution boundary before it touches the same wire.
+            _protocol.ResumeCancellationOwner(this);
             await ResetSession(context, resetCommand).ConfigureAwait(false);
         }
         return ValueTask.CompletedTask;
@@ -232,21 +234,30 @@ sealed class ExclusiveAccessFlow : PgClientFlow
 
     static async ValueTask ResetSession(PgEncoder encoder, PgDecoder decoder, string? command)
     {
-        if (!WriteScopeReset(encoder, command))
-            return;
-        await encoder.FlushAsync().ConfigureAwait(false);
-
-        PgError? error = null;
         while (true)
         {
-            var message = await decoder.GetNextAsync().ConfigureAwait(false);
-            if (message.TryCreateError(out var currentError))
-                error ??= currentError.Preserve();
-            if (message.Header.Type is PgTypes.BackendType.ReadyForQuery)
-                break;
-        }
+            if (!WriteScopeReset(encoder, command))
+                return;
+            await encoder.FlushAsync().ConfigureAwait(false);
 
-        ThrowSessionResetError(error);
+            PgError? error = null;
+            while (true)
+            {
+                var message = await decoder.GetNextAsync().ConfigureAwait(false);
+                if (message.TryCreateError(out var currentError))
+                    error ??= currentError.Preserve();
+                if (message.Header.Type is PgTypes.BackendType.ReadyForQuery)
+                    break;
+            }
+
+            if (error is null)
+                return;
+            // One CancelRequest can produce two SIGINTs. If either reaches this internal successor,
+            // its retained wire-level exposure marks the reset error collateral. Retry after RFQ;
+            // once that bounded exposure is exhausted, an unrelated 57014 is no longer suppressed.
+            if (!error.IsCollateralCancellation)
+                ThrowSessionResetError(error);
+        }
     }
 
     internal static void ThrowSessionResetError(PgError? error)
