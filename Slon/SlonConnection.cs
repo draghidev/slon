@@ -12,6 +12,17 @@ using IsolationLevel = System.Data.IsolationLevel;
 
 namespace Slon;
 
+/// <summary>Specifies options for a <see cref="SlonConnection"/>.</summary>
+[Flags]
+public enum SlonConnectionOptions
+{
+    /// <summary>Uses the datasource's normal connection options.</summary>
+    None = 0,
+
+    /// <summary>Prevents unrelated datasource work from being admitted behind this connection.</summary>
+    LongRunning = 1
+}
+
 // Implementation
 public sealed partial class SlonConnection : IAdoConnection
 {
@@ -274,8 +285,9 @@ public sealed partial class SlonConnection : IAdoConnection
             await cmd.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
 
-    void OpenCore(bool longRunning = false)
+    void OpenCore(SlonConnectionOptions options = SlonConnectionOptions.None)
     {
+        ValidateOptions(options);
         ThrowIfDisposed();
         if (_state is not (ConnectionState.Closed or ConnectionState.Broken))
             ThrowHelper.ThrowInvalidOperation("Connection is already open or being opened.");
@@ -283,9 +295,7 @@ public sealed partial class SlonConnection : IAdoConnection
         _state = ConnectionState.Connecting;
         try
         {
-            SetProxy(longRunning
-                ? DbDataSource.GetLongRunningProxy(this, DbDataSource.ConnectionTimeout)
-                : DbDataSource.GetProxy(this, DbDataSource.ConnectionTimeout));
+            SetProxy(DbDataSource.GetProxy(this, DbDataSource.ConnectionTimeout, options));
         }
         catch
         {
@@ -294,8 +304,10 @@ public sealed partial class SlonConnection : IAdoConnection
         }
     }
 
-    async Task OpenAsyncCore(CancellationToken cancellationToken = default, bool longRunning = false)
+    async Task OpenAsyncCore(SlonConnectionOptions options = SlonConnectionOptions.None,
+        CancellationToken cancellationToken = default)
     {
+        ValidateOptions(options);
         ThrowIfDisposed();
         if (_state is not (ConnectionState.Closed or ConnectionState.Broken))
             ThrowHelper.ThrowInvalidOperation("Connection is already open or being opened.");
@@ -304,17 +316,20 @@ public sealed partial class SlonConnection : IAdoConnection
         try
         {
 
-            SetProxy(longRunning
-                ? await DbDataSource.GetLongRunningProxyAsync(
-                    this, DbDataSource.ConnectionTimeout, cancellationToken).ConfigureAwait(false)
-                : await DbDataSource.GetProxyAsync(
-                    this, DbDataSource.ConnectionTimeout, cancellationToken).ConfigureAwait(false));
+            SetProxy(await DbDataSource.GetProxyAsync(
+                this, DbDataSource.ConnectionTimeout, cancellationToken, options).ConfigureAwait(false));
         }
         catch
         {
             await CloseAsyncCore().ConfigureAwait(false);
             throw;
         }
+    }
+
+    static void ValidateOptions(SlonConnectionOptions options)
+    {
+        if ((options & ~SlonConnectionOptions.LongRunning) != 0)
+            throw new ArgumentOutOfRangeException(nameof(options), options, "Unsupported connection options.");
     }
 
     SlonConnection CloneCore() => _dataSource.CreateConnection();
@@ -546,24 +561,18 @@ public sealed partial class SlonConnection : DbConnection
     /// <inheritdoc />
     public override void Open() => OpenCore();
 
-    /// <summary>Opens the connection, optionally excluding its physical connection from datasource admission.</summary>
-    /// <param name="longRunning">
-    /// <see langword="true"/> when newly arriving datasource operations must not be scheduled behind
-    /// this connection until it is closed.
-    /// </param>
-    public void Open(bool longRunning) => OpenCore(longRunning);
+    /// <summary>Opens the connection using the requested connection policy.</summary>
+    public void Open(SlonConnectionOptions options) => OpenCore(options);
 
     /// <inheritdoc />
-    public override Task OpenAsync(CancellationToken cancellationToken) => OpenAsyncCore(cancellationToken);
+    public override Task OpenAsync(CancellationToken cancellationToken)
+        => OpenAsyncCore(cancellationToken: cancellationToken);
 
-    /// <summary>Opens the connection asynchronously, optionally excluding its physical connection from datasource admission.</summary>
-    /// <param name="longRunning">
-    /// <see langword="true"/> when newly arriving datasource operations must not be scheduled behind
-    /// this connection until it is closed.
-    /// </param>
+    /// <summary>Opens the connection asynchronously using the requested connection policy.</summary>
+    /// <param name="options">The connection options.</param>
     /// <param name="cancellationToken">A token for cancelling the open operation.</param>
-    public Task OpenAsync(bool longRunning, CancellationToken cancellationToken = default)
-        => OpenAsyncCore(cancellationToken, longRunning);
+    public Task OpenAsync(SlonConnectionOptions options, CancellationToken cancellationToken = default)
+        => OpenAsyncCore(options, cancellationToken);
 
     /// <inheritdoc />
     public override void ChangeDatabase(string databaseName)

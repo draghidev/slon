@@ -6,12 +6,22 @@ using Microsoft.Extensions.Time.Testing;
 public class LongRunningConnectionTests : ConnectionCreatingTest
 {
     [TestMethod]
+    public void UnknownOpenOption_IsRejected()
+    {
+        using var dataSource = AdoTestPool.NewIsolatedDataSource();
+        using var connection = dataSource.CreateConnection();
+
+        Assert.ThrowsExactly<ArgumentOutOfRangeException>(
+            () => connection.Open((SlonConnectionOptions)2));
+    }
+
+    [TestMethod]
     public async Task DataSourceCommand_IsNotScheduledBehindLongRunningConnection()
     {
         var time = new FakeTimeProvider();
         await using var dataSource = AdoTestPool.NewIsolatedDataSource(
             options => options with { PoolSize = 1, TimeProvider = time });
-        var connection = await dataSource.OpenConnectionAsync(longRunning: true);
+        var connection = await dataSource.OpenConnectionAsync(SlonConnectionOptions.LongRunning);
         try
         {
             await using var dataSourceCommand = dataSource.CreateCommand("select 42");

@@ -28,7 +28,7 @@ public class FlowMigrationTests : ConnectionCreatingTest
                 ExecutionScheduler = scheduler,
                 TimeProvider = time
             });
-        var connection = await dataSource.OpenConnectionAsync(longRunning: false);
+        var connection = await dataSource.OpenConnectionAsync(CancellationToken.None);
         try
         {
             var protocol = connection.UnderlyingPgConnection!.Protocol;

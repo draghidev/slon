@@ -825,15 +825,11 @@ public sealed class SlonDataSource : DbDataSource
         return connection;
     }
 
-    /// <summary>Opens a connection, optionally excluding it from datasource command admission.</summary>
-    /// <param name="longRunning">
-    /// <see langword="true"/> when newly arriving datasource operations must not be scheduled behind
-    /// the returned connection during its tenure.
-    /// </param>
-    public SlonConnection OpenConnection(bool longRunning)
+    /// <summary>Opens a connection using the requested connection policy.</summary>
+    public SlonConnection OpenConnection(SlonConnectionOptions options)
     {
         var connection = CreateConnection();
-        connection.Open(longRunning);
+        connection.Open(options);
         return connection;
     }
 
@@ -851,17 +847,14 @@ public sealed class SlonDataSource : DbDataSource
         return connection;
     }
 
-    /// <summary>Opens a connection asynchronously, optionally excluding it from datasource command admission.</summary>
-    /// <param name="longRunning">
-    /// <see langword="true"/> when newly arriving datasource operations must not be scheduled behind
-    /// the returned connection during its tenure.
-    /// </param>
+    /// <summary>Opens a connection asynchronously using the requested connection policy.</summary>
+    /// <param name="options">The connection options.</param>
     /// <param name="cancellationToken">A token for cancelling the open operation.</param>
-    public async ValueTask<SlonConnection> OpenConnectionAsync(bool longRunning,
+    public async ValueTask<SlonConnection> OpenConnectionAsync(SlonConnectionOptions options,
         CancellationToken cancellationToken = default)
     {
         var connection = CreateConnection();
-        await connection.OpenAsync(longRunning, cancellationToken).ConfigureAwait(false);
+        await connection.OpenAsync(options, cancellationToken).ConfigureAwait(false);
         return connection;
     }
 
@@ -942,51 +935,56 @@ public sealed class SlonDataSource : DbDataSource
     internal AdoConnectionProxy GetProxy(IAdoConnection connection, TimeSpan timeout)
     {
         EnsureInitialized(timeout);
-        return GetScopedProxy(connection, timeout, longRunning: false);
+        return GetScopedProxy(connection, timeout, SlonConnectionOptions.None);
     }
 
     internal async ValueTask<AdoConnectionProxy> GetProxyAsync(IAdoConnection connection, TimeSpan timeout, CancellationToken cancellationToken = default)
     {
         await EnsureInitializedAsync(timeout, cancellationToken).ConfigureAwait(false);
-        return await GetScopedProxyAsync(connection, timeout, cancellationToken, longRunning: false).ConfigureAwait(false);
+        return await GetScopedProxyAsync(
+            connection, timeout, cancellationToken, SlonConnectionOptions.None).ConfigureAwait(false);
     }
 
-    internal AdoConnectionProxy GetLongRunningProxy(IAdoConnection connection, TimeSpan timeout)
+    internal AdoConnectionProxy GetProxy(IAdoConnection connection, TimeSpan timeout,
+        SlonConnectionOptions options)
     {
         EnsureInitialized(timeout);
-        return GetScopedProxy(connection, timeout, longRunning: true);
+        return GetScopedProxy(connection, timeout, options);
     }
 
-    AdoConnectionProxy GetScopedProxy(IAdoConnection connection, TimeSpan timeout, bool longRunning)
+    AdoConnectionProxy GetScopedProxy(IAdoConnection connection, TimeSpan timeout,
+        SlonConnectionOptions options)
     {
         var proxy = new AdoConnectionProxy(this, connection);
         _connectionPool.Get(static (candidate, state) => TryStartExclusiveScope(candidate, state),
-            (Proxy: proxy, Async: false, LongRunning: longRunning), timeout);
+            (Proxy: proxy, Async: false, Options: options), timeout);
         proxy.AcquireExclusiveScope();
         return proxy;
     }
 
-    internal async ValueTask<AdoConnectionProxy> GetLongRunningProxyAsync(IAdoConnection connection,
-        TimeSpan timeout, CancellationToken cancellationToken)
+    internal async ValueTask<AdoConnectionProxy> GetProxyAsync(IAdoConnection connection,
+        TimeSpan timeout, CancellationToken cancellationToken, SlonConnectionOptions options)
     {
         await EnsureInitializedAsync(timeout, cancellationToken).ConfigureAwait(false);
-        return await GetScopedProxyAsync(connection, timeout, cancellationToken, longRunning: true).ConfigureAwait(false);
+        return await GetScopedProxyAsync(connection, timeout, cancellationToken, options).ConfigureAwait(false);
     }
 
     async ValueTask<AdoConnectionProxy> GetScopedProxyAsync(IAdoConnection connection, TimeSpan timeout,
-        CancellationToken cancellationToken, bool longRunning)
+        CancellationToken cancellationToken, SlonConnectionOptions options)
     {
         var proxy = new AdoConnectionProxy(this, connection);
         await _connectionPool.GetAsync(static (candidate, state) => TryStartExclusiveScope(candidate, state),
-            (Proxy: proxy, Async: true, LongRunning: longRunning), timeout, cancellationToken).ConfigureAwait(false);
+            (Proxy: proxy, Async: true, Options: options), timeout, cancellationToken).ConfigureAwait(false);
         await proxy.AcquireExclusiveScopeAsync(cancellationToken).ConfigureAwait(false);
         return proxy;
     }
 
     static bool TryStartExclusiveScope(ConnectionCandidate<PgConnection> candidate,
-        (AdoConnectionProxy Proxy, bool Async, bool LongRunning) state)
+        (AdoConnectionProxy Proxy, bool Async, SlonConnectionOptions Options) state)
     {
-        var enqueueOptions = (state.LongRunning ? FlowEnqueueOptions.BlockAdmission : FlowEnqueueOptions.None) |
+        var enqueueOptions = ((state.Options & SlonConnectionOptions.LongRunning) != 0
+                ? FlowEnqueueOptions.BlockAdmission
+                : FlowEnqueueOptions.None) |
             (candidate.IsIdleCandidate ? FlowEnqueueOptions.None : FlowEnqueueOptions.RequireExistingPipeline);
         return state.Proxy.TryStartExclusiveScope(candidate.Connection, state.Async, enqueueOptions);
     }
