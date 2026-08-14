@@ -64,7 +64,8 @@ sealed class PgAdvisoryLock : IAsyncDisposable
         catch (PgErrorException ex) when (ex.SqlState == "55P03")
         {
             var holders = await ReadSingleValueAsync(owner,
-                "select coalesce(string_agg(a.pid || ' age=' || (now() - a.backend_start)::text || ' ' || coalesce(left(a.query, 40), ''), '; '), '<none>') " +
+                "select coalesce(string_agg(a.pid || ' age=' || " +
+                "(now() - a.backend_start)::text || ' ' || coalesce(left(a.query, 40), ''), '; '), '<none>') " +
                 "from pg_locks l join pg_stat_activity a on a.pid = l.pid where l.locktype = 'advisory'");
             throw new InvalidOperationException(
                 $"Advisory lock {key} could not be acquired within 10s. Advisory holders: [{holders}]", ex);
@@ -106,6 +107,7 @@ sealed class PgAdvisoryLock : IAsyncDisposable
         => PgTestPool.RunAsync(_owner, $$"""
             do $$
             begin
+                perform set_config('client_connection_check_interval', '1s', true);
                 loop
                     perform pg_stat_clear_snapshot();
                     if not exists (select 1 from pg_stat_activity where pid = {{backendProcessId}}) then
@@ -128,6 +130,7 @@ sealed class PgAdvisoryLock : IAsyncDisposable
         => PgTestPool.RunAsync(_owner, $$"""
             do $$
             begin
+                perform set_config('client_connection_check_interval', '1s', true);
                 loop
                     perform pg_stat_clear_snapshot();
                     if not exists (select 1 from pg_stat_activity where pid = {{backendProcessId}}) then
@@ -175,6 +178,7 @@ sealed class PgAdvisoryLock : IAsyncDisposable
         => PgTestPool.RunAsync(_owner, $$"""
             do $$
             begin
+                perform set_config('client_connection_check_interval', '1s', true);
                 while not exists (
                     select 1 from pg_stat_activity
                     where query like '%pg_advisory_xact_lock({{Key}})%' and wait_event = 'advisory')
@@ -189,6 +193,7 @@ sealed class PgAdvisoryLock : IAsyncDisposable
         => PgTestPool.RunAsync(_owner, $$"""
             do $$
             begin
+                perform set_config('client_connection_check_interval', '1s', true);
                 while exists (select 1 from pg_stat_activity where pid = {{backendProcessId}})
                 loop
                     perform pg_stat_clear_snapshot();
