@@ -61,8 +61,13 @@ public class FlushBatchingTests
 
     static async Task WaitForBytes(FlushCountingTransport t, long target)
     {
-        while (Volatile.Read(ref t.Counter.FlushedBytes) < target)
-            await t.Counter.WaitForFlushAsync(Volatile.Read(ref t.Counter.FlushedBytes));
+        while (true)
+        {
+            var observedBytes = Volatile.Read(ref t.Counter.FlushedBytes);
+            if (observedBytes >= target)
+                return;
+            await t.Counter.WaitForFlushAsync(observedBytes);
+        }
     }
 
     // Queue one flow, wait for its write to reach the wire (the executor flushes on park), return its size.
