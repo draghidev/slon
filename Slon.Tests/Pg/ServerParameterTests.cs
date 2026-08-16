@@ -6,7 +6,7 @@ using Slon.Pg.Types;
 namespace Slon.Tests.Pg;
 
 [TestClass]
-public class ServerParameterTests : ConnectionCreatingTest
+public class ServerParameterTests
 {
     [TestMethod]
     public void BackendInfo_SharesTheOwnedStartupSnapshot()
@@ -63,7 +63,7 @@ public class ServerParameterTests : ConnectionCreatingTest
         Assert.AreSame(@base, state.CurrentSnapshot);
     }
 
-    [TestMethod]
+    [ConnectionCreatingTestMethod]
     public async Task ReportedParameters_KeepStableBaseAndEvolveCurrentSnapshot()
     {
         await using var protocol = await PgTestPool.NewIsolatedAsync();

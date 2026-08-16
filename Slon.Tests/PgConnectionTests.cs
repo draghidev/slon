@@ -15,7 +15,7 @@ namespace Slon.Tests;
 // (e.g., shared heartbeat thread). Each test owns its connection end-to-end because
 // PgConnection isn't pool-managed without an actual pool above it.
 [TestClass]
-public class PgConnectionTests : ConnectionCreatingTest
+public class PgConnectionTests
 {
     sealed class AsyncOnlyTransport : TransportConnection
     {
@@ -80,7 +80,7 @@ public class PgConnectionTests : ConnectionCreatingTest
         Assert.AreEqual(0, tracker.RegisteredConnectionCount);
     }
 
-    [TestMethod]
+    [ConnectionCreatingTestMethod]
     public async Task FailedPostStartupWiring_CompletesSessionLifetime()
     {
         var options = NewOptions();
@@ -96,7 +96,7 @@ public class PgConnectionTests : ConnectionCreatingTest
         Assert.AreEqual(0, tracker.RegisteredConnectionCount);
     }
 
-    [TestMethod]
+    [ConnectionCreatingTestMethod]
     public async Task Sync_Completes()
     {
         var conn = await ConnectAsync();
@@ -104,7 +104,7 @@ public class PgConnectionTests : ConnectionCreatingTest
         finally { await conn.Protocol.CompleteAsync(); }
     }
 
-    [TestMethod]
+    [ConnectionCreatingTestMethod]
     public async Task Async_Completes()
     {
         var conn = await ConnectAsync();
@@ -112,7 +112,7 @@ public class PgConnectionTests : ConnectionCreatingTest
         finally { await conn.Protocol.CompleteAsync(); }
     }
 
-    [TestMethod]
+    [ConnectionCreatingTestMethod]
     public async Task SyncWhileAsyncInFlight_SameConn_BothComplete()
     {
         var conn = await ConnectAsync();

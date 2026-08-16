@@ -5,7 +5,7 @@ using Slon.Pg.Types;
 namespace Slon.Tests.Pg;
 
 [TestClass]
-public class PgBackendInfoTests : ConnectionCreatingTest
+public class PgBackendInfoTests
 {
 
     [TestMethod]
@@ -178,4 +178,3 @@ public class PgBackendInfoTests : ConnectionCreatingTest
         }).Build();
 
 }
-

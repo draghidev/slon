@@ -3,7 +3,7 @@ namespace Slon.Tests;
 using Microsoft.Extensions.Time.Testing;
 
 [TestClass]
-public class LongRunningConnectionTests : ConnectionCreatingTest
+public class LongRunningConnectionTests
 {
     [TestMethod]
     public void UnknownOpenOption_IsRejected()
@@ -15,7 +15,7 @@ public class LongRunningConnectionTests : ConnectionCreatingTest
             () => connection.Open((SlonConnectionOptions)2));
     }
 
-    [TestMethod]
+    [ConnectionCreatingTestMethod]
     public async Task DataSourceCommand_IsNotScheduledBehindLongRunningConnection()
     {
         var time = new FakeTimeProvider();
