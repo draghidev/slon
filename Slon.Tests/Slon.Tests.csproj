@@ -12,4 +12,11 @@
         <PackageReference Include="Microsoft.Extensions.TimeProvider.Testing" Version="9.0.0" />
         <ProjectReference Include="../Slon/Slon.csproj" />
     </ItemGroup>
+
+    <ItemGroup>
+        <TestingPlatformBuilderHook Include="61BA53CE-BF62-4E39-927A-A491E78473F1">
+            <DisplayName>Slon last-chance test ledger</DisplayName>
+            <TypeFullName>Slon.Tests.LastChanceTestLedgerHook</TypeFullName>
+        </TestingPlatformBuilderHook>
+    </ItemGroup>
 </Project>
