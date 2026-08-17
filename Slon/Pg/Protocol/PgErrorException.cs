@@ -53,9 +53,9 @@ public sealed class PgErrorException : Exception
     {
         var exception = new PgErrorException(error);
         if (error.IsCollateralCancellation)
-            return new PgCollateralException(PgCollateralKind.Cancellation, exception);
+            return new PgCollateralException(PgCollateralSource.Cancellation, exception);
         if (error.IsBackendTermination)
-            return new PgCollateralException(PgCollateralKind.BackendTermination, exception);
+            return new PgCollateralException(PgCollateralSource.BackendTermination, exception);
         return exception;
     }
 }

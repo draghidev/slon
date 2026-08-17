@@ -76,7 +76,7 @@ public class ParameterSerializationTests
                     new SlonParameter<Stream>(new ThrowingReadStream(256 * 1024, 64 * 1024)));
                 var exception = await Assert.ThrowsExactlyAsync<SlonException>(
                     () => command.ExecuteNonQueryAsync());
-                Assert.AreEqual(SlonExceptionKind.ClientFailure, exception.Kind);
+                Assert.IsNull(exception.PostgreSqlError);
             }
             Assert.AreEqual(System.Data.ConnectionState.Broken, connection.State);
         }

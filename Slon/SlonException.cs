@@ -16,34 +16,23 @@ public class SlonException : DbException
 
     internal Exception ProjectedException { get; }
 
-    /// <summary>Identifies the broad source of the ADO.NET failure.</summary>
-    public SlonExceptionKind Kind => ProjectedException switch
-    {
-        PgErrorException => SlonExceptionKind.PostgreSqlError,
-        PgCollateralException => SlonExceptionKind.Collateral,
-        PgProtocolException => SlonExceptionKind.ProtocolFailure,
-        PgClientClosedException => SlonExceptionKind.Closed,
-        PgClientException => SlonExceptionKind.ClientFailure,
-        _ => SlonExceptionKind.ClientFailure
-    };
+    /// <summary>The error reported by PostgreSQL, when this failure contains one.</summary>
+    public PostgreSqlException? PostgreSqlError
+        => this as PostgreSqlException ?? InnerException as PostgreSqlException;
+
+    /// <summary>
+    /// Whether this operation failed because another operation or PostgreSQL itself affected the shared session.
+    /// </summary>
+    public bool IsCollateral => ProjectedException is PgCollateralException;
 
     public override bool IsTransient
-        => ProjectedException is PgCollateralException { Kind: PgCollateralKind.Cancellation };
-}
-
-public enum SlonExceptionKind : byte
-{
-    ClientFailure,
-    ProtocolFailure,
-    Closed,
-    Collateral,
-    PostgreSqlError
+        => ProjectedException is PgCollateralException { CollateralSource: PgCollateralSource.Cancellation };
 }
 
 /// <summary>Represents an error reported by PostgreSQL.</summary>
-public sealed class PostgresException : SlonException
+public sealed class PostgreSqlException : SlonException
 {
-    internal PostgresException(PgErrorException error)
+    internal PostgreSqlException(PgErrorException error)
         : base(error.Message, error)
     {
         Severity = error.Severity;
@@ -82,13 +71,13 @@ static class AdoException
 {
     public static Exception Project(Exception exception)
     {
-        if (exception is PostgresException or SlonException
+        if (exception is PostgreSqlException or SlonException
             or OperationCanceledException or ObjectDisposedException
             or ArgumentException or NotSupportedException)
             return exception;
 
         if (exception is PgErrorException error)
-            return new PostgresException(error);
+            return new PostgreSqlException(error);
 
         // The low-level drain preserves every PostgreSQL error. ADO follows the conventional
         // single-error surface and reports the first server failure.
@@ -97,7 +86,7 @@ static class AdoException
             foreach (var inner in aggregate.InnerExceptions)
             {
                 if (inner is PgErrorException pgError)
-                    return new PostgresException(pgError);
+                    return new PostgreSqlException(pgError);
             }
         }
 
@@ -109,7 +98,7 @@ static class AdoException
             PgClientException client => new SlonException(
                 client.Message, client, client.InnerException),
             PgProtocolException protocol => new SlonException(
-                protocol.Message, protocol, protocol.InnerException),
+                protocol.Message, protocol, protocol),
             PgClientClosedException closed => new SlonException(
                 closed.Message, closed, closed.InnerException),
             IOException io => new SlonException(io.Message, io, io.InnerException),

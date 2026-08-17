@@ -371,10 +371,11 @@ public class RecoveryTests : ConnectionCreatingTest
         var e = successor.GetAsyncEnumerator();
         var collateral = await Assert.ThrowsExactlyAsync<PgCollateralException>(
             () => e.MoveNextAsync().AsTask());
-        Assert.AreEqual(PgCollateralKind.ProtocolFailure, collateral.Kind);
+        Assert.AreEqual(PgCollateralSource.ProtocolFailure, collateral.CollateralSource);
         Assert.AreSame(violation, collateral.InnerException);
         var projected = Assert.IsInstanceOfType<SlonException>(AdoException.Project(collateral));
-        Assert.AreEqual(SlonExceptionKind.Collateral, projected.Kind);
+        Assert.IsNull(projected.PostgreSqlError);
+        Assert.IsTrue(projected.IsCollateral);
         Assert.IsFalse(projected.IsTransient);
     }
 

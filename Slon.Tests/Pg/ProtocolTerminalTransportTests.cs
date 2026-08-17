@@ -122,7 +122,7 @@ public class ProtocolTerminalTransportTests
         foreach (var failure in new[] { await observingFailure, await successorFailure })
         {
             var collateral = Assert.IsInstanceOfType<PgCollateralException>(failure);
-            Assert.AreEqual(PgCollateralKind.BackendTermination, collateral.Kind);
+            Assert.AreEqual(PgCollateralSource.BackendTermination, collateral.CollateralSource);
             var backend = Assert.IsInstanceOfType<PgErrorException>(collateral.InnerException);
             Assert.AreEqual(sqlState, backend.SqlState);
         }
@@ -153,7 +153,7 @@ public class ProtocolTerminalTransportTests
         var successorException = await successorFailure;
         var collateral = Assert.IsInstanceOfType<PgCollateralException>(
             successorException, successorException.ToString());
-        Assert.AreEqual(PgCollateralKind.ProtocolFailure, collateral.Kind);
+        Assert.AreEqual(PgCollateralSource.ProtocolFailure, collateral.CollateralSource);
         Assert.IsInstanceOfType<PgProtocolException>(collateral.InnerException);
         await protocol.Completion;
     }

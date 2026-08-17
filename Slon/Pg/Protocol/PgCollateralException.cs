@@ -6,33 +6,33 @@ namespace Slon.Pg.Protocol;
 /// </summary>
 public sealed class PgCollateralException : PgClientException
 {
-    internal PgCollateralException(PgCollateralKind collateralSource, Exception cause)
+    internal PgCollateralException(PgCollateralSource collateralSource, Exception cause)
         : base(BuildMessage(collateralSource), cause)
-        => Kind = collateralSource;
+        => CollateralSource = collateralSource;
 
     /// <summary>Identifies the shared-wire event that caused this operation to fail.</summary>
-    public PgCollateralKind Kind { get; }
+    public PgCollateralSource CollateralSource { get; }
 
     internal static PgCollateralException ForProtocolFailure(Exception? cause)
         => cause as PgCollateralException
-            ?? new(PgCollateralKind.ProtocolFailure,
+            ?? new(PgCollateralSource.ProtocolFailure,
                 cause ?? new InvalidOperationException("The protocol was condemned without a specific cause."));
 
-    static string BuildMessage(PgCollateralKind collateralSource) => collateralSource switch
+    static string BuildMessage(PgCollateralSource collateralSource) => collateralSource switch
     {
-        PgCollateralKind.ProtocolFailure =>
+        PgCollateralSource.ProtocolFailure =>
             "This operation failed collaterally because another operation caused the PostgreSQL protocol to be condemned.",
-        PgCollateralKind.Cancellation =>
+        PgCollateralSource.Cancellation =>
             "This operation was canceled collaterally by a PostgreSQL CancelRequest intended for an earlier pipelined operation. " +
             "PostgreSQL applies the request to whichever operation is running when it is processed, so drivers cannot eliminate this race.",
-        PgCollateralKind.BackendTermination =>
+        PgCollateralSource.BackendTermination =>
             "This operation failed collaterally because PostgreSQL terminated the shared session.",
         _ => throw ThrowHelper.ThrowUnhandledCase(collateralSource)
     };
 }
 
 /// <summary>Identifies the source of a collateral PostgreSQL operation failure.</summary>
-public enum PgCollateralKind : byte
+public enum PgCollateralSource : byte
 {
     /// <summary>Another client-side failure condemned the shared protocol.</summary>
     ProtocolFailure,

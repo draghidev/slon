@@ -1136,7 +1136,7 @@ public class CommandUserCancellationTests : ConnectionCreatingTest
             await rows.DisposeAsync();
             var collateral = Assert.ThrowsExactly<PgCollateralException>(
                 () => result.GetCommandComplete());
-            Assert.AreEqual(PgCollateralKind.Cancellation, collateral.Kind);
+            Assert.AreEqual(PgCollateralSource.Cancellation, collateral.CollateralSource);
             var backendError = Assert.IsInstanceOfType<PgErrorException>(collateral.InnerException);
             Assert.AreEqual(PgErrorCodes.QueryCanceled, backendError.SqlState);
             Assert.IsTrue(backendError.IsCollateralCancellation);
@@ -1144,10 +1144,11 @@ public class CommandUserCancellationTests : ConnectionCreatingTest
             Assert.IsFalse(backendError.Message.Contains("drivers cannot eliminate this race"),
                 "the collateral wrapper owns attribution prose; its PostgreSQL cause stays canonical");
             var projected = Assert.IsInstanceOfType<SlonException>(AdoException.Project(collateral));
-            Assert.AreEqual(SlonExceptionKind.Collateral, projected.Kind);
+            Assert.IsTrue(projected.IsCollateral);
             Assert.IsTrue(projected.IsTransient);
             StringAssert.Contains(projected.Message, "drivers cannot eliminate this race");
-            var projectedError = Assert.IsInstanceOfType<PostgresException>(projected.InnerException);
+            var projectedError = Assert.IsInstanceOfType<PostgreSqlException>(projected.InnerException);
+            Assert.AreSame(projectedError, projected.PostgreSqlError);
             Assert.IsTrue(projectedError.IsCollateralCancellation);
             Assert.IsFalse(projectedError.Message.Contains("drivers cannot eliminate this race"));
             Assert.IsFalse(await successor.MoveNextAsync());

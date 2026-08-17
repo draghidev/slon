@@ -1,3 +1,5 @@
+using System.Buffers;
+using System.Text;
 using Slon.Pg.Protocol;
 using Microsoft.Extensions.Time.Testing;
 
@@ -18,7 +20,7 @@ public class AdoErrorSurfacingTests
     static void AssertUsable() => Assert.AreEqual(0, AdoTestPool.ExecuteNonQuery("SELECT 1"));
 
     [TestMethod]
-    public void ClientFailureProjection_DoesNotDuplicateInnerMessage()
+    public void ClientProjection_DoesNotDuplicateInnerMessage()
     {
         const string causeMessage = "synthetic protocol cause";
         var cause = new PgProtocolException(causeMessage);
@@ -28,18 +30,78 @@ public class AdoErrorSurfacingTests
         var projected = Assert.IsInstanceOfType<SlonException>(
             AdoException.Project(lowLevel));
 
-        Assert.AreEqual(SlonExceptionKind.ClientFailure, projected.Kind);
+        Assert.IsNull(projected.PostgreSqlError);
         Assert.AreEqual(lowLevel.Message, projected.Message);
         Assert.AreSame(cause, projected.InnerException);
         Assert.IsFalse(projected.Message.Contains(causeMessage));
     }
 
     [TestMethod]
+    public void RawProtocolViolationProjection_IsClientAndPreservesOriginalException()
+    {
+        var lowLevel = new PgProtocolException("synthetic protocol violation");
+
+        var projected = Assert.IsInstanceOfType<SlonException>(AdoException.Project(lowLevel));
+
+        Assert.IsNull(projected.PostgreSqlError);
+        Assert.AreSame(lowLevel, projected.InnerException);
+        Assert.IsFalse(projected.IsTransient);
+    }
+
+    [TestMethod]
+    public void ClosedProtocolProjection_IsClient()
+    {
+        var projected = Assert.IsInstanceOfType<SlonException>(
+            AdoException.Project(new PgClientClosedException()));
+
+        Assert.IsNull(projected.PostgreSqlError);
+        Assert.IsFalse(projected.IsTransient);
+    }
+
+    [TestMethod]
+    public void BackendTerminationProjection_IsPostgreSqlErrorAndNonTransient()
+    {
+        PgError error = ErrorOrNoticeMessage.FromFieldBlock(ErrorBlock(
+            ('S', "FATAL"),
+            ('V', "FATAL"),
+            ('C', PgErrorCodes.AdminShutdown),
+            ('M', "terminating connection due to administrator command")));
+        var lowLevel = new PgCollateralException(
+            PgCollateralSource.BackendTermination,
+            new PgErrorException(error));
+
+        var projected = Assert.IsInstanceOfType<SlonException>(AdoException.Project(lowLevel));
+
+        Assert.IsTrue(projected.IsCollateral);
+        Assert.IsFalse(projected.IsTransient);
+        var backend = Assert.IsInstanceOfType<PostgreSqlException>(projected.InnerException);
+        Assert.AreSame(backend, projected.PostgreSqlError);
+        Assert.AreEqual(PgErrorCodes.AdminShutdown, backend.SqlState);
+    }
+
+    [TestMethod]
+    public void ProtocolCondemnationProjection_IsClient()
+    {
+        var cause = new PgProtocolException("synthetic protocol failure");
+        var lowLevel = new PgCollateralException(PgCollateralSource.ProtocolFailure, cause);
+
+        var projected = Assert.IsInstanceOfType<SlonException>(AdoException.Project(lowLevel));
+
+        Assert.IsNull(projected.PostgreSqlError);
+        Assert.IsTrue(projected.IsCollateral);
+        var projectedCause = Assert.IsInstanceOfType<SlonException>(projected.InnerException);
+        Assert.IsNull(projectedCause.PostgreSqlError);
+        Assert.AreSame(cause, projectedCause.InnerException);
+        Assert.IsFalse(projected.IsTransient);
+    }
+
+    [TestMethod]
     public void ExecuteNonQuery_FailedCommand_Throws()
     {
         using var cmd = Failed();
-        var exception = Assert.ThrowsExactly<PostgresException>(() => cmd.ExecuteNonQuery());
-        Assert.AreEqual(SlonExceptionKind.PostgreSqlError, exception.Kind);
+        var exception = Assert.ThrowsExactly<PostgreSqlException>(() => cmd.ExecuteNonQuery());
+        Assert.AreSame(exception, exception.PostgreSqlError);
+        Assert.IsFalse(exception.IsCollateral);
         Assert.AreEqual("42703", exception.SqlState);
         StringAssert.Contains(exception.MessageText, "slon_no_such_column");
         Assert.IsNull(exception.InnerException,
@@ -51,7 +113,7 @@ public class AdoErrorSurfacingTests
     public async Task ExecuteNonQueryAsync_FailedCommand_Throws()
     {
         await using var cmd = Failed();
-        await Assert.ThrowsExactlyAsync<PostgresException>(async () => await cmd.ExecuteNonQueryAsync(CancellationToken.None));
+        await Assert.ThrowsExactlyAsync<PostgreSqlException>(async () => await cmd.ExecuteNonQueryAsync(CancellationToken.None));
         AssertUsable();
     }
 
@@ -63,7 +125,7 @@ public class AdoErrorSurfacingTests
         batch.BatchCommands.Add(batch.CreateBatchCommand("SELECT 1"));
         batch.BatchCommands.Add(batch.CreateBatchCommand(Failing));
 
-        await Assert.ThrowsExactlyAsync<PostgresException>(async () => await batch.ExecuteNonQueryAsync(CancellationToken.None));
+        await Assert.ThrowsExactlyAsync<PostgreSqlException>(async () => await batch.ExecuteNonQueryAsync(CancellationToken.None));
         await using var command = new SlonCommand(connection, "SELECT 1");
         Assert.AreEqual(0, await command.ExecuteNonQueryAsync());
     }
@@ -72,7 +134,7 @@ public class AdoErrorSurfacingTests
     public void ExecuteScalar_FailedCommand_Throws()
     {
         using var cmd = Failed();
-        Assert.ThrowsExactly<PostgresException>(() => cmd.ExecuteScalar());
+        Assert.ThrowsExactly<PostgreSqlException>(() => cmd.ExecuteScalar());
         AssertUsable();
     }
 
@@ -80,7 +142,7 @@ public class AdoErrorSurfacingTests
     public async Task ExecuteScalarAsync_FailedCommand_Throws()
     {
         await using var cmd = Failed();
-        await Assert.ThrowsExactlyAsync<PostgresException>(async () => await cmd.ExecuteScalarAsync(CancellationToken.None));
+        await Assert.ThrowsExactlyAsync<PostgreSqlException>(async () => await cmd.ExecuteScalarAsync(CancellationToken.None));
         AssertUsable();
     }
 
@@ -94,7 +156,7 @@ public class AdoErrorSurfacingTests
             Assert.IsTrue(reader.Read());
             Assert.AreEqual(1, reader.GetInt32(0));
             Assert.IsTrue(reader.NextResult());
-            Assert.ThrowsExactly<PostgresException>(() => reader.Read());
+            Assert.ThrowsExactly<PostgreSqlException>(() => reader.Read());
         }
 
         AssertUsable();
@@ -110,7 +172,7 @@ public class AdoErrorSurfacingTests
             Assert.IsTrue(await reader.ReadAsync());
             Assert.AreEqual(1, reader.GetInt32(0));
             Assert.IsTrue(await reader.NextResultAsync());
-            await Assert.ThrowsExactlyAsync<PostgresException>(() => reader.ReadAsync());
+            await Assert.ThrowsExactlyAsync<PostgreSqlException>(() => reader.ReadAsync());
         }
 
         AssertUsable();
@@ -125,7 +187,7 @@ public class AdoErrorSurfacingTests
             var reader = batch.ExecuteReader();
 
             Assert.IsTrue(reader.Read());
-            Assert.ThrowsExactly<PostgresException>(() => reader.Dispose());
+            Assert.ThrowsExactly<PostgreSqlException>(() => reader.Dispose());
         }
         AssertUsable();
     }
@@ -158,13 +220,13 @@ public class AdoErrorSurfacingTests
                         Assert.IsTrue(reader.Read(), $"iter {i}: first row was not delivered");
                         if ((i & 1) == 0)
                         {
-                            Assert.ThrowsExactly<PostgresException>(reader.Dispose,
+                            Assert.ThrowsExactly<PostgreSqlException>(reader.Dispose,
                                 $"iter {i}: disposal did not surface the unread successor error");
                         }
                         else
                         {
                             Assert.IsTrue(reader.NextResult(), $"iter {i}: failed successor was not exposed");
-                            Assert.ThrowsExactly<PostgresException>(() => reader.Read(),
+                            Assert.ThrowsExactly<PostgreSqlException>(() => reader.Read(),
                                 $"iter {i}: reading the failed successor did not surface its error");
                             reader.Dispose();
                         }
@@ -190,7 +252,7 @@ public class AdoErrorSurfacingTests
             var reader = await batch.ExecuteReaderAsync();
 
             Assert.IsTrue(await reader.ReadAsync());
-            await Assert.ThrowsExactlyAsync<PostgresException>(async () => await reader.DisposeAsync());
+            await Assert.ThrowsExactlyAsync<PostgreSqlException>(async () => await reader.DisposeAsync());
         }
         AssertUsable();
     }
@@ -201,5 +263,18 @@ public class AdoErrorSurfacingTests
         batch.BatchCommands.Add(batch.CreateBatchCommand("SELECT 1"));
         batch.BatchCommands.Add(batch.CreateBatchCommand(Failing));
         return batch;
+    }
+
+    static ReadOnlySequence<byte> ErrorBlock(params (char Type, string Value)[] fields)
+    {
+        using var stream = new MemoryStream();
+        foreach (var (type, value) in fields)
+        {
+            stream.WriteByte((byte)type);
+            stream.Write(Encoding.UTF8.GetBytes(value));
+            stream.WriteByte(0);
+        }
+        stream.WriteByte(0);
+        return new ReadOnlySequence<byte>(stream.ToArray());
     }
 }
