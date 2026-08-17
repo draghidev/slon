@@ -196,7 +196,7 @@ static class CommandExtensions
             if (!decoder.TryGetNext(out var message))
             {
                 if (!await decoder.MoveNextAsync().ConfigureAwait(false))
-                    throw PgProtocolException.UnexpectedEof();
+                    decoder.ThrowUnexpectedEof();
                 message = decoder.Current;
             }
             if (message.EnsureExpectedOrError(PgTypes.BackendType.RowDescription, PgTypes.BackendType.NoData)
@@ -223,7 +223,7 @@ static class CommandExtensions
             if (!decoder.TryGetNext(out message))
             {
                 if (!await decoder.MoveNextAsync().ConfigureAwait(false))
-                    throw PgProtocolException.UnexpectedEof();
+                    decoder.ThrowUnexpectedEof();
                 message = decoder.Current;
             }
             message.DebugEnsureExpected(PgTypes.BackendType.DataRow, PgTypes.BackendType.CommandComplete);
@@ -240,7 +240,7 @@ static class CommandExtensions
                 if (!decoder.TryGetNext(out message))
                 {
                     if (!await decoder.MoveNextAsync().ConfigureAwait(false))
-                        throw PgProtocolException.UnexpectedEof();
+                        decoder.ThrowUnexpectedEof();
                     message = decoder.Current;
                 }
                 if (message.EnsureExpectedOrError(PgTypes.BackendType.ParseComplete) is { } parseError)
@@ -253,7 +253,7 @@ static class CommandExtensions
             if (!decoder.TryGetNext(out message))
             {
                 if (!await decoder.MoveNextAsync().ConfigureAwait(false))
-                    throw PgProtocolException.UnexpectedEof();
+                    decoder.ThrowUnexpectedEof();
                 message = decoder.Current;
             }
             if (message.EnsureExpectedOrError(PgTypes.BackendType.BindComplete) is { } bindError)
@@ -268,7 +268,7 @@ static class CommandExtensions
                 if (!decoder.TryGetNext(out message))
                 {
                     if (!await decoder.MoveNextAsync().ConfigureAwait(false))
-                        throw PgProtocolException.UnexpectedEof();
+                        decoder.ThrowUnexpectedEof();
                     message = decoder.Current;
                 }
                 if (message.EnsureExpectedOrError(PgTypes.BackendType.RowDescription, PgTypes.BackendType.NoData)
@@ -297,7 +297,7 @@ static class CommandExtensions
                 if (!decoder.TryGetNext(out message))
                 {
                     if (!await decoder.MoveNextAsync().ConfigureAwait(false))
-                        throw PgProtocolException.UnexpectedEof();
+                        decoder.ThrowUnexpectedEof();
                     message = decoder.Current;
                 }
                 message.DebugEnsureExpected(PgTypes.BackendType.DataRow, PgTypes.BackendType.CommandComplete);

@@ -13,6 +13,7 @@ sealed class BackendMessageContext
     BackendMessage _current;
     short _version;
     bool _hasPriorCancellationExposure;
+    bool _backendTermination;
     bool _errorObserved;
     bool _bodyWindowAdvanced;
 
@@ -183,6 +184,18 @@ sealed class BackendMessageContext
         return _hasPriorCancellationExposure;
     }
 
+    public void MarkBackendTermination(short token)
+    {
+        Validate(token);
+        _backendTermination = true;
+    }
+
+    public bool IsBackendTermination(short token)
+    {
+        Validate(token);
+        return _backendTermination;
+    }
+
     public bool TryObserveError(short token)
     {
         Validate(token);
@@ -215,6 +228,7 @@ sealed class BackendMessageContext
         void ResetMessageState()
         {
             _hasPriorCancellationExposure = false;
+            _backendTermination = false;
             _errorObserved = false;
             _bodyWindowAdvanced = false;
         }

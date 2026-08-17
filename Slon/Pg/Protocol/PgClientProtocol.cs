@@ -791,6 +791,9 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
     void FailProtocol(Exception? reason)
         => FireAndForget(DisposeAsyncCore(reason, collateral: true));
 
+    void FailBackendTermination(PgError error)
+        => FailProtocol(PgErrorException.Create(error));
+
     internal void ReportUnobservedCallback(Exception exception, string callback)
         => SlonLogMessages.UnobservedCallbackException(_logger, exception, callback);
 
@@ -1358,7 +1361,9 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
             // bytes and condemn successors with misleading secondary failures. Publish the cause and
             // abort the connection instead; the failed flow keeps its specific exception while queued
             // successors receive the collateral flow-termination verdict.
-            if (context.Exception is PgFramingException)
+            if (context.Exception is PgFramingException
+                || (context.Exception is not PgProtocolException and not PgClientException
+                    && _control.IsConnectionLost(context.Exception)))
             {
                 _control.FailProtocol(context.Exception);
                 recoveryItem = null;
@@ -1568,6 +1573,10 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         // inner-scope Control reads the same one. Idle / Transaction / Error, or Unknown pre-first-RFQ.
         public TransactionStatus TransactionStatus => protocol._transactionStatus;
         public bool QueryProtocolEstablished => Volatile.Read(ref protocol._queryProtocolEstablished) is not 0;
+
+        public bool IsConnectionLost(Exception exception) => protocol._connection.IsConnectionLost(exception);
+
+        public void FailBackendTermination(PgError error) => protocol.FailBackendTermination(error);
         public IImmutableDictionary<string, string> StartupParameters
             => protocol._serverParameterState.BaseSnapshot;
         public IImmutableDictionary<string, string> SessionParameters

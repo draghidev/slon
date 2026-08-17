@@ -242,6 +242,11 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
             return null;
         }
 
+        // The source owns this flush as part of parking the wire driver. A failure means the wire can
+        // no longer make progress; route it through protocol termination instead of faulting Draghi's
+        // generic source executor with a transport detail it does not own.
+        internal void FailProtocol(Exception exception) => _control.FailProtocol(exception);
+
         internal void SignalHeldSyncFlow()
             => HeldSyncFlow?.GetExecutionControl(_control).HandoffEvent?.Set();
 
@@ -541,7 +546,15 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
         [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
         async ValueTask<bool> FlushThenWaitAsync(ValueTask flushTask)
         {
-            await flushTask.ConfigureAwait(false);
+            try
+            {
+                await flushTask.ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _state.FailProtocol(ex);
+                return false;
+            }
             return await WaitCore();
         }
 

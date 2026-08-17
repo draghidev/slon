@@ -32,6 +32,11 @@ abstract class TransportConnection
 
     public virtual X509Certificate? RemoteCertificate => null;
 
+    // A true verdict means the established byte stream cannot be recovered. Timeout, cancellation,
+    // and local-abort translation happen before the protocol asks this question. Transports with a
+    // different I/O error surface classify their own exceptions here.
+    public virtual bool IsConnectionLost(Exception exception) => false;
+
     // Parks the calling thread until the transport is writable.
     public abstract void WaitWritable();
 

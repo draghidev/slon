@@ -1,6 +1,7 @@
 using System.Buffers;
 using System.Collections;
 using System.Diagnostics;
+using System.Diagnostics.CodeAnalysis;
 using System.IO.Pipelines;
 using System.Runtime.CompilerServices;
 using System.Text;
@@ -598,15 +599,28 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
         // Closing a socket may settle a pending read as EOF instead of an exception. Once shutdown has
         // published its reason, EOF is the same terminal event and must use the flow's termination
         // verdict. The protocol completion itself retains the canonical close.
-        if (_control.ClosedException is not null)
-            throw _control.FlowTerminationException;
-        return false;
+        // EOF on an open PostgreSQL session is itself a terminal wire failure. Publish that fact here,
+        // before returning control to whichever pipelined flow happened to own the read. Deferring the
+        // verdict to item recovery lets a successor win the race and expose its locally manufactured EOF
+        // (or a secondary parsing error) instead of the protocol-wide collateral failure.
+        throw TranslateTerminalRead(PgProtocolException.UnexpectedEof());
     }
 
     Exception TranslateEof(EndOfStreamException exception)
-        => _control.ClosedException is not null
-            ? _control.FlowTerminationException
-            : PgProtocolException.UnexpectedEof(exception);
+        => TranslateTerminalRead(PgProtocolException.UnexpectedEof(exception));
+
+    Exception TranslateTerminalRead(PgProtocolException exception)
+    {
+        if (_control.ClosedException is not null)
+            return _control.FlowTerminationException;
+
+        _control.FailProtocol(exception);
+        return _control.FlowTerminationException;
+    }
+
+    [DoesNotReturn]
+    internal void ThrowUnexpectedEof()
+        => throw TranslateTerminalRead(PgProtocolException.UnexpectedEof());
 
 
     public BackendMessage Current
@@ -646,6 +660,17 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
             message.MarkPriorCancellationExposure();
         if (message.TryCreateError(out var error))
         {
+            if (_control.QueryProtocolEstablished && error.TerminatesSession)
+            {
+                // FATAL/PANIC is a wire event, not a command result. Mark the live message before
+                // preserving the canonical cause so the observing flow and every successor receive
+                // the same collateral classification. Shutdown publication then makes a following
+                // EOF/RST translate to this verdict instead of replacing it with a framing failure.
+                message.MarkBackendTermination();
+                message.TryCreateError(out error);
+                _control.FailBackendTermination(error!);
+                return message;
+            }
             if (error.SqlState == PgErrorCodes.QueryCanceled)
                 _control.OnBackendCancellationObserved(flow, flow.CancellationWindow);
         }
@@ -710,7 +735,8 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
         if (task.Result)
             return new(Current);
 
-        throw PgProtocolException.UnexpectedEof();
+        ThrowUnexpectedEof();
+        return default;
     }
 
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
@@ -719,7 +745,8 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
         if (await task.ConfigureAwait(false))
             return Current;
 
-        throw PgProtocolException.UnexpectedEof();
+        ThrowUnexpectedEof();
+        return default;
     }
 
     public bool MoveNext()
@@ -789,7 +816,7 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
     public BackendMessage GetNext()
     {
         if (!MoveNext())
-            throw PgProtocolException.UnexpectedEof();
+            ThrowUnexpectedEof();
         return Current;
     }
 

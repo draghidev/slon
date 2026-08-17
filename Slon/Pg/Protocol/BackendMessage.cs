@@ -324,6 +324,12 @@ readonly struct BackendMessage
     internal bool HasPriorCancellationExposure
         => _context.HasPriorCancellationExposure(_token);
 
+    internal void MarkBackendTermination()
+        => _context.MarkBackendTermination(_token);
+
+    internal bool IsBackendTermination
+        => _context.IsBackendTermination(_token);
+
     internal bool TryObserveError()
         => _context.TryObserveError(_token);
 

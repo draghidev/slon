@@ -503,7 +503,7 @@ sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
                     if (!_decoder.TryGetNext(out var message))
                     {
                         if (!await _decoder.MoveNextAsync().ConfigureAwait(false))
-                            throw PgProtocolException.UnexpectedEof();
+                            _decoder.ThrowUnexpectedEof();
                         message = _decoder.Current;
                     }
 
@@ -517,7 +517,7 @@ sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
                         if (!_decoder.TryGetNext(out message))
                         {
                             if (!await _decoder.MoveNextAsync().ConfigureAwait(false))
-                                throw PgProtocolException.UnexpectedEof();
+                                _decoder.ThrowUnexpectedEof();
                             message = _decoder.Current;
                         }
                         message.DebugEnsureExpected(PgTypes.BackendType.DataRow, PgTypes.BackendType.CommandComplete);

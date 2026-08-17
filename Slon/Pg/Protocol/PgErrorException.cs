@@ -52,8 +52,10 @@ public sealed class PgErrorException : Exception
     internal static Exception Create(PgError error)
     {
         var exception = new PgErrorException(error);
-        return error.IsCollateralCancellation
-            ? new PgCollateralException(PgCollateralKind.Cancellation, exception)
-            : exception;
+        if (error.IsCollateralCancellation)
+            return new PgCollateralException(PgCollateralKind.Cancellation, exception);
+        if (error.IsBackendTermination)
+            return new PgCollateralException(PgCollateralKind.BackendTermination, exception);
+        return exception;
     }
 }

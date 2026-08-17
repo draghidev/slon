@@ -1,15 +1,16 @@
 namespace Slon.Pg.Protocol;
 
 /// <summary>
-/// Indicates that this operation failed because an action triggered by another operation reached it.
+/// Indicates that this operation failed because a shared-wire event not owned by it reached it.
 /// The inner exception preserves the concrete protocol or PostgreSQL failure.
 /// </summary>
 public sealed class PgCollateralException : PgClientException
 {
-    internal PgCollateralException(PgCollateralKind kind, Exception cause)
-        : base(BuildMessage(kind), cause)
-        => Kind = kind;
+    internal PgCollateralException(PgCollateralKind collateralSource, Exception cause)
+        : base(BuildMessage(collateralSource), cause)
+        => Kind = collateralSource;
 
+    /// <summary>Identifies the shared-wire event that caused this operation to fail.</summary>
     public PgCollateralKind Kind { get; }
 
     internal static PgCollateralException ForProtocolFailure(Exception? cause)
@@ -17,19 +18,26 @@ public sealed class PgCollateralException : PgClientException
             ?? new(PgCollateralKind.ProtocolFailure,
                 cause ?? new InvalidOperationException("The protocol was condemned without a specific cause."));
 
-    static string BuildMessage(PgCollateralKind kind) => kind switch
+    static string BuildMessage(PgCollateralKind collateralSource) => collateralSource switch
     {
         PgCollateralKind.ProtocolFailure =>
             "This operation failed collaterally because another operation caused the PostgreSQL protocol to be condemned.",
         PgCollateralKind.Cancellation =>
             "This operation was canceled collaterally by a PostgreSQL CancelRequest intended for an earlier pipelined operation. " +
             "PostgreSQL applies the request to whichever operation is running when it is processed, so drivers cannot eliminate this race.",
-        _ => throw ThrowHelper.ThrowUnhandledCase(kind)
+        PgCollateralKind.BackendTermination =>
+            "This operation failed collaterally because PostgreSQL terminated the shared session.",
+        _ => throw ThrowHelper.ThrowUnhandledCase(collateralSource)
     };
 }
 
+/// <summary>Identifies the source of a collateral PostgreSQL operation failure.</summary>
 public enum PgCollateralKind : byte
 {
+    /// <summary>Another client-side failure condemned the shared protocol.</summary>
     ProtocolFailure,
-    Cancellation
+    /// <summary>A PostgreSQL CancelRequest reached an operation other than its intended target.</summary>
+    Cancellation,
+    /// <summary>PostgreSQL terminated the shared backend session.</summary>
+    BackendTermination
 }

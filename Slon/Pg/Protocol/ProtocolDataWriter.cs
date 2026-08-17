@@ -144,9 +144,12 @@ sealed class ProtocolDataWriter : IOutputWriter
         {
             task = _pipe.FlushAsync(_cts.Token);
         }
-        catch (Exception) when (_control.ClosedException is not null)
+        catch (Exception ex)
         {
-            throw _control.FlowTerminationException;
+            // Async I/O reports operational failure through its awaitable even when the lower writer
+            // discovers it synchronously. This keeps orchestration callers free of EH-only inline walls.
+            task = ValueTask.FromException(
+                _control.ClosedException is not null ? _control.FlowTerminationException : ex);
         }
         if (task.IsCompletedSuccessfully)
             return task;

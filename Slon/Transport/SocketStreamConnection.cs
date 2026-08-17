@@ -60,6 +60,8 @@ sealed class SocketStreamConnection : TransportConnection
     public override PipeReader Reader => _reader;
     public override PipeWriter Writer => _writer;
     public override X509Certificate? RemoteCertificate => (_stream as SslStream)?.RemoteCertificate;
+    public override bool IsConnectionLost(Exception exception)
+        => exception is SocketException || exception is IOException { InnerException: SocketException };
     public override void WaitWritable() => _networkStream.WaitWritable();
 
     public static Factory CreateFactory(EndPoint endPoint, TransportConnectionOptions? options = null) => new(endPoint, options);

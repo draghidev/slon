@@ -11,6 +11,7 @@ readonly struct ErrorOrNoticeMessage
     readonly ReadOnlySequence<byte> _body;
     public bool IsNotice { get; }
     public bool HasPriorCancellationExposure { get; }
+    public bool IsBackendTermination { get; }
     /// <summary>
     /// Specifies whether the exception is considered transient, that is, whether retrying the operation could
     /// succeed (e.g. a network error). Check <see cref="SqlState"/>.
@@ -91,12 +92,13 @@ readonly struct ErrorOrNoticeMessage
     public ReadOnlySpan<PgTypes.BackendType> Expected => _expected;
 
     ErrorOrNoticeMessage(ReadOnlySequence<byte> body, PgTypes.BackendType[] expected, bool isNotice, bool unhandled,
-        bool hasPriorCancellationExposure = false)
+        bool hasPriorCancellationExposure = false, bool isBackendTermination = false)
     {
         _body = body;
         _expected = expected;
         IsNotice = isNotice;
         HasPriorCancellationExposure = hasPriorCancellationExposure;
+        IsBackendTermination = isBackendTermination;
         Unhandled = unhandled;
         SqlState = GetAscii((byte)'C');
     }
@@ -107,7 +109,8 @@ readonly struct ErrorOrNoticeMessage
     /// human-readable fields decode as UTF8 (TODO: thread ClientEncoding for non-UTF8 connections);
     /// the protocol-defined fields (C/S/V/P/p/L/R) are always ASCII.
     public ErrorOrNoticeMessage Preserve()
-        => new(new ReadOnlySequence<byte>(_body.ToArray()), _expected, IsNotice, Unhandled, HasPriorCancellationExposure);
+        => new(new ReadOnlySequence<byte>(_body.ToArray()), _expected, IsNotice, Unhandled,
+            HasPriorCancellationExposure, IsBackendTermination);
 
     // Scan the field block for fieldType, returning its value bytes. One pass per access; the body is
     // small and the common path reads only a couple of fields.
@@ -140,7 +143,7 @@ readonly struct ErrorOrNoticeMessage
         message.EnsureBuffered();
 
         return new(message.GetSequence(), expected.ToArray(), message.Header.Type is PgTypes.BackendType.NoticeResponse,
-            unhandled, message.HasPriorCancellationExposure);
+            unhandled, message.HasPriorCancellationExposure, message.IsBackendTermination);
     }
 
     // Test seam: build directly from a raw error/notice field block, bypassing the BackendMessage
@@ -184,6 +187,8 @@ sealed class PgError
     public bool IsTransientError => _message.IsTransientError;
     public bool IsCollateralCancellation
         => _message.HasPriorCancellationExposure && SqlState == PgErrorCodes.QueryCanceled;
+    public bool IsBackendTermination => _message.IsBackendTermination;
+    public bool TerminatesSession => InvariantSeverity is "FATAL" or "PANIC";
 
     /// Copies the underlying field bytes so the error can outlive the transient message buffer.
     /// See <see cref="ErrorOrNoticeMessage.Preserve"/>.
@@ -205,4 +210,3 @@ sealed class PgNotice
 
     public static implicit operator PgNotice(ErrorOrNoticeMessage message) => new(message);
 }
-
