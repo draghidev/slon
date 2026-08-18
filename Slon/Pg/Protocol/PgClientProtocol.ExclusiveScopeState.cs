@@ -75,7 +75,7 @@ sealed partial class PgClientProtocol
         // Starts or reinitializes the inner pipeline only after the hosting flow wins its outer turn.
         public PgClientFlowSource AcquireForTurn(PgClientProtocol protocol)
         {
-            var innerSource = PgClientFlowSource.Create(protocol, _innerControl, protocol._options.ExecutionScheduler);
+            var innerSource = PgClientFlowSource.Create(protocol, _innerControl, protocol._executionScheduler);
             var first = _innerPipeline is null;
             _innerPipeline = Pipeline.Create<PgClientFlow, Policy, PgClientFlowSource, PgClientFlowSource.Enumerator>(
                 new Policy(protocol, _innerControl, this), innerSource, _innerPipeline);
@@ -89,6 +89,12 @@ sealed partial class PgClientProtocol
             => source.Backlog == 0 && _innerPipeline!.Depth == 0;
 
         public Task Completion => _innerPipeline!.Completion;
+
+        // Inner completion may run inside its source-driver callback. Queue the outer release so that
+        // callback can unwind before caller code can synchronously drive more work on this protocol.
+        public void SignalScopeEnded(TaskCompletionSource scopeEnded)
+            => _protocol._executionScheduler.SubmitDetached(
+                static state => ((TaskCompletionSource)state!).TrySetResult(), scopeEnded);
 
         internal void Terminate(Exception exception)
             => _ = _innerPipeline!.CompleteAsync(exception);

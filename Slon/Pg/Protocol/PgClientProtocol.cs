@@ -122,6 +122,8 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
     int _currentFlowStartTick;
     Heartbeat? _heartbeat;
     Action<bool>? _poolConnectionAvailabilitySignal;
+    PipelineScheduler _executionScheduler = null!;
+    PipelineScheduler _activationScheduler = null!;
 
     // BackendKeyData used for diagnostics and side-channel cancellation.
     int _backendProcessId;
@@ -253,6 +255,11 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
 
     void Initialize(TransportConnection connection, Action<bool>? onAvailability)
     {
+        _executionScheduler = _options.ExecutionScheduler
+            ?? PipelineScheduler.ThreadPool;
+        _activationScheduler = _options.ActivationScheduler
+            ?? PipelineScheduler.ThreadPool;
+
         _connection = connection;
         _pipeWriter = connection.Writer as IOutputWriter ?? new PipeOutputWriter(connection.Writer);
         _protocolDataWriter = new(_pipeWriter, PgClientOptions.PreStartupEncoding, connection.WaitWritable, AbortToken, FlowControl);
@@ -423,7 +430,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
     async ValueTask StartAsync(StartupFlow flow, ValueTask<PgClientFlow> flowCompletion, CancellationToken cancellationToken = default)
     {
         _source = PgClientFlowSource.Create(
-            this, FlowControl, _options.ExecutionScheduler, _options.MaxInFlightFlowsPerWire);
+            this, FlowControl, _executionScheduler, _options.MaxInFlightFlowsPerWire);
         _pipeline = Pipeline.Create<PgClientFlow, Policy, PgClientFlowSource, PgClientFlowSource.Enumerator>(new Policy(this, FlowControl), _source);
         FlowControl.BindSource(_source);
         FlowControl.BindPipeline(_pipeline);
@@ -1148,10 +1155,10 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
             _control = control;
             _promise = new();
             _localPipeline = localPipeline;
-            ActivationScheduler = protocol._options.ActivationScheduler;
+            ActivationScheduler = protocol._activationScheduler;
         }
 
-        PipelineScheduler? ActivationScheduler { get; }
+        PipelineScheduler ActivationScheduler { get; }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public void CompleteItem(PgClientFlow item, int remainingDepth, Exception? exception)
@@ -1321,10 +1328,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
                 item.PrepareActivationDispatch(_control);
                 // SubmitDetached must not throw (the PipeScheduler.Schedule-style dispatch contract); a
                 // caller handing us a fallible scheduler owns the resulting connection breakage. No guard.
-                if (ActivationScheduler is { } scheduler)
-                    scheduler.SubmitDetached(ActivationWorkItemAction, item, preferLocal: true);
-                else
-                    ThreadPool.UnsafeQueueUserWorkItem(item, preferLocal: true);
+                ActivationScheduler.SubmitDetached(ActivationWorkItemAction, item, preferLocal: true);
             }
             else
                 _control.Activate(item);

@@ -159,11 +159,9 @@ sealed class ExclusiveAccessFlow : PgClientFlow
     internal async ValueTask CompleteScopeAsync(long tenure)
     {
         EnsureTenure(tenure);
-        // Register before inner completion can wake the hosting body and retire this flow.
         var completion = WaitForComplete();
         // Gracefully drain submitted subflows before releasing the outer flow.
         await _completeInner(null).ConfigureAwait(false);
-        _scopeEnded.TrySetResult();
         // Completion follows teardown, making the flow safe to reuse on return.
         await completion.ConfigureAwait(false);
     }
@@ -205,7 +203,19 @@ sealed class ExclusiveAccessFlow : PgClientFlow
         var innerCompletion = _state.Completion;
         var ended = await Task.WhenAny(_scopeEnded.Task, _consumerGone.Task, innerCompletion).ConfigureAwait(false);
         if (ended == innerCompletion)
-            await innerCompletion.ConfigureAwait(false);
+        {
+            try
+            {
+                await innerCompletion.ConfigureAwait(false);
+            }
+            finally
+            {
+                // Inner completion can resume inside its source-driver callback. Suspend the outer
+                // scope until a queued edge runs after that callback relinquishes its driver turn.
+                _state.SignalScopeEnded(_scopeEnded);
+                await _scopeEnded.Task.ConfigureAwait(false);
+            }
+        }
         if (ended == _consumerGone.Task && Volatile.Read(ref _acquired))
             await _completeInner(null).ConfigureAwait(false);
         if (_protocol.TransactionStatus is not TransactionStatus.Idle)
