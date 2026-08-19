@@ -36,6 +36,7 @@ public sealed partial class SlonDataReader
         bool _closing;
 
         bool _enumeratedSingleRow;
+        public bool _currentErrorObserved;
         CommandResult.RowEnumerator _rowEnumerator;
 
         // Public for CreateAsync which holds an inline copy of NextResultAsync to avoid an extra state machine.
@@ -75,6 +76,7 @@ public sealed partial class SlonDataReader
                 return false;
 
             _remainingResults--;
+            _currentErrorObserved = false;
             if (!current.CanHaveRows)
             {
                 // Prefer completing the reader over detecting a practically unreachable row-count overflow.
@@ -89,8 +91,13 @@ public sealed partial class SlonDataReader
 
         public bool NextResult()
         {
-            if (Current is { } current && !current.TryGetCommandComplete(out var completeMessage))
-                current.Dispose();
+            if (Current is { } current)
+            {
+                if (!current.IsComplete)
+                    current.Dispose();
+                if (!_currentErrorObserved)
+                    current.TryGetCommandComplete(out _);
+            }
 
             var next = false;
             while (_remainingResults > 0 && (next = _enumerator.MoveNext()) && !ProcessCurrent());
@@ -100,6 +107,12 @@ public sealed partial class SlonDataReader
                 DisposeEnumerator();
             }
             return next;
+        }
+
+        public void ObserveCurrentError()
+        {
+            if (Current?.Error is not null)
+                _currentErrorObserved = true;
         }
 
         public bool Read()
@@ -597,7 +610,12 @@ public sealed partial class SlonDataReader : DbDataReader, IDbColumnSchemaGenera
     {
         ThrowIfClosedOrDisposed();
         try { return _core.NextResult(); }
-        catch (Exception ex) { AdoException.Throw(ex); return default; }
+        catch (Exception ex)
+        {
+            _core.ObserveCurrentError();
+            AdoException.Throw(ex);
+            return default;
+        }
     }
 
     /// <inheritdoc/>
@@ -613,8 +631,13 @@ public sealed partial class SlonDataReader : DbDataReader, IDbColumnSchemaGenera
     {
         try
         {
-            if (_core.Current is { IsComplete: false } current)
-                await current.DisposeAsync().ConfigureAwait(false);
+            if (_core.Current is { } current)
+            {
+                if (!current.IsComplete)
+                    await current.DisposeAsync().ConfigureAwait(false);
+                if (!_core._currentErrorObserved)
+                    current.TryGetCommandComplete(out _);
+            }
 
             var next = false;
             while (_core._remainingResults > 0
@@ -626,7 +649,12 @@ public sealed partial class SlonDataReader : DbDataReader, IDbColumnSchemaGenera
                 await _core.DisposeEnumeratorAsync().ConfigureAwait(false);
             return next;
         }
-        catch (Exception ex) { AdoException.Throw(ex); return default; }
+        catch (Exception ex)
+        {
+            _core.ObserveCurrentError();
+            AdoException.Throw(ex);
+            return default;
+        }
     }
 
     /// <inheritdoc/>
@@ -634,7 +662,12 @@ public sealed partial class SlonDataReader : DbDataReader, IDbColumnSchemaGenera
     {
         ThrowIfClosedOrDisposed();
         try { return _core.Read(); }
-        catch (Exception ex) { AdoException.Throw(ex); return default; }
+        catch (Exception ex)
+        {
+            _core.ObserveCurrentError();
+            AdoException.Throw(ex);
+            return default;
+        }
     }
 
     /// <inheritdoc/>
@@ -650,7 +683,12 @@ public sealed partial class SlonDataReader : DbDataReader, IDbColumnSchemaGenera
     async Task<bool> ReadAsyncCore(CancellationToken cancellationToken)
     {
         try { return await _core.ReadAsync(cancellationToken).ConfigureAwait(false); }
-        catch (Exception ex) { AdoException.Throw(ex); return default; }
+        catch (Exception ex)
+        {
+            _core.ObserveCurrentError();
+            AdoException.Throw(ex);
+            return default;
+        }
     }
 
     /// <inheritdoc/>

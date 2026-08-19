@@ -179,6 +179,66 @@ public class AdoErrorSurfacingTests
     }
 
     [TestMethod]
+    public void ErrorBarrierBatch_CanContinueAfterObservedError()
+    {
+        using var batch = CreateErrorBarrierBatch();
+        using var reader = batch.ExecuteReader();
+
+        Assert.IsTrue(reader.Read());
+        Assert.AreEqual(1, reader.GetInt32(0));
+        Assert.IsTrue(reader.NextResult());
+        Assert.ThrowsExactly<PostgreSqlException>(() => reader.Read());
+        Assert.IsTrue(reader.NextResult());
+        Assert.IsTrue(reader.Read());
+        Assert.AreEqual(3, reader.GetInt32(0));
+        Assert.IsFalse(reader.NextResult());
+    }
+
+    [TestMethod]
+    public async Task ErrorBarrierBatchAsync_CanContinueAfterObservedError()
+    {
+        await using var batch = CreateErrorBarrierBatch();
+        await using var reader = await batch.ExecuteReaderAsync(CancellationToken.None);
+
+        Assert.IsTrue(await reader.ReadAsync());
+        Assert.AreEqual(1, reader.GetInt32(0));
+        Assert.IsTrue(await reader.NextResultAsync());
+        await Assert.ThrowsExactlyAsync<PostgreSqlException>(() => reader.ReadAsync());
+        Assert.IsTrue(await reader.NextResultAsync());
+        Assert.IsTrue(await reader.ReadAsync());
+        Assert.AreEqual(3, reader.GetInt32(0));
+        Assert.IsFalse(await reader.NextResultAsync());
+    }
+
+    [TestMethod]
+    public void ErrorBarrierBatch_CanContinueAfterSkippingFailedResult()
+    {
+        using var batch = CreateErrorBarrierBatch();
+        using var reader = batch.ExecuteReader();
+
+        Assert.IsTrue(reader.Read());
+        Assert.IsTrue(reader.NextResult());
+        Assert.ThrowsExactly<PostgreSqlException>(() => reader.NextResult());
+        Assert.IsTrue(reader.NextResult());
+        Assert.IsTrue(reader.Read());
+        Assert.AreEqual(3, reader.GetInt32(0));
+    }
+
+    [TestMethod]
+    public async Task ErrorBarrierBatchAsync_CanContinueAfterSkippingFailedResult()
+    {
+        await using var batch = CreateErrorBarrierBatch();
+        await using var reader = await batch.ExecuteReaderAsync(CancellationToken.None);
+
+        Assert.IsTrue(await reader.ReadAsync());
+        Assert.IsTrue(await reader.NextResultAsync());
+        await Assert.ThrowsExactlyAsync<PostgreSqlException>(() => reader.NextResultAsync());
+        Assert.IsTrue(await reader.NextResultAsync());
+        Assert.IsTrue(await reader.ReadAsync());
+        Assert.AreEqual(3, reader.GetInt32(0));
+    }
+
+    [TestMethod]
     public void ReaderDispose_FailedSuccessor_Throws()
     {
         using (var connection = AdoTestPool.OpenConnection())
@@ -262,6 +322,16 @@ public class AdoErrorSurfacingTests
         var batch = connection.CreateBatch();
         batch.BatchCommands.Add(batch.CreateBatchCommand("SELECT 1"));
         batch.BatchCommands.Add(batch.CreateBatchCommand(Failing));
+        return batch;
+    }
+
+    static SlonBatch CreateErrorBarrierBatch()
+    {
+        var batch = AdoTestPool.CreateBatch();
+        batch.EnableErrorBarriers = true;
+        batch.BatchCommands.Add(batch.CreateBatchCommand("SELECT 1"));
+        batch.BatchCommands.Add(batch.CreateBatchCommand(Failing));
+        batch.BatchCommands.Add(batch.CreateBatchCommand("SELECT 3"));
         return batch;
     }
 
