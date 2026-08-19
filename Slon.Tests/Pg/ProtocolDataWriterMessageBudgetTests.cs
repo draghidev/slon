@@ -218,8 +218,9 @@ public class ProtocolDataWriterMessageBudgetTests
             return new object();
         }
 
-        public override void Write(object state, in Parameter parameter) => throw new NotSupportedException();
-        public override ValueTask WriteAsync(object state, Parameter parameter,
+        public override void Write(object state, int parameterIndex, in Parameter parameter)
+            => throw new NotSupportedException();
+        public override ValueTask WriteAsync(object state, int parameterIndex, Parameter parameter,
             CancellationToken cancellationToken = default) => throw new NotSupportedException();
     }
 }

@@ -65,9 +65,9 @@ sealed class PgConnection : IPoolConnection<PgConnection>
     int _sessionLifetimeReleased;
     ConnectionPool<PgConnection>.Registration _poolRegistration;
     // Session-wide explicit-prepare names remain unique across successive leases.
-    int _explicitPrepareCounter;
+    int _connectionPrepareCounter;
 
-    public string MintExplicitPrepareName() => $"_ep{Interlocked.Increment(ref _explicitPrepareCounter)}";
+    public string MintConnectionPrepareName() => $"_cp{Interlocked.Increment(ref _connectionPrepareCounter)}";
 
     // Startup suppresses idle publication until the create path has committed the initial lease.
     ConnectionPoolContext<PgConnection>? _poolContext;

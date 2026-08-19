@@ -1,11 +1,5 @@
 namespace Slon.Pg;
 
-/// Support type for reading a value stored on an instance of IParameter{T}, allows values to stay unboxed if they are.
-interface IParameterValueReader
-{
-    void Read<T>(T? value);
-}
-
 // Shared exchange type to bridge ADO.NET and protocol layers without re-boxing, allowing us to surface more info etc..
 interface IParameter
 {
@@ -19,9 +13,6 @@ interface IParameter
     // Value will be boxed on return if the static type is a value type.
     object? Value { get; }
     void SetOutputResult(object? value);
-
-    /// Apply a reader to a value stored on an instance of IParameter{T}, allows values to stay unboxed if they are.
-    void ApplyReader<TReader>(ref TReader reader) where TReader: IParameterValueReader, allows ref struct;
 }
 
 interface IParameter<T> : IParameter

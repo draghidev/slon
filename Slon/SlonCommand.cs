@@ -18,6 +18,7 @@ public sealed class SlonCommand: DbCommand
     CommandType _overallCommandType;
     SlonParameters? _overallParameterCollection;
     bool _isOverallStateDirty;
+    bool _disableAutoPreparation;
 
     internal unsafe SlonCommand(SlonConnection? connection, SlonDataSource? dataSource, string? commandText)
     {
@@ -82,7 +83,8 @@ public sealed class SlonCommand: DbCommand
             {
                 CommandText = _overallCommandText,
                 CommandType = _overallCommandType,
-                Parameters = _overallParameterCollection
+                Parameters = _overallParameterCollection,
+                DisableAutoPreparation = _disableAutoPreparation
             });
             _isOverallStateDirty = false;
         }
@@ -107,30 +109,31 @@ public sealed class SlonCommand: DbCommand
         }
     }
 
-    void PrepareCore(DbParameterCollection? parameters)
+    void PrepareCore()
     {
         SetupCommands();
-        _batchCore.Prepare(parameters);
+        _batchCore.Prepare(parameters: null);
     }
 
-    ValueTask PrepareCoreAsync(DbParameterCollection? parameters, CancellationToken cancellationToken)
+    ValueTask PrepareCoreAsync(CancellationToken cancellationToken)
     {
         if (SetupCommandsWrappedExceptions<object>() is { IsCompleted: true, IsCompletedSuccessfully: false } task)
             return new(task.AsTask());
-        return _batchCore.PrepareAsync(parameters, cancellationToken);
+        return _batchCore.PrepareAsync(parameters: null, cancellationToken);
     }
 
-    public static SlonCommand Prepare(SlonConnection connection, string commandText, DbParameterCollection? parameters)
+    public static SlonCommand Prepare(SlonConnection connection, string commandText)
     {
         var cmd = new SlonCommand(connection, commandText);
-        cmd.PrepareCore(parameters);
+        cmd.PrepareCore();
         return cmd;
     }
 
-    public static async ValueTask<SlonCommand> PrepareAsync(SlonConnection connection, string commandText, DbParameterCollection? parameters, CancellationToken cancellationToken = default)
+    public static async ValueTask<SlonCommand> PrepareAsync(SlonConnection connection, string commandText,
+        CancellationToken cancellationToken = default)
     {
         var cmd = new SlonCommand(connection, commandText);
-        await cmd.PrepareCoreAsync(parameters, cancellationToken).ConfigureAwait(false);
+        await cmd.PrepareCoreAsync(cancellationToken).ConfigureAwait(false);
         return cmd;
     }
 
@@ -147,28 +150,29 @@ public sealed class SlonCommand: DbCommand
     /// </summary>
     public bool IsReadOnly => _batchCore.IsReadOnly;
 
+    /// <summary>Whether executions of this command are excluded from automatic preparation.</summary>
+    /// <remarks>
+    /// Explicit <see cref="Prepare()"/> creates an owned prepared command regardless of this value.
+    /// After preparation this setting has no effect.
+    /// </remarks>
+    public bool DisableAutoPreparation
+    {
+        get => _disableAutoPreparation;
+        set
+        {
+            ThrowIfDisposedOrReadOnly();
+            _isOverallStateDirty = _isOverallStateDirty || _disableAutoPreparation != value;
+            _disableAutoPreparation = value;
+        }
+    }
+
     /// <inheritdoc/>
     public override void Prepare()
-        => PrepareCore(parameters: null);
-
-    /// <summary>Creates a prepared (or compiled) version of the command on the data source.</summary>
-    /// <param name="parameters">The parameter collection deciding which parameter database types to use.</param>
-    public void Prepare(DbParameterCollection parameters)
-        => PrepareCore(parameters);
+        => PrepareCore();
 
     /// <inheritdoc/>
     public override Task PrepareAsync(CancellationToken cancellationToken = default)
-        => PrepareCoreAsync(parameters: null, cancellationToken).AsTask();
-
-    /// <summary>
-    /// Asynchronously creates a prepared (or compiled) version of the command on the data source.
-    /// </summary>
-    /// <param name="parameters">The parameter collection deciding which parameter database types to use.</param>
-    /// <param name="cancellationToken">An optional token to cancel the asynchronous operation. The default value is None.</param>
-    /// <returns></returns>
-    /// <exception cref="OperationCanceledException">The cancellation token was canceled. This exception is stored into the returned task.</exception>
-    public ValueTask PrepareAsync(DbParameterCollection parameters, CancellationToken cancellationToken = default)
-        => PrepareCoreAsync(parameters, cancellationToken);
+        => PrepareCoreAsync(cancellationToken).AsTask();
 
     /// <inheritdoc/>
     [AllowNull]
@@ -251,9 +255,6 @@ public sealed class SlonCommand: DbCommand
     internal void OnFlowStarted(CommandFlow flow)
         => _batchCore.OnFlowStarted(flow);
 
-    internal void OnCommandResult(CommandFlow flow, CommandResult result)
-        => _batchCore.OnCommandResult(flow, result);
-
     internal void OnFlowCompleting(CommandFlow flow, Exception? exception)
         => _batchCore.OnFlowCompleting(flow, exception);
 
@@ -291,7 +292,8 @@ public sealed class SlonCommand: DbCommand
     /// <returns>A task returning the number of records affected.</returns>
     public ValueTask<int> ExecuteNonQueryAsync(DbParameterCollection parameters, CancellationToken cancellationToken = default)
     {
-        if (SetupCommandsWrappedExceptions<int>() is { IsCompleted: true, IsCompletedSuccessfully: false } task)
+        if (SetupCommandsWrappedExceptions<int>() is
+            { IsCompleted: true, IsCompletedSuccessfully: false } task)
             return task;
 
         return _batchCore.ExecuteNonQueryAsync(parameters, cancellationToken);
@@ -330,7 +332,8 @@ public sealed class SlonCommand: DbCommand
     /// <returns>A task returning the first column of the first row in the first result set.</returns>
     public ValueTask<object?> ExecuteScalarAsync(DbParameterCollection parameters, CancellationToken cancellationToken = default)
     {
-        if (SetupCommandsWrappedExceptions<object?>() is { IsCompleted: true, IsCompletedSuccessfully: false } task)
+        if (SetupCommandsWrappedExceptions<object?>() is
+            { IsCompleted: true, IsCompletedSuccessfully: false } task)
             return task;
 
         return _batchCore.ExecuteScalarAsync(parameters, cancellationToken);
@@ -403,7 +406,8 @@ public sealed class SlonCommand: DbCommand
     /// <returns>A task representing the asynchronous operation.</returns>
     public ValueTask<SlonDataReader> ExecuteReaderAsync(DbParameterCollection parameters, CancellationToken cancellationToken = default)
     {
-        if (SetupCommandsWrappedExceptions<SlonDataReader>() is { IsCompleted: true, IsCompletedSuccessfully: false } task)
+        if (SetupCommandsWrappedExceptions<SlonDataReader>() is
+            { IsCompleted: true, IsCompletedSuccessfully: false } task)
             return task;
         return _batchCore.ExecuteReaderAsync(parameters, CommandBehavior.Default, cancellationToken);
     }
@@ -417,7 +421,8 @@ public sealed class SlonCommand: DbCommand
     /// <returns>A task representing the asynchronous operation.</returns>
     public ValueTask<SlonDataReader> ExecuteReaderAsync(DbParameterCollection parameters, CommandBehavior behavior, CancellationToken cancellationToken = default)
     {
-        if (SetupCommandsWrappedExceptions<SlonDataReader>() is { IsCompleted: true, IsCompletedSuccessfully: false } task)
+        if (SetupCommandsWrappedExceptions<SlonDataReader>() is
+            { IsCompleted: true, IsCompletedSuccessfully: false } task)
             return task;
         return _batchCore.ExecuteReaderAsync(parameters, behavior, cancellationToken);
     }
@@ -479,5 +484,6 @@ public sealed class SlonCommand: DbCommand
         public CommandType CommandType { get; set; }
         public SlonParameters? Parameters { get; set; }
         public bool AppendErrorBarrier { get; set; }
+        public bool DisableAutoPreparation { get; set; }
     }
 }

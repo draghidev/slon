@@ -50,7 +50,7 @@ public class ExplicitPrepareTests
     static async Task<int> CountExplicitStatements(SlonConnection connection)
     {
         await using var command = new SlonCommand(connection,
-            "SELECT count(*)::int FROM pg_prepared_statements WHERE left(name, 3) = '_ep'");
+            "SELECT count(*)::int FROM pg_prepared_statements WHERE left(name, 3) = '_cp'");
         await using var reader = await command.ExecuteReaderAsync();
         Assert.IsTrue(await reader.ReadAsync());
         return reader.GetInt32(0);
@@ -59,7 +59,7 @@ public class ExplicitPrepareTests
     static int CountExplicitStatementsSync(SlonConnection connection)
     {
         using var command = new SlonCommand(connection,
-            "SELECT count(*)::int FROM pg_prepared_statements WHERE left(name, 3) = '_ep'");
+            "SELECT count(*)::int FROM pg_prepared_statements WHERE left(name, 3) = '_cp'");
         using var reader = command.ExecuteReader();
         Assert.IsTrue(reader.Read());
         return reader.GetInt32(0);

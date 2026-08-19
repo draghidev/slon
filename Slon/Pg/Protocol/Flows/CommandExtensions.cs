@@ -40,7 +40,20 @@ static class CommandExtensions
             {
                 var command = commands[i];
                 var descriptor = command.Descriptor;
-                if (descriptor.IsPrepared)
+                if (command.DescribeForPreparation)
+                {
+                    Debug.Assert(!descriptor.IsPrepared);
+                    await encoder.WriteParseAsync(descriptor.UnpreparedCommandText, descriptor.CommandName,
+                        descriptor.ParameterTypes, cancellationToken).ConfigureAwait(false);
+                    encoder.WriteDescribe(descriptor.CommandName, portalName: false);
+                    encoder.WriteBind(descriptor.CommandName,
+                        parameters: descriptor.ParameterTypes.ToDbNullParameterList(),
+                        resultFormats: command.ResultFormats);
+                    encoder.WriteDescribe();
+                    if (command.WithSync)
+                        encoder.WriteSync();
+                }
+                else if (descriptor.IsPrepared)
                 {
                     var parameters = command.Parameters;
                     if (parameters.Length != descriptor.ParameterTypes.Count)
@@ -116,7 +129,20 @@ static class CommandExtensions
         {
             var command = commands[i];
             var descriptor = command.Descriptor;
-            if (descriptor.IsPrepared)
+            if (command.DescribeForPreparation)
+            {
+                Debug.Assert(!descriptor.IsPrepared);
+                await encoder.WriteParseResumable(descriptor.UnpreparedCommandText, descriptor.CommandName,
+                    descriptor.ParameterTypes).ConfigureAwait(false);
+                encoder.WriteDescribe(descriptor.CommandName, portalName: false);
+                encoder.WriteBind(descriptor.CommandName,
+                    parameters: descriptor.ParameterTypes.ToDbNullParameterList(),
+                    resultFormats: command.ResultFormats);
+                encoder.WriteDescribe();
+                if (command.WithSync)
+                    encoder.WriteSync();
+            }
+            else if (descriptor.IsPrepared)
             {
                 var parameters = command.Parameters;
                 if (parameters.Length != descriptor.ParameterTypes.Count)
@@ -402,6 +428,123 @@ static class CommandExtensions
             Debug.Assert(!readDescribe || requestedRowDescription is not null);
             return (null, requestedRowDescription);
         }
+    }
+
+    public static async ValueTask<(PgError?, ParameterTypeList, RowDescription?)> ReadPreparationDescriptionAsync(
+        this Command command, PgDecoder decoder, RowDescription rowDescription)
+    {
+        Debug.Assert(command.DescribeForPreparation);
+        if (!decoder.TryGetNext(out var message))
+        {
+            if (!await decoder.MoveNextAsync().ConfigureAwait(false))
+                decoder.ThrowUnexpectedEof();
+            message = decoder.Current;
+        }
+        if (message.EnsureExpectedOrError(PgTypes.BackendType.ParseComplete) is { } parseError)
+            return (parseError, default, null);
+
+        if (!decoder.TryGetNext(out message))
+        {
+            if (!await decoder.MoveNextAsync().ConfigureAwait(false))
+                decoder.ThrowUnexpectedEof();
+            message = decoder.Current;
+        }
+        if (message.EnsureExpectedOrError(PgTypes.BackendType.ParameterDescription) is { } parameterError)
+            return (parameterError, default, null);
+        var parameterTypes = ParameterDescription.Parse(message.BodyReader);
+
+        if (!decoder.TryGetNext(out message))
+        {
+            if (!await decoder.MoveNextAsync().ConfigureAwait(false))
+                decoder.ThrowUnexpectedEof();
+            message = decoder.Current;
+        }
+        if (message.EnsureExpectedOrError(PgTypes.BackendType.RowDescription, PgTypes.BackendType.NoData)
+                is var result && result.Error is { } describeError)
+            return (describeError, default, null);
+
+        // Statement Describe supplies parameter inference. Its RowDescription always reports text formats,
+        // so consume it and retain the concrete description from the NULL-bound binary portal below.
+        if (result.Type is PgTypes.BackendType.NoData)
+            Debug.Assert(message.Header.BodyLength is 0);
+
+        if (!decoder.TryGetNext(out message))
+        {
+            if (!await decoder.MoveNextAsync().ConfigureAwait(false))
+                decoder.ThrowUnexpectedEof();
+            message = decoder.Current;
+        }
+        if (message.EnsureExpectedOrError(PgTypes.BackendType.BindComplete) is { } bindError)
+            return (bindError, default, null);
+
+        if (!decoder.TryGetNext(out message))
+        {
+            if (!await decoder.MoveNextAsync().ConfigureAwait(false))
+                decoder.ThrowUnexpectedEof();
+            message = decoder.Current;
+        }
+        if (message.EnsureExpectedOrError(PgTypes.BackendType.RowDescription, PgTypes.BackendType.NoData)
+                is var portalResult && portalResult.Error is { } portalDescribeError)
+            return (portalDescribeError, default, null);
+
+        RowDescription requestedRowDescription;
+        if (portalResult.Type is PgTypes.BackendType.RowDescription)
+        {
+            requestedRowDescription = rowDescription;
+            requestedRowDescription.Initialize(message.BodyReader, decoder.ClientEncoding);
+        }
+        else
+        {
+            Debug.Assert(portalResult.Type is PgTypes.BackendType.NoData && message.Header.BodyLength is 0);
+            requestedRowDescription = RowDescription.NoData;
+        }
+        return (null, parameterTypes, requestedRowDescription);
+    }
+
+    public static (PgError?, ParameterTypeList, RowDescription?) ReadPreparationDescription(
+        this in Command command, PgDecoder decoder, RowDescription rowDescription)
+    {
+        Debug.Assert(command.DescribeForPreparation);
+        var message = decoder.TryGetNext(out var current) ? current : decoder.GetNext();
+        if (message.EnsureExpectedOrError(PgTypes.BackendType.ParseComplete) is { } parseError)
+            return (parseError, default, null);
+
+        message = decoder.TryGetNext(out current) ? current : decoder.GetNext();
+        if (message.EnsureExpectedOrError(PgTypes.BackendType.ParameterDescription) is { } parameterError)
+            return (parameterError, default, null);
+        var parameterTypes = ParameterDescription.Parse(message.BodyReader);
+
+        message = decoder.TryGetNext(out current) ? current : decoder.GetNext();
+        if (message.EnsureExpectedOrError(PgTypes.BackendType.RowDescription, PgTypes.BackendType.NoData)
+                is var result && result.Error is { } describeError)
+            return (describeError, default, null);
+
+        // Statement Describe supplies parameter inference. Its RowDescription always reports text formats,
+        // so consume it and retain the concrete description from the NULL-bound binary portal below.
+        if (result.Type is PgTypes.BackendType.NoData)
+            Debug.Assert(message.Header.BodyLength is 0);
+
+        message = decoder.TryGetNext(out current) ? current : decoder.GetNext();
+        if (message.EnsureExpectedOrError(PgTypes.BackendType.BindComplete) is { } bindError)
+            return (bindError, default, null);
+
+        message = decoder.TryGetNext(out current) ? current : decoder.GetNext();
+        if (message.EnsureExpectedOrError(PgTypes.BackendType.RowDescription, PgTypes.BackendType.NoData)
+                is var portalResult && portalResult.Error is { } portalDescribeError)
+            return (portalDescribeError, default, null);
+
+        RowDescription requestedRowDescription;
+        if (portalResult.Type is PgTypes.BackendType.RowDescription)
+        {
+            requestedRowDescription = rowDescription;
+            requestedRowDescription.Initialize(message.BodyReader, decoder.ClientEncoding);
+        }
+        else
+        {
+            Debug.Assert(portalResult.Type is PgTypes.BackendType.NoData && message.Header.BodyLength is 0);
+            requestedRowDescription = RowDescription.NoData;
+        }
+        return (null, parameterTypes, requestedRowDescription);
     }
 
     /// Any command without a Sync boundary - or when its transaction status is not clean - completing with an error

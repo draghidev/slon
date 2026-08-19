@@ -399,10 +399,8 @@ public partial class SlonDbParameter: DbParameter
 public abstract partial class SlonDbParameter: IParameter
 {
     bool? _preferTextualFormat;
-    bool _inferredSlonDbType;
-    bool _isTypeInfoDirty = true;
     SlonDbType _slonDbType;
-    int _valueRevision;
+    int _typeRevision;
 
     /// <summary>Creates a new instance of a <see cref="T:Slon.SlonDbParameter" /> object.</summary>
     /// <returns>The new instance.</returns>
@@ -437,10 +435,10 @@ public abstract partial class SlonDbParameter: IParameter
         get => DirectionBase;
         set
         {
-            // We ignore values for output parameter type info, so any switch to input must mark the type info dirty.
+            // Output values do not participate in resolution. Switching back to input invalidates it.
             if (DirectionCore is ParameterDirection.Output or ParameterDirection.ReturnValue
                 && value is ParameterDirection.Input or ParameterDirection.InputOutput)
-                _isTypeInfoDirty = true;
+                AdvanceTypeRevision();
 
             DirectionBase = value;
         }
@@ -458,46 +456,26 @@ public abstract partial class SlonDbParameter: IParameter
         set
         {
             if (value != _slonDbType)
-                _isTypeInfoDirty = true;
-            _inferredSlonDbType = false;
+                AdvanceTypeRevision();
             _slonDbType = value;
         }
     }
 
     private protected virtual Type StaticValueType => typeof(object);
 
-    private protected void ValueUpdated() => _valueRevision++;
-
-    internal bool IsTypeInfoDirty => _isTypeInfoDirty;
-    internal void SetTypeInfo(SlonDbType? inferredDbType = null)
+    internal int TypeRevision => _typeRevision;
+    internal (SlonDbType SlonDbType, Type? ValueType) GetResolutionInput()
     {
-        _isTypeInfoDirty = false;
-        if (inferredDbType is not null)
-        {
-            _inferredSlonDbType = true;
-            _slonDbType = inferredDbType.GetValueOrDefault();
-        }
-    }
-
-    internal (SlonDbType SlonDbType, Type? ValueType, int ValueRevision) GetTypeInfo(int? valueRevision = null)
-    {
-        SlonDbType slonDbType = _slonDbType;
-        // If db type was inferred and value revision is not the same we have no actual db type.
-        if (_inferredSlonDbType && _valueRevision != valueRevision)
-            slonDbType = SlonDbType.Infer;
-
         var staticValueType = StaticValueType;
-        return (slonDbType, staticValueType == typeof(object) ? ValueCore?.GetType() : staticValueType, _valueRevision);
+        return (_slonDbType, staticValueType == typeof(object) ? ValueCore?.GetType() : staticValueType);
     }
 
     private protected SlonDbParameter Clone(SlonDbParameter instance)
     {
         CloneBase(instance);
         instance._preferTextualFormat = _preferTextualFormat;
-        instance._inferredSlonDbType = _inferredSlonDbType;
-        instance._isTypeInfoDirty = _isTypeInfoDirty;
         instance._slonDbType = _slonDbType;
-        instance._valueRevision = _valueRevision;
+        instance._typeRevision = 0;
         return instance;
     }
 
@@ -521,19 +499,28 @@ public abstract partial class SlonDbParameter: IParameter
 
     private protected abstract void SetOutputValue(object? value);
     void IParameter.SetOutputResult(object? value) => SetOutputValue(value);
-    void IParameter.ApplyReader<TReader>(ref TReader reader) => reader.Read(Value);
 
-    private protected void DirtyCheckObjectValueTypeInfo(object? previousValue, object? value)
+    internal abstract void Bind(ref SerializerParameterWriterStrategy.ParameterBinder binder);
+    internal abstract void Write(ref SerializerParameterWriterStrategy.ParameterWriter writer);
+    internal abstract void WriteAsync(ref SerializerParameterWriterStrategy.AsyncParameterWriter writer);
+
+    private protected void TrackObjectValueTypeChange(object? previousValue, object? value)
     {
         // We ignore the value for output parameters.
-        if (previousValue is null || value is null || previousValue == value || Direction is ParameterDirection.Output or ParameterDirection.ReturnValue)
+        if (previousValue == value
+            || Direction is ParameterDirection.Output or ParameterDirection.ReturnValue)
             return;
 
-        // Also don't reset the type info when the new value is a DBNull, any type info will handle it.
-        var valueType = value.GetType();
-        if (valueType == typeof(DBNull) || previousValue.GetType() == valueType)
+        // DBNull can be written through any existing resolution.
+        if (value is DBNull)
             return;
 
-        _isTypeInfoDirty = true;
+        if (previousValue is not null && value is not null
+            && previousValue.GetType() == value.GetType())
+            return;
+
+        AdvanceTypeRevision();
     }
+
+    void AdvanceTypeRevision() => _typeRevision = checked(_typeRevision + 1);
 }

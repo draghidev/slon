@@ -27,6 +27,7 @@ sealed class CommandTracker : IDisposable, IAsyncDisposable
     List<PgConnection>? _registeredConnections;
     readonly Lock _registryLock = new();
     bool _disposed;
+    int _dataSourcePrepareCounter;
 
     readonly CommandTracker? _parent;
 
@@ -93,8 +94,9 @@ sealed class CommandTracker : IDisposable, IAsyncDisposable
     // Track is admission/identity only. Completion (transitioning Tracked status, presence updates,
     // etc.) is the caller's concern. The proxy's delegate-baked path attaches a winner closure
     // that calls tracked.Complete + protocol.SetTracked when Parse lands. For the explicit-prepare
-    // path, `nameSource` mints `_ep{N}` names, per-session so successive SlonConnections sharing
-    // the same PgConnection through the pool can't collide on names.
+    // path, a connection-local tracker uses its session as the name source while a datasource
+    // tracker uses its own sequence. The latter name is reused across sessions, so its sequence
+    // must be unique across every template that can appear on any one of them.
     public TrackerResult Track(in CommandDescriptor descriptor, TrackedCommand? tracked = null, object? owningInstance = null, PgConnection? nameSource = null)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
@@ -114,12 +116,10 @@ sealed class CommandTracker : IDisposable, IAsyncDisposable
             return default;
         }
 
-        if (nameSource is null)
-            ThrowHelper.ThrowArgumentException(nameof(nameSource), "Explicit-prepare path requires a name source.");
         return Core(owningInstance, descriptor, nameSource);
 
         [MethodImpl(MethodImplOptions.NoInlining)]
-        TrackerResult Core(object owningInstance, in CommandDescriptor descriptor, PgConnection nameSource)
+        TrackerResult Core(object owningInstance, in CommandDescriptor descriptor, PgConnection? nameSource)
         {
             // Explicit-prepare path.
             _owned ??= new();
@@ -129,7 +129,7 @@ sealed class CommandTracker : IDisposable, IAsyncDisposable
             TrackedCommand? tc;
             while ((tc = ownedTracker.Find(descriptor)) is null)
             {
-                tc = new(TrackedCommandKind.Command, descriptor with { CommandName = nameSource.MintExplicitPrepareName() });
+                tc = new(TrackedCommandKind.Command, descriptor with { CommandName = MintName(nameSource) });
                 if (ownedTracker.TryAdd(tc))
                     break;
             }
@@ -137,9 +137,11 @@ sealed class CommandTracker : IDisposable, IAsyncDisposable
             return tc.IsInvalid ? default : new(tc);
         }
 
-        OwnedCommands CreateOwnedTracker(object owningInstance, in CommandDescriptor descriptor, PgConnection nameSource)
+        OwnedCommands CreateOwnedTracker(
+            object owningInstance, in CommandDescriptor descriptor, PgConnection? nameSource)
         {
-            var tc = new TrackedCommand(TrackedCommandKind.Command, descriptor with { CommandName = nameSource.MintExplicitPrepareName() });
+            var tc = new TrackedCommand(
+                TrackedCommandKind.Command, descriptor with { CommandName = MintName(nameSource) });
             var tracker = new OwnedCommands(_leakedCommandNames ??= new());
             var success = tracker.TryAdd(tc);
             Debug.Assert(success);
@@ -155,6 +157,10 @@ sealed class CommandTracker : IDisposable, IAsyncDisposable
             }
             return tracker;
         }
+
+        string MintName(PgConnection? source)
+            => source?.MintConnectionPrepareName()
+                ?? $"_dp{Interlocked.Increment(ref _dataSourcePrepareCounter)}";
     }
 
     // Atomically take + clear the accumulated leaked-names list. Used by SlonConnection.Dispose
@@ -195,6 +201,53 @@ sealed class CommandTracker : IDisposable, IAsyncDisposable
         ownedTracker.CollectInto(sink);
         ownedTracker.Dispose();
         return sink.Count is 0 ? [] : sink.ToArray();
+    }
+
+    public ValueTask ReleaseOwned(object owningInstance, bool awaitable)
+    {
+        var tracked = TakeOwned(owningInstance);
+        if (tracked.Length is 0)
+            return default;
+
+        PgConnection[] connections;
+        lock (_registryLock)
+            connections = _registeredConnections?.ToArray() ?? [];
+
+        foreach (var command in tracked)
+            command.Invalidate();
+
+        List<Task>? completions = awaitable ? new(connections.Length) : null;
+        foreach (var connection in connections)
+        {
+            List<TrackedCommand>? present = null;
+            foreach (var command in tracked)
+            {
+                if (connection.GetTrackedStatus(command) is not TrackedStatus.Tracked)
+                    continue;
+                (present ??= new()).Add(command);
+            }
+
+            if (present is null)
+                continue;
+            TaskCompletionSource? completion = null;
+            if (completions is not null)
+            {
+                completion = new(TaskCreationOptions.RunContinuationsAsynchronously);
+                completions.Add(completion.Task);
+            }
+
+            for (var i = 0; i < present.Count; i++)
+            {
+                connection.PushMaintenance(new EvictDeallocate(present[i])
+                {
+                    Completion = i == present.Count - 1 ? completion : null
+                });
+            }
+        }
+
+        return completions is { Count: > 0 }
+            ? new ValueTask(Task.WhenAll(completions))
+            : default;
     }
 
     public void Dispose()

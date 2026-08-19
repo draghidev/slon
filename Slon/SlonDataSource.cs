@@ -805,6 +805,9 @@ public sealed class SlonDataSource : DbDataSource
         }
     }
 
+    internal ValueTask ReleaseOwnedPreparedCommand(object owner, bool awaitable)
+        => GetCommandTracker(initializedOnly: true).ReleaseOwned(owner, awaitable);
+
     internal ValueTask<PgDbDependencies> GetDbDependenciesAsync(CancellationToken cancellationToken)
     {
         return _isInitialized ? new(GetDbDependencies()) : Core(cancellationToken);

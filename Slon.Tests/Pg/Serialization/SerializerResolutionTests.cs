@@ -1,3 +1,5 @@
+using System.Data;
+using Slon.Pg;
 using Slon.Pg.Serialization;
 using Slon.Pg.Types;
 
@@ -49,5 +51,68 @@ public class SerializerResolutionTests
         var options = new PgSerializerOptions(PgTypeCatalog.Default);
 
         Assert.AreEqual((Oid)25u, options.GetTypeInfo(typeof(string)).PgTypeId.Oid);
+    }
+
+    [TestMethod]
+    public void ParameterCollectionCachesNakedValueResolutionPerSerializerGraph()
+    {
+        var options = new PgSerializerOptions(PgTypeCatalog.Default);
+        var parameters = SlonParameters.Create(41);
+
+        var first = parameters.GetOrResolveTypeInfo(
+                0, options, preparedTypeId: null, allowUnspecified: false)
+            .CreateParameter(41, parameterIndex: 0);
+        var constrained = parameters.GetOrResolveTypeInfo(0, options, (Oid)23u, allowUnspecified: false)
+            .CreateParameter(41, parameterIndex: 0);
+        Assert.AreSame(first.TypeResolution, constrained.TypeResolution);
+
+        ((IDataParameterCollection)parameters)[SlonParameters.PositionalName] = 42;
+        var replacedValue = parameters.GetOrResolveTypeInfo(0, options, (Oid)23u, allowUnspecified: false)
+            .CreateParameter(42, parameterIndex: 0);
+        Assert.AreSame(first.TypeResolution, replacedValue.TypeResolution);
+
+        var otherOptions = new PgSerializerOptions(PgTypeCatalog.Default);
+        var otherGraph = parameters.GetOrResolveTypeInfo(
+                0, otherOptions, (Oid)23u, allowUnspecified: false)
+            .CreateParameter(42, parameterIndex: 0);
+        Assert.AreNotSame(first.TypeResolution, otherGraph.TypeResolution);
+    }
+
+    [TestMethod]
+    public void ParameterCollectionValidatesParameterResolutionWithItsTypeRevision()
+    {
+        var options = new PgSerializerOptions(PgTypeCatalog.Default);
+        VerifyObjectParameter(new SlonParameter(41));
+        VerifyObjectParameter(new SlonParameter<object>(41));
+
+        var typedValue = new SlonParameter<int>(41);
+        var typedParameters = new SlonParameters { typedValue };
+        var typedFirst = Resolve(typedParameters, typedValue);
+        typedValue.Value = 42;
+        Assert.AreSame(typedFirst.TypeResolution,
+            Resolve(typedParameters, typedValue).TypeResolution);
+
+        void VerifyObjectParameter(SlonDbParameter value)
+        {
+            var parameters = new SlonParameters { value };
+            var first = Resolve(parameters, value);
+            value.Value = 42;
+            Assert.AreSame(first.TypeResolution, Resolve(parameters, value).TypeResolution);
+
+            value.Value = "forty-two";
+            var changedType = Resolve(parameters, value);
+            Assert.AreNotSame(first.TypeResolution, changedType.TypeResolution);
+            Assert.AreEqual((Oid)25u, changedType.PgTypeId.Oid);
+
+            value.SlonDbType = SlonDbTypes.Varchar;
+            var requestedType = Resolve(parameters, value);
+            Assert.AreNotSame(changedType.TypeResolution, requestedType.TypeResolution);
+            Assert.AreEqual((Oid)1043u, requestedType.PgTypeId.Oid);
+        }
+
+        Parameter Resolve(SlonParameters parameters, SlonDbParameter value)
+            => parameters.GetOrResolveTypeInfo(
+                    0, options, preparedTypeId: null, allowUnspecified: false)
+                .CreateParameter(value, parameterIndex: 0);
     }
 }

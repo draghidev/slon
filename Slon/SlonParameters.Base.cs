@@ -5,6 +5,9 @@ using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using Slon.Pg;
+using Slon.Pg.Serialization;
+using Slon.Pg.Types;
 
 namespace Slon;
 
@@ -19,8 +22,12 @@ public partial class SlonParameters
     {
         readonly string _name;
         readonly object? _value;
+        readonly ParameterTypeResolution _typeResolution;
+        readonly int _typeRevision;
+        readonly bool _resolvedForPreparedType;
 
-        ParameterItem(string name, object? value)
+        ParameterItem(string name, object? value, ParameterTypeResolution typeResolution = default,
+            int typeRevision = 0, bool resolvedForPreparedType = false)
         {
             if (value is DbParameter)
             {
@@ -38,6 +45,9 @@ public partial class SlonParameters
 
             _name = name;
             _value = value;
+            _typeResolution = typeResolution;
+            _typeRevision = typeRevision;
+            _resolvedForPreparedType = resolvedForPreparedType;
         }
 
         /// The canonical name used for uniqueness.
@@ -60,6 +70,43 @@ public partial class SlonParameters
 
         public KeyValuePair<string, object?> AsKeyValuePair() => new(_name, _value);
 
+        public bool TryGetTypeResolution(PgSerializerOptions options, PgTypeId? preparedTypeId,
+            out ParameterTypeResolution resolution)
+        {
+            resolution = _typeResolution;
+            if (!resolution.IsResolved)
+                return false;
+            if (Value is SlonDbParameter parameter && parameter.TypeRevision != _typeRevision)
+                return false;
+            if (preparedTypeId is null)
+                return !_resolvedForPreparedType;
+
+            if (resolution.PgTypeId == preparedTypeId.Value)
+                return true;
+            return options.GetCanonicalTypeId(resolution.PgTypeId)
+                == options.GetCanonicalTypeId(preparedTypeId.Value);
+        }
+
+        public ParameterItem WithTypeResolution(ParameterTypeResolution resolution, bool resolvedForPreparedType)
+            => new(_name, _value, resolution,
+                Value is SlonDbParameter parameter ? parameter.TypeRevision : 0,
+                resolvedForPreparedType);
+
+        public ParameterItem WithoutTypeResolution()
+            => _typeResolution.IsResolved ? new(_name, _value) : this;
+
+        public ParameterItem PreserveTypeResolutionFrom(in ParameterItem previous)
+        {
+            if (Value is IParameter || previous.Value is IParameter
+                || Value?.GetType() != previous.Value?.GetType())
+            {
+                return this;
+            }
+
+            return new(_name, _value, previous._typeResolution, previous._typeRevision,
+                previous._resolvedForPreparedType);
+        }
+
         static int ComputePrefixLength(string name) => name.Length > 0 && name[0] is '@' or ':' ? 1 : 0;
         static string CreateName(string parameterName) => parameterName.Substring(ComputePrefixLength(parameterName));
         public static ReadOnlySpan<char> CreateNameSpan(string parameterName) => parameterName.AsSpan(ComputePrefixLength(parameterName));
@@ -81,6 +128,7 @@ public partial class SlonParameters
     }
 
     readonly List<ParameterItem> _parameters;
+    PgSerializerOptions? _parameterResolutionOptions;
 
     // Dictionary lookups for GetValue to improve performance.
     Dictionary<string, int>? _caseInsensitiveLookup;
@@ -94,6 +142,38 @@ public partial class SlonParameters
     }
 
     bool LookupEnabled => _parameters.Count >= LookupThreshold;
+
+    internal ParameterTypeResolution GetOrResolveTypeInfo(int index, PgSerializerOptions options,
+        PgTypeId? preparedTypeId, bool allowUnspecified)
+    {
+        ref var item = ref GetItemRef(index);
+        var value = item.Value;
+
+        if (allowUnspecified && value is (null or DBNull))
+            return SerializerParameterWriterStrategy.ResolveTypeInfo(
+                value, options, preparedTypeId, allowUnspecified);
+
+        EnsureParameterResolutionOptions(options);
+        if (item.TryGetTypeResolution(options, preparedTypeId, out var resolution))
+            return resolution;
+
+        resolution = SerializerParameterWriterStrategy.ResolveTypeInfo(
+            value, options, preparedTypeId, allowUnspecified);
+        item = item.WithTypeResolution(resolution,
+            resolvedForPreparedType: preparedTypeId is not null);
+        return resolution;
+    }
+
+    void EnsureParameterResolutionOptions(PgSerializerOptions options)
+    {
+        if (ReferenceEquals(_parameterResolutionOptions, options))
+            return;
+
+        _parameterResolutionOptions = options;
+        var parameters = CollectionsMarshal.AsSpan(_parameters);
+        for (var i = 0; i < parameters.Length; i++)
+            parameters[i] = parameters[i].WithoutTypeResolution();
+    }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     string GetName(int index) => _parameters[index].Name;
@@ -222,7 +302,7 @@ public partial class SlonParameters
     void ReplaceCore(int index, string? parameterName, object? value)
     {
         ref var current = ref GetItemRef(index);
-        var item = ParameterItem.Create(parameterName, value);
+        var item = ParameterItem.Create(parameterName, value).PreserveTypeResolutionFrom(current);
         LookupChangeName(item, current.Name, index);
         current = item;
     }
@@ -239,6 +319,8 @@ public partial class SlonParameters
     {
         var item = _parameters[index];
         _parameters.RemoveAt(index);
+        if (_parameters.Count is 0)
+            _parameterResolutionOptions = null;
         if (!LookupEnabled)
             LookupClear();
         else
@@ -637,6 +719,7 @@ public partial class SlonParameters: DbParameterCollection, ICollection<KeyValue
     {
         LookupClear();
         _parameters.Clear();
+        _parameterResolutionOptions = null;
     }
 
     /// <inheritdoc />

@@ -27,20 +27,26 @@ public sealed class SlonParameter: SlonDbParameter, IParameter<object>
         get => _value;
         set
         {
-            DirtyCheckObjectValueTypeInfo(_value?.GetType(), value);
+            TrackObjectValueTypeChange(_value, value);
             _value = value;
-            ValueUpdated();
         }
     }
 
     private protected override SlonDbParameter CloneCore() => Clone(new SlonParameter { ValueCore = ValueCore });
+
+    internal override void Bind(ref SerializerParameterWriterStrategy.ParameterBinder binder)
+        => binder.Bind(_value);
+    internal override void Write(ref SerializerParameterWriterStrategy.ParameterWriter writer)
+        => writer.Write(_value);
+    internal override void WriteAsync(ref SerializerParameterWriterStrategy.AsyncParameterWriter writer)
+        => writer.Write(_value);
 
     private protected override void SetOutputValue(object? value)
     {
         if (Direction is not (ParameterDirection.Output or ParameterDirection.InputOutput))
             throw new InvalidOperationException("Cannot change value of a non-output parameter.");
 
-        // For input output we have to dirty check the type info, just so a write of this new value later on is handled correctly.
+        // An input/output result can become the value of a later execution.
         if (Direction is ParameterDirection.InputOutput)
             ValueCore = value;
         else
@@ -82,9 +88,8 @@ public sealed class SlonParameter<T> : SlonDbParameter, IDbDataParameter<T>, IPa
     void SetValue(T? value)
     {
         if (typeof(T) == typeof(object))
-            DirtyCheckObjectValueTypeInfo(_value?.GetType(), value);
+            TrackObjectValueTypeChange(_value, value);
         _value = value;
-        ValueUpdated();
     }
 
     private protected override Type StaticValueType => typeof(T);
@@ -92,7 +97,13 @@ public sealed class SlonParameter<T> : SlonDbParameter, IDbDataParameter<T>, IPa
     private protected override SlonDbParameter CloneCore() => Clone(new SlonParameter<T> { _value = _value });
     private protected override void SetOutputValue(object? value) => ((IParameter<T>)this).SetOutputResult((T?)value);
 
-    void IParameter.ApplyReader<TReader>(ref TReader reader) => reader.Read(Value);
+    internal override void Bind(ref SerializerParameterWriterStrategy.ParameterBinder binder)
+        => binder.Bind(_value);
+    internal override void Write(ref SerializerParameterWriterStrategy.ParameterWriter writer)
+        => writer.Write(_value);
+    internal override void WriteAsync(ref SerializerParameterWriterStrategy.AsyncParameterWriter writer)
+        => writer.Write(_value);
+
     T? IParameter<T>.Value => _value;
     void IParameter<T>.SetOutputResult(T? value)
     {

@@ -119,20 +119,6 @@ public class RecoveryTests : ConnectionCreatingTest
         }
     }
 
-    sealed class TestParameter<T>(T? value) : IParameter<T>
-    {
-        public ParameterKind Kind => ParameterKind.Input;
-        public string Name => string.Empty;
-        public Type StaticValueType => typeof(T);
-        object? IParameter.Value => value;
-        public T? Value => value;
-        public void SetOutputResult(object? value) => throw new NotSupportedException();
-        public void SetOutputResult(T? value) => throw new NotSupportedException();
-        public void ApplyReader<TReader>(ref TReader reader)
-            where TReader : IParameterValueReader, allows ref struct
-            => reader.Read(value);
-    }
-
     sealed class ThrowingReadStream(int length, int throwAfter) : Stream
     {
         int _position;
@@ -692,9 +678,10 @@ public class RecoveryTests : ConnectionCreatingTest
         var scope = protocol.QueueExclusiveScope(async: true);
         await scope.HandoffReady;
         var serializerOptions = new PgSerializerOptions(PgTypeCatalog.Default);
-        var parameter = Parameter.Create(
-            new TestParameter<Stream>(new ThrowingReadStream(256 * 1024, 64 * 1024)),
-            serializerOptions, new() { TextEncoding = Encoding.UTF8 });
+        var value = new SlonParameter<Stream>(new ThrowingReadStream(256 * 1024, 64 * 1024));
+        var parameter = SerializerParameterWriterStrategy.ResolveTypeInfo(
+                value, serializerOptions)
+            .CreateParameter(value, parameterIndex: 0);
         var command = Command.Create("select octet_length($1::bytea)", new([parameter])) with
         {
             Parameters = [parameter]

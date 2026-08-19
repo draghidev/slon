@@ -43,6 +43,7 @@ readonly struct CommandFlowBinding
     internal nint Getter { get; init; }
     internal int Behavior { get; init; }
     internal int CommandCount { get; init; }
+    internal bool IsPreparing { get; init; }
 }
 
 sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSource<FlowCallerInteractionCoreResult>, IValueTaskSource
@@ -469,10 +470,12 @@ sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
                 _isResultReady = false;
                 bool hasPreparedDescription;
                 bool suppressEnumeration;
+                bool describeForPreparation;
                 {
                     ref readonly var command = ref _options.Commands.ItemRef(_commandIndex);
                     _decoder.UseReadTimeout(command.Timeout);
                     suppressEnumeration = command.SuppressEnumeration;
+                    describeForPreparation = command.DescribeForPreparation;
                     hasPreparedDescription = command.Descriptor is { IsPrepared: true, PreparedRowDescription: not null }
                         && !command.DescribeOnly;
                 }
@@ -496,7 +499,24 @@ sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
                 if (!IsDraining && context.IsProtocolClosed)
                     throw context.FlowTerminationException;
 
-                if (IsAsync && hasPreparedDescription)
+                ParameterTypeList describedParameterTypes = default;
+                if (describeForPreparation)
+                {
+                    var rowDescription = context.GetProtocolStatic<ReadState>().RowDescription;
+                    if (IsAsync)
+                    {
+                        (_pgError, describedParameterTypes, _requestedRowDescription) =
+                            await _options.Commands.ItemRef(_commandIndex)
+                                .ReadPreparationDescriptionAsync(_decoder, rowDescription).ConfigureAwait(false);
+                    }
+                    else
+                    {
+                        (_pgError, describedParameterTypes, _requestedRowDescription) =
+                            _options.Commands.ItemRef(_commandIndex)
+                                .ReadPreparationDescription(_decoder, rowDescription);
+                    }
+                }
+                else if (IsAsync && hasPreparedDescription)
                 {
                     // Prepared commands with a known description have the compact BindComplete ->
                     // DataRow/CommandComplete prelude. Await the decoder directly so a read wake resumes
@@ -579,7 +599,9 @@ sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
                         && (_pgError is not { } err || !err.Expected.Contains(PgTypes.BackendType.ParseComplete)))
                     {
                         descriptor = CommandDescriptor.CreatePrepared(
-                            descriptor.CommandName, descriptor.ParameterTypes, _requestedRowDescription?.Preserve());
+                            descriptor.CommandName,
+                            describeForPreparation ? describedParameterTypes : descriptor.ParameterTypes,
+                            _requestedRowDescription?.Preserve());
                     }
                     result.Initialize(_commandIndex, descriptor, _requestedRowDescription,
                         !resultCommand.DescribeOnly, resultCommand.IsSimple(), _options.SerializerOptions,

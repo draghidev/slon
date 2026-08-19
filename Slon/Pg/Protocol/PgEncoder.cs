@@ -1,6 +1,7 @@
 using System.Buffers;
 using System.Collections.Immutable;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using Slon.Buffers;
@@ -182,18 +183,19 @@ readonly struct PgEncoder
         CancellationToken cancellationToken = default)
     {
         NormalizeAndValidate(ref parameters, ref resultFormats);
-        WriteBindPreamble(commandName, portalName, parameters, resultFormats);
         var strategy = parameterWriterStrategy ?? ParameterWriterStrategy.Raw;
-        object? state = null;
-        foreach (var parameter in parameters)
+        var state = BindParameters(parameters, strategy);
+        WriteBindPreamble(commandName, portalName, parameters, resultFormats);
+        for (var parameterIndex = 0; parameterIndex < parameters.Length; parameterIndex++)
         {
+            var parameter = parameters[parameterIndex];
             var size = parameter.GetSize();
             _writer.WriteInt(size);
             if (size < 0)
                 continue;
 
             state ??= _writer.GetParameterWriterState(strategy);
-            await strategy.WriteAsync(state, parameter, cancellationToken).ConfigureAwait(false);
+            await strategy.WriteAsync(state, parameterIndex, parameter, cancellationToken).ConfigureAwait(false);
         }
         WriteResultFormats(resultFormats);
     }
@@ -221,20 +223,41 @@ readonly struct PgEncoder
         ParameterWriterStrategy? parameterWriterStrategy = null)
     {
         NormalizeAndValidate(ref parameters, ref resultFormats);
-        WriteBindPreamble(commandName, portalName, parameters, resultFormats);
         var strategy = parameterWriterStrategy ?? ParameterWriterStrategy.Raw;
-        object? state = null;
-        foreach (var parameter in parameters)
+        var state = BindParameters(parameters, strategy);
+        WriteBindPreamble(commandName, portalName, parameters, resultFormats);
+        for (var parameterIndex = 0; parameterIndex < parameters.Length; parameterIndex++)
         {
+            var parameter = parameters[parameterIndex];
             var size = parameter.GetSize();
             _writer.WriteInt(size);
             if (size < 0)
                 continue;
 
             state ??= _writer.GetParameterWriterState(strategy);
-            strategy.Write(state, in parameter);
+            strategy.Write(state, parameterIndex, in parameter);
         }
         WriteResultFormats(resultFormats);
+    }
+
+    object? BindParameters(ImmutableArray<Parameter> parameters, ParameterWriterStrategy strategy)
+    {
+        object? state = null;
+        Parameter[]? array = null;
+        for (var parameterIndex = 0; parameterIndex < parameters.Length; parameterIndex++)
+        {
+            var parameter = parameters[parameterIndex];
+            if (!parameter.RequiresBinding)
+                continue;
+
+            state ??= _writer.GetParameterWriterState(strategy);
+            // Command construction gives this execution sole ownership of the immutable array.
+            // Binding may therefore fill its transient protocol values without another array.
+            array ??= ImmutableCollectionsMarshal.AsArray(parameters)
+                ?? throw new InvalidOperationException("The parameter array has no backing storage.");
+            array[parameterIndex] = strategy.Bind(state, parameterIndex, in parameter);
+        }
+        return state;
     }
 
     void WriteBindPreamble(EncodedString commandName, EncodedString portalName,

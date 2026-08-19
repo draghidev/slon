@@ -1,7 +1,9 @@
+using System.Collections.Immutable;
 using System.Diagnostics;
 using Slon.Pg;
 using Slon.Pg.Protocol;
 using Slon.Pg.Protocol.Flows;
+using Slon.Pg.Types;
 
 namespace Slon.Tests.Pg;
 
@@ -47,6 +49,31 @@ public class ProtocolExecutionTests
         Assert.AreEqual("43", rows.Current.GetValue<string>(1));
         Assert.IsFalse(await rows.MoveNextAsync());
         await rows.DisposeAsync();
+        Assert.IsFalse(await results.MoveNextAsync());
+        await results.DisposeAsync();
+    }
+
+    [ConnectionCreatingTestMethod]
+    public async Task Preparation_UsesStatementParametersAndPortalRowDescription()
+    {
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
+        var parameters = ImmutableArray.Create(Parameter.Create(null, default(PgTypeId)));
+        var command = Command.Create("select $1::int, 42", ParameterTypeList.Create(parameters), "prepared_probe") with
+        {
+            DescribeOnly = true,
+            DescribeForPreparation = true,
+            WithSync = true,
+            ResultFormats = [PgFormat.Binary, PgFormat.Text]
+        };
+        var flow = protocol.Queue(new CommandFlow(async: true, command));
+        var results = flow.GetAsyncEnumerator();
+
+        Assert.IsTrue(await results.MoveNextAsync());
+        var metadata = results.Current.GetMetadata();
+        Assert.AreEqual(1, metadata.ParameterTypes.Count);
+        Assert.AreEqual(PgFormat.Binary, metadata.RowDescription![0].Format);
+        Assert.AreEqual(PgFormat.Text, metadata.RowDescription[1].Format);
+        await results.Current.DisposeAsync();
         Assert.IsFalse(await results.MoveNextAsync());
         await results.DisposeAsync();
     }

@@ -43,7 +43,8 @@ public sealed class SlonBatch : DbBatch
                 {
                     CommandText = dbCommand.CommandText,
                     CommandType = dbCommand.CommandType,
-                    AppendErrorBarrier = dbCommand.AppendErrorBarrier
+                    AppendErrorBarrier = dbCommand.AppendErrorBarrier,
+                    DisableAutoPreparation = dbCommand.DisableAutoPreparation
                 };
                 ((IAdoCommand)batchCommand).Tracked = dbCommand.Tracked;
                 if (withParameters && batchCommand.Parameters is { Count: > 0 } parameters)
@@ -199,9 +200,6 @@ public sealed class SlonBatch : DbBatch
 
     internal void OnFlowStarted(CommandFlow flow)
         => _batchCore.OnFlowStarted(flow);
-
-    internal void OnCommandResult(CommandFlow flow, CommandResult result)
-        => _batchCore.OnCommandResult(flow, result);
 
     internal void OnFlowCompleting(CommandFlow flow, Exception? exception)
         => _batchCore.OnFlowCompleting(flow, exception);

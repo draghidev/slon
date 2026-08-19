@@ -41,6 +41,21 @@ public sealed class SlonBatchCommand : DbBatchCommand, IAdoCommand
         }
     }
 
+    /// <summary>Whether executions of this command are excluded from automatic preparation.</summary>
+    /// <remarks>
+    /// Explicit preparation of the containing batch creates an owned prepared command regardless of this value.
+    /// Afterward this setting has no effect.
+    /// </remarks>
+    public bool DisableAutoPreparation
+    {
+        get;
+        set
+        {
+            EnsureMutable();
+            field = value;
+        }
+    }
+
     // TODO decide what to do with this, we have a few options to pass data back.
     /// <inheritdoc cref="System.Data.Common.DbBatchCommand.RecordsAffected" />
     public override int RecordsAffected { get; }
@@ -64,7 +79,8 @@ public sealed class SlonBatchCommand : DbBatchCommand, IAdoCommand
             CommandText = CommandText,
             CommandType = CommandType,
             _parameters = _parameters is null ? null : new(_parameters),
-            AppendErrorBarrier = AppendErrorBarrier
+            AppendErrorBarrier = AppendErrorBarrier,
+            DisableAutoPreparation = DisableAutoPreparation
         };
         ((IAdoCommand)clone).Tracked = ((IAdoCommand)this).Tracked;
         return clone;

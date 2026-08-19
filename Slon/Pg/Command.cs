@@ -10,6 +10,8 @@ readonly struct Command()
 {
     // Whether the command only describes itself, without execution, also redescribes prepared commands.
     public bool DescribeOnly { get; init; } = false;
+    // Parse and describe the statement, then describe a NULL-bound probe portal for its concrete row metadata.
+    public bool DescribeForPreparation { get; init; } = false;
     // Process the complete response, but omit it from the flow enumerator.
     public bool SuppressEnumeration { get; init; } = false;
     public bool WithSync { get; init; } = false;

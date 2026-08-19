@@ -1,102 +1,61 @@
+using System.Diagnostics;
 using Slon.Pg.Types;
-using Slon.Pg.Serialization;
 
 namespace Slon.Pg;
 
+// A transient protocol value. A strategy-backed value carries opaque type resolution until the
+// writer binds it against the live wire context and fills its size and write state.
 readonly struct Parameter
 {
-    PgValueBinding Binding { get; init; }
+    const int Unbound = int.MinValue;
+    readonly int _sizePlusOne;
 
-    public int GetSize() => Binding.Converter is not null
-        ? Binding.Size?.Value ?? -1
-        : GetLegacySize(ResolvedValueType);
-    public PgTypeId PgTypeId { get; private init; }
-    public object? Value { get; private init; }
+    public PgTypeId PgTypeId { get; }
+    public object? Value { get; }
+    // Opaque type-resolution state interpreted by ParameterWriterStrategy.
+    internal object? TypeResolution { get; }
+    internal object? WriteState { get; }
+
+    Parameter(object? value, PgTypeId pgTypeId, int size, object? typeResolution, object? writeState)
+    {
+        Value = value;
+        PgTypeId = pgTypeId;
+        _sizePlusOne = size is Unbound ? Unbound : checked(size + 1);
+        TypeResolution = typeResolution;
+        WriteState = writeState;
+    }
+
+    public static Parameter Create(object? value, PgTypeId pgTypeId)
+        => new(value, pgTypeId, GetRawSize(ResolveValueType(value)), typeResolution: null, writeState: null);
+
+    public static Parameter Create(object? value)
+    {
+        var type = ResolveValueType(value);
+        var pgTypeId = type == typeof(int)
+            ? new PgTypeId(DataTypeNames.Int4)
+            : throw new NotSupportedException("Unknown parameter type.");
+        return new(value, pgTypeId, GetRawSize(type), typeResolution: null, writeState: null);
+    }
+
+    internal static Parameter CreateUnbound(object? value, PgTypeId pgTypeId, object typeResolution)
+        => new(value, pgTypeId, Unbound, typeResolution, writeState: null);
+
+    internal Parameter WithBinding(int size, object? writeState)
+        => new(Value, PgTypeId, size, TypeResolution, writeState);
+
+    public int GetSize()
+    {
+        Debug.Assert(!RequiresBinding);
+        return _sizePlusOne - 1;
+    }
+
+    internal bool RequiresBinding => _sizePlusOne is Unbound;
 
     internal Type? ResolvedValueType => ResolveValueType(Value);
 
-    public static Parameter Create(object? value, PgTypeId pgTypeId) => new() { Value = value, PgTypeId = pgTypeId };
-    public static Parameter Create(object? value) => new()
-    {
-        Value = value,
-        PgTypeId = ResolveValueType(value) switch
-        {
-            var t when t == typeof(int) => DataTypeNames.Int4,
-            _ => throw new NotSupportedException("Unknown parameter type.")
-        }
-    };
+    internal void Release() => (WriteState as IDisposable)?.Dispose();
 
-    internal static Parameter Create(object? value, PgSerializerOptions options,
-        PgConversionContext conversionContext, PgTypeId? pgTypeId = null)
-    {
-        if (value is IParameter parameter)
-        {
-            var binder = new ParameterBinder(options, conversionContext, pgTypeId, parameter);
-            parameter.ApplyReader(ref binder);
-            return binder.Result;
-        }
-
-        var typeInfo = options.GetTypeInfo(ResolveValueType(value), pgTypeId);
-        return new Parameter
-        {
-            Value = value,
-            PgTypeId = typeInfo.PgTypeId,
-            Binding = typeInfo.BindParameterValue(conversionContext, value)
-        };
-    }
-
-    internal void Write(PgWriter writer)
-    {
-        if (Binding.Converter is null)
-        {
-            if (ResolvedValueType == typeof(int))
-            {
-                writer.WriteInt32((int)Value!);
-                return;
-            }
-            throw new NotSupportedException("Only int parameters are supported without serializer options.");
-        }
-
-        if (Binding.IsDbNullBinding)
-            return;
-
-        if (Value is IParameter parameter)
-        {
-            var valueWriter = new ParameterWriter(Binding.Converter, writer);
-            parameter.ApplyReader(ref valueWriter);
-        }
-        else
-        {
-            Binding.Converter.Write(writer, Value);
-        }
-    }
-
-    internal ValueTask WriteAsync(PgWriter writer, CancellationToken cancellationToken = default)
-    {
-        if (Binding.Converter is null)
-        {
-            Write(writer);
-            return default;
-        }
-
-        if (Binding.IsDbNullBinding)
-            return default;
-
-        if (Value is IParameter parameter)
-        {
-            var valueWriter = new AsyncParameterWriter(Binding.Converter, writer, cancellationToken);
-            parameter.ApplyReader(ref valueWriter);
-            return valueWriter.Task;
-        }
-        return Binding.Converter.WriteAsync(writer, Value, cancellationToken);
-    }
-
-    internal object? WriteState => Binding.WriteState;
-
-    internal void Release() => (Binding.WriteState as IDisposable)?.Dispose();
-
-    // Fixed length only for now.
-    static int GetLegacySize(Type? type) => type switch
+    static int GetRawSize(Type? type) => type switch
     {
         null => -1,
         _ when type == typeof(int) => sizeof(int),
@@ -107,33 +66,4 @@ readonly struct Parameter
     static Type? ResolveValueType(object? value) => value is IParameter p
         ? p.StaticValueType is var type && type == typeof(object) ? p.Value?.GetType() : type
         : value?.GetType();
-
-    ref struct ParameterBinder(PgSerializerOptions options, PgConversionContext conversionContext,
-        PgTypeId? pgTypeId, IParameter parameter) : IParameterValueReader
-    {
-        public Parameter Result { get; private set; }
-
-        public void Read<T>(T? value)
-        {
-            var typeInfo = options.GetTypeInfo(typeof(T), pgTypeId);
-            Result = new Parameter
-            {
-                Value = parameter,
-                PgTypeId = typeInfo.PgTypeId,
-                Binding = typeInfo.BindParameterValue(conversionContext, value)
-            };
-        }
-    }
-
-    ref struct ParameterWriter(PgConverter converter, PgWriter writer) : IParameterValueReader
-    {
-        public void Read<T>(T? value) => converter.Write(writer, value);
-    }
-
-    ref struct AsyncParameterWriter(PgConverter converter, PgWriter writer,
-        CancellationToken cancellationToken) : IParameterValueReader
-    {
-        public ValueTask Task { get; private set; }
-        public void Read<T>(T? value) => Task = converter.WriteAsync(writer, value, cancellationToken);
-    }
 }

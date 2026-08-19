@@ -12,15 +12,17 @@ abstract class ParameterWriterStrategy
     public static ParameterWriterStrategy Raw { get; } = new RawParameterWriterStrategy();
 
     public abstract object CreateState(IOutputWriter output, Encoding textEncoding);
-    public abstract void Write(object state, in Parameter parameter);
-    public abstract ValueTask WriteAsync(object state, Parameter parameter,
+    public virtual Parameter Bind(object state, int parameterIndex, in Parameter parameter)
+        => parameter;
+    public abstract void Write(object state, int parameterIndex, in Parameter parameter);
+    public abstract ValueTask WriteAsync(object state, int parameterIndex, Parameter parameter,
         CancellationToken cancellationToken = default);
 
     sealed class RawParameterWriterStrategy : ParameterWriterStrategy
     {
         public override object CreateState(IOutputWriter output, Encoding textEncoding) => output;
 
-        public override void Write(object state, in Parameter parameter)
+        public override void Write(object state, int parameterIndex, in Parameter parameter)
         {
             if (parameter.ResolvedValueType != typeof(int))
                 throw new NotSupportedException("Only int parameters are supported without a parameter writer strategy.");
@@ -31,10 +33,10 @@ abstract class ParameterWriterStrategy
             output.Advance(sizeof(int));
         }
 
-        public override ValueTask WriteAsync(object state, Parameter parameter,
+        public override ValueTask WriteAsync(object state, int parameterIndex, Parameter parameter,
             CancellationToken cancellationToken = default)
         {
-            Write(state, in parameter);
+            Write(state, parameterIndex, in parameter);
             return default;
         }
     }

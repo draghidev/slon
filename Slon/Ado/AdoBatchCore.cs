@@ -12,18 +12,65 @@ using Slon.Runtime.CompilerServices;
 
 namespace Slon;
 
+sealed class AdoCommandFlowObserverState(
+    object owner, Action<CommandResult, object?> resultObserver, object? resultObserverState)
+{
+    internal object Owner { get; } = owner;
+
+    internal void OnCommandResult(CommandResult result)
+        => resultObserver(result, resultObserverState);
+}
+
 sealed class SlonCommandFlowObserver : CommandFlowObserver
 {
     internal static readonly SlonCommandFlowObserver Instance = new();
 
     internal override void OnStarted(CommandFlow flow, object? state)
-        => ((SlonCommand)state!).OnFlowStarted(flow);
+        => GetOwner(state).OnFlowStarted(flow);
 
     internal override void OnCommandResult(CommandFlow flow, CommandResult result, object? state)
-        => ((SlonCommand)state!).OnCommandResult(flow, result);
+        => (state as AdoCommandFlowObserverState)?.OnCommandResult(result);
 
     internal override void OnCompleting(PgClientFlow flow, Exception? exception, object? state)
-        => ((SlonCommand)state!).OnFlowCompleting((CommandFlow)flow, exception);
+        => GetOwner(state).OnFlowCompleting((CommandFlow)flow, exception);
+
+    static SlonCommand GetOwner(object? state)
+        => (SlonCommand)(state is AdoCommandFlowObserverState observerState ? observerState.Owner : state!);
+}
+
+sealed class PreparedSlonCommandFlowObserver : CommandFlowObserver
+{
+    internal static readonly PreparedSlonCommandFlowObserver Instance = new();
+
+    internal override void OnCommandResult(CommandFlow flow, CommandResult result, object? state)
+    {
+        if (state is PgConnection connection)
+            AdoPreparedCommandObserver.AttachTerminal(result, connection);
+        else
+            (state as AdoCommandFlowObserverState)?.OnCommandResult(result);
+    }
+}
+
+static class AdoPreparedCommandObserver
+{
+    internal static void AttachTerminal(CommandResult result, PgConnection connection)
+        => result.OnCompleted(static (completed, state) =>
+        {
+            var connection = (PgConnection)state!;
+            try
+            {
+                if (completed.Error is not { } error)
+                    return;
+
+                var metadata = completed.GetMetadata();
+                if (metadata.IsPrepared)
+                    connection.ReconcilePreparedError(metadata.ToPreparedDescriptor(), error.SqlState);
+            }
+            catch (Exception ex)
+            {
+                connection.ReportUnobservedCallback(ex, "a command-result observer");
+            }
+        }, connection);
 }
 
 sealed class SlonBatchFlowObserver : CommandFlowObserver
@@ -31,13 +78,16 @@ sealed class SlonBatchFlowObserver : CommandFlowObserver
     internal static readonly SlonBatchFlowObserver Instance = new();
 
     internal override void OnStarted(CommandFlow flow, object? state)
-        => ((SlonBatch)state!).OnFlowStarted(flow);
+        => GetOwner(state).OnFlowStarted(flow);
 
     internal override void OnCommandResult(CommandFlow flow, CommandResult result, object? state)
-        => ((SlonBatch)state!).OnCommandResult(flow, result);
+        => (state as AdoCommandFlowObserverState)?.OnCommandResult(result);
 
     internal override void OnCompleting(PgClientFlow flow, Exception? exception, object? state)
-        => ((SlonBatch)state!).OnFlowCompleting((CommandFlow)flow, exception);
+        => GetOwner(state).OnFlowCompleting((CommandFlow)flow, exception);
+
+    static SlonBatch GetOwner(object? state)
+        => (SlonBatch)(state is AdoCommandFlowObserverState observerState ? observerState.Owner : state!);
 }
 
 readonly struct EnqueueArgs<TCommand> where TCommand : IAdoCommand
@@ -48,10 +98,11 @@ readonly struct EnqueueArgs<TCommand> where TCommand : IAdoCommand
     public readonly SlonConnection Connection;
     public readonly PgSerializerOptions SerializerOptions;
     public readonly ParameterWriterStrategy ParameterWriterStrategy;
+    public readonly bool Preparing;
 
     public EnqueueArgs(FieldRef<AdoBatchCore<TCommand>> fieldRef, DbParameterCollection? parameters,
         CommandBehavior behavior, SlonConnection connection, PgSerializerOptions serializerOptions,
-        ParameterWriterStrategy parameterWriterStrategy)
+        ParameterWriterStrategy parameterWriterStrategy, bool preparing)
     {
         FieldRef = fieldRef;
         Parameters = parameters;
@@ -59,6 +110,7 @@ readonly struct EnqueueArgs<TCommand> where TCommand : IAdoCommand
         Connection = connection;
         SerializerOptions = serializerOptions;
         ParameterWriterStrategy = parameterWriterStrategy;
+        Preparing = preparing;
     }
 }
 
@@ -82,7 +134,7 @@ sealed class AdoCommandFlowBindingStrategy<TCommand> : CommandFlowBindingStrateg
             tracker: dependencies.CommandsTracker, pgConnection: connection,
             serializerOptions: dependencies.SerializerOptions,
             parameterWriterStrategy: dependencies.ParameterWriterStrategy,
-            pendingTimeout: pendingTimeout);
+            pendingTimeout: pendingTimeout, preparing: binding.IsPreparing);
     }
 }
 
@@ -106,8 +158,6 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
     TimeSpan? _pendingTimeout;
     bool _enableErrorBarriers;
     CommandFlow? _activeFlow;
-    Action<CommandResult, object?>? _onCommandResultAction;
-    object? _onCommandResultActionState;
     AdoCommandList<TCommand> _commands;
 
     public AdoBatchCore(FieldRef<AdoBatchCore<TCommand>> fieldRef)
@@ -213,10 +263,8 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     void ThrowIfReadOnly()
     {
-        if (IsReadOnly)
-            Throw();
-
-        static void Throw() => throw new InvalidOperationException("Command is prepared, no changes can be made until it's unprepared.");
+        if (_explicitlyPrepared)
+            ThrowHelper.ThrowInvalidOperation("Command is prepared and cannot be changed until it is unprepared.");
     }
 
     public void SetConnection(SlonConnection connection)
@@ -275,7 +323,8 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
     internal CommandFlowOptions CreateCommandFlowOptions(ReadOnlySpan<DbParameterCollection?> parametersSpan,
         CommandBehavior behavior, SlonConnection? connection = null, CommandTracker? tracker = null,
         PgConnection? pgConnection = null, PgSerializerOptions? serializerOptions = null,
-        ParameterWriterStrategy? parameterWriterStrategy = null, TimeSpan? pendingTimeout = null)
+        ParameterWriterStrategy? parameterWriterStrategy = null, TimeSpan? pendingTimeout = null,
+        bool preparing = false)
     {
         if (_commands.Count is 0)
             ThrowHelper.ThrowInvalidOperation("No commands were added to the batch.");
@@ -308,22 +357,20 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
                 TrackerContext trackerContext = default;
                 if (connection is not null)
                 {
-                    trackerContext = _explicitlyPrepared && adoCommand.Tracked is null
+                    trackerContext = preparing
                         ? TrackerContext.Create(connection, _fieldRef.Instance)
                         : TrackerContext.Create(connection, adoCommand.Tracked);
                 }
                 else if (tracker is not null)
                 {
-                    trackerContext = TrackerContext.Create(tracker, adoCommand.Tracked);
+                    trackerContext = preparing
+                        ? TrackerContext.Create(tracker, _fieldRef.Instance)
+                        : TrackerContext.Create(tracker, adoCommand.Tracked);
                 }
 
                 var parameters = indexParameters ? parametersSpan[i] : !parametersSpan.IsEmpty ? parametersSpan[0] : null;
-                var conversionContext = pgConnection is null ? null : new PgConversionContext
-                {
-                    TextEncoding = pgConnection.Protocol.FlowControl.ClientEncoding
-                };
                 result = adoCommand.CreateCommand(_enableErrorBarriers, behavior, trackerContext, parameters,
-                    Timeout, serializerOptions, conversionContext);
+                    Timeout, preparing, serializerOptions);
                 // Refresh the cache when the tracker resolved to a different TC than the one we
                 // passed in (catches workload-tracker recreation via DbDepsRevision++ and similar).
                 if (result.TrackerResult.Tracked is not null && !ReferenceEquals(adoCommand.Tracked, result.TrackerResult.Tracked))
@@ -354,7 +401,8 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
                                     tracked.CommandName, descriptor.ParameterTypes, rowDescription: null)
                             }, result.TrackerResult);
                         }
-                        thisResultAction = static (result, state) => AttachPreparedTerminalObserver(result, (PgConnection)state!);
+                        thisResultAction = static (result, state) =>
+                            AdoPreparedCommandObserver.AttachTerminal(result, (PgConnection)state!);
                         thisResultActionState = pgConnection;
                     }
                     else if (status is TrackedStatus.Preparing)
@@ -395,7 +443,7 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
                                 }
 
                                 if (metadata.IsPrepared)
-                                    AttachPreparedTerminalObserver(cmdResult, p);
+                                    AdoPreparedCommandObserver.AttachTerminal(cmdResult, p);
                             };
                             thisResultActionState = (pgConnection, tracked);
                             (preparationClaims ??= new(pgConnection)).Add(tracked);
@@ -453,15 +501,21 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
                 }
             }
 
-            _onCommandResultAction = onResultAction;
-            _onCommandResultActionState = onResultActionState;
-            var observerState = _fieldRef.Instance;
-            var observer = observerState switch
+            var owner = _fieldRef.Instance;
+            var observer = owner switch
             {
-                SlonCommand => (CommandFlowObserver)SlonCommandFlowObserver.Instance,
+                SlonCommand when _explicitlyPrepared && TryGetDataSource(out _, out _) =>
+                    (CommandFlowObserver)PreparedSlonCommandFlowObserver.Instance,
+                SlonCommand => SlonCommandFlowObserver.Instance,
                 SlonBatch => SlonBatchFlowObserver.Instance,
-                _ => throw new NotSupportedException($"Unsupported ADO command owner {observerState.GetType()}.")
+                _ => throw new NotSupportedException($"Unsupported ADO command owner {owner.GetType()}.")
             };
+            var preparedDataSourceCommand = observer is PreparedSlonCommandFlowObserver;
+            var observerState = preparedDataSourceCommand && onResultActionState is PgConnection
+                ? onResultActionState
+                : onResultAction is null
+                    ? owner
+                    : new AdoCommandFlowObserverState(owner, onResultAction, onResultActionState);
             return new()
             {
                 Observer = observer,
@@ -483,33 +537,14 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
         }
     }
 
-    static void AttachPreparedTerminalObserver(CommandResult result, PgConnection connection)
-        => result.OnCompleted(static (completed, state) =>
-        {
-            var connection = (PgConnection)state!;
-            try
-            {
-                if (completed.Error is not { } error)
-                    return;
-
-                var metadata = completed.GetMetadata();
-                if (metadata.IsPrepared)
-                    connection.ReconcilePreparedError(metadata.ToPreparedDescriptor(), error.SqlState);
-            }
-            catch (Exception ex)
-            {
-                connection.ReportUnobservedCallback(ex, "a command-result observer");
-            }
-        }, connection);
-
-    CommandFlow Enqueue(DbParameterCollection? parameters, CommandBehavior behavior)
+    CommandFlow Enqueue(DbParameterCollection? parameters, CommandBehavior behavior, bool preparing = false)
     {
         if (TryGetDataSource(out var dataSource, out var connection))
         {
             ThrowIfHasCloseConnection(behavior);
             var pendingTimeout = PendingTimeout;
             var dependencies = dataSource.GetDbDependencies();
-            var binding = CreateDataSourceBinding(parameters, behavior, dependencies);
+            var binding = CreateDataSourceBinding(parameters, behavior, dependencies, preparing);
             return dataSource.EnqueueCommands(new CommandFlow(async: false, binding, pendingTimeout), pendingTimeout);
         }
 
@@ -521,17 +556,20 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
                 ref var core = ref args.FieldRef.Invoke();
                 var options = core.CreateCommandFlowOptions([args.Parameters], args.Behavior,
                     args.Connection, tracker: null, pgConnection, args.SerializerOptions,
-                    args.ParameterWriterStrategy);
+                    args.ParameterWriterStrategy, preparing: args.Preparing);
                 return new CommandFlow(async: false, options);
             },
             new EnqueueArgs<TCommand>(_fieldRef, parameters, behavior, connection,
-                connectionDependencies.SerializerOptions, connectionDependencies.ParameterWriterStrategy));
+                connectionDependencies.SerializerOptions, connectionDependencies.ParameterWriterStrategy,
+                preparing));
     }
 
-    ValueTask<CommandFlow> EnqueueAsync(DbParameterCollection? parameters, CommandBehavior behavior, CancellationToken cancellationToken)
+    ValueTask<CommandFlow> EnqueueAsync(DbParameterCollection? parameters, CommandBehavior behavior,
+        CancellationToken cancellationToken, bool preparing = false)
     {
         if (TryGetDataSource(out var dataSource, out var connection))
-            return DataSourceCore(_fieldRef, dataSource, parameters, behavior, PendingTimeout, cancellationToken);
+            return DataSourceCore(_fieldRef, dataSource, parameters, behavior, PendingTimeout,
+                cancellationToken, preparing);
 
         connection ??= ThrowConnectionNotInitialized();
         var connectionDependencies = connection.DbDataSource.GetDbDependencies();
@@ -544,21 +582,22 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
                 ref var core = ref args.FieldRef.Invoke();
                 var options = core.CreateCommandFlowOptions([args.Parameters], args.Behavior,
                     args.Connection, tracker: null, pgConnection, args.SerializerOptions,
-                    args.ParameterWriterStrategy);
+                    args.ParameterWriterStrategy, preparing: args.Preparing);
                 return new CommandFlow(async: true, options);
             },
             new EnqueueArgs<TCommand>(_fieldRef, parameters, behavior, connection,
-                connectionDependencies.SerializerOptions, connectionDependencies.ParameterWriterStrategy),
+                connectionDependencies.SerializerOptions, connectionDependencies.ParameterWriterStrategy,
+                preparing),
             cancellationToken);
 
         static async ValueTask<CommandFlow> DataSourceCore(FieldRef<AdoBatchCore<TCommand>> fieldRef,
             SlonDataSource dataSource, DbParameterCollection? parameters, CommandBehavior behavior,
-            TimeSpan pendingTimeout, CancellationToken cancellationToken)
+            TimeSpan pendingTimeout, CancellationToken cancellationToken, bool preparing)
         {
             fieldRef.Invoke().ThrowIfHasCloseConnection(behavior);
             var dependencies = await dataSource.GetDbDependenciesAsync(cancellationToken).ConfigureAwait(false);
             ref var core = ref fieldRef.Invoke();
-            var binding = core.CreateDataSourceBinding(parameters, behavior, dependencies);
+            var binding = core.CreateDataSourceBinding(parameters, behavior, dependencies, preparing);
             return await dataSource.EnqueueCommandsAsync(
                 new CommandFlow(async: true, binding, pendingTimeout), pendingTimeout, cancellationToken)
                 .ConfigureAwait(false);
@@ -566,7 +605,7 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
     }
 
     CommandFlowBinding CreateDataSourceBinding(DbParameterCollection? parameters, CommandBehavior behavior,
-        SlonDataSource.PgDbDependencies dependencies)
+        SlonDataSource.PgDbDependencies dependencies, bool preparing)
         => new()
         {
             Strategy = AdoCommandFlowBindingStrategy<TCommand>.Instance,
@@ -575,7 +614,8 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
             Parameters = parameters,
             Dependencies = dependencies,
             Behavior = (int)behavior,
-            CommandCount = _commands.Count
+            CommandCount = _commands.Count,
+            IsPreparing = preparing
         };
 
     [DoesNotReturn]
@@ -585,17 +625,14 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
     public void Prepare(DbParameterCollection? parameters)
     {
         ThrowIfDisposedOrReadOnly();
-        // TODO begin tracking the protocol on flow Bind, once we have it we can also queue close flows correctly for datasource commands on subsequent command errors.
-        // For now we only support explicit preparation on connections as we don't yet track the protocol from a flow, so we can't recover from errors.
-        if (TryGetDataSource(out _, out var connection))
-            ThrowHelper.ThrowInvalidOperation("Explicit preparation is not supported for DbDataSource commands.");
+        TryGetDataSource(out var dataSource, out var connection);
 
         _explicitlyPrepared = true;
         CommandFlow.Enumerator enumerator = default;
         List<(int, Exception)>? exceptions = null;
         try
         {
-            var flow = Enqueue(parameters, CommandBehavior.SchemaOnly);
+            var flow = Enqueue(parameters, CommandBehavior.SchemaOnly, preparing: true);
             enumerator = flow.GetEnumerator();
             var span = _commands.AsSpan();
             for (var i = 0; i < span.Length; i++)
@@ -611,12 +648,15 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
                 catch (Exception ex)
                 {
                     exceptions ??= new();
-                    exceptions.Add((i, ex));
+                    exceptions.Add((i, AdoException.Project(ex)));
                 }
             }
 
             if (exceptions is not null)
                 throw new AggregateException(SelectException(exceptions));
+
+            foreach (var command in _commands.AsSpan())
+                command.MakeReadOnly();
         }
         catch (Exception)
         {
@@ -628,7 +668,12 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
         {
             enumerator.Dispose();
             if (!_explicitlyPrepared)
-                connection!.CloseOwned(_fieldRef.Instance);
+            {
+                if (connection is not null)
+                    connection.CloseOwned(_fieldRef.Instance);
+                else if (dataSource is not null)
+                    _ = dataSource.ReleaseOwnedPreparedCommand(_fieldRef.Instance, awaitable: false);
+            }
         }
 
         IEnumerable<Exception> SelectException(List<(int, Exception)> exceptions)
@@ -644,17 +689,15 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
         ref var thisRef = ref fieldRef.Invoke();
         thisRef.ThrowIfDisposedOrReadOnly();
 
-        // TODO begin tracking the protocol on flow Bind, once we have it we can also queue close flows correctly for datasource commands on subsequent command errors.
-        // For now we only support explicit preparation on connections as we don't yet track the protocol from a flow, so we can't recover from errors.
-        if (thisRef.TryGetDataSource(out _, out var connection))
-            ThrowHelper.ThrowInvalidOperation("Explicit preparation is not supported for DbDataSource commands.");
+        thisRef.TryGetDataSource(out var dataSource, out var connection);
 
         thisRef._explicitlyPrepared = true;
         CommandFlow.Enumerator enumerator = default;
         List<(int, Exception)>? exceptions = null;
         try
         {
-            var flow = await thisRef.EnqueueAsync(parameters, CommandBehavior.SchemaOnly, cancellationToken).ConfigureAwait(false);
+            var flow = await thisRef.EnqueueAsync(parameters, CommandBehavior.SchemaOnly, cancellationToken,
+                preparing: true).ConfigureAwait(false);
             enumerator = flow.GetAsyncEnumerator(cancellationToken);
             for (var i = 0; i < fieldRef.Invoke()._commands.AsSpan().Length; i++)
             {
@@ -670,12 +713,15 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
                 catch (Exception ex)
                 {
                     exceptions ??= new();
-                    exceptions.Add((i, ex));
+                    exceptions.Add((i, AdoException.Project(ex)));
                 }
             }
 
             if (exceptions is not null)
                 throw new AggregateException(SelectException(exceptions));
+
+            foreach (var command in fieldRef.Invoke()._commands.AsSpan())
+                command.MakeReadOnly();
         }
         catch (Exception)
         {
@@ -687,7 +733,13 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
         {
             await enumerator.DisposeAsync().ConfigureAwait(false);
             if (!fieldRef.Invoke()._explicitlyPrepared)
-                await connection!.CloseOwnedAsync(fieldRef.Instance).ConfigureAwait(false);
+            {
+                if (connection is not null)
+                    await connection.CloseOwnedAsync(fieldRef.Instance).ConfigureAwait(false);
+                else if (dataSource is not null)
+                    await dataSource.ReleaseOwnedPreparedCommand(fieldRef.Instance, awaitable: true)
+                        .ConfigureAwait(false);
+            }
         }
 
         IEnumerable<Exception> SelectException(List<(int, Exception)> exceptions)
@@ -928,9 +980,9 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
         _disposed = true;
         if (!_explicitlyPrepared)
             return;
-        if (TryGetDataSource(out _, out var connection))
+        if (TryGetDataSource(out var dataSource, out var connection))
         {
-            // TODO once we support explicit prepare for datasource commands, unprepare here.
+            _ = dataSource.ReleaseOwnedPreparedCommand(_fieldRef.Instance, awaitable: false);
             return;
         }
 
@@ -946,22 +998,23 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
         _disposed = true;
         if (!_explicitlyPrepared)
             return new();
-        if (TryGetDataSource(out _, out var connection))
-        {
-            // TODO once we support explicit prepare for datasource commands, unprepare here.
-            return new();
-        }
+        if (TryGetDataSource(out var dataSource, out var connection))
+            return dataSource.ReleaseOwnedPreparedCommand(_fieldRef.Instance, awaitable: true);
 
         return connection is null ? default : ReleaseOwnedAsync(connection);
     }
 
     public void Cancel()
     {
+        if (_explicitlyPrepared && TryGetDataSource(out _, out _))
+            ThrowPreparedCancellationNotSupported();
         Volatile.Read(ref _activeFlow)?.CancelAsync().GetAwaiter().GetResult();
     }
 
     public Task CancelAsync(CancellationToken cancellationToken = default)
     {
+        if (_explicitlyPrepared && TryGetDataSource(out _, out _))
+            ThrowPreparedCancellationNotSupported();
         var flow = Volatile.Read(ref _activeFlow);
         if (flow is null)
             return Task.CompletedTask;
@@ -969,13 +1022,12 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
         return cancellationToken.CanBeCanceled ? task.WaitAsync(cancellationToken) : task;
     }
 
-    internal void OnFlowStarted(CommandFlow flow) => Volatile.Write(ref _activeFlow, flow);
+    [DoesNotReturn]
+    static void ThrowPreparedCancellationNotSupported()
+        => throw new NotSupportedException(
+            "A datasource-prepared command can have multiple executions; cancel an execution with its token.");
 
-    internal void OnCommandResult(CommandFlow flow, CommandResult result)
-    {
-        if (ReferenceEquals(Volatile.Read(ref _activeFlow), flow))
-            _onCommandResultAction?.Invoke(result, _onCommandResultActionState);
-    }
+    internal void OnFlowStarted(CommandFlow flow) => Volatile.Write(ref _activeFlow, flow);
 
     internal void OnFlowCompleting(CommandFlow flow, Exception? exception)
     {
@@ -987,8 +1039,6 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
 
         if (!ReferenceEquals(Interlocked.CompareExchange(ref _activeFlow, null, flow), flow))
             return;
-
-        _onCommandResultAction = null;
-        _onCommandResultActionState = null;
     }
+
 }
