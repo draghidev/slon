@@ -58,7 +58,8 @@ static class AdoTestPool
 
     // A data-source-bound (MULTIPLEXED) command, for tests that need to drive a specific execute method
     // themselves (e.g. assert ExecuteScalar throws). Runs on a pool-picked wire - no connection lease.
-    internal static SlonCommand CreateCommand(string sql) => new(_shared, sql);
+    internal static SlonCommand CreateCommand(string sql) => _shared.CreateCommand(sql);
+    internal static SlonBatch CreateBatch() => _shared.CreateBatch();
 
     internal static async Task WarmAsync()
         => Assert.AreEqual(0, await ExecuteNonQueryAsync("SELECT 1"));

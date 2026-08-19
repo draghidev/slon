@@ -576,7 +576,8 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
             Getter = _fieldRef.Getter,
             Parameters = parameters,
             Dependencies = dependencies,
-            Behavior = (int)behavior
+            Behavior = (int)behavior,
+            CommandCount = _commands.Count
         };
 
     [DoesNotReturn]

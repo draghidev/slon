@@ -42,6 +42,7 @@ readonly struct CommandFlowBinding
     internal object? Dependencies { get; init; }
     internal nint Getter { get; init; }
     internal int Behavior { get; init; }
+    internal int CommandCount { get; init; }
 }
 
 sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSource<FlowCallerInteractionCoreResult>, IValueTaskSource
@@ -252,7 +253,8 @@ sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
             : _flowCancellationToken;
 
     public int CommandCount => _options.Commands.Count;
-    internal int VisibleCommandCount => _options.Commands.VisibleCount;
+    internal int VisibleCommandCount
+        => _binding.CommandCount is > 0 ? _binding.CommandCount : _options.Commands.VisibleCount;
     public bool IsResultReady => _isResultReady;
 
     public Enumerator GetEnumerator()

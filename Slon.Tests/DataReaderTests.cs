@@ -5,6 +5,28 @@ using System.Data;
 [TestClass]
 public class DataReaderTests
 {
+    [TestMethod]
+    public async Task ConcurrentDataSourceBatches_ExposeEveryResult()
+    {
+        var tasks = Enumerable.Range(0, 16).Select(async operationId =>
+        {
+            await using var batch = AdoTestPool.CreateBatch();
+            for (var i = 0; i < 3; i++)
+                batch.BatchCommands.Add(batch.CreateBatchCommand($"select {operationId * 3 + i}"));
+
+            await using var reader = await batch.ExecuteReaderAsync(CancellationToken.None);
+            for (var i = 0; i < 3; i++)
+            {
+                Assert.IsTrue(await reader.ReadAsync(CancellationToken.None));
+                Assert.AreEqual(operationId * 3 + i, reader.GetInt32(0));
+                Assert.IsFalse(await reader.ReadAsync(CancellationToken.None));
+                Assert.AreEqual(i != 2, await reader.NextResultAsync(CancellationToken.None));
+            }
+        });
+
+        await Task.WhenAll(tasks);
+    }
+
     const int FirstLength = 128 * 1024;
     const int SecondLength = FirstLength + 1;
     static readonly string Query = $"SELECT repeat('x', {FirstLength}), 42 UNION ALL SELECT repeat('y', {SecondLength}), 43";
