@@ -127,8 +127,10 @@ sealed class PostgreSqlTypeCatalogFactory : PgTypeCatalogFactory
         var sql = new StringBuilder(
             "SELECT t.oid, n.nspname::text, t.typname::text, t.typtype::text, t.typnotnull, " +
             "CASE WHEN et.typarray = t.oid THEN t.typelem ELSE 0 END, t.typbasetype, ");
-        sql.Append(capabilities.SupportsRangeTypes ? "COALESCE(r.rngsubtype, 0), " : "0, ");
-        sql.Append(capabilities.SupportsMultirangeTypes ? "COALESCE(m.rngtypid, 0) " : "0 ");
+        // Results use binary format. Keep absent OID columns four bytes even on dialects whose
+        // untyped integer literals default to int8.
+        sql.Append(capabilities.SupportsRangeTypes ? "COALESCE(r.rngsubtype, 0), " : "0::oid, ");
+        sql.Append(capabilities.SupportsMultirangeTypes ? "COALESCE(m.rngtypid, 0) " : "0::oid ");
         sql.Append(
             "FROM pg_catalog.pg_type AS t " +
             "JOIN pg_catalog.pg_namespace AS n ON n.oid = t.typnamespace " +

@@ -169,6 +169,27 @@ public class PgBackendInfoTests
             "OR t.typcategory = 'U'");
     }
 
+    [TestMethod]
+    public void PostgreSqlFactory_AbsentRangeColumnsRetainOidBinaryShape()
+    {
+        var options = new PgTypeLoadingOptions
+        {
+            Schemas = [],
+            LoadTableComposites = false
+        };
+
+        var withoutEither = PostgreSqlTypeCatalogFactory.BuildTypeQuery(options, new());
+        StringAssert.Contains(withoutEither, "0::oid, 0::oid FROM");
+
+        var withoutMultiranges = PostgreSqlTypeCatalogFactory.BuildTypeQuery(options,
+            new PgBackendCapabilities { SupportsRangeTypes = true });
+        StringAssert.Contains(withoutMultiranges, "COALESCE(r.rngsubtype, 0), 0::oid FROM");
+
+        var withoutRanges = PostgreSqlTypeCatalogFactory.BuildTypeQuery(options,
+            new PgBackendCapabilities { SupportsMultirangeTypes = true });
+        StringAssert.Contains(withoutRanges, "0::oid, COALESCE(m.rngtypid, 0) FROM");
+    }
+
     static PgBackendInfo CreateInfo(string version, string encoding, string integerDateTimes)
         => new PgBackendInfoBuilder(new Dictionary<string, string>
         {
