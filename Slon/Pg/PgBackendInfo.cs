@@ -10,14 +10,12 @@ sealed class PgBackendInfo
     {
         ServerVersionString = builder.ServerVersionString;
         ServerVersion = builder.ServerVersion;
-        ServerEncoding = builder.ServerEncoding;
         StartupParameters = builder.StartupParameters;
         Capabilities = builder.Capabilities;
     }
 
     public string ServerVersionString { get; }
     public Version ServerVersion { get; }
-    public string ServerEncoding { get; }
     public IImmutableDictionary<string, string> StartupParameters { get; }
     public PgBackendCapabilities Capabilities { get; }
 }
@@ -58,13 +56,38 @@ readonly record struct PgBackendCapabilities
             HasTypeCategory = IsAtLeast(8, 4),
             HasIntegerDateTimes = hasIntegerDateTimes,
             SupportsDiscardTemp = IsAtLeast(8, 3),
-            SupportsUnlisten = true,
+            SupportsUnlisten = IsAtLeast(6, 4),
             SupportsCloseAll = IsAtLeast(8, 3),
-            SupportsResetAll = true,
-            SupportsSessionAuthorization = true,
+            SupportsResetAll = IsAtLeast(7, 2),
+            SupportsSessionAuthorization = IsAtLeast(7, 3),
             SupportsAdvisoryLocks = IsAtLeast(8, 2),
             SupportsListen = true,
             SupportsNotifications = true
+        };
+    }
+
+    internal static PgBackendCapabilities FromCompatibilityFeatures(
+        PostgreSqlCompatibilityFeatures features)
+    {
+        bool Has(PostgreSqlCompatibilityFeatures feature)
+            => (features & feature) != PostgreSqlCompatibilityFeatures.None;
+
+        return new()
+        {
+            SupportsRangeTypes = Has(PostgreSqlCompatibilityFeatures.RangeTypes),
+            SupportsMultirangeTypes = Has(PostgreSqlCompatibilityFeatures.MultirangeTypes),
+            SupportsEnumTypes = Has(PostgreSqlCompatibilityFeatures.EnumTypes),
+            HasEnumSortOrder = Has(PostgreSqlCompatibilityFeatures.EnumSortOrder),
+            HasTypeCategory = Has(PostgreSqlCompatibilityFeatures.TypeCategory),
+            HasIntegerDateTimes = Has(PostgreSqlCompatibilityFeatures.IntegerDateTimes),
+            SupportsDiscardTemp = Has(PostgreSqlCompatibilityFeatures.DiscardTemp),
+            SupportsUnlisten = Has(PostgreSqlCompatibilityFeatures.Unlisten),
+            SupportsCloseAll = Has(PostgreSqlCompatibilityFeatures.CloseAll),
+            SupportsResetAll = Has(PostgreSqlCompatibilityFeatures.ResetAll),
+            SupportsSessionAuthorization = Has(PostgreSqlCompatibilityFeatures.SessionAuthorization),
+            SupportsAdvisoryLocks = Has(PostgreSqlCompatibilityFeatures.AdvisoryLocks),
+            SupportsListen = Has(PostgreSqlCompatibilityFeatures.Listen),
+            SupportsNotifications = Has(PostgreSqlCompatibilityFeatures.Notifications)
         };
     }
 }
@@ -97,31 +120,29 @@ sealed class PgBackendInfoBuilder
         StartupParameters = Snapshot(serverParameters);
         ServerVersionString = GetRequired(serverParameters, "server_version");
         ServerVersion = ParseServerVersion(ServerVersionString);
-        ServerEncoding = GetRequired(serverParameters, "server_encoding");
+        // server_encoding describes database storage. Wire text follows the client_encoding Slon
+        // requests and the server subsequently reports, so storage encoding is neither required
+        // nor part of pooled compatibility.
         Capabilities = CreateCapabilities(serverParameters, ServerVersion);
     }
 
     public PgBackendInfoBuilder(
         IReadOnlyDictionary<string, string> serverParameters,
         string serverVersionString,
-        Version serverVersion,
-        string serverEncoding)
+        Version serverVersion)
     {
         ArgumentNullException.ThrowIfNull(serverParameters);
         ArgumentException.ThrowIfNullOrWhiteSpace(serverVersionString);
         ArgumentNullException.ThrowIfNull(serverVersion);
-        ArgumentException.ThrowIfNullOrWhiteSpace(serverEncoding);
         StartupParameters = Snapshot(serverParameters);
         ServerVersionString = serverVersionString;
         ServerVersion = serverVersion;
-        ServerEncoding = serverEncoding;
 
         Capabilities = CreateCapabilities(serverParameters, ServerVersion);
     }
 
     public string ServerVersionString { get; }
     public Version ServerVersion { get; }
-    public string ServerEncoding { get; }
     public IImmutableDictionary<string, string> StartupParameters { get; }
     public PgBackendCapabilities Capabilities { get; set; }
 
@@ -187,6 +208,10 @@ abstract class PgBackendInfoProvider
 
     public virtual void ValidateConnectionCompatibility(PgBackendInfo expected, PgBackendInfo actual)
         => PgBackendCompatibility.ValidateConnectionCompatibility(expected, actual);
+
+    public virtual string? ResolveScopeResetCommand(
+        ScopeResetOptions options, PgBackendInfo backendInfo)
+        => options.ResolveCommand(backendInfo.Capabilities);
 }
 
 static class PgBackendCompatibility
@@ -197,12 +222,10 @@ static class PgBackendCompatibility
         ArgumentNullException.ThrowIfNull(actual);
         var expectedShape = PgBackendCompatibilityShape.From(expected.Capabilities);
         var actualShape = PgBackendCompatibilityShape.From(actual.Capabilities);
-        if (!StringComparer.OrdinalIgnoreCase.Equals(expected.ServerEncoding, actual.ServerEncoding)
-            || expectedShape != actualShape)
+        if (expectedShape != actualShape)
             throw new InvalidOperationException(
                 "The PostgreSQL connection is not compatible with the datasource bootstrap connection. " +
-                $"Expected server encoding '{expected.ServerEncoding}' and {expectedShape}; " +
-                $"actual server encoding '{actual.ServerEncoding}' and {actualShape}. " +
+                $"Expected {expectedShape}; actual {actualShape}. " +
                 "Recycle the data source after a backend compatibility change.");
     }
 }

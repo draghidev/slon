@@ -27,4 +27,27 @@ public class SerializerResolutionTests
         Assert.AreEqual(typeof(TestEnum), enumInfo.Type);
         Assert.AreEqual((Oid)23u, enumInfo.PgTypeId.Oid);
     }
+
+    [TestMethod]
+    [DataRow(25u)]
+    [DataRow(1043u)]
+    [DataRow(1042u)]
+    [DataRow(19u)]
+    public void StringMappingAcceptsPostgreSqlCharacterTypes(uint oid)
+    {
+        var options = new PgSerializerOptions(PgTypeCatalog.Default);
+
+        var info = options.GetTypeInfo(typeof(string), (Oid)oid);
+
+        Assert.AreEqual(typeof(string), info.Type);
+        Assert.AreEqual((Oid)oid, info.PgTypeId.Oid);
+    }
+
+    [TestMethod]
+    public void StringMappingDefaultsToText()
+    {
+        var options = new PgSerializerOptions(PgTypeCatalog.Default);
+
+        Assert.AreEqual((Oid)25u, options.GetTypeInfo(typeof(string)).PgTypeId.Oid);
+    }
 }

@@ -13,7 +13,10 @@ sealed class TestBackendProvider : PgBackendProvider
 
     public override PgBackendInfo CreateBackendInfo(IReadOnlyDictionary<string, string> serverParameters)
         => new PgBackendInfoBuilder(
-            serverParameters, "synthetic", new Version(0, 0), "UTF8").Build();
+            serverParameters, "synthetic", new Version(0, 0))
+        {
+            Capabilities = PgBackendCapabilities.PostgreSqlCompatibility
+        }.Build();
 
     public override PgTypeCatalogFactory CreateTypeCatalogFactory(PgBackendInfo backendInfo)
         => PgTypeCatalogFactory.FromBaseline(PgTypeCatalog.Default);

@@ -31,6 +31,8 @@ public sealed record SlonDataSourceOptions
     public PostgreSqlAuthenticationOptions Authentication { get; init; } = new();
     public PostgreSqlOAuthOptions? OAuth { get; init; }
     public PostgreSqlIntegratedSecurityOptions? IntegratedSecurity { get; init; }
+    /// <summary>Describes differences from PostgreSQL for a compatible wire-protocol backend.</summary>
+    public PostgreSqlCompatibilityProfile? CompatibilityProfile { get; init; }
     public TimeSpan ConnectionTimeout { get; init; } = TimeSpan.FromSeconds(10);
     /// <summary>
     /// Bounds cancellation convergence after a command has acquired a PostgreSQL wire. The bound
@@ -93,10 +95,10 @@ public sealed record SlonDataSourceOptions
     /// <summary>Whether table row types should be loaded as composites.</summary>
     public bool LoadTableComposites { get; init; }
 
-    // Public builder surface follows once the backend/type-loading contracts settle. Keep the
-    // configured backend singular; automatic backend detection is not reliable for PostgreSQL-
-    // compatible servers that deliberately advertise PostgreSQL identity.
-    internal PgBackendProvider BackendProvider { get; init; } = PostgreSqlBackendProvider.Instance;
+    // Keep the provider override internal while its type-loading contracts settle. Public callers
+    // select a supported profile through CompatibilityProfile; automatic backend detection is not
+    // reliable for servers that deliberately advertise PostgreSQL identity.
+    internal PgBackendProvider? BackendProvider { get; init; }
     internal IReadOnlyList<PgTypeCatalogPlugin> TypeCatalogPlugins { get; init; } = [];
 
     // Internal, tests need to override these to drive maintenance flows on a tight loop. Public
@@ -134,6 +136,7 @@ public sealed record SlonDataSourceOptions
         ArgumentNullException.ThrowIfNull(Ssl);
         ArgumentNullException.ThrowIfNull(Authentication);
         ArgumentNullException.ThrowIfNull(LoggerFactory);
+        CompatibilityProfile?.Validate();
         if (Name is not null && string.IsNullOrWhiteSpace(Name))
             throw new ArgumentException("Cannot be empty or whitespace.", nameof(Name));
         if ((ConnectionInitializer is null) != (AsyncConnectionInitializer is null))
@@ -216,8 +219,7 @@ public sealed class SlonDataSource : DbDataSource
         DisplayEndpoint = _options.EndPoint.AddressFamily is AddressFamily.InterNetwork or AddressFamily.InterNetworkV6 ? $"tcp://{_options.EndPoint}" : _options.EndPoint.ToString()!;
         Name = _options.Name ?? $"{DisplayEndpoint}/{Database}";
         _connectionString = $"Endpoint={DisplayEndpoint};Username={_options.Username};Database={Database}";
-        _backendProvider = _options.BackendProvider
-            ?? throw new ArgumentNullException(nameof(_options.BackendProvider));
+        _backendProvider = _options.BackendProvider ?? PgBackendProviders.Create(_options.CompatibilityProfile);
         _userTypeCatalogPlugins = [.. (_options.TypeCatalogPlugins
             ?? throw new ArgumentNullException(nameof(_options.TypeCatalogPlugins)))];
         _lifecycleLock = new(1);

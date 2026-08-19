@@ -36,6 +36,14 @@ public sealed class ScopeResetOptions
         DropTemporaryObjects = DropTemporaryObjects,
     };
 
+    internal bool HasEnabledActions
+        => CloseCursors || ResetSessionAuthorization || ResetParameters || ClearListeners
+           || ReleaseAdvisoryLocks || DropTemporaryObjects;
+
+    internal bool HasAllActionsEnabled
+        => CloseCursors && ResetSessionAuthorization && ResetParameters && ClearListeners
+           && ReleaseAdvisoryLocks && DropTemporaryObjects;
+
     internal string? ResolveCommand(PgBackendCapabilities capabilities)
     {
         // A configured reset action whose capability is absent is deliberately omitted: dialect

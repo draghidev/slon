@@ -27,3 +27,38 @@ sealed class PostgreSqlBackendProvider : PgBackendProvider
     public override PgTypeCatalogFactory CreateTypeCatalogFactory(PgBackendInfo backendInfo)
         => PostgreSqlTypeCatalogFactory.Instance;
 }
+
+sealed class ConfiguredBackendProvider(PostgreSqlCompatibilityProfile profile) : PgBackendProvider
+{
+    public override PgBackendInfo CreateBackendInfo(IReadOnlyDictionary<string, string> serverParameters)
+    {
+        var builder = new PgBackendInfoBuilder(serverParameters);
+        if (profile.Features is { } features)
+            builder.Capabilities = PgBackendCapabilities.FromCompatibilityFeatures(features);
+        return builder.Build();
+    }
+
+    public override PgTypeCatalogFactory CreateTypeCatalogFactory(PgBackendInfo backendInfo)
+        => profile.LoadTypesFromCatalog
+            ? PostgreSqlTypeCatalogFactory.Instance
+            : PgTypeCatalogFactory.FromBaseline(PgTypeCatalog.Default);
+
+    public override string? ResolveScopeResetCommand(
+        ScopeResetOptions options, PgBackendInfo backendInfo)
+    {
+        if (options.HasAllActionsEnabled && profile.CompleteScopeResetCommand is not null)
+            return profile.CompleteScopeResetCommand;
+
+        var command = base.ResolveScopeResetCommand(options, backendInfo);
+        if (command is null && options.HasEnabledActions && profile.CompleteScopeResetCommand is not null)
+            throw new NotSupportedException(
+                "The compatibility profile provides complete scope reset but not the configured partial reset.");
+        return command;
+    }
+}
+
+static class PgBackendProviders
+{
+    public static PgBackendProvider Create(PostgreSqlCompatibilityProfile? profile)
+        => profile is null ? PostgreSqlBackendProvider.Instance : new ConfiguredBackendProvider(profile);
+}

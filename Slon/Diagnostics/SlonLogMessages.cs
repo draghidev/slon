@@ -51,4 +51,5 @@ static partial class SlonLogMessages
     [LoggerMessage(10, LogLevel.Trace,
         "Sending PostgreSQL Terminate during graceful connection shutdown failed; closing the transport directly.")]
     public static partial void TerminateWriteFailed(ILogger logger, Exception exception);
+
 }

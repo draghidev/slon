@@ -22,7 +22,11 @@ sealed class PgSerializerOptions
         Add<float>(new RealConverter<float>(), DataTypeNames.Float4);
         Add<double>(new DoubleConverter<double>(), DataTypeNames.Float8);
         Add<Guid>(new GuidUuidConverter(), DataTypeNames.Uuid);
-        Add<string>(TextConverter.CreateStringConverter(), DataTypeNames.Text);
+        var stringConverter = TextConverter.CreateStringConverter();
+        Add<string>(stringConverter, DataTypeNames.Text);
+        Add<string>(stringConverter, DataTypeNames.Varchar, defaultForClrType: false);
+        Add<string>(stringConverter, DataTypeNames.Bpchar, defaultForClrType: false);
+        Add<string>(stringConverter, DataTypeNames.Name, defaultForClrType: false);
         Add<TextReader>(TextConverter.CreateTextReaderConverter(), DataTypeNames.Text,
             defaultForPgType: false);
         Add<Stream>(new StreamConverter(), DataTypeNames.Bytea, defaultForPgType: false);
@@ -40,14 +44,15 @@ sealed class PgSerializerOptions
 
     public PgTypeInfo GetTypeInfo(Type? type, PgTypeId? pgTypeId = null)
     {
+        Mapping? mapping = null;
         if (type?.IsEnum is true)
         {
             var underlying = type.GetEnumUnderlyingType();
-            if (pgTypeId is null && _byClrType.TryGetValue(underlying, out var enumMapping))
+            if (_byClrType.TryGetValue(underlying, out var enumMapping)
+                && (pgTypeId is null || Matches(enumMapping, pgTypeId.Value)))
                 return enumMapping.Create(this, type);
         }
 
-        Mapping? mapping = null;
         if (type is not null && type != typeof(object))
         {
             _byClrType.TryGetValue(type, out mapping);
@@ -55,6 +60,9 @@ sealed class PgSerializerOptions
                 _byClrType.TryGetValue(typeof(Stream), out mapping);
             if (mapping is null && typeof(TextReader).IsAssignableFrom(type))
                 _byClrType.TryGetValue(typeof(TextReader), out mapping);
+            if (mapping is not null && pgTypeId is { } specifiedTypeId
+                && !Matches(mapping, specifiedTypeId))
+                mapping = null;
         }
         if (mapping is null && pgTypeId is { } id)
             _byPgTypeId.TryGetValue(GetCanonicalTypeId(id), out mapping);
@@ -71,10 +79,14 @@ sealed class PgSerializerOptions
             throw new NotSupportedException(
                 $"CLR type '{type}' does not support PostgreSQL type '{pgTypeId}'.");
 
-        return mapping.Create(this, requestedType: null);
+        return mapping.Create(this, type?.IsEnum is true ? type : null);
+
+        bool Matches(Mapping candidate, PgTypeId requestedTypeId)
+            => GetCanonicalTypeId(candidate.DataTypeName) == GetCanonicalTypeId(requestedTypeId);
     }
 
-    void Add<T>(PgConverter<T> converter, DataTypeName dataTypeName, bool defaultForPgType = true)
+    void Add<T>(PgConverter<T> converter, DataTypeName dataTypeName, bool defaultForPgType = true,
+        bool defaultForClrType = true)
     {
         // Synthetic and deliberately restricted catalogs need not contain every built-in.
         // Resolution advertises only mappings whose PostgreSQL identity exists in this snapshot.
@@ -82,7 +94,8 @@ sealed class PgSerializerOptions
             return;
 
         var mapping = new Mapping(typeof(T), converter, dataTypeName);
-        _byClrType.Add(typeof(T), mapping);
+        if (defaultForClrType)
+            _byClrType.Add(typeof(T), mapping);
         if (defaultForPgType)
             _byPgTypeId.Add(canonicalTypeId, mapping);
     }

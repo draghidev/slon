@@ -7,6 +7,61 @@ namespace Slon.Tests.Pg;
 [TestClass]
 public class PgBackendInfoTests
 {
+    [TestMethod]
+    public void ConfiguredProfileControlsBackendBehavior()
+    {
+        Assert.AreSame(PostgreSqlBackendProvider.Instance, PgBackendProviders.Create(null));
+        Assert.IsInstanceOfType<ConfiguredBackendProvider>(PgBackendProviders.Create(CreateQuestDbProfile()));
+    }
+
+    [TestMethod]
+    public void QuestDbProfileUsesExplicitFeaturesAndPrebuiltTypes()
+    {
+        var provider = PgBackendProviders.Create(CreateQuestDbProfile());
+
+        var info = provider.CreateBackendInfo(new Dictionary<string, string>
+        {
+            ["server_version"] = "11.3"
+        });
+
+        Assert.IsTrue(info.Capabilities.HasIntegerDateTimes);
+        Assert.IsFalse(info.Capabilities.SupportsRangeTypes);
+        Assert.IsFalse(provider.CreateTypeCatalogFactory(info).RequiresProtocol);
+    }
+
+    [TestMethod]
+    public void QuestDbProfileUsesDiscardAllForCompleteReset()
+    {
+        var provider = PgBackendProviders.Create(CreateQuestDbProfile());
+        var info = provider.CreateBackendInfo(new Dictionary<string, string>
+        {
+            ["server_version"] = "11.3"
+        });
+
+        Assert.AreEqual("DISCARD ALL", provider.ResolveScopeResetCommand(new ScopeResetOptions(), info));
+
+        var disabled = new ScopeResetOptions
+        {
+            CloseCursors = false,
+            ResetSessionAuthorization = false,
+            ResetParameters = false,
+            ClearListeners = false,
+            ReleaseAdvisoryLocks = false,
+            DropTemporaryObjects = false
+        };
+        Assert.IsNull(provider.ResolveScopeResetCommand(disabled, info));
+
+        disabled.CloseCursors = true;
+        Assert.ThrowsExactly<NotSupportedException>(() => provider.ResolveScopeResetCommand(disabled, info));
+    }
+
+    static PostgreSqlCompatibilityProfile CreateQuestDbProfile()
+        => new()
+        {
+            Features = PostgreSqlCompatibilityFeatures.IntegerDateTimes,
+            LoadTypesFromCatalog = false,
+            CompleteScopeResetCommand = "DISCARD ALL"
+        };
 
     [TestMethod]
     public void Builder_SeedsPostgreSqlCapabilitiesFromVersionAndParameters()
@@ -20,7 +75,6 @@ public class PgBackendInfoTests
 
         Assert.AreEqual(new Version(14, 12), info.ServerVersion);
         Assert.AreEqual("14.12 (test build)", info.ServerVersionString);
-        Assert.AreEqual("UTF8", info.ServerEncoding);
         Assert.IsTrue(info.Capabilities.SupportsRangeTypes);
         Assert.IsTrue(info.Capabilities.SupportsMultirangeTypes);
         Assert.IsTrue(info.Capabilities.SupportsEnumTypes);
@@ -28,6 +82,25 @@ public class PgBackendInfoTests
         Assert.IsTrue(info.Capabilities.HasTypeCategory);
         Assert.IsFalse(info.Capabilities.HasIntegerDateTimes);
         Assert.AreEqual("14.12 (test build)", info.StartupParameters["server_version"]);
+    }
+
+    [TestMethod]
+    [DataRow("6.3", false, false, false)]
+    [DataRow("6.4", true, false, false)]
+    [DataRow("7.1", true, false, false)]
+    [DataRow("7.2", true, true, false)]
+    [DataRow("7.3", true, true, true)]
+    public void Builder_VersionGatesLegacySessionFeatures(
+        string version,
+        bool supportsUnlisten,
+        bool supportsResetAll,
+        bool supportsSessionAuthorization)
+    {
+        var capabilities = CreateInfo(version, "UTF8", "on").Capabilities;
+
+        Assert.AreEqual(supportsUnlisten, capabilities.SupportsUnlisten);
+        Assert.AreEqual(supportsResetAll, capabilities.SupportsResetAll);
+        Assert.AreEqual(supportsSessionAuthorization, capabilities.SupportsSessionAuthorization);
     }
 
     [TestMethod]
@@ -108,16 +181,14 @@ public class PgBackendInfoTests
         var exception = Assert.ThrowsExactly<InvalidOperationException>(
             () => provider.ValidateConnectionCompatibility(expected, actual));
         StringAssert.Contains(exception.Message, nameof(PgBackendCapabilities.SupportsMultirangeTypes));
-        StringAssert.Contains(exception.Message, "Expected server encoding 'UTF8'");
-        StringAssert.Contains(exception.Message, "actual server encoding 'UTF8'");
     }
 
     [TestMethod]
-    public void Provider_AllowsDifferentVersionsWithTheSameCapabilityShape()
+    public void Provider_AllowsDifferentVersionsAndServerEncodingsWithTheSameCapabilityShape()
     {
         var provider = PostgreSqlBackendProvider.Instance;
         var expected = CreateInfo("17.1", "UTF8", "on");
-        var actual = CreateInfo("17.2 (rolling upgrade)", "utf8", "on");
+        var actual = CreateInfo("17.2 (rolling upgrade)", "LATIN1", "on");
 
         provider.ValidateConnectionCompatibility(expected, actual);
     }

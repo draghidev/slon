@@ -458,8 +458,12 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
                 if (_options.ExpectedBackendInfo is { } expectedBackendInfo)
                     backendProvider.ValidateConnectionCompatibility(expectedBackendInfo, _backendInfo);
                 _backendCapabilities = _backendInfo.Capabilities;
+                _scopeResetCommand = backendProvider.ResolveScopeResetCommand(_scopeReset, _backendInfo);
             }
-            _scopeResetCommand = _scopeReset.ResolveCommand(_backendCapabilities);
+            else
+            {
+                _scopeResetCommand = _scopeReset.ResolveCommand(_backendCapabilities);
+            }
             Volatile.Write(ref _queryProtocolEstablished, 1);
             SignalReady();
         }
