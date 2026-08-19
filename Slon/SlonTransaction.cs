@@ -46,15 +46,17 @@ public sealed class SlonTransaction : DbTransaction
         _completed = true;
     }
 
-    /// <summary>Specifies the <see cref="Slon.SlonConnection" /> object associated with the transaction.</summary>
-    /// <returns>The <see cref="Slon.SlonConnection" /> object associated with the transaction.</returns>
-    public new SlonConnection Connection => _connection;
+    /// <summary>Gets the connection while this transaction remains active.</summary>
+    /// <returns>The associated connection, or <see langword="null" /> after completion or disposal.</returns>
+    public new SlonConnection? Connection => _completed ? null : _connection;
 
     /// <inheritdoc/>
     protected override DbConnection? DbConnection => Connection;
 
     /// <inheritdoc/>
     public override IsolationLevel IsolationLevel => _isolationLevel;
+
+    internal void Detach() => _completed = true;
 
     /// <inheritdoc/>
     protected override void Dispose(bool disposing)

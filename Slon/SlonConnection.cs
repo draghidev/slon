@@ -34,7 +34,6 @@ public sealed partial class SlonConnection : IAdoConnection
     Exception? _breakException;
     bool _disposed;
     AdoConnectionProxy? _proxy;
-    bool _closingConnection;
     bool _stateChangeEventHandlerAdded;
 
     // Test access to auto-prepare and connection state without a server query.
@@ -92,6 +91,7 @@ public sealed partial class SlonConnection : IAdoConnection
         if (!HasProxy)
             return;
 
+        RollbackTransactionOnClose();
         ConnectionState state;
         try
         {
@@ -125,6 +125,7 @@ public sealed partial class SlonConnection : IAdoConnection
         if (!HasProxy)
             return;
 
+        await RollbackTransactionOnCloseAsync().ConfigureAwait(false);
         ConnectionState state;
         try
         {
@@ -165,11 +166,50 @@ public sealed partial class SlonConnection : IAdoConnection
     internal SlonTransaction? CurrentTransaction { get; private set; }
     string? _pendingTransactionStatement;
 
+    void DetachTransaction()
+    {
+        var transaction = CurrentTransaction;
+        CurrentTransaction = null;
+        _pendingTransactionStatement = null;
+        transaction?.Detach();
+    }
+
+    void RollbackTransactionOnClose()
+    {
+        var transaction = CurrentTransaction;
+        if (transaction is null)
+            return;
+
+        if (_state is not ConnectionState.Open || _pendingTransactionStatement is not null)
+        {
+            DetachTransaction();
+            return;
+        }
+
+        try { transaction.Rollback(); }
+        finally { DetachTransaction(); }
+    }
+
+    async ValueTask RollbackTransactionOnCloseAsync()
+    {
+        var transaction = CurrentTransaction;
+        if (transaction is null)
+            return;
+
+        if (_state is not ConnectionState.Open || _pendingTransactionStatement is not null)
+        {
+            DetachTransaction();
+            return;
+        }
+
+        try { await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false); }
+        finally { DetachTransaction(); }
+    }
+
     void DisposeCore()
     {
         if (_disposed)
             return;
-        _disposed = true;
         try
         {
             ReleaseOwnedAndLeaked(awaitable: false).GetAwaiter().GetResult();
@@ -177,6 +217,7 @@ public sealed partial class SlonConnection : IAdoConnection
         }
         finally
         {
+            _disposed = true;
             _proxy?.Dispose();
             base.Dispose();
         }
@@ -186,7 +227,6 @@ public sealed partial class SlonConnection : IAdoConnection
     {
         if (_disposed)
             return;
-        _disposed = true;
         try
         {
             await ReleaseOwnedAndLeaked(awaitable: true).ConfigureAwait(false);
@@ -194,6 +234,7 @@ public sealed partial class SlonConnection : IAdoConnection
         }
         finally
         {
+            _disposed = true;
             if (_proxy is not null)
                 await _proxy.DisposeAsync().ConfigureAwait(false);
             base.Dispose();
@@ -334,38 +375,15 @@ public sealed partial class SlonConnection : IAdoConnection
 
     SlonConnection CloneCore() => _dataSource.CreateConnection();
 
-    internal CommandFlow EnqueueCommands(in CommandFlowOptions options, bool closeConnection)
-    {
-        var proxy = EnsureConnected();
-        if (closeConnection && Interlocked.CompareExchange(ref _closingConnection, true, false))
-            ThrowHelper.ThrowInvalidOperation($"A command has already been committed with the {nameof(CommandBehavior.CloseConnection)} behavior.");
-
-        var commandFlow = proxy.RentCommandFlow(async: false, options);
-        proxy.Enqueue(commandFlow);
-        return commandFlow;
-    }
-
     // Sync delegate-based enqueue, mirror of the async variant.
     internal TFlow Enqueue<TArg, TFlow>(
         Func<PgConnection, TArg, TFlow> flowFactory,
-        TArg arg,
-        bool closeConnection)
+        TArg arg)
         where TFlow : PgClientFlow
         where TArg : allows ref struct
     {
         var proxy = EnsureConnected();
-        if (closeConnection && Interlocked.CompareExchange(ref _closingConnection, true, false))
-            ThrowHelper.ThrowInvalidOperation($"A command has already been committed with the {nameof(CommandBehavior.CloseConnection)} behavior.");
         return proxy.Enqueue(flowFactory, arg);
-    }
-
-    internal ValueTask<CommandFlow> EnqueueCommandsAsync(in CommandFlowOptions options, bool closeConnection, CancellationToken cancellationToken)
-    {
-        var proxy = EnsureConnected();
-        if (closeConnection && Interlocked.CompareExchange(ref _closingConnection, true, false))
-            ThrowHelper.ThrowInvalidOperation($"A command has already been committed with the {nameof(CommandBehavior.CloseConnection)} behavior.");
-        var commandFlow = proxy.RentCommandFlow(async: true, options);
-        return proxy.EnqueueAsync(commandFlow, cancellationToken);
     }
 
     // Delegate-based enqueue: the flowFactory callback runs inside the proxy's atomic PgConnection scope,
@@ -374,14 +392,11 @@ public sealed partial class SlonConnection : IAdoConnection
     internal ValueTask<TFlow> EnqueueAsync<TArg, TFlow>(
         Func<PgConnection, TArg, TFlow> flowFactory,
         TArg arg,
-        bool closeConnection,
         CancellationToken cancellationToken)
         where TFlow : PgClientFlow
         where TArg : allows ref struct
     {
         var proxy = EnsureConnected();
-        if (closeConnection && Interlocked.CompareExchange(ref _closingConnection, true, false))
-            ThrowHelper.ThrowInvalidOperation($"A command has already been committed with the {nameof(CommandBehavior.CloseConnection)} behavior.");
         return proxy.EnqueueAsync(flowFactory, arg, cancellationToken);
     }
 
@@ -559,20 +574,28 @@ public sealed partial class SlonConnection : DbConnection
     public override ConnectionState State => GetState();
 
     /// <inheritdoc />
-    public override void Open() => OpenCore();
+    public override void Open()
+    {
+        try { OpenCore(); }
+        catch (Exception ex) { AdoException.Throw(ex); }
+    }
 
     /// <summary>Opens the connection using the requested connection policy.</summary>
-    public void Open(SlonConnectionOptions options) => OpenCore(options);
+    public void Open(SlonConnectionOptions options)
+    {
+        try { OpenCore(options); }
+        catch (Exception ex) { AdoException.Throw(ex); }
+    }
 
     /// <inheritdoc />
     public override Task OpenAsync(CancellationToken cancellationToken)
-        => OpenAsyncCore(cancellationToken: cancellationToken);
+        => OpenAsyncProjected(SlonConnectionOptions.None, cancellationToken);
 
     /// <summary>Opens the connection asynchronously using the requested connection policy.</summary>
     /// <param name="options">The connection options.</param>
     /// <param name="cancellationToken">A token for cancelling the open operation.</param>
     public Task OpenAsync(SlonConnectionOptions options, CancellationToken cancellationToken = default)
-        => OpenAsyncCore(options, cancellationToken);
+        => OpenAsyncProjected(options, cancellationToken);
 
     /// <inheritdoc />
     public override void ChangeDatabase(string databaseName)
@@ -658,12 +681,16 @@ public sealed partial class SlonConnection : DbConnection
     /// Commands that were previously prepared via <see cref="DbCommand.Prepare"/> will be
     /// re-prepared transparently on next use.
     /// </summary>
-    public void UnprepareAll() => UnprepareAllCore();
+    public void UnprepareAll()
+    {
+        try { UnprepareAllCore(); }
+        catch (Exception ex) { AdoException.Throw(ex); }
+    }
 
     /// <summary>
     /// Asynchronously releases all explicit-prepared commands held by this connection.
     /// </summary>
-    public ValueTask UnprepareAllAsync() => UnprepareAllAsyncCore();
+    public ValueTask UnprepareAllAsync() => UnprepareAllAsyncProjected();
 
     /// <inheritdoc />
     protected override DbCommand CreateDbCommand() => CreateCommand();
@@ -672,16 +699,48 @@ public sealed partial class SlonConnection : DbConnection
     protected override DbBatch CreateDbBatch() => CreateBatch();
 
     /// <inheritdoc />
-    public override void Close() => CloseCore();
+    public override void Close()
+    {
+        try { CloseCore(); }
+        catch (Exception ex) { AdoException.Throw(ex); }
+    }
 
     /// <inheritdoc />
-    public override Task CloseAsync() => CloseAsyncCore().AsTask();
+    public override Task CloseAsync() => CloseAsyncProjected().AsTask();
 
     /// <inheritdoc />
-    public override ValueTask DisposeAsync() => DisposeAsyncCore();
+    public override ValueTask DisposeAsync() => DisposeAsyncProjected();
 
     /// <inheritdoc />
-    protected override void Dispose(bool disposing) => DisposeCore();
+    protected override void Dispose(bool disposing)
+    {
+        try { DisposeCore(); }
+        catch (Exception ex) { AdoException.Throw(ex); }
+    }
+
+    async Task OpenAsyncProjected(SlonConnectionOptions options, CancellationToken cancellationToken)
+    {
+        try { await OpenAsyncCore(options, cancellationToken).ConfigureAwait(false); }
+        catch (Exception ex) { AdoException.Throw(ex); }
+    }
+
+    async ValueTask UnprepareAllAsyncProjected()
+    {
+        try { await UnprepareAllAsyncCore().ConfigureAwait(false); }
+        catch (Exception ex) { AdoException.Throw(ex); }
+    }
+
+    async ValueTask CloseAsyncProjected()
+    {
+        try { await CloseAsyncCore().ConfigureAwait(false); }
+        catch (Exception ex) { AdoException.Throw(ex); }
+    }
+
+    async ValueTask DisposeAsyncProjected()
+    {
+        try { await DisposeAsyncCore().ConfigureAwait(false); }
+        catch (Exception ex) { AdoException.Throw(ex); }
+    }
 
     /// <inheritdoc />
     public override DataTable GetSchema() => GetSchema(null);

@@ -15,6 +15,7 @@ namespace Slon;
 public sealed partial class SlonDataReader
 {
     Core _core;
+    SlonConnection? _connectionToClose;
 
     ReaderState State { get; set; }
 
@@ -237,7 +238,8 @@ public sealed partial class SlonDataReader
         }
     }
 
-    internal static SlonDataReader Create(CommandBehavior behavior, CommandFlow flow)
+    internal static SlonDataReader Create(CommandBehavior behavior, CommandFlow flow,
+        SlonConnection? connectionToClose = null)
     {
         var enumerator = flow.GetEnumerator();
         try
@@ -245,7 +247,12 @@ public sealed partial class SlonDataReader
             var core = new Core(enumerator, behavior, flow.VisibleCommandCount, asyncExecute: false);
             core.NextResult();
             // TODO now that we don't need a DataReader while we wait for the first result we can pool the reader on the connection.
-            return new SlonDataReader { State = ReaderState.Active, _core = core };
+            return new SlonDataReader
+            {
+                State = ReaderState.Active,
+                _core = core,
+                _connectionToClose = connectionToClose
+            };
         }
         catch (Exception)
         {
@@ -254,7 +261,9 @@ public sealed partial class SlonDataReader
         }
     }
 
-    internal static async ValueTask<TReader> CreateAsync<TReader>(CommandBehavior behavior, ValueTask<CommandFlow> flowTask, CancellationToken cancellationToken = default)
+    internal static async ValueTask<TReader> CreateAsync<TReader>(CommandBehavior behavior,
+        ValueTask<CommandFlow> flowTask, CancellationToken cancellationToken = default,
+        SlonConnection? connectionToClose = null)
         where TReader: DbDataReader
     {
         Debug.Assert(typeof(TReader) == typeof(SlonDataReader) || typeof(TReader) == typeof(DbDataReader));
@@ -278,7 +287,12 @@ public sealed partial class SlonDataReader
                 await core.DisposeEnumeratorAsync().ConfigureAwait(false);
             }
             // TODO now that we don't need a DataReader while we wait for the first result we can pool the reader on the connection.
-            return (TReader)(object)new SlonDataReader { State = ReaderState.Active, _core = core };
+            return (TReader)(object)new SlonDataReader
+            {
+                State = ReaderState.Active,
+                _core = core,
+                _connectionToClose = connectionToClose
+            };
         }
         catch (Exception)
         {
@@ -350,12 +364,18 @@ public sealed partial class SlonDataReader
 
     void CloseCore()
     {
-        _core.DisposeEnumerator();
+        try { _core.DisposeEnumerator(); }
+        finally { Interlocked.Exchange(ref _connectionToClose, null)?.Close(); }
     }
 
-    ValueTask CloseAsyncCore()
+    async ValueTask CloseAsyncCore()
     {
-        return _core.DisposeEnumeratorAsync();
+        try { await _core.DisposeEnumeratorAsync().ConfigureAwait(false); }
+        finally
+        {
+            if (Interlocked.Exchange(ref _connectionToClose, null) is { } connection)
+                await connection.CloseAsync().ConfigureAwait(false);
+        }
     }
 
     void Reset()

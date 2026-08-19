@@ -281,5 +281,19 @@ public sealed class SlonBatch : DbBatch
     /// <inheritdoc/>
     protected override DbTransaction? DbTransaction { get => Transaction; set {} }
 
+    /// <inheritdoc/>
+    public override void Dispose()
+    {
+        _batchCore.Dispose();
+        base.Dispose();
+    }
+
+    /// <inheritdoc/>
+    public override async ValueTask DisposeAsync()
+    {
+        await _batchCore.DisposeAsync().ConfigureAwait(false);
+        base.Dispose();
+    }
+
     static ref AdoBatchCore<SlonBatchCommand> GetBatchCore(SlonBatch instance) => ref instance._batchCore;
 }

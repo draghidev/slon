@@ -525,8 +525,7 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
                 return new CommandFlow(async: false, options);
             },
             new EnqueueArgs<TCommand>(_fieldRef, parameters, behavior, connection,
-                connectionDependencies.SerializerOptions, connectionDependencies.ParameterWriterStrategy),
-            closeConnection: HasCloseConnection(behavior));
+                connectionDependencies.SerializerOptions, connectionDependencies.ParameterWriterStrategy));
     }
 
     ValueTask<CommandFlow> EnqueueAsync(DbParameterCollection? parameters, CommandBehavior behavior, CancellationToken cancellationToken)
@@ -550,7 +549,6 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
             },
             new EnqueueArgs<TCommand>(_fieldRef, parameters, behavior, connection,
                 connectionDependencies.SerializerOptions, connectionDependencies.ParameterWriterStrategy),
-            closeConnection: HasCloseConnection(behavior),
             cancellationToken);
 
         static async ValueTask<CommandFlow> DataSourceCore(FieldRef<AdoBatchCore<TCommand>> fieldRef,
@@ -774,7 +772,7 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
         {
             using var rowEnumerator = result.GetAsyncEnumerator();
             if (rowEnumerator.MoveNext())
-                return result.FieldCount is not 0 ? rowEnumerator.Current.GetValue<object>(0) : null;
+                return result.FieldCount is not 0 ? result.ReadObject(rowEnumerator.Current, 0) : null;
             // No row from this result: surface a failed command (stored ErrorResponse) instead of
             // silently returning null.
             result.GetCommandComplete();
@@ -799,7 +797,8 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
                 {
                     if (await rowEnumerator.MoveNextAsync(cancellationToken).ConfigureAwait(false))
                         return enumerator.Current.FieldCount is not 0
-                            ? await rowEnumerator.Current.GetValueAsync<object>(0, cancellationToken).ConfigureAwait(false)
+                            ? await enumerator.Current.ReadObjectAsync(rowEnumerator.Current, 0, cancellationToken)
+                                .ConfigureAwait(false)
                             : null;
                 }
                 finally
@@ -820,7 +819,15 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
         }
         finally
         {
-            await enumerator.DisposeAsync().ConfigureAwait(false);
+            try
+            {
+                await enumerator.DisposeAsync().ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                SlonTracing.RecordException(activity, ex);
+                AdoException.Throw(ex);
+            }
         }
     }
 
@@ -844,7 +851,14 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
     }
 
     SlonDataReader ExecuteReaderCore(DbParameterCollection? parameters, CommandBehavior behavior)
-        => SlonDataReader.Create(behavior, Enqueue(parameters, behavior));
+        => SlonDataReader.Create(behavior, Enqueue(parameters, behavior), GetConnectionToClose(behavior));
+
+    SlonConnection? GetConnectionToClose(CommandBehavior behavior)
+    {
+        if (!HasCloseConnection(behavior) || TryGetDataSource(out _, out var connection))
+            return null;
+        return connection;
+    }
 
     public ValueTask<DbDataReader> ExecuteDbReaderAsync(DbParameterCollection? parameters, CommandBehavior behavior, CancellationToken cancellationToken = default)
     {
@@ -877,8 +891,9 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
         using var activity = core.StartActivity();
         try
         {
+            var connectionToClose = core.GetConnectionToClose(behavior);
             return await SlonDataReader.CreateAsync<TReader>(behavior,
-                core.EnqueueAsync(parameters, behavior, cancellationToken), cancellationToken)
+                core.EnqueueAsync(parameters, behavior, cancellationToken), cancellationToken, connectionToClose)
                 .ConfigureAwait(false);
         }
         catch (Exception ex)
@@ -907,10 +922,12 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
 
     public void Dispose()
     {
-        if (_disposed || !_explicitlyPrepared)
+        if (_disposed)
             return;
 
         _disposed = true;
+        if (!_explicitlyPrepared)
+            return;
         if (TryGetDataSource(out _, out var connection))
         {
             // TODO once we support explicit prepare for datasource commands, unprepare here.
@@ -923,10 +940,12 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
 
     public ValueTask DisposeAsync()
     {
-        if (_disposed || !_explicitlyPrepared)
+        if (_disposed)
             return new();
 
         _disposed = true;
+        if (!_explicitlyPrepared)
+            return new();
         if (TryGetDataSource(out _, out var connection))
         {
             // TODO once we support explicit prepare for datasource commands, unprepare here.

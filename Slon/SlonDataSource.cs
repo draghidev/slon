@@ -823,7 +823,7 @@ public sealed class SlonDataSource : DbDataSource
     public new SlonConnection OpenConnection()
     {
         var connection = CreateConnection();
-        connection.SetProxy(GetProxy(connection, ConnectionTimeout));
+        connection.Open();
         return connection;
     }
 
@@ -839,13 +839,13 @@ public sealed class SlonDataSource : DbDataSource
     protected override async ValueTask<DbConnection> OpenDbConnectionAsync(CancellationToken cancellationToken = default)
     {
         var connection = CreateConnection();
-        connection.SetProxy(await GetProxyAsync(connection, ConnectionTimeout, cancellationToken).ConfigureAwait(false));
+        await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
         return connection;
     }
     public new async ValueTask<SlonConnection> OpenConnectionAsync(CancellationToken cancellationToken)
     {
         var connection = CreateConnection();
-        connection.SetProxy(await GetProxyAsync(connection, ConnectionTimeout, cancellationToken).ConfigureAwait(false));
+        await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
         return connection;
     }
 

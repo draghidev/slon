@@ -50,7 +50,7 @@ public class FlowMigrationTests : ConnectionCreatingTest
         {
             scheduler.Resume();
             try { await connection.DisposeAsync(); }
-            catch (Slon.Pg.Protocol.PgClientClosedException) { }
+            catch (SlonException) { }
         }
     }
 

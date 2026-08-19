@@ -125,7 +125,6 @@ public sealed class SlonBatchCommands: DbBatchCommandCollection, IList<SlonBatch
 
     void ThrowIfReadOnly()
     {
-        if (IsReadOnly)
-            ThrowHelper.ThrowInvalidOperation("The batch command collection is read-only.");
+        _batchRef.Invoke().ThrowIfDisposedOrReadOnly();
     }
 }

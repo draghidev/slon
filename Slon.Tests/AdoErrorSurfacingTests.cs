@@ -131,6 +131,42 @@ public class AdoErrorSurfacingTests
     }
 
     [TestMethod]
+    public void ExecuteScalar_Success_ReturnsTypedValue()
+    {
+        using var command = AdoTestPool.CreateCommand("select 42");
+        Assert.AreEqual(42, command.ExecuteScalar());
+    }
+
+    [TestMethod]
+    public async Task ExecuteScalarAsync_Success_ReturnsTypedValue()
+    {
+        await using var command = AdoTestPool.CreateCommand("select 42");
+        Assert.AreEqual(42, await command.ExecuteScalarAsync(CancellationToken.None));
+    }
+
+    [TestMethod]
+    public async Task ExecuteScalarAsync_BackendTermination_DoesNotLeakProtocolException()
+    {
+        await using var dataSource = AdoTestPool.NewIsolatedDataSource();
+        await using var command = dataSource.CreateCommand("select pg_terminate_backend(pg_backend_pid())");
+        await Assert.ThrowsAsync<SlonException>(async () =>
+            await command.ExecuteScalarAsync(CancellationToken.None));
+    }
+
+    [TestMethod]
+    public async Task TransactionScope_BackendTermination_DoesNotLeakProtocolException()
+    {
+        await using var dataSource = AdoTestPool.NewIsolatedDataSource();
+        await Assert.ThrowsAsync<SlonException>(async () =>
+        {
+            await using var connection = await dataSource.OpenConnectionAsync(CancellationToken.None);
+            await using var transaction = await connection.BeginTransactionAsync(CancellationToken.None);
+            await using var command = connection.CreateCommand("select pg_terminate_backend(pg_backend_pid())");
+            await command.ExecuteNonQueryAsync(CancellationToken.None);
+        });
+    }
+
+    [TestMethod]
     public void ExecuteScalar_FailedCommand_Throws()
     {
         using var cmd = Failed();
