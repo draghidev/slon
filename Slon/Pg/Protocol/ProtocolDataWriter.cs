@@ -74,7 +74,7 @@ sealed class ProtocolDataWriter : IOutputWriter
         if (!ReferenceEquals(_parameterWriterStrategy, strategy)
             || !ReferenceEquals(_parameterWriterEncoding, encoding))
         {
-            _parameterWriterState = strategy.CreateState(this, encoding);
+            _parameterWriterState = strategy.CreateWriterState(this, encoding);
             _parameterWriterStrategy = strategy;
             _parameterWriterEncoding = encoding;
         }

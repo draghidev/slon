@@ -326,13 +326,13 @@ sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
                 // protocol recovery and can strand already-pipelined successors; the body instead
                 // observes the latched intent and drains every written command to RFQ.
                 writeTask = _options.Commands.WriteCommandsAsync(context.GetEncoder(), appendSync,
-                    _options.ParameterWriterStrategy ?? ParameterWriterStrategy.Raw, default);
+                    _options.ParameterWriterStrategy, default);
             }
             else
             {
                 using (encoder.BeginResumableScope())
                     writeTask = _options.Commands.WriteCommandsResumable(encoder, appendSync,
-                        _options.ParameterWriterStrategy ?? ParameterWriterStrategy.Raw);
+                        _options.ParameterWriterStrategy);
             }
 
             // Observe synchronous faults here; pending writes remain the framework-owned trailing task.

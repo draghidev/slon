@@ -168,10 +168,11 @@ public partial class SlonParameters
     internal PgTypeId GetResolvedParameterType(int index)
         => GetItemRef(index).TypeResolution.PgTypeId;
 
-    internal Parameter CreateResolvedParameter(int index)
+    internal void GetResolvedParameter(int index, out object? value, out PgTypeInfo typeInfo)
     {
         ref var item = ref GetItemRef(index);
-        return item.TypeResolution.CreateParameter(item.Value, index);
+        value = item.Value;
+        typeInfo = item.TypeResolution.GetTypeInfo(index);
     }
 
     void EnsureParameterResolutionOptions(PgSerializerOptions options)

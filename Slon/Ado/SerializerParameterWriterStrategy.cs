@@ -1,3 +1,5 @@
+using System.Buffers;
+using System.Diagnostics;
 using System.Text;
 using Slon.Buffers;
 using Slon.Pg;
@@ -52,56 +54,68 @@ sealed class SerializerParameterWriterStrategy : ParameterWriterStrategy
         return new(options.GetTypeInfo(value?.GetType(), preparedTypeId));
     }
 
-    public override object CreateState(IOutputWriter output, Encoding textEncoding)
+    public override object CreateWriterState(IOutputWriter output, Encoding textEncoding)
         => new PgWriter(output, new() { TextEncoding = textEncoding });
 
-    public override int GetParameterCount(object source) => ((SlonParameters)source).Count;
     public override PgTypeId GetParameterType(object source, int index)
         => ((SlonParameters)source).GetResolvedParameterType(index);
 
-    public override void Materialize(object source, Span<Parameter> destination)
+    public override WriteLease BeginWrite(object source, int count)
     {
         var parameters = (SlonParameters)source;
-        if (parameters.Count != destination.Length)
+        if (parameters.Count != count)
             ThrowHelper.ThrowInvalidOperation("The parameter source changed during execution.");
-        for (var i = 0; i < destination.Length; i++)
-            destination[i] = parameters.CreateResolvedParameter(i);
+        var bindings = ArrayPool<Binding>.Shared.Rent(count);
+        for (var i = 0; i < count; i++)
+            bindings[i].Initialize();
+        return new(bindings, count, this);
     }
 
-    public override Parameter Bind(object state, int parameterIndex, in Parameter parameter)
+    public override void EndWrite(object writeState, int count)
     {
-        if (!parameter.RequiresBinding)
-            return parameter;
+        var bindings = (Binding[])writeState;
+        foreach (ref readonly var binding in bindings.AsSpan(0, count))
+            binding.Release();
+        ArrayPool<Binding>.Shared.Return(bindings, clearArray: true);
+    }
 
-        var typeInfo = (PgTypeInfo)parameter.TypeResolution!;
-        var conversionContext = ((PgWriter)state).ConversionContext;
-        if (parameter.Value is SlonParameter value)
+    public override int GetSize(object writeState, int parameterIndex)
+        => GetBinding(writeState, parameterIndex).GetSize();
+
+    public override void Bind(object writerState, object source, object writeState, int parameterIndex)
+    {
+        ref var binding = ref GetBinding(writeState, parameterIndex);
+        ((SlonParameters)source).GetResolvedParameter(parameterIndex, out var value, out var typeInfo);
+        var conversionContext = ((PgWriter)writerState).ConversionContext;
+        if (value is SlonParameter parameter)
         {
-            var binder = new ParameterBinder(typeInfo, conversionContext, value);
-            value.Bind(ref binder);
-            return binder.Result;
+            var binder = new ParameterBinder(typeInfo, conversionContext, ref binding);
+            parameter.Bind(ref binder);
+            return;
         }
 
-        var binding = typeInfo.BindParameterValue(conversionContext, parameter.Value);
-        return parameter.WithBinding(binding.Size?.Value ?? -1, binding.WriteState);
+        var result = typeInfo.BindParameterValue(conversionContext, value);
+        binding.Set(result.Size?.Value ?? -1, result.WriteState);
     }
 
-    public override void Write(object state, int parameterIndex, in Parameter parameter)
+    public override void Write(object writerState, object source, object writeState, int parameterIndex)
     {
-        var writer = (PgWriter)state;
-        var converter = ((PgTypeInfo)parameter.TypeResolution!).Converter;
-        var size = parameter.GetSize();
-        writer.Init(writer.ConversionContext, FlushMode.Blocking, parameter.WriteState);
+        ((SlonParameters)source).GetResolvedParameter(parameterIndex, out var value, out var typeInfo);
+        ref readonly var binding = ref GetBinding(writeState, parameterIndex);
+        var writer = (PgWriter)writerState;
+        var converter = typeInfo.Converter;
+        var size = binding.GetSize();
+        writer.Init(writer.ConversionContext, FlushMode.Blocking, binding.WriteState);
         try
         {
-            if (parameter.Value is SlonParameter value)
+            if (value is SlonParameter parameter)
             {
                 var valueWriter = new ParameterWriter(converter, writer);
-                value.Write(ref valueWriter);
+                parameter.Write(ref valueWriter);
             }
             else
             {
-                converter.Write(writer, parameter.Value);
+                converter.Write(writer, value);
             }
             writer.EndWrite(size);
         }
@@ -112,24 +126,26 @@ sealed class SerializerParameterWriterStrategy : ParameterWriterStrategy
         }
     }
 
-    public override async ValueTask WriteAsync(object state, int parameterIndex, Parameter parameter,
-        CancellationToken cancellationToken = default)
+    public override async ValueTask WriteAsync(object writerState, object source, object writeState,
+        int parameterIndex, CancellationToken cancellationToken = default)
     {
-        var writer = (PgWriter)state;
-        var converter = ((PgTypeInfo)parameter.TypeResolution!).Converter;
-        var size = parameter.GetSize();
-        writer.Init(writer.ConversionContext, FlushMode.NonBlocking, parameter.WriteState);
+        ((SlonParameters)source).GetResolvedParameter(parameterIndex, out var value, out var typeInfo);
+        var binding = GetBinding(writeState, parameterIndex);
+        var writer = (PgWriter)writerState;
+        var converter = typeInfo.Converter;
+        var size = binding.GetSize();
+        writer.Init(writer.ConversionContext, FlushMode.NonBlocking, binding.WriteState);
         try
         {
-            if (parameter.Value is SlonParameter value)
+            if (value is SlonParameter parameter)
             {
                 var valueWriter = new AsyncParameterWriter(converter, writer, cancellationToken);
-                value.WriteAsync(ref valueWriter);
+                parameter.WriteAsync(ref valueWriter);
                 await valueWriter.Task.ConfigureAwait(false);
             }
             else
             {
-                await converter.WriteAsync(writer, parameter.Value, cancellationToken).ConfigureAwait(false);
+                await converter.WriteAsync(writer, value, cancellationToken).ConfigureAwait(false);
             }
             writer.EndWrite(size);
         }
@@ -140,42 +156,80 @@ sealed class SerializerParameterWriterStrategy : ParameterWriterStrategy
         }
     }
 
-    internal ref struct ParameterBinder(PgTypeInfo typeInfo, PgConversionContext conversionContext,
-        SlonParameter parameter)
+    internal ref struct ParameterBinder
     {
-        public Parameter Result { get; private set; }
+        readonly PgTypeInfo _typeInfo;
+        readonly PgConversionContext _conversionContext;
+        ref Binding _binding;
 
-        public void Bind<T>(T? value)
+        internal ParameterBinder(PgTypeInfo typeInfo, PgConversionContext conversionContext,
+            ref Binding destination)
         {
-            var binding = typeInfo.BindParameterValue(conversionContext, value);
-            Result = Parameter.CreateUnbound(parameter, typeInfo.PgTypeId, typeInfo)
-                .WithBinding(binding.Size?.Value ?? -1, binding.WriteState);
+            _typeInfo = typeInfo;
+            _conversionContext = conversionContext;
+            _binding = ref destination;
+        }
+
+        internal void Bind<T>(T? value)
+        {
+            var binding = _typeInfo.BindParameterValue(_conversionContext, value);
+            _binding.Set(binding.Size?.Value ?? -1, binding.WriteState);
         }
     }
 
     internal ref struct ParameterWriter(PgConverter converter, PgWriter writer)
     {
-        public void Write<T>(T? value) => converter.Write(writer, value);
+        internal void Write<T>(T? value) => converter.Write(writer, value);
     }
 
     internal ref struct AsyncParameterWriter(PgConverter converter, PgWriter writer,
         CancellationToken cancellationToken)
     {
-        public ValueTask Task { get; private set; }
-        public void Write<T>(T? value) => Task = converter.WriteAsync(writer, value, cancellationToken);
+        internal ValueTask Task { get; private set; }
+        internal void Write<T>(T? value) => Task = converter.WriteAsync(writer, value, cancellationToken);
+    }
+
+    static ref Binding GetBinding(object writeState, int parameterIndex)
+        => ref ((Binding[])writeState)[parameterIndex];
+
+    internal struct Binding
+    {
+        const int Unbound = int.MinValue;
+        int _sizePlusOne;
+        object? _writeState;
+
+        internal readonly object? WriteState => _writeState;
+        internal void Initialize()
+        {
+            _sizePlusOne = Unbound;
+            _writeState = null;
+        }
+
+        internal void Set(int size, object? writeState)
+        {
+            _sizePlusOne = checked(size + 1);
+            _writeState = writeState;
+        }
+
+        internal readonly int GetSize()
+        {
+            Debug.Assert(_sizePlusOne is not Unbound);
+            return _sizePlusOne - 1;
+        }
+
+        internal readonly void Release() => (WriteState as IDisposable)?.Dispose();
     }
 }
 
 readonly struct ParameterTypeResolution(PgTypeInfo? typeInfo)
 {
-    public bool IsResolved => typeInfo is not null;
-    public PgTypeId PgTypeId => typeInfo?.PgTypeId ?? default;
-
-    public Parameter CreateParameter(object? value, int parameterIndex)
+    internal bool IsResolved => typeInfo is not null;
+    internal PgTypeId PgTypeId => typeInfo?.PgTypeId ?? default;
+    internal PgTypeInfo GetTypeInfo(int parameterIndex)
     {
         if (typeInfo is null)
             ThrowHelper.ThrowInvalidOperation(
                 $"Parameter ${parameterIndex + 1} cannot be bound before PostgreSQL resolves its type.");
-        return Parameter.CreateUnbound(value, typeInfo.PgTypeId, typeInfo);
+        return typeInfo;
     }
 }

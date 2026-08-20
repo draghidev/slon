@@ -1,8 +1,6 @@
-using System.Collections.Immutable;
 using System.Data;
 using System.Data.Common;
 using System.Diagnostics;
-using System.Runtime.InteropServices;
 using Slon.Pg;
 using Slon.Text;
 using Slon.Pg.Serialization;
@@ -63,7 +61,8 @@ static class AdoCommandExtensions
         ParameterTypeList parameterTypes = default;
         if (dbParameters?.Count > 0)
         {
-            var parameterArray = serializerOptions is null ? new Parameter[dbParameters.Count] : null;
+            if (serializerOptions is null)
+                ThrowHelper.ThrowInvalidOperation("ADO parameter serialization requires serializer options.");
             using var preparedTypes = preparedParameterTypes.GetEnumerator();
             var parameterIndex = 0;
             foreach (var kv in slonParameters!.GetStructEnumerator())
@@ -76,24 +75,14 @@ static class AdoCommandExtensions
 
                 var currentParameterIndex = parameterIndex++;
                 var preparedType = preparedTypes.MoveNext() ? preparedTypes.Current : (PgTypeId?)null;
-                if (serializerOptions is null)
-                {
-                    var parameter = preparedType is { } type
-                        ? Parameter.Create(kv.Value, type)
-                        : Parameter.Create(kv.Value);
-                    parameterArray![currentParameterIndex] = parameter;
-                    continue;
-                }
-
                 slonParameters.GetOrResolveTypeInfo(
                     currentParameterIndex, serializerOptions, preparedType, allowUnspecified: preparing);
             }
 
-            if (parameterArray is null)
-                parameters = new(slonParameters!);
-            else
-                parameters = ImmutableCollectionsMarshal.AsImmutableArray(parameterArray);
-            parameterTypes = parameters.GetParameterTypes(parameterWriterStrategy ?? ParameterWriterStrategy.Raw);
+            parameters = new(slonParameters!, slonParameters.Count);
+            parameterTypes = new(parameters,
+                parameterWriterStrategy ?? throw new InvalidOperationException(
+                    "ADO parameter serialization requires a writer strategy."));
             Debug.Assert(parameterTypes.Count == dbParameters.Count);
         }
 

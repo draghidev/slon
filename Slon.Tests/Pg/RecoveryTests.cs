@@ -680,12 +680,13 @@ public class RecoveryTests : ConnectionCreatingTest
         await scope.HandoffReady;
         var serializerOptions = new PgSerializerOptions(PgTypeCatalog.Default);
         var value = new SlonParameter<Stream>(new ThrowingReadStream(256 * 1024, 64 * 1024));
-        var parameter = SerializerParameterWriterStrategy.ResolveTypeInfo(
-                value, serializerOptions)
-            .CreateParameter(value, parameterIndex: 0);
-        var command = Command.Create("select octet_length($1::bytea)", new([parameter])) with
+        var parameters = new SlonParameters { value };
+        parameters.GetOrResolveTypeInfo(0, serializerOptions, preparedTypeId: null, allowUnspecified: false);
+        var parameterSource = new ParameterSource(parameters, parameters.Count);
+        var command = Command.Create("select octet_length($1::bytea)",
+            new ParameterTypeList(parameterSource, SerializerParameterWriterStrategy.Instance)) with
         {
-            Parameters = ImmutableArray.Create(parameter)
+            Parameters = parameterSource
         };
         var faulting = new CommandFlow(async: true, new CommandFlowOptions
         {

@@ -167,42 +167,46 @@ readonly struct PgEncoder
             _writer.WriteUInt(enumerator.Current.Oid.Value);
     }
 
-    public ValueTask WriteBindAuto(EncodedString commandName = default, EncodedString portalName = default,
-        ParameterBuffer parameters = default, CancellationToken cancellationToken = default)
-    {
-        if (_executionControl.IsAsync)
-            return WriteBindAsync(commandName, portalName, parameters,
-                cancellationToken: cancellationToken);
-        WriteBind(commandName, portalName, parameters);
-        return new();
-    }
-
     public async ValueTask WriteBindAsync(EncodedString commandName = default, EncodedString portalName = default,
-        ParameterBuffer parameters = default, ImmutableArray<PgFormat> resultFormats = default,
+        ParameterSource parameters = default, ImmutableArray<PgFormat> resultFormats = default,
         ParameterWriterStrategy? parameterWriterStrategy = null,
         CancellationToken cancellationToken = default)
     {
-        NormalizeAndValidate(parameters, ref resultFormats);
-        var strategy = parameterWriterStrategy ?? ParameterWriterStrategy.Raw;
-        var state = BindParameters(parameters, strategy);
-        WriteBindPreamble(commandName, portalName, parameters, resultFormats);
-        for (var parameterIndex = 0; parameterIndex < parameters.Length; parameterIndex++)
+        var parameterCount = parameters.Count;
+        NormalizeAndValidate(parameterCount, ref resultFormats);
+        if (parameters.State is null or Parameter[])
         {
-            var parameter = parameters[parameterIndex];
-            var size = parameter.GetSize();
-            _writer.WriteInt(size);
-            if (size < 0)
-                continue;
-
-            state ??= _writer.GetParameterWriterState(strategy);
-            await strategy.WriteAsync(state, parameterIndex, parameter, cancellationToken).ConfigureAwait(false);
+            var directParameters = parameters.State as Parameter[] ?? [];
+            WriteBindPreamble(commandName, portalName, parameterCount,
+                GetDirectParameterBytes(directParameters), resultFormats);
+            for (var i = 0; i < directParameters.Length; i++)
+                await WriteDirectParameterAsync(directParameters[i], cancellationToken).ConfigureAwait(false);
+        }
+        else
+        {
+            var strategy = parameterWriterStrategy
+                ?? throw new InvalidOperationException("A deferred parameter source requires a writer strategy.");
+            var source = parameters.State;
+            using var lease = strategy.BeginWrite(source, parameterCount);
+            var writeState = lease.State;
+            var writerState = BindParameters(source, writeState, parameterCount, strategy, out var parameterBytes);
+            WriteBindPreamble(commandName, portalName, parameterCount,
+                parameterBytes, resultFormats);
+            for (var i = 0; i < parameterCount; i++)
+            {
+                var size = strategy.GetSize(writeState, i);
+                _writer.WriteInt(size);
+                if (size >= 0)
+                    await strategy.WriteAsync(writerState!, source, writeState, i, cancellationToken)
+                        .ConfigureAwait(false);
+            }
         }
         WriteResultFormats(resultFormats);
     }
 
     // See WriteQueryResumable for the contract.
     public ValueTask WriteBindResumable(EncodedString commandName = default, EncodedString portalName = default,
-        ParameterBuffer parameters = default, ImmutableArray<PgFormat> resultFormats = default,
+        ParameterSource parameters = default, ImmutableArray<PgFormat> resultFormats = default,
         ParameterWriterStrategy? parameterWriterStrategy = null)
         => WriteBindAsync(commandName, portalName, parameters, resultFormats, parameterWriterStrategy);
 
@@ -219,55 +223,64 @@ readonly struct PgEncoder
     }
 
     public void WriteBind(EncodedString commandName = default, EncodedString portalName = default,
-        ParameterBuffer parameters = default, ImmutableArray<PgFormat> resultFormats = default,
+        ParameterSource parameters = default, ImmutableArray<PgFormat> resultFormats = default,
         ParameterWriterStrategy? parameterWriterStrategy = null)
     {
-        NormalizeAndValidate(parameters, ref resultFormats);
-        var strategy = parameterWriterStrategy ?? ParameterWriterStrategy.Raw;
-        var state = BindParameters(parameters, strategy);
-        WriteBindPreamble(commandName, portalName, parameters, resultFormats);
-        for (var parameterIndex = 0; parameterIndex < parameters.Length; parameterIndex++)
+        var parameterCount = parameters.Count;
+        NormalizeAndValidate(parameterCount, ref resultFormats);
+        if (parameters.State is null or Parameter[])
         {
-            var parameter = parameters[parameterIndex];
-            var size = parameter.GetSize();
-            _writer.WriteInt(size);
-            if (size < 0)
-                continue;
-
-            state ??= _writer.GetParameterWriterState(strategy);
-            strategy.Write(state, parameterIndex, in parameter);
+            var directParameters = parameters.State as Parameter[] ?? [];
+            WriteBindPreamble(commandName, portalName, parameterCount,
+                GetDirectParameterBytes(directParameters), resultFormats);
+            foreach (var parameter in directParameters)
+                WriteDirectParameter(parameter);
+        }
+        else
+        {
+            var strategy = parameterWriterStrategy
+                ?? throw new InvalidOperationException("A deferred parameter source requires a writer strategy.");
+            var source = parameters.State;
+            using var lease = strategy.BeginWrite(source, parameterCount);
+            var writeState = lease.State;
+            var writerState = BindParameters(source, writeState, parameterCount, strategy, out var parameterBytes);
+            WriteBindPreamble(commandName, portalName, parameterCount,
+                parameterBytes, resultFormats);
+            for (var i = 0; i < parameterCount; i++)
+            {
+                var size = strategy.GetSize(writeState, i);
+                _writer.WriteInt(size);
+                if (size >= 0)
+                    strategy.Write(writerState!, source, writeState, i);
+            }
         }
         WriteResultFormats(resultFormats);
     }
 
-    object? BindParameters(ParameterBuffer parameters, ParameterWriterStrategy strategy)
+    object? BindParameters(object source, object writeState, int parameterCount,
+        ParameterWriterStrategy strategy, out int parameterBytes)
     {
-        object? state = null;
-        for (var parameterIndex = 0; parameterIndex < parameters.Length; parameterIndex++)
-        {
-            var parameter = parameters[parameterIndex];
-            if (!parameter.RequiresBinding)
-                continue;
+        parameterBytes = sizeof(ushort);
+        if (parameterCount is 0)
+            return null;
 
-            state ??= _writer.GetParameterWriterState(strategy);
-            parameters[parameterIndex] = strategy.Bind(state, parameterIndex, in parameter);
+        var writerState = _writer.GetParameterWriterState(strategy);
+        for (var parameterIndex = 0; parameterIndex < parameterCount; parameterIndex++)
+        {
+            strategy.Bind(writerState, source, writeState, parameterIndex);
+            parameterBytes = checked(parameterBytes + sizeof(int)
+                + Math.Max(0, strategy.GetSize(writeState, parameterIndex)));
         }
-        return state;
+        return writerState;
     }
 
     void WriteBindPreamble(EncodedString commandName, EncodedString portalName,
-        ParameterBuffer parameters, ImmutableArray<PgFormat> resultFormats)
+        int parameterCountValue, int parameterBytes, ImmutableArray<PgFormat> resultFormats)
     {
         var encoding = ClientEncoding;
         var portalNameBytes = portalName.AsNullTerminatedSpan(encoding);
         var commandNameBytes = commandName.AsNullTerminatedSpan(encoding);
-        var parameterCount = checked((ushort)parameters.Length);
-        var parameterBytes = sizeof(ushort);
-        foreach (var parameter in parameters.Span)
-        {
-            var size = parameter.GetSize();
-            parameterBytes = checked(parameterBytes + sizeof(int) + Math.Max(0, size));
-        }
+        var parameterCount = checked((ushort)parameterCountValue);
         var formatCodeBytes = parameterCount is 0 ? sizeof(ushort) : 2 * sizeof(ushort);
 
         StartMessage(FrontendType.Bind, bodyLength: checked(
@@ -288,6 +301,65 @@ readonly struct PgEncoder
         }
     }
 
+    static int GetDirectParameterBytes(Parameter[] parameters)
+    {
+        var bytes = sizeof(ushort);
+        foreach (var parameter in parameters)
+            bytes = checked(bytes + sizeof(int) + Math.Max(0, parameter.Size));
+        return bytes;
+    }
+
+    void WriteDirectParameter(in Parameter parameter)
+    {
+        var size = parameter.Size;
+        _writer.WriteInt(size);
+        if (size < 0)
+            return;
+        if (parameter.Value is byte[] bytes)
+        {
+            _writer.WriteRaw(bytes);
+            return;
+        }
+
+        var stream = (Stream)parameter.Value!;
+        var remaining = size;
+        while (remaining > 0)
+        {
+            var span = _writer.GetSpan(1);
+            var read = stream.Read(span[..Math.Min(span.Length, remaining)]);
+            if (read is 0)
+                throw new EndOfStreamException("Parameter stream ended before its declared length.");
+            _writer.Advance(read);
+            remaining -= read;
+        }
+    }
+
+    async ValueTask WriteDirectParameterAsync(Parameter parameter, CancellationToken cancellationToken)
+    {
+        var size = parameter.Size;
+        _writer.WriteInt(size);
+        if (size < 0)
+            return;
+        if (parameter.Value is byte[] bytes)
+        {
+            _writer.WriteRaw(bytes);
+            return;
+        }
+
+        var stream = (Stream)parameter.Value!;
+        var remaining = size;
+        while (remaining > 0)
+        {
+            var memory = _writer.GetMemory(1);
+            var read = await stream.ReadAsync(memory[..Math.Min(memory.Length, remaining)], cancellationToken)
+                .ConfigureAwait(false);
+            if (read is 0)
+                throw new EndOfStreamException("Parameter stream ended before its declared length.");
+            _writer.Advance(read);
+            remaining -= read;
+        }
+    }
+
     void WriteResultFormats(ImmutableArray<PgFormat> resultFormats)
     {
         if (resultFormats.Length is 0)
@@ -302,12 +374,12 @@ readonly struct PgEncoder
             _writer.WriteUShort((ushort)format);
     }
 
-    static void NormalizeAndValidate(ParameterBuffer parameters, ref ImmutableArray<PgFormat> resultFormats)
+    static void NormalizeAndValidate(int parameterCount, ref ImmutableArray<PgFormat> resultFormats)
     {
         if (resultFormats.IsDefault)
             resultFormats = ImmutableArray<PgFormat>.Empty;
-        if (parameters.Length > ushort.MaxValue)
-            throw new ArgumentException("Too many parameters.", nameof(parameters));
+        if (parameterCount > ushort.MaxValue)
+            throw new ArgumentException("Too many parameters.", nameof(parameterCount));
         if (resultFormats.Length > ushort.MaxValue)
             throw new ArgumentException("Too many result format codes.", nameof(resultFormats));
         foreach (var format in resultFormats)

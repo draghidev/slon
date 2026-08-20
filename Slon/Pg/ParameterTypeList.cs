@@ -13,38 +13,31 @@ readonly struct ParameterTypeList : IEquatable<ParameterTypeList>
 {
     readonly object _source;
     readonly ParameterWriterStrategy? _strategy;
+    readonly int _count;
 
     public ParameterTypeList(ImmutableArray<PgTypeId> typeIds)
     {
-        if (!MemoryMarshal.TryGetArray(typeIds.AsMemory(), out var seg) || seg.Array!.Length != seg.Count)
-            ThrowHelper.ThrowArgumentException(nameof(typeIds), "Must be backed by an exact sized array.");
-
-        _source = seg.Array!;
+        _source = ImmutableCollectionsMarshal.AsArray(typeIds)!;
         _strategy = null;
+        _count = typeIds.Length;
     }
 
     public ParameterTypeList(ImmutableArray<Parameter> parameters)
     {
-        if (!MemoryMarshal.TryGetArray(parameters.AsMemory(), out var seg) || seg.Array!.Length != seg.Count)
-            ThrowHelper.ThrowArgumentException(nameof(parameters), "Must be backed by an exact sized array.");
-
-        _source = seg.Array!;
+        _source = ImmutableCollectionsMarshal.AsArray(parameters)!;
         _strategy = null;
+        _count = parameters.Length;
     }
 
-    internal ParameterTypeList(object? source, ParameterWriterStrategy strategy)
+    public ParameterTypeList(in ParameterSource source, ParameterWriterStrategy strategy)
     {
-        _source = source!;
+        _source = source.State!;
         _strategy = strategy;
+        _count = source.Count;
     }
 
     public ushort PgCount => checked((ushort)Count);
-    public int Count => _source switch
-    {
-        null => 0,
-        Array array => array.Length,
-        var state => _strategy!.GetParameterCount(state)
-    };
+    public int Count => _count;
 
     public ParameterTypeList Preserve(Func<PgTypeId, Oid>? oidLookup = null)
     {
@@ -59,15 +52,13 @@ readonly struct ParameterTypeList : IEquatable<ParameterTypeList>
         return new(ImmutableCollectionsMarshal.AsImmutableArray(array));
     }
 
-    public static ParameterTypeList Create(ImmutableArray<Parameter> parameters) => new(parameters);
-
     // Create a NULL filled parameter list, used to make portal describe easy.
-    internal ImmutableArray<Parameter> ToDbNullParameterList()
+    internal ParameterSource CreateNullParameters()
     {
         if (Count is 0)
             return default;
 
-        return ImmutableCollectionsMarshal.AsImmutableArray(new Parameter[Count]);
+        return new(ImmutableCollectionsMarshal.AsImmutableArray(new Parameter[Count]));
     }
 
     [UnscopedRef]
@@ -92,8 +83,7 @@ readonly struct ParameterTypeList : IEquatable<ParameterTypeList>
             {
                 case Parameter[] parameters when index < parameters.Length:
                 {
-                    var pgTypeId = parameters[index].PgTypeId;
-                    _current = pgTypeId.IsDataTypeName && oidLookup is not null ? oidLookup(pgTypeId) : pgTypeId;
+                    _current = parameters[index].Oid;
                     return true;
                 }
                 case PgTypeId[] pgTypeIds when index < pgTypeIds.Length:
@@ -102,7 +92,7 @@ readonly struct ParameterTypeList : IEquatable<ParameterTypeList>
                     _current = pgTypeId.IsDataTypeName && oidLookup is not null ? oidLookup(pgTypeId) : pgTypeId;
                     return true;
                 }
-                case not null when _list._strategy is { } strategy && index < strategy.GetParameterCount(_list._source):
+                case not null when _list._strategy is { } strategy && index < _list._count:
                 {
                     var pgTypeId = strategy.GetParameterType(_list._source, index);
                     _current = pgTypeId.IsDataTypeName && oidLookup is not null ? oidLookup(pgTypeId) : pgTypeId;
@@ -168,10 +158,12 @@ readonly struct ParameterTypeList : IEquatable<ParameterTypeList>
     }
 
     public bool Equals(ParameterTypeList other)
-        => ReferenceEquals(_source, other._source) && ReferenceEquals(_strategy, other._strategy);
+        => _count == other._count
+            && ReferenceEquals(_source, other._source)
+            && ReferenceEquals(_strategy, other._strategy);
 
     public override bool Equals(object? obj) => obj is ParameterTypeList other && Equals(other);
-    public override int GetHashCode() => throw new NotImplementedException();
+    public override int GetHashCode() => HashCode.Combine(_source, _strategy, _count);
     public static bool operator ==(ParameterTypeList left, ParameterTypeList right) => left.Equals(right);
     public static bool operator !=(ParameterTypeList left, ParameterTypeList right) => !left.Equals(right);
 }

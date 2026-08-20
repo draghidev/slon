@@ -57,8 +57,8 @@ public class ProtocolExecutionTests
     public async Task Preparation_UsesStatementParametersAndPortalRowDescription()
     {
         await using var protocol = await PgTestPool.NewIsolatedAsync();
-        var parameters = ImmutableArray.Create(Parameter.Create(null, default(PgTypeId)));
-        var command = Command.Create("select $1::int, 42", ParameterTypeList.Create(parameters), "prepared_probe") with
+        var parameters = ImmutableArray.Create(Parameter.CreateNull(Oid.Unspecified));
+        var command = Command.Create("select $1::int, 42", new ParameterTypeList(parameters), "prepared_probe") with
         {
             DescribeOnly = true,
             DescribeForPreparation = true,

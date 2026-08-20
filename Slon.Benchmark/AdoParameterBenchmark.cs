@@ -79,12 +79,13 @@ public class AdoParameterBenchmark : ClientBenchmark
         }
         await _externalCommand.ExecuteScalarAsync(_externalParameters);
 
-        _parameterSource = new(_externalParameters);
+        _parameterSource = new(_externalParameters, _externalParameters.Count);
         _parameterWriterStrategy = _dataSource.GetDbDependencies().ParameterWriterStrategy;
-        _parameterWriterState = _parameterWriterStrategy.CreateState(new BufferOutputWriter(), Encoding.UTF8);
+        _parameterWriterState = _parameterWriterStrategy.CreateWriterState(new BufferOutputWriter(), Encoding.UTF8);
 
         // Warm the shared array pool before measuring materialization.
-        using var warmLease = _parameterSource.Materialize(_parameterWriterStrategy);
+        using var warmLease = _parameterWriterStrategy.BeginWrite(
+            _parameterSource.State!, _parameterSource.Count);
     }
 
     [GlobalCleanup]
@@ -98,32 +99,34 @@ public class AdoParameterBenchmark : ClientBenchmark
     }
 
     [Benchmark]
-    public int MaterializeResolvedParameter()
+    public int BeginParameterWrite()
     {
-        using var lease = _parameterSource.Materialize(_parameterWriterStrategy);
-        return lease.Buffer.Length;
+        var count = _parameterSource.Count;
+        using var lease = _parameterWriterStrategy.BeginWrite(_parameterSource.State!, count);
+        return count;
     }
 
     [Benchmark]
-    public int MaterializeAndBindResolvedParameter()
+    public int BeginAndBindParameterWrite()
     {
-        using var lease = _parameterSource.Materialize(_parameterWriterStrategy);
+        var source = _parameterSource.State!;
+        var count = _parameterSource.Count;
+        using var lease = _parameterWriterStrategy.BeginWrite(source, count);
+        var writeState = lease.State;
         var totalSize = 0;
-        for (var i = 0; i < lease.Buffer.Length; i++)
+        for (var i = 0; i < count; i++)
         {
-            ref var destination = ref lease.Buffer[i];
-            var parameter = destination;
-            destination = _parameterWriterStrategy.Bind(_parameterWriterState, i, in parameter);
-            totalSize += destination.GetSize();
+            _parameterWriterStrategy.Bind(_parameterWriterState, source, writeState, i);
+            totalSize += _parameterWriterStrategy.GetSize(writeState, i);
         }
         return totalSize;
     }
 
     [Benchmark]
-    public int MaterializeAndBindChangedValues()
+    public int BeginAndBindChangedValues()
     {
         SetValues(_externalParameterValues);
-        return MaterializeAndBindResolvedParameter();
+        return BeginAndBindParameterWrite();
     }
 
     [Benchmark]

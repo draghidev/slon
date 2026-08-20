@@ -1,50 +1,45 @@
-using System.Buffers.Binary;
 using System.Text;
 using Slon.Buffers;
 using Slon.Pg.Types;
 
 namespace Slon.Pg;
 
-// Protocol-facing parameter serialization boundary. A flow captures one strategy with its
-// dependency snapshot; the protocol owns Bind framing while the returned session owns value
-// encoding, resumable flushes and implementation-specific write state.
+// Protocol-facing parameter serialization component. The protocol owns Bind framing; the
+// component projects parameter types and owns its per-wire writer and per-execution write state.
 abstract class ParameterWriterStrategy
 {
-    public static ParameterWriterStrategy Raw { get; } = new RawParameterWriterStrategy();
-
-    public abstract object CreateState(IOutputWriter output, Encoding textEncoding);
-    public virtual int GetParameterCount(object source)
-        => throw new NotSupportedException("This parameter writer strategy does not support deferred sources.");
-    public virtual PgTypeId GetParameterType(object source, int index)
-        => throw new NotSupportedException("This parameter writer strategy does not support deferred sources.");
-    public virtual void Materialize(object source, Span<Parameter> destination)
-        => throw new NotSupportedException("This parameter writer strategy does not support deferred sources.");
-    public virtual Parameter Bind(object state, int parameterIndex, in Parameter parameter)
-        => parameter;
-    public abstract void Write(object state, int parameterIndex, in Parameter parameter);
-    public abstract ValueTask WriteAsync(object state, int parameterIndex, Parameter parameter,
-        CancellationToken cancellationToken = default);
-
-    sealed class RawParameterWriterStrategy : ParameterWriterStrategy
+    public struct WriteLease : IDisposable
     {
-        public override object CreateState(IOutputWriter output, Encoding textEncoding) => output;
+        object? _state;
+        readonly ParameterWriterStrategy? _strategy;
+        readonly int _count;
 
-        public override void Write(object state, int parameterIndex, in Parameter parameter)
+        public WriteLease(object state, int count, ParameterWriterStrategy strategy)
         {
-            if (parameter.ResolvedValueType != typeof(int))
-                throw new NotSupportedException("Only int parameters are supported without a parameter writer strategy.");
-
-            var output = (IOutputWriter)state;
-            var span = output.GetSpan(sizeof(int));
-            BinaryPrimitives.WriteInt32BigEndian(span, (int)parameter.Value!);
-            output.Advance(sizeof(int));
+            _state = state;
+            _strategy = strategy;
+            _count = count;
         }
 
-        public override ValueTask WriteAsync(object state, int parameterIndex, Parameter parameter,
-            CancellationToken cancellationToken = default)
+        public readonly object State => _state!;
+
+        void IDisposable.Dispose()
         {
-            Write(state, parameterIndex, in parameter);
-            return default;
+            var state = _state;
+            if (state is null)
+                return;
+            _state = null;
+            _strategy!.EndWrite(state, _count);
         }
     }
+
+    public abstract object CreateWriterState(IOutputWriter output, Encoding textEncoding);
+    public abstract PgTypeId GetParameterType(object source, int index);
+    public abstract WriteLease BeginWrite(object source, int count);
+    public virtual void EndWrite(object writeState, int count) { }
+    public abstract int GetSize(object writeState, int parameterIndex);
+    public virtual void Bind(object writerState, object source, object writeState, int parameterIndex) { }
+    public abstract void Write(object writerState, object source, object writeState, int parameterIndex);
+    public abstract ValueTask WriteAsync(object writerState, object source, object writeState, int parameterIndex,
+        CancellationToken cancellationToken = default);
 }
