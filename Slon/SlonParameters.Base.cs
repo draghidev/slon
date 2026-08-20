@@ -31,16 +31,16 @@ public partial class SlonParameters
         {
             if (value is DbParameter)
             {
-                if (value is not SlonDbParameter p)
+                if (value is not SlonParameter p)
                     throw new InvalidCastException(
-                        $"The DbParameter \"{value}\" is not of type \"{nameof(SlonDbParameter)}\" and cannot be used in this parameter collection, it can be added as a value to an {nameof(SlonDbParameter)} if this was intended.");
+                        $"The DbParameter \"{value}\" is not of type \"{nameof(SlonParameter)}\" and cannot be used in this parameter collection, it can be added as a value to an {nameof(SlonParameter)} if this was intended.");
 
                 // Prevent any changes from now on as the name may end up being used in the lookup.
                 // We don't want the lookup to get out of sync but we also don't want any backreferences from parameter to collection so we freeze the name instead.
                 p.NotifyCollectionAdd();
 
                 if (!name.AsSpan().Equals(CreateNameSpan(p.ParameterName), StringComparison.OrdinalIgnoreCase))
-                    throw new ArgumentException($"Parameter name must be a case-insensitive match with the property '{nameof(SlonDbParameter.ParameterName)}' on the given {nameof(SlonDbParameter)}.", nameof(name));
+                    throw new ArgumentException($"Parameter name must be a case-insensitive match with the property '{nameof(SlonParameter.ParameterName)}' on the given {nameof(SlonParameter)}.", nameof(name));
             }
 
             _name = name;
@@ -53,13 +53,13 @@ public partial class SlonParameters
         /// The canonical name used for uniqueness.
         public string Name => _name;
 
-        /// Either null, an object or an SlonDbParameter, any other derived DbParameter types are not accepted.
+        /// Either null, an object or a SlonParameter, any other derived DbParameter types are not accepted.
         public object? Value => _value;
         internal ParameterTypeResolution TypeResolution => _typeResolution;
 
-        public bool TryGetAsParameter([NotNullWhen(true)]out SlonDbParameter? parameter)
+        public bool TryGetAsParameter([NotNullWhen(true)]out SlonParameter? parameter)
         {
-            if (Value is SlonDbParameter p)
+            if (Value is SlonParameter p)
             {
                 parameter = p;
                 return true;
@@ -77,7 +77,7 @@ public partial class SlonParameters
             resolution = _typeResolution;
             if (!resolution.IsResolved)
                 return false;
-            if (Value is SlonDbParameter parameter && parameter.TypeRevision != _typeRevision)
+            if (Value is SlonParameter parameter && parameter.TypeRevision != _typeRevision)
                 return false;
             if (preparedTypeId is null)
                 return !_resolvedForPreparedType;
@@ -90,7 +90,7 @@ public partial class SlonParameters
 
         public ParameterItem WithTypeResolution(ParameterTypeResolution resolution, bool resolvedForPreparedType)
             => new(_name, _value, resolution,
-                Value is SlonDbParameter parameter ? parameter.TypeRevision : 0,
+                Value is SlonParameter parameter ? parameter.TypeRevision : 0,
                 resolvedForPreparedType);
 
         public ParameterItem WithoutTypeResolution()
@@ -98,7 +98,7 @@ public partial class SlonParameters
 
         public ParameterItem PreserveTypeResolutionFrom(in ParameterItem previous)
         {
-            if (Value is IParameter || previous.Value is IParameter
+            if (Value is SlonParameter || previous.Value is SlonParameter
                 || Value?.GetType() != previous.Value?.GetType())
             {
                 return this;
@@ -262,7 +262,7 @@ public partial class SlonParameters
     ref ParameterItem GetItemRef(int index) => ref CollectionsMarshal.AsSpan(_parameters)[index];
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    SlonDbParameter GetOrAddParameterInstance(int index)
+    SlonParameter GetOrAddParameterInstance(int index)
     {
         ref var p = ref GetItemRef(index);
         if (p.TryGetAsParameter(out var parameter))
@@ -270,7 +270,7 @@ public partial class SlonParameters
 
         return ReplaceValue(ref p);
 
-        SlonDbParameter ReplaceValue(ref ParameterItem p)
+        SlonParameter ReplaceValue(ref ParameterItem p)
         {
             var parameter = CreateParameter(p.Name, p.Value);
             p = ParameterItem.Create(p.Name, parameter);
@@ -286,18 +286,18 @@ public partial class SlonParameters
         return _parameters.Count;
     }
 
-    /// parameterName can only be null if object is an instance of SlonDbParameter.
+    /// parameterName can only be null if object is an instance of SlonParameter.
     int AddCore(string? parameterName, object? value)
     {
-        if (parameterName is null && value is not SlonDbParameter)
+        if (parameterName is null && value is not SlonParameter)
         {
             if (CanParameterBePositional)
                 parameterName = PositionalName;
             else if (!AlwaysCreateParameter)
-                ThrowHelper.ThrowInvalidOperation($"Parameters must be of type {nameof(SlonDbParameter)} when no parameter name is given.");
+                ThrowHelper.ThrowInvalidOperation($"Parameters must be of type {nameof(SlonParameter)} when no parameter name is given.");
         }
 
-        if (AlwaysCreateParameter && value is not SlonDbParameter)
+        if (AlwaysCreateParameter && value is not SlonParameter)
         {
             Debug.Assert(parameterName is not null);
             value = CreateParameter(parameterName, value);
@@ -455,7 +455,7 @@ public partial class SlonParameters: DbParameterCollection, ICollection<KeyValue
 
     /// <summary>Adds a parameter instance.</summary>
     /// <param name="parameter">The parameter instance.</param>
-    public void Add(SlonDbParameter parameter)
+    public void Add(SlonParameter parameter)
     {
         AddCore(parameter);
     }

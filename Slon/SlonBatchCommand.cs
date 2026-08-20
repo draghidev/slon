@@ -60,7 +60,7 @@ public sealed class SlonBatchCommand : DbBatchCommand, IAdoCommand
     /// <inheritdoc cref="System.Data.Common.DbBatchCommand.RecordsAffected" />
     public override int RecordsAffected { get; }
 
-    /// <summary>Gets the collection of <see cref="T:Slon.SlonDbParameter" /> objects. For more information on parameters, see Configuring Parameters and Parameter Data Types.</summary>
+    /// <summary>Gets the collection of <see cref="T:Slon.SlonParameter" /> objects. For more information on parameters, see Configuring Parameters and Parameter Data Types.</summary>
     /// <returns>The parameters of the SQL statement or stored procedure.</returns>
     public new SlonParameters Parameters => _parameters ??= new();
     /// <inheritdoc cref="System.Data.Common.DbBatchCommand.DbParameterCollection" />

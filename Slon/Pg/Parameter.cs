@@ -152,7 +152,5 @@ readonly struct Parameter
         _ => throw new NotSupportedException()
     };
 
-    static Type? ResolveValueType(object? value) => value is IParameter p
-        ? p.StaticValueType is var type && type == typeof(object) ? p.Value?.GetType() : type
-        : value?.GetType();
+    static Type? ResolveValueType(object? value) => value?.GetType();
 }

@@ -9,7 +9,7 @@ namespace Slon;
 /// Represents a collection of parameters relevant to a <see cref="Slon.SlonCommand"/> or <see cref="Slon.SlonBatchCommand"/> as well as their respective mappings to columns in
 /// a <see cref="DataSet"/>.
 /// </summary>
-public sealed partial class SlonParameters : IList<SlonDbParameter>
+public sealed partial class SlonParameters : IList<SlonParameter>
 {
     public SlonParameters() : this(initialCapacity: 5) {}
     public SlonParameters(IEnumerable<KeyValuePair<string, object?>> parameters) : this(initialCapacity: 5)
@@ -168,7 +168,7 @@ public sealed partial class SlonParameters : IList<SlonDbParameter>
         AddCore(parameterName, parameter);
     }
 
-    bool TryGetValueCore(string parameterName, [NotNullWhen(true)]out SlonDbParameter? parameter)
+    bool TryGetValueCore(string parameterName, [NotNullWhen(true)]out SlonParameter? parameter)
     {
         var index = IndexOfCore(parameterName);
 
@@ -183,7 +183,7 @@ public sealed partial class SlonParameters : IList<SlonDbParameter>
     }
 
     /// <inheritdoc />
-    IEnumerator<SlonDbParameter> IEnumerable<SlonDbParameter>.GetEnumerator()
+    IEnumerator<SlonParameter> IEnumerable<SlonParameter>.GetEnumerator()
     {
         for (var i = 0; i < Count; i++)
             yield return GetOrAddParameterInstance(i);
@@ -194,12 +194,12 @@ public sealed partial class SlonParameters : IList<SlonDbParameter>
     /// <value>
     /// The <see cref="SlonParameter"/> with the specified name, or a <see langword="null"/> reference if the parameter is not found.
     /// </value>
-    public new SlonDbParameter this[string parameterName]
+    public new SlonParameter this[string parameterName]
     {
         get
         {
             ArgumentNullException.ThrowIfNull(parameterName);
-            if (!TryGetValueCore(parameterName, out SlonDbParameter? parameter))
+            if (!TryGetValueCore(parameterName, out SlonParameter? parameter))
                 throw new ArgumentException("Parameter was not found.");
 
             return parameter;
@@ -220,7 +220,7 @@ public sealed partial class SlonParameters : IList<SlonDbParameter>
     /// <summary>Gets the <see cref="SlonParameter"/> at the specified index.</summary>
     /// <param name="index">The zero-based index of the <see cref="SlonParameter"/> to retrieve.</param>
     /// <value>The <see cref="SlonParameter"/> at the specified index.</value>
-    public new SlonDbParameter this[int index]
+    public new SlonParameter this[int index]
     {
         get
         {
@@ -241,8 +241,8 @@ public sealed partial class SlonParameters : IList<SlonDbParameter>
         }
     }
 
-    /// <summary>Gets a value indicating whether a <see cref="Slon.SlonDbParameter"/> with the specified name exists in the collection.</summary>
-    /// <param name="parameterName">The name of the <see cref="Slon.SlonDbParameter"/> object to find.</param>
+    /// <summary>Gets a value indicating whether a <see cref="Slon.SlonParameter"/> with the specified name exists in the collection.</summary>
+    /// <param name="parameterName">The name of the <see cref="Slon.SlonParameter"/> object to find.</param>
     /// <param name="parameter">
     /// A reference to the requested parameter is returned if it is found in the list.
     /// This value is <see langword="null"/> if the parameter is not found.
@@ -251,19 +251,19 @@ public sealed partial class SlonParameters : IList<SlonDbParameter>
     /// <see langword="true"/> if the collection contains the parameter and param will contain the parameter.
     /// Otherwise, <see langword="false"/>.
     /// </returns>
-    public bool TryGetValue(string parameterName, [NotNullWhen(true)] out SlonDbParameter? parameter)
+    public bool TryGetValue(string parameterName, [NotNullWhen(true)] out SlonParameter? parameter)
     {
         ArgumentNullException.ThrowIfNull(parameterName);
         return TryGetValueCore(parameterName, out parameter);
     }
 
     /// <inheritdoc />
-    void ICollection<SlonDbParameter>.Add(SlonDbParameter item) => AddCore(null, item ?? throw new ArgumentNullException(nameof(item)));
+    void ICollection<SlonParameter>.Add(SlonParameter item) => AddCore(null, item ?? throw new ArgumentNullException(nameof(item)));
 
     /// <summary>Insert the specified parameter into the collection.</summary>
     /// <param name="index">Index of the existing parameter before which to insert the new one.</param>
     /// <param name="value">Parameter to insert.</param>
-    public void Insert(int index, SlonDbParameter value)
+    public void Insert(int index, SlonParameter value)
     {
         if ((uint)index > Count)
             throw new ArgumentOutOfRangeException(nameof(index), "Index cannot be negative or larger than Count.");
@@ -277,7 +277,7 @@ public sealed partial class SlonParameters : IList<SlonDbParameter>
     /// <summary>Remove the specified parameter from the collection.</summary>
     /// <param name="value">Parameter to remove.</param>
     /// <returns>True if the parameter was found and removed, otherwise false.</returns>
-    public bool Remove(SlonDbParameter value)
+    public bool Remove(SlonParameter value)
     {
         var index = IndexOfCore(value ?? throw new ArgumentNullException(nameof(value)));
         if (index == -1)
@@ -290,7 +290,7 @@ public sealed partial class SlonParameters : IList<SlonDbParameter>
     /// <summary>Report the offset within the collection of the given parameter.</summary>
     /// <param name="value">Parameter to find.</param>
     /// <returns>Index of the parameter, or -1 if the parameter is not present.</returns>
-    public int IndexOf(SlonDbParameter value)
+    public int IndexOf(SlonParameter value)
     {
         if (value is null)
             throw new ArgumentNullException(nameof(value));
@@ -301,7 +301,7 @@ public sealed partial class SlonParameters : IList<SlonDbParameter>
     /// <summary>Report whether the specified parameter is present in the collection.</summary>
     /// <param name="value">Parameter to find.</param>
     /// <returns>True if the parameter was found, otherwise false.</returns>
-    public bool Contains(SlonDbParameter value)
+    public bool Contains(SlonParameter value)
     {
         if (value is null)
             throw new ArgumentNullException(nameof(value));
@@ -312,12 +312,12 @@ public sealed partial class SlonParameters : IList<SlonDbParameter>
     /// <summary>Convert collection to a System.Array.</summary>
     /// <param name="array">Destination array.</param>
     /// <param name="arrayIndex">Starting index in destination array.</param>
-    public void CopyTo(SlonDbParameter[] array, int arrayIndex) => CopyTo((Array)array, arrayIndex);
+    public void CopyTo(SlonParameter[] array, int arrayIndex) => CopyTo((Array)array, arrayIndex);
 
     /// <inheritdoc />
-    bool ICollection<SlonDbParameter>.IsReadOnly => false;
+    bool ICollection<SlonParameter>.IsReadOnly => false;
 
     bool CanParameterBePositional => true;
     bool AlwaysCreateParameter => false;
-    SlonDbParameter CreateParameter(string parameterName, object? value) => new SlonParameter(parameterName, value);
+    SlonParameter CreateParameter(string parameterName, object? value) => new(parameterName, value);
 }

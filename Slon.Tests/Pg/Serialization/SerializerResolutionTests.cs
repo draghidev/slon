@@ -92,7 +92,7 @@ public class SerializerResolutionTests
         Assert.AreSame(typedFirst.TypeResolution,
             Resolve(typedParameters, typedValue).TypeResolution);
 
-        void VerifyObjectParameter(SlonDbParameter value)
+        void VerifyObjectParameter(SlonParameter value)
         {
             var parameters = new SlonParameters { value };
             var first = Resolve(parameters, value);
@@ -110,7 +110,7 @@ public class SerializerResolutionTests
             Assert.AreEqual((Oid)1043u, requestedType.PgTypeId.Oid);
         }
 
-        Parameter Resolve(SlonParameters parameters, SlonDbParameter value)
+        Parameter Resolve(SlonParameters parameters, SlonParameter value)
             => parameters.GetOrResolveTypeInfo(
                     0, options, preparedTypeId: null, allowUnspecified: false)
                 .CreateParameter(value, parameterIndex: 0);

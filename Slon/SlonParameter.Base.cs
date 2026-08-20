@@ -1,43 +1,27 @@
 using System.Data;
 using System.Data.Common;
 using System.Diagnostics.CodeAnalysis;
-using System.Runtime.CompilerServices;
-using Slon.Pg;
 
 namespace Slon;
 
-// TODO old code, should redo it with a bit less twiddling.
-
-// Size optimized base class.
-// Originally DbDataParameter but now just a partial of SlonDbParameter, implements all the uninteresting base members.
-public abstract partial class SlonDbParameter
+// Implements the size-optimized storage for the less frequently used DbParameter members.
+public partial class SlonParameter
 {
+    const byte DirectionMask = 0b0000_0111;
+    const byte NullableMask = 0b0100_0000;
+    const byte FrozenNameMask = 0b1000_0000;
+
     // Either a parameter name (string) or a reference to additional (less commonly used) properties, see Props below.
     object _nameOrProps = "";
+    byte _flags = (byte)ParameterDirection.Input;
 
-    // TODO Maybe want to use a BitVector32 for _combinedEnums.
-    // Combines 'Uses' (first 3 bytes), the last byte contains 'ParameterDirection' (least significant 3 bits), 'IsNullable' (bit 7) and 'IsFrozenName' (bit 8).
-    volatile uint _combinedEnums;
+    private protected void InitializeName(string parameterName)
+        => _nameOrProps = parameterName ?? string.Empty;
 
-    // Internal for now.
-    private protected SlonDbParameter() {}
-    private protected SlonDbParameter(string parameterName)
-        :this()
-        => _nameOrProps = parameterName ?? string.Empty; // Just to be sure, it's relied upon in the implementation.
-
-    bool IsReadOnlyName
+    bool IsNameFrozen
     {
-        get => (_combinedEnums & 0x80) == 0x80; // get the most significant bit.
-        set
-        {
-            uint current;
-            uint newValue;
-            do
-            {
-                current = _combinedEnums;
-                newValue = (uint)(value ? 1 : 0) << 7 | (current & 0xffffff7f); // 0x7f == 255 - 128
-            } while (Interlocked.CompareExchange(ref _combinedEnums, newValue, current) != (int)current);
-        }
+        get => (_flags & FrozenNameMask) != 0;
+        set => _flags = value ? (byte)(_flags | FrozenNameMask) : (byte)(_flags & ~FrozenNameMask);
     }
 
     Props GetOrCreateProps()
@@ -49,78 +33,16 @@ public abstract partial class SlonDbParameter
         return (Props)nameOrProps;
     }
 
-    private protected abstract object? ValueCore { get; set; }
-
-    int UsesCount => (int)_combinedEnums >> 8;
-    bool IsReadOnly => UsesCount != 0;
-
-    // private protected for testing.
-    private protected int IncrementUses(int count = 1)
-    {
-        if (count < 0)
-            throw new ArgumentOutOfRangeException(nameof(count), "Cannot be negative.");
-
-        uint current;
-        uint newValue;
-        do
-        {
-            // Operate on an unsigned int as we don't want the top bit to be interpreted as a sign bit, we have 24 bits.
-            current = _combinedEnums;
-            if ((current >> 8) + count > (int)Math.Pow(2, 24) - 1)
-                throw new InvalidOperationException("Cannot increment past uint24.MaxValue.");
-
-            var incremented = (uint)((current >> 8) + count) << 8;
-            newValue = incremented | (current & 0x000000ff);
-        } while (Interlocked.CompareExchange(ref _combinedEnums, newValue, current) != (int)current);
-        return (int)(newValue >> 8);
-    }
-
-    /// <returns>The new value that was stored by this operation.</returns>
-    int IncrementUses() => IncrementUses(count: 1);
-
-    // private protected for testing.
-    private protected int DecrementUses(int count = 1)
-    {
-        if (count < 0)
-            throw new ArgumentOutOfRangeException(nameof(count), "Cannot be negative.");
-
-        uint current;
-        uint newValue;
-        do
-        {
-            // Operate on an unsigned int as we don't want the top bit to be interpreted as a sign bit, we have 24 bits.
-            current = _combinedEnums;
-            if ((current >> 8) - count < 0)
-                throw new InvalidOperationException("Cannot decrement past 0.");
-
-            var incremented = (uint)((current >> 8) - count) << 8;
-            newValue = incremented | (current & 0x000000ff);
-        } while (Interlocked.CompareExchange(ref _combinedEnums, newValue, current) != (int)current);
-        return (int)(newValue >> 8);
-    }
-
-    /// <returns>The new value that was stored by this operation.</returns>
-    int DecrementUses() => DecrementUses(count: 1);
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private protected void ThrowIfReadOnly()
-    {
-        if (IsReadOnly)
-            Throw();
-
-        static void Throw() => throw new InvalidOperationException("This parameter is currently in use for a command execution, clone the parameter to change its values or wait for execution to end.");
-    }
-
     private protected virtual ParameterDirection DirectionBase
     {
-        get => (ParameterDirection)(_combinedEnums & 0x07); // take the first 3 bits.
-        set => _combinedEnums = (byte)value | (_combinedEnums & 0xfffffff8); // 0xf8 == 255 - 7
+        get => (ParameterDirection)(_flags & DirectionMask);
+        set => _flags = (byte)(((byte)value & DirectionMask) | (_flags & ~DirectionMask));
     }
 
     private protected virtual bool IsNullableBase
     {
-        get => (_combinedEnums & 0x40) == 0x40; // get the second most significant bit of the first byte.
-        set => _combinedEnums = (uint)(value ? 1 : 0) << 6 | (_combinedEnums & 0xffffffbf); // 0xbf == 255 - 64
+        get => (_flags & NullableMask) != 0;
+        set => _flags = value ? (byte)(_flags | NullableMask) : (byte)(_flags & ~NullableMask);
     }
 
     private protected virtual byte? PrecisionBase
@@ -188,17 +110,16 @@ public abstract partial class SlonDbParameter
             p.ResetFacets();
     }
 
-    private protected abstract SlonDbParameter CloneCore();
-    void CloneBase(SlonDbParameter instance)
+    void CloneBase(SlonParameter instance)
     {
         if (_nameOrProps is Props p)
             instance._nameOrProps = p.Clone();
         else
             instance._nameOrProps = _nameOrProps;
-        instance._combinedEnums = _combinedEnums;
+        instance._flags = _flags;
     }
 
-    internal void NotifyCollectionAdd() => IsReadOnlyName = true;
+    internal void NotifyCollectionAdd() => IsNameFrozen = true;
 
     sealed class Props
     {
@@ -226,7 +147,7 @@ public abstract partial class SlonDbParameter
 
 // Public surface & ADO.NET
 /// <inheritdoc cref="System.Data.Common.DbParameter" />
-public partial class SlonDbParameter: DbParameter
+public partial class SlonParameter: DbParameter
 {
     [AllowNull]
     public sealed override string ParameterName
@@ -240,10 +161,9 @@ public partial class SlonDbParameter: DbParameter
         }
         set
         {
-            if (IsReadOnlyName)
+            if (IsNameFrozen)
                 throw new InvalidOperationException("Parameter has been added to a collection at least once, clone the parameter to change the name.");
 
-            ThrowIfReadOnly();
             value ??= string.Empty;
             if (_nameOrProps is Props p)
             {
@@ -256,18 +176,13 @@ public partial class SlonDbParameter: DbParameter
     public sealed override object? Value
     {
         get => ValueCore;
-        set
-        {
-            ThrowIfReadOnly();
-            ValueCore = value;
-        }
+        set => ValueCore = value;
     }
     public sealed override DbType DbType
     {
         get => DbTypeCore ?? DbType.String;
         set
         {
-            ThrowIfReadOnly();
             if ((int)value is 24 or > 27 && !Enum.IsDefined(value))
                 throw new ArgumentOutOfRangeException(nameof(value), $"Invalid {nameof(System.Data.DbType)} value.");
             DbTypeCore = value;
@@ -278,7 +193,6 @@ public partial class SlonDbParameter: DbParameter
         get => DirectionCore;
         set
         {
-            ThrowIfReadOnly();
             switch (value)
             {
                 case ParameterDirection.Input or ParameterDirection.Output or ParameterDirection.InputOutput or ParameterDirection.ReturnValue:
@@ -294,48 +208,28 @@ public partial class SlonDbParameter: DbParameter
     public sealed override bool IsNullable
     {
         get => IsNullableBase;
-        set
-        {
-            ThrowIfReadOnly();
-            IsNullableBase = value;
-        }
+        set => IsNullableBase = value;
     }
 
     public sealed override byte Precision
     {
         get => PrecisionBase.GetValueOrDefault();
-        set
-        {
-            ThrowIfReadOnly();
-            PrecisionBase = value;
-        }
+        set => PrecisionBase = value;
     }
 
     public sealed override byte Scale
     {
         get => ScaleBase.GetValueOrDefault();
-        set
-        {
-            ThrowIfReadOnly();
-            ScaleBase = value;
-        }
+        set => ScaleBase = value;
     }
 
     public sealed override int Size
     {
         get => SizeBase.GetValueOrDefault();
-        set
-        {
-            ThrowIfReadOnly();
-            SizeBase = value;
-        }
+        set => SizeBase = value;
     }
 
-    public sealed override void ResetDbType()
-    {
-        ThrowIfReadOnly();
-        ResetInference();
-    }
+    public sealed override void ResetDbType() => ResetInference();
 
     [AllowNull]
     public sealed override string SourceColumn
@@ -349,7 +243,6 @@ public partial class SlonDbParameter: DbParameter
         }
         set
         {
-            ThrowIfReadOnly();
             value ??= string.Empty;
             if (value is "")
                 return;
@@ -368,7 +261,6 @@ public partial class SlonDbParameter: DbParameter
         }
         set
         {
-            ThrowIfReadOnly();
             if (value == default)
                 return;
 
@@ -386,7 +278,6 @@ public partial class SlonDbParameter: DbParameter
         }
         set
         {
-            ThrowIfReadOnly();
             if (value == default)
                 return;
 
@@ -395,16 +286,15 @@ public partial class SlonDbParameter: DbParameter
     }
 }
 
-// Base class for the two parameter types in Slon, see SlonDbParameter.Base.cs for all the uninteresting parts.
-public abstract partial class SlonDbParameter: IParameter
+public partial class SlonParameter
 {
     bool? _preferTextualFormat;
     SlonDbType _slonDbType;
     int _typeRevision;
 
-    /// <summary>Creates a new instance of a <see cref="T:Slon.SlonDbParameter" /> object.</summary>
+    /// <summary>Creates a new instance of a <see cref="T:Slon.SlonParameter" /> object.</summary>
     /// <returns>The new instance.</returns>
-    public SlonDbParameter Clone() => CloneCore();
+    public SlonParameter Clone() => CloneCore();
 
     /// Some converters support both a textual and binary format for the postgres type this parameter maps to.
     /// When this property is set to true a textual format should be preferred.
@@ -413,21 +303,13 @@ public abstract partial class SlonDbParameter: IParameter
     public bool? PreferTextualFormat
     {
         get => _preferTextualFormat;
-        set
-        {
-            ThrowIfReadOnly();
-            _preferTextualFormat = value;
-        }
+        set => _preferTextualFormat = value;
     }
 
     public SlonDbType SlonDbType
     {
         get => SlonDbTypeCore;
-        set
-        {
-            ThrowIfReadOnly();
-            SlonDbTypeCore = value;
-        }
+        set => SlonDbTypeCore = value;
     }
 
     protected ParameterDirection DirectionCore
@@ -470,7 +352,7 @@ public abstract partial class SlonDbParameter: IParameter
         return (_slonDbType, staticValueType == typeof(object) ? ValueCore?.GetType() : staticValueType);
     }
 
-    private protected SlonDbParameter Clone(SlonDbParameter instance)
+    private protected SlonParameter Clone(SlonParameter instance)
     {
         CloneBase(instance);
         instance._preferTextualFormat = _preferTextualFormat;
@@ -478,31 +360,6 @@ public abstract partial class SlonDbParameter: IParameter
         instance._typeRevision = 0;
         return instance;
     }
-
-    internal IParameter StartSession()
-    {
-        if (IncrementUses() > 1 && Direction is not ParameterDirection.Input)
-        {
-            DecrementUses();
-            ThrowHelper.ThrowInvalidOperation("An output or return value direction parameter can't be used by commands executing in parallel.");
-        }
-
-        return this;
-    }
-
-    internal void EndSession() => DecrementUses();
-
-    ParameterKind IParameter.Kind => (ParameterKind)Direction;
-    Type IParameter.StaticValueType => StaticValueType;
-    string IParameter.Name => ParameterName;
-    object? IParameter.Value => Value;
-
-    private protected abstract void SetOutputValue(object? value);
-    void IParameter.SetOutputResult(object? value) => SetOutputValue(value);
-
-    internal abstract void Bind(ref SerializerParameterWriterStrategy.ParameterBinder binder);
-    internal abstract void Write(ref SerializerParameterWriterStrategy.ParameterWriter writer);
-    internal abstract void WriteAsync(ref SerializerParameterWriterStrategy.AsyncParameterWriter writer);
 
     private protected void TrackObjectValueTypeChange(object? previousValue, object? value)
     {

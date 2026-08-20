@@ -435,9 +435,9 @@ public sealed class SlonCommand: DbCommand
         return _batchCore.ExecuteDbReaderAsync(parameters: null, behavior, cancellationToken).AsTask();
     }
 
-    /// <summary>Creates a new instance of a <see cref="T:Slon.SlonDbParameter" /> object.</summary>
-    /// <returns>A <see cref="T:Slon.SlonDbParameter" /> object.</returns>
-    public new SlonDbParameter CreateParameter() => new SlonParameter();
+    /// <summary>Creates a new instance of a <see cref="T:Slon.SlonParameter" /> object.</summary>
+    /// <returns>A <see cref="T:Slon.SlonParameter" /> object.</returns>
+    public new SlonParameter CreateParameter() => new();
 
     /// <inheritdoc/>
     protected override DbParameter CreateDbParameter() => CreateParameter();

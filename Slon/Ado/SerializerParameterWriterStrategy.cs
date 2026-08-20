@@ -17,7 +17,7 @@ sealed class SerializerParameterWriterStrategy : ParameterWriterStrategy
     internal static ParameterTypeResolution ResolveTypeInfo(object? value, PgSerializerOptions options,
         PgTypeId? preparedTypeId = null, bool allowUnspecified = false)
     {
-        if (value is SlonDbParameter parameter)
+        if (value is SlonParameter parameter)
         {
             var (dbType, valueType) = parameter.GetResolutionInput();
             if (allowUnspecified && dbType.IsInfer
@@ -49,14 +49,6 @@ sealed class SerializerParameterWriterStrategy : ParameterWriterStrategy
         if (allowUnspecified && value is null or DBNull)
             return default;
 
-        if (value is IParameter protocolParameter)
-        {
-            var valueType = protocolParameter.StaticValueType;
-            if (valueType == typeof(object))
-                valueType = protocolParameter.Value?.GetType();
-            return new(options.GetTypeInfo(valueType, preparedTypeId));
-        }
-
         return new(options.GetTypeInfo(value?.GetType(), preparedTypeId));
     }
 
@@ -83,7 +75,7 @@ sealed class SerializerParameterWriterStrategy : ParameterWriterStrategy
 
         var typeInfo = (PgTypeInfo)parameter.TypeResolution!;
         var conversionContext = ((PgWriter)state).ConversionContext;
-        if (parameter.Value is SlonDbParameter value)
+        if (parameter.Value is SlonParameter value)
         {
             var binder = new ParameterBinder(typeInfo, conversionContext, value);
             value.Bind(ref binder);
@@ -102,7 +94,7 @@ sealed class SerializerParameterWriterStrategy : ParameterWriterStrategy
         writer.Init(writer.ConversionContext, FlushMode.Blocking, parameter.WriteState);
         try
         {
-            if (parameter.Value is SlonDbParameter value)
+            if (parameter.Value is SlonParameter value)
             {
                 var valueWriter = new ParameterWriter(converter, writer);
                 value.Write(ref valueWriter);
@@ -129,7 +121,7 @@ sealed class SerializerParameterWriterStrategy : ParameterWriterStrategy
         writer.Init(writer.ConversionContext, FlushMode.NonBlocking, parameter.WriteState);
         try
         {
-            if (parameter.Value is SlonDbParameter value)
+            if (parameter.Value is SlonParameter value)
             {
                 var valueWriter = new AsyncParameterWriter(converter, writer, cancellationToken);
                 value.WriteAsync(ref valueWriter);
@@ -149,7 +141,7 @@ sealed class SerializerParameterWriterStrategy : ParameterWriterStrategy
     }
 
     internal ref struct ParameterBinder(PgTypeInfo typeInfo, PgConversionContext conversionContext,
-        SlonDbParameter parameter)
+        SlonParameter parameter)
     {
         public Parameter Result { get; private set; }
 
