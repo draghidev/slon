@@ -1,19 +1,20 @@
 using System.Runtime.CompilerServices;
 using Slon.Pools;
+using static Slon.Pools.ConnectionPool;
 
 namespace Slon.Tests;
 
 [TestClass]
-public class AcquisitionCoordinatorTests
+public class WaitQueueTests
 {
     [TestMethod]
     public async Task NewWaiter_DrivesCapacityPublishedWhileDormant()
     {
-        using var coordinator = new AcquisitionCoordinator<int>();
-        coordinator.NotifyAvailability();
+        using var queue = new ConnectionPool.WaitQueue<int>();
+        queue.NotifyAvailability();
         var available = new StrongBox<bool>(true);
         var attempts = new StrongBox<int>();
-        var waiter = coordinator.CreateWaiter(
+        var waiter = queue.CreateWaiter(
             static state =>
             {
                 Interlocked.Increment(ref state.Attempts.Value);
@@ -23,21 +24,21 @@ public class AcquisitionCoordinatorTests
             },
             (Available: available, Attempts: attempts));
 
-        using var registration = coordinator.Enqueue(waiter);
+        using var registration = queue.Enqueue(waiter);
         var completion = await waiter.AsValueTask();
 
         Assert.IsTrue(completion.HasResult);
         Assert.AreEqual(42, completion.Result);
         Assert.AreEqual(1, attempts.Value);
-        Assert.IsFalse(coordinator.HasDemand);
+        Assert.IsFalse(queue.HasDemand);
     }
 
     [TestMethod]
     public async Task BellDuringPass_ForcesGenerationRecheck()
     {
-        using var coordinator = new AcquisitionCoordinator<int>();
+        using var queue = new ConnectionPool.WaitQueue<int>();
         var attempts = new StrongBox<int>();
-        var waiter = coordinator.CreateWaiter(
+        var waiter = queue.CreateWaiter(
             static state =>
             {
                 if (Interlocked.Increment(ref state.Attempts.Value) == 1)
@@ -47,29 +48,29 @@ public class AcquisitionCoordinatorTests
                 }
                 return PlacementAttempt<int>.Placed(42);
             },
-            (Coordinator: coordinator, Attempts: attempts));
+            (Coordinator: queue, Attempts: attempts));
 
-        using var registration = coordinator.Enqueue(waiter);
+        using var registration = queue.Enqueue(waiter);
         var completion = await waiter.AsValueTask();
 
         Assert.IsTrue(completion.HasResult);
         Assert.AreEqual(42, completion.Result);
         Assert.AreEqual(2, attempts.Value);
-        Assert.AreEqual(2, coordinator.Metrics.TotalExamined);
-        Assert.AreEqual(1, coordinator.Metrics.TotalPlacements);
-        Assert.AreEqual(1, coordinator.Metrics.TotalGenerationRestarts);
-        Assert.IsTrue(coordinator.Metrics.MaxInlineDuration > TimeSpan.Zero);
+        Assert.AreEqual(2, queue.Metrics.TotalExamined);
+        Assert.AreEqual(1, queue.Metrics.TotalPlacements);
+        Assert.AreEqual(1, queue.Metrics.TotalGenerationRestarts);
+        Assert.IsTrue(queue.Metrics.MaxInlineDuration > TimeSpan.Zero);
     }
 
     [TestMethod]
     public async Task BellDuringAttempt_RestartsFifoBeforeTryingNewFollower()
     {
-        using var coordinator = new AcquisitionCoordinator<int>();
+        using var queue = new ConnectionPool.WaitQueue<int>();
         var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         using var release = new ManualResetEventSlim();
         var attempts = new StrongBox<int>();
         var winner = new StrongBox<int>();
-        var first = coordinator.CreateWaiter(
+        var first = queue.CreateWaiter(
             static state =>
             {
                 var attempt = Interlocked.Increment(ref state.Attempts.Value);
@@ -84,18 +85,18 @@ public class AcquisitionCoordinatorTests
                     return PlacementAttempt<int>.Placed(1);
                 return PlacementAttempt<int>.Unavailable;
             },
-            (Coordinator: coordinator, Entered: entered, Release: release, Attempts: attempts, Winner: winner));
-        using var firstRegistration = coordinator.Enqueue(first);
+            (Coordinator: queue, Entered: entered, Release: release, Attempts: attempts, Winner: winner));
+        using var firstRegistration = queue.Enqueue(first);
 
-        var publication = Task.Factory.StartNew(coordinator.NotifyAvailability,
+        var publication = Task.Factory.StartNew(queue.NotifyAvailability,
             CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
         await entered.Task;
 
-        var second = coordinator.CreateWaiter(static winner =>
+        var second = queue.CreateWaiter(static winner =>
             Interlocked.CompareExchange(ref winner.Value, 2, 0) == 0
                 ? PlacementAttempt<int>.Placed(2)
                 : PlacementAttempt<int>.Unavailable, winner);
-        using var secondRegistration = coordinator.Enqueue(second);
+        using var secondRegistration = queue.Enqueue(second);
         release.Set();
         await publication;
 
@@ -109,11 +110,11 @@ public class AcquisitionCoordinatorTests
     [TestMethod]
     public async Task JoinDuringPass_DoesNotRestartAheadOfExistingFollower()
     {
-        using var coordinator = new AcquisitionCoordinator<int>();
+        using var queue = new ConnectionPool.WaitQueue<int>();
         var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         using var release = new ManualResetEventSlim();
         var attempts = new StrongBox<int>();
-        var first = coordinator.CreateWaiter(
+        var first = queue.CreateWaiter(
             static state =>
             {
                 var attempt = Interlocked.Increment(ref state.Attempts.Value);
@@ -130,19 +131,19 @@ public class AcquisitionCoordinatorTests
                 }
                 return PlacementAttempt<int>.Unavailable;
             },
-            (Coordinator: coordinator, Entered: entered, Release: release, Attempts: attempts));
-        using var firstRegistration = coordinator.Enqueue(first);
+            (Coordinator: queue, Entered: entered, Release: release, Attempts: attempts));
+        using var firstRegistration = queue.Enqueue(first);
 
-        var drive = Task.Factory.StartNew(coordinator.NotifyAvailability,
+        var drive = Task.Factory.StartNew(queue.NotifyAvailability,
             CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
         await entered.Task;
         var attemptsSeenByFollower = new StrongBox<int>();
-        var follower = coordinator.CreateWaiter(static state =>
+        var follower = queue.CreateWaiter(static state =>
         {
             state.Seen.Value = state.Attempts.Value;
             return PlacementAttempt<int>.Placed(2);
         }, (Seen: attemptsSeenByFollower, Attempts: attempts));
-        using var followerRegistration = coordinator.Enqueue(follower);
+        using var followerRegistration = queue.Enqueue(follower);
         release.Set();
 
         Assert.AreEqual(2, (await follower.AsValueTask()).Result);
@@ -154,11 +155,11 @@ public class AcquisitionCoordinatorTests
     [TestMethod]
     public async Task GenerationChurn_DoesNotRestartFiniteSnapshot()
     {
-        using var coordinator = new AcquisitionCoordinator<int>();
+        using var queue = new ConnectionPool.WaitQueue<int>();
         var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         using var release = new ManualResetEventSlim();
         var attempts = new StrongBox<int>();
-        var first = coordinator.CreateWaiter(static state =>
+        var first = queue.CreateWaiter(static state =>
         {
             var attempt = Interlocked.Increment(ref state.Attempts.Value);
             if (attempt == 1)
@@ -169,17 +170,17 @@ public class AcquisitionCoordinatorTests
             if (attempt is 2 or 3)
                 state.Coordinator.NotifyAvailability();
             return PlacementAttempt<int>.Unavailable;
-        }, (Coordinator: coordinator, Entered: entered, Release: release, Attempts: attempts));
-        var firstEnqueue = Task.Factory.StartNew(() => coordinator.Enqueue(first),
+        }, (Coordinator: queue, Entered: entered, Release: release, Attempts: attempts));
+        var firstEnqueue = Task.Factory.StartNew(() => queue.Enqueue(first),
             CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
         await entered.Task;
         var attemptsSeenByFollower = new StrongBox<int>();
-        var follower = coordinator.CreateWaiter(static state =>
+        var follower = queue.CreateWaiter(static state =>
         {
             state.Seen.Value = state.Attempts.Value;
             return PlacementAttempt<int>.Placed(2);
         }, (Seen: attemptsSeenByFollower, Attempts: attempts));
-        using var followerRegistration = coordinator.Enqueue(follower);
+        using var followerRegistration = queue.Enqueue(follower);
         release.Set();
 
         Assert.AreEqual(2, (await follower.AsValueTask()).Result);
@@ -191,23 +192,23 @@ public class AcquisitionCoordinatorTests
     [TestMethod]
     public async Task FirstCompatibleWaiterWinsWithoutRemovingRejectedHead()
     {
-        using var coordinator = new AcquisitionCoordinator<int>();
+        using var queue = new ConnectionPool.WaitQueue<int>();
         var firstEnabled = new StrongBox<bool>();
-        var first = coordinator.CreateWaiter(
+        var first = queue.CreateWaiter(
             static enabled => enabled.Value
                 ? PlacementAttempt<int>.Placed(1)
                 : PlacementAttempt<int>.Unavailable,
             firstEnabled);
-        using var firstRegistration = coordinator.Enqueue(first);
+        using var firstRegistration = queue.Enqueue(first);
 
-        var second = coordinator.CreateWaiter(static _ => PlacementAttempt<int>.Placed(2), state: 0);
-        using var secondRegistration = coordinator.Enqueue(second);
+        var second = queue.CreateWaiter(static _ => PlacementAttempt<int>.Placed(2), state: 0);
+        using var secondRegistration = queue.Enqueue(second);
         var secondCompletion = await second.AsValueTask();
         Assert.AreEqual(2, secondCompletion.Result);
-        Assert.AreEqual(1, coordinator.Count);
+        Assert.AreEqual(1, queue.Count);
 
         firstEnabled.Value = true;
-        coordinator.NotifyAvailability();
+        queue.NotifyAvailability();
         var firstCompletion = await first.AsValueTask();
         Assert.AreEqual(1, firstCompletion.Result);
     }
@@ -215,46 +216,46 @@ public class AcquisitionCoordinatorTests
     [TestMethod]
     public async Task AlreadyCancelledWaiterNeverCallsPlacer()
     {
-        using var coordinator = new AcquisitionCoordinator<int>();
+        using var queue = new ConnectionPool.WaitQueue<int>();
         using var cancellation = new CancellationTokenSource();
         cancellation.Cancel();
-        var waiter = coordinator.CreateWaiter(
+        var waiter = queue.CreateWaiter(
             static _ => throw new InvalidOperationException("a cancelled waiter must not drive"), state: 0);
 
-        using var registration = coordinator.Enqueue(waiter, cancellation.Token);
+        using var registration = queue.Enqueue(waiter, cancellation.Token);
         var completion = await waiter.AsValueTask();
 
         Assert.IsFalse(completion.HasResult);
         Assert.IsInstanceOfType<OperationCanceledException>(completion.Exception);
-        Assert.IsFalse(coordinator.HasDemand);
+        Assert.IsFalse(queue.HasDemand);
     }
 
     [TestMethod]
     public async Task QueuedCancellationCompletesWithoutDisturbingActiveDriver()
     {
-        using var coordinator = new AcquisitionCoordinator<int>();
+        using var queue = new ConnectionPool.WaitQueue<int>();
         var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         using var release = new ManualResetEventSlim();
-        var first = coordinator.CreateWaiter(
+        var first = queue.CreateWaiter(
             static state =>
             {
                 state.Entered.TrySetResult();
                 state.Release.Wait();
                 return PlacementAttempt<int>.Unavailable;
             }, (Entered: entered, Release: release));
-        var firstEnqueue = Task.Run(() => coordinator.Enqueue(first));
+        var firstEnqueue = Task.Run(() => queue.Enqueue(first));
         await entered.Task;
 
         using var cancellation = new CancellationTokenSource();
-        var second = coordinator.CreateWaiter(static _ => PlacementAttempt<int>.Placed(2), state: 0);
-        using var secondRegistration = coordinator.Enqueue(second, cancellation.Token);
+        var second = queue.CreateWaiter(static _ => PlacementAttempt<int>.Placed(2), state: 0);
+        using var secondRegistration = queue.Enqueue(second, cancellation.Token);
         cancellation.Cancel();
         var secondCompletion = await second.AsValueTask();
         Assert.IsInstanceOfType<OperationCanceledException>(secondCompletion.Exception);
 
         release.Set();
         using var firstRegistration = await firstEnqueue;
-        coordinator.Dispose();
+        queue.Dispose();
         var firstCompletion = await first.AsValueTask();
         Assert.IsInstanceOfType<ObjectDisposedException>(firstCompletion.Exception);
     }
@@ -278,22 +279,22 @@ public class AcquisitionCoordinatorTests
     [TestMethod]
     public async Task DisposalSweep_CompletesQueuedWaiterAndDefersTryingWaiter()
     {
-        var coordinator = new AcquisitionCoordinator<int>();
+        var queue = new ConnectionPool.WaitQueue<int>();
         var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         using var release = new ManualResetEventSlim();
-        var first = coordinator.CreateWaiter(
+        var first = queue.CreateWaiter(
             static state =>
             {
                 state.Entered.TrySetResult();
                 state.Release.Wait();
                 return PlacementAttempt<int>.Unavailable;
             }, (Entered: entered, Release: release));
-        var firstEnqueue = Task.Run(() => coordinator.Enqueue(first));
+        var firstEnqueue = Task.Run(() => queue.Enqueue(first));
         await entered.Task;
 
-        var second = coordinator.CreateWaiter(static _ => PlacementAttempt<int>.Placed(2), state: 0);
-        using var secondRegistration = coordinator.Enqueue(second);
-        coordinator.Dispose();
+        var second = queue.CreateWaiter(static _ => PlacementAttempt<int>.Placed(2), state: 0);
+        using var secondRegistration = queue.Enqueue(second);
+        queue.Dispose();
 
         var secondCompletion = await second.AsValueTask();
         Assert.IsFalse(secondCompletion.HasResult);
@@ -309,11 +310,11 @@ public class AcquisitionCoordinatorTests
     [TestMethod]
     public void SynchronousWaiter_UsesSamePlacementResult()
     {
-        using var coordinator = new AcquisitionCoordinator<int>();
-        var waiter = coordinator.CreateWaiter(
+        using var queue = new ConnectionPool.WaitQueue<int>();
+        var waiter = queue.CreateWaiter(
             static _ => PlacementAttempt<int>.Placed(42), state: 0, synchronous: true);
 
-        using var registration = coordinator.Enqueue(waiter);
+        using var registration = queue.Enqueue(waiter);
         var completion = waiter.Wait();
 
         Assert.IsTrue(completion.HasResult);
@@ -323,11 +324,11 @@ public class AcquisitionCoordinatorTests
 
     static async Task AssertTerminationDuringTrying(bool dispose, bool placementSucceeds)
     {
-        var coordinator = new AcquisitionCoordinator<int>();
+        var queue = new ConnectionPool.WaitQueue<int>();
         using var cancellation = new CancellationTokenSource();
         var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         using var release = new ManualResetEventSlim();
-        var waiter = coordinator.CreateWaiter(
+        var waiter = queue.CreateWaiter(
             static state =>
             {
                 state.Entered.TrySetResult();
@@ -336,11 +337,11 @@ public class AcquisitionCoordinatorTests
                     ? PlacementAttempt<int>.Placed(42)
                     : PlacementAttempt<int>.Unavailable;
             }, (Entered: entered, Release: release, Succeeds: placementSucceeds));
-        var enqueue = Task.Run(() => coordinator.Enqueue(waiter, cancellation.Token));
+        var enqueue = Task.Run(() => queue.Enqueue(waiter, cancellation.Token));
         await entered.Task;
 
         if (dispose)
-            coordinator.Dispose();
+            queue.Dispose();
         else
             cancellation.Cancel();
         release.Set();
@@ -354,6 +355,6 @@ public class AcquisitionCoordinatorTests
             Assert.IsInstanceOfType<ObjectDisposedException>(completion.Exception);
         else
             Assert.IsInstanceOfType<OperationCanceledException>(completion.Exception);
-        coordinator.Dispose();
+        queue.Dispose();
     }
 }

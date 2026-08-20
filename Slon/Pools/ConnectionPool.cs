@@ -80,9 +80,9 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
     readonly Func<T, bool>? _tryBeginPruning;
 
     readonly ConcurrentQueue<IdleToken> _idle = new();
-    readonly AcquisitionCoordinator<Placement> _acquisitions = new();
+    readonly WaitQueue<Placement> _waiters = new();
     ConcurrentDictionary<Task, byte>? _detachedTasks;
-    internal int WaiterCount => _acquisitions.Count;
+    internal int WaiterCount => _waiters.Count;
 
     PoolMetricsSnapshot IPoolMetricsSource.GetMetricsSnapshot()
     {
@@ -102,7 +102,7 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
             if (connection.IsIdle)
                 idle++;
         }
-        return new(open, idle, _connections.Length, _acquisitions.Count);
+        return new(open, idle, _connections.Length, _waiters.Count);
     }
 
     readonly Heartbeat _heartbeat;
@@ -275,7 +275,7 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
     }
 
     void PublishIdle(ConnectionFuture registration, T connection)
-        => _acquisitions.PublishAvailability(
+        => _waiters.PublishAvailability(
             static (state, generation) =>
             {
                 ref var tenure = ref state.Registration.IdleTokenTenure;
@@ -292,7 +292,7 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
         _idle.Enqueue(new(registration, connection, generation));
     }
 
-    void SignalAvailability() => _acquisitions.NotifyAvailability();
+    void SignalAvailability() => _waiters.NotifyAvailability();
 
     void RecordIdleRemovalForPruning()
     {
@@ -342,7 +342,7 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
             var publicationPending = registration.IdleTokenTenure.Return();
             if (publish || publicationPending)
             {
-                _acquisitions.PublishAvailability(
+                _waiters.PublishAvailability(
                     static (state, generation) =>
                     {
                         ref var tenure = ref state.Token.Registration.IdleTokenTenure;
@@ -373,11 +373,11 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
         var deadline = new Deadline(timeout, _timeProvider);
         var timeoutSource = RentTimeoutSource(deadline.GetRemaining(), _timeProvider, cancellationToken);
         var waitToken = timeoutSource?.Token ?? CancellationToken.None;
-        var waiter = _acquisitions.CreateWaiter(
+        var waiter = _waiters.CreateWaiter(
             static (placement, generation) => placement.Pool.TryPlace(
                 placement.Schedule, placement.State, placement.CancellationToken, generation),
             new PlacementState<TState>(this, schedule, state, cancellationToken));
-        using var registration = _acquisitions.Enqueue(waiter, timeoutSource?.Token ?? cancellationToken);
+        using var registration = _waiters.Enqueue(waiter, timeoutSource?.Token ?? cancellationToken);
         try
         {
             var completion = await waiter.AsValueTask().ConfigureAwait(false);
@@ -416,11 +416,11 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
     {
         var deadline = new Deadline(timeout, _timeProvider);
         var timeoutSource = RentTimeoutSource(deadline.GetRemaining(), _timeProvider);
-        var waiter = _acquisitions.CreateWaiter(
+        var waiter = _waiters.CreateWaiter(
             static (placement, generation) => placement.Pool.TryPlace(
                 placement.Schedule, placement.State, CancellationToken.None, generation),
             new PlacementState<TState>(this, schedule, state, CancellationToken.None), synchronous: true);
-        using var registration = _acquisitions.Enqueue(waiter, timeoutSource?.Token ?? CancellationToken.None);
+        using var registration = _waiters.Enqueue(waiter, timeoutSource?.Token ?? CancellationToken.None);
         try
         {
             return ResolvePlacement(waiter.Wait(), schedule, state, deadline);
@@ -811,7 +811,7 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
     // Publication transfers opener ownership. Future visibility and its generation are fused:
     // otherwise a later waiter can claim the slot between Complete and the availability bell.
     void SettleOpener(ConnectionFuture future, T? conn)
-        => _acquisitions.PublishAvailability(
+        => _waiters.PublishAvailability(
             static (state, _) => state.Future.Complete(state.Connection),
             (Future: future, Connection: conn), publishWhenDisposed: true);
 
@@ -824,7 +824,7 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
 
         ThrowIfDisposed();
 
-        if (!_acquisitions.HasDemand)
+        if (!_waiters.HasDemand)
         {
             if (TrySchedule(schedule, state, CancellationToken.None, exhaustive: false,
                 long.MaxValue, out var future, out var conn, out _))
@@ -843,7 +843,7 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
             {
                 ThrowIfDisposed();
 
-                if (!_acquisitions.HasDemand)
+                if (!_waiters.HasDemand)
                 {
                     if (TrySchedule(schedule, state, CancellationToken.None, exhaustive: false,
                         long.MaxValue, out var future, out var conn, out _))
@@ -876,7 +876,7 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
 
         var reportAdmissions = _metrics?.AdmissionsEnabled is true;
         var reportTimeouts = _metrics?.AdmissionTimeoutsEnabled is true;
-        if (!_acquisitions.HasDemand)
+        if (!_waiters.HasDemand)
         {
             if (TrySchedule(schedule, state, cancellationToken, exhaustive: false,
                 long.MaxValue, out var future, out var conn, out _))
@@ -1071,7 +1071,7 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
 
             Volatile.Write(ref _disposed, true);
             ownsDisposal = true;
-            _acquisitions.Dispose();
+            _waiters.Dispose();
             for (var i = 0; i < _connections.Length; i++)
             {
                 ref var connSlot = ref _connections[i].Item;
@@ -1327,7 +1327,7 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
 
 }
 
-static class ConnectionPool
+static partial class ConnectionPool
 {
     [ThreadStatic]
     static PooledLinkedSource? TimeoutSource;
