@@ -370,7 +370,7 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
 
                 var parameters = indexParameters ? parametersSpan[i] : !parametersSpan.IsEmpty ? parametersSpan[0] : null;
                 result = adoCommand.CreateCommand(_enableErrorBarriers, behavior, trackerContext, parameters,
-                    Timeout, preparing, serializerOptions);
+                    Timeout, preparing, serializerOptions, parameterWriterStrategy);
                 // Refresh the cache when the tracker resolved to a different TC than the one we
                 // passed in (catches workload-tracker recreation via DbDepsRevision++ and similar).
                 if (result.TrackerResult.Tracked is not null && !ReferenceEquals(adoCommand.Tracked, result.TrackerResult.Tracked))

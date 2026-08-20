@@ -18,7 +18,7 @@ readonly struct Command()
     public bool PreferSimple { get; init; } = false;
     public CommandDescriptor Descriptor { get; init; } = default;
     public TimeSpan Timeout { get; init; } = default;
-    public ImmutableArray<Parameter> Parameters { get; init; } = [];
+    public ParameterSource Parameters { get; init; }
     // Empty means Slon's default (all binary). A single entry applies to every result column;
     // otherwise the count must match the returned RowDescription.
     public ImmutableArray<PgFormat> ResultFormats { get; init; } = [];

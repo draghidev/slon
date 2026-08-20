@@ -1094,7 +1094,6 @@ sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
     protected override void OnReleasing(Exception? exception)
     {
         Volatile.Read(ref _cancelDelivery)?.TrySetResult();
-        ReleaseParameterState();
         _options.Commands.Return();
     }
 
@@ -1102,15 +1101,7 @@ sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
     {
         // Discarded flows never enter the base release path.
         GetObserver(out var observerState)?.OnCompleting(this, null, observerState);
-        ReleaseParameterState();
         _options.Commands.Return();
-    }
-
-    void ReleaseParameterState()
-    {
-        foreach (ref readonly var command in _options.Commands)
-            foreach (ref readonly var parameter in command.Parameters.AsSpan())
-                parameter.Release();
     }
 
     protected override void OnReset()

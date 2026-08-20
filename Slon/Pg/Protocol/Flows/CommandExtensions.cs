@@ -22,7 +22,7 @@ static class CommandExtensions
         {
             var command = commands[i];
             var descriptor = command.Descriptor;
-            if (!descriptor.IsPrepared || command.Parameters.Length is not 0
+            if (!descriptor.IsPrepared || command.Parameters.GetCount(parameterWriterStrategy) is not 0
                 || descriptor.ParameterTypes.Count is not 0 || command.ResultFormats.Length is not 0)
                 return WriteCommandsAsyncCore(commands, encoder, appendSync, parameterWriterStrategy, cancellationToken, i);
 
@@ -46,8 +46,10 @@ static class CommandExtensions
                     await encoder.WriteParseAsync(descriptor.UnpreparedCommandText, descriptor.CommandName,
                         descriptor.ParameterTypes, cancellationToken).ConfigureAwait(false);
                     encoder.WriteDescribe(descriptor.CommandName, portalName: false);
+                    ParameterSource parameters = descriptor.ParameterTypes.ToDbNullParameterList();
+                    using var parameterLease = parameters.Materialize(parameterWriterStrategy);
                     encoder.WriteBind(descriptor.CommandName,
-                        parameters: descriptor.ParameterTypes.ToDbNullParameterList(),
+                        parameters: parameterLease.Buffer,
                         resultFormats: command.ResultFormats);
                     encoder.WriteDescribe();
                     if (command.WithSync)
@@ -55,16 +57,9 @@ static class CommandExtensions
                 }
                 else if (descriptor.IsPrepared)
                 {
-                    var parameters = command.Parameters;
-                    if (parameters.Length != descriptor.ParameterTypes.Count)
-                    {
-                        if (!command.DescribeOnly)
-                            ThrowHelper.ThrowInvalidOperation($"Prepared command parameter count mismatch with descriptor, expected: ${descriptor.ParameterTypes.Count}.");
-
-                        parameters = descriptor.ParameterTypes.ToDbNullParameterList();
-                    }
-
-                    await encoder.WriteBindAsync(descriptor.CommandName, parameters: parameters,
+                    var parameters = ResolveParameters(command, descriptor, parameterWriterStrategy);
+                    using var parameterLease = parameters.Materialize(parameterWriterStrategy);
+                    await encoder.WriteBindAsync(descriptor.CommandName, parameters: parameterLease.Buffer,
                         resultFormats: command.ResultFormats, parameterWriterStrategy: parameterWriterStrategy,
                         cancellationToken: cancellationToken).ConfigureAwait(false);
                     CompletePreparedWrite(command, descriptor, encoder);
@@ -75,18 +70,12 @@ static class CommandExtensions
                 }
                 else
                 {
-                    var parameters = command.Parameters;
-                    if (parameters.Length != descriptor.ParameterTypes.Count)
-                    {
-                        if (!command.DescribeOnly)
-                            ThrowHelper.ThrowInvalidOperation("Parameter count mismatch between descriptor and command, unprepared parameter sources must match.");
-
-                        parameters = descriptor.ParameterTypes.ToDbNullParameterList();
-                    }
+                    var parameters = ResolveParameters(command, descriptor, parameterWriterStrategy);
+                    using var parameterLease = parameters.Materialize(parameterWriterStrategy);
 
                     // Extended unprepared.
                     await encoder.WriteParseAsync(descriptor.UnpreparedCommandText, descriptor.CommandName, descriptor.ParameterTypes, cancellationToken: cancellationToken).ConfigureAwait(false);
-                    await encoder.WriteBindAsync(descriptor.CommandName, parameters: parameters,
+                    await encoder.WriteBindAsync(descriptor.CommandName, parameters: parameterLease.Buffer,
                         resultFormats: command.ResultFormats, parameterWriterStrategy: parameterWriterStrategy,
                         cancellationToken: cancellationToken).ConfigureAwait(false);
                     encoder.WriteDescribe();
@@ -135,8 +124,10 @@ static class CommandExtensions
                 await encoder.WriteParseResumable(descriptor.UnpreparedCommandText, descriptor.CommandName,
                     descriptor.ParameterTypes).ConfigureAwait(false);
                 encoder.WriteDescribe(descriptor.CommandName, portalName: false);
+                ParameterSource parameters = descriptor.ParameterTypes.ToDbNullParameterList();
+                using var parameterLease = parameters.Materialize(parameterWriterStrategy);
                 encoder.WriteBind(descriptor.CommandName,
-                    parameters: descriptor.ParameterTypes.ToDbNullParameterList(),
+                    parameters: parameterLease.Buffer,
                     resultFormats: command.ResultFormats);
                 encoder.WriteDescribe();
                 if (command.WithSync)
@@ -144,16 +135,9 @@ static class CommandExtensions
             }
             else if (descriptor.IsPrepared)
             {
-                var parameters = command.Parameters;
-                if (parameters.Length != descriptor.ParameterTypes.Count)
-                {
-                    if (!command.DescribeOnly)
-                        ThrowHelper.ThrowInvalidOperation($"Prepared command parameter count mismatch with descriptor, expected: ${descriptor.ParameterTypes.Count}.");
-
-                    parameters = descriptor.ParameterTypes.ToDbNullParameterList();
-                }
-
-                await encoder.WriteBindResumable(descriptor.CommandName, parameters: parameters,
+                var parameters = ResolveParameters(command, descriptor, parameterWriterStrategy);
+                using var parameterLease = parameters.Materialize(parameterWriterStrategy);
+                await encoder.WriteBindResumable(descriptor.CommandName, parameters: parameterLease.Buffer,
                     resultFormats: command.ResultFormats,
                     parameterWriterStrategy: parameterWriterStrategy).ConfigureAwait(false);
 
@@ -176,17 +160,11 @@ static class CommandExtensions
             }
             else
             {
-                var parameters = command.Parameters;
-                if (parameters.Length != descriptor.ParameterTypes.Count)
-                {
-                    if (!command.DescribeOnly)
-                        ThrowHelper.ThrowInvalidOperation("Parameter count mismatch between descriptor and command, unprepared parameter sources must match.");
-
-                    parameters = descriptor.ParameterTypes.ToDbNullParameterList();
-                }
+                var parameters = ResolveParameters(command, descriptor, parameterWriterStrategy);
+                using var parameterLease = parameters.Materialize(parameterWriterStrategy);
 
                 await encoder.WriteParseResumable(descriptor.UnpreparedCommandText, descriptor.CommandName, descriptor.ParameterTypes).ConfigureAwait(false);
-                await encoder.WriteBindResumable(descriptor.CommandName, parameters: parameters,
+                await encoder.WriteBindResumable(descriptor.CommandName, parameters: parameterLease.Buffer,
                     resultFormats: command.ResultFormats,
                     parameterWriterStrategy: parameterWriterStrategy).ConfigureAwait(false);
                 encoder.WriteDescribe();
@@ -199,6 +177,21 @@ static class CommandExtensions
         if (appendSync)
             encoder.WriteSync();
         await encoder.FlushResumable().ConfigureAwait(false);
+    }
+
+    static ParameterSource ResolveParameters(in Command command, in CommandDescriptor descriptor,
+        ParameterWriterStrategy strategy)
+    {
+        var parameters = command.Parameters;
+        if (parameters.GetCount(strategy) == descriptor.ParameterTypes.Count)
+            return parameters;
+        if (!command.DescribeOnly)
+        {
+            ThrowHelper.ThrowInvalidOperation(descriptor.IsPrepared
+                ? $"Prepared command parameter count mismatch with descriptor, expected: ${descriptor.ParameterTypes.Count}."
+                : "Parameter count mismatch between descriptor and command, unprepared parameter sources must match.");
+        }
+        return descriptor.ParameterTypes.ToDbNullParameterList();
     }
 
     /// Reads the response messages up to (but not including) the actual row stream / CommandComplete.

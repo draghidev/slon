@@ -1,6 +1,7 @@
 using System.Buffers.Binary;
 using System.Text;
 using Slon.Buffers;
+using Slon.Pg.Types;
 
 namespace Slon.Pg;
 
@@ -12,6 +13,12 @@ abstract class ParameterWriterStrategy
     public static ParameterWriterStrategy Raw { get; } = new RawParameterWriterStrategy();
 
     public abstract object CreateState(IOutputWriter output, Encoding textEncoding);
+    public virtual int GetParameterCount(object source)
+        => throw new NotSupportedException("This parameter writer strategy does not support deferred sources.");
+    public virtual PgTypeId GetParameterType(object source, int index)
+        => throw new NotSupportedException("This parameter writer strategy does not support deferred sources.");
+    public virtual void Materialize(object source, Span<Parameter> destination)
+        => throw new NotSupportedException("This parameter writer strategy does not support deferred sources.");
     public virtual Parameter Bind(object state, int parameterIndex, in Parameter parameter)
         => parameter;
     public abstract void Write(object state, int parameterIndex, in Parameter parameter);

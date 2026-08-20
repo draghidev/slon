@@ -1,7 +1,6 @@
 using System.Buffers;
 using System.Collections.Immutable;
 using System.Runtime.CompilerServices;
-using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using Slon.Buffers;
@@ -168,7 +167,8 @@ readonly struct PgEncoder
             _writer.WriteUInt(enumerator.Current.Oid.Value);
     }
 
-    public ValueTask WriteBindAuto(EncodedString commandName = default, EncodedString portalName = default, ImmutableArray<Parameter> parameters = default, CancellationToken cancellationToken = default)
+    public ValueTask WriteBindAuto(EncodedString commandName = default, EncodedString portalName = default,
+        ParameterBuffer parameters = default, CancellationToken cancellationToken = default)
     {
         if (_executionControl.IsAsync)
             return WriteBindAsync(commandName, portalName, parameters,
@@ -178,11 +178,11 @@ readonly struct PgEncoder
     }
 
     public async ValueTask WriteBindAsync(EncodedString commandName = default, EncodedString portalName = default,
-        ImmutableArray<Parameter> parameters = default, ImmutableArray<PgFormat> resultFormats = default,
+        ParameterBuffer parameters = default, ImmutableArray<PgFormat> resultFormats = default,
         ParameterWriterStrategy? parameterWriterStrategy = null,
         CancellationToken cancellationToken = default)
     {
-        NormalizeAndValidate(ref parameters, ref resultFormats);
+        NormalizeAndValidate(parameters, ref resultFormats);
         var strategy = parameterWriterStrategy ?? ParameterWriterStrategy.Raw;
         var state = BindParameters(parameters, strategy);
         WriteBindPreamble(commandName, portalName, parameters, resultFormats);
@@ -202,7 +202,7 @@ readonly struct PgEncoder
 
     // See WriteQueryResumable for the contract.
     public ValueTask WriteBindResumable(EncodedString commandName = default, EncodedString portalName = default,
-        ImmutableArray<Parameter> parameters = default, ImmutableArray<PgFormat> resultFormats = default,
+        ParameterBuffer parameters = default, ImmutableArray<PgFormat> resultFormats = default,
         ParameterWriterStrategy? parameterWriterStrategy = null)
         => WriteBindAsync(commandName, portalName, parameters, resultFormats, parameterWriterStrategy);
 
@@ -219,10 +219,10 @@ readonly struct PgEncoder
     }
 
     public void WriteBind(EncodedString commandName = default, EncodedString portalName = default,
-        ImmutableArray<Parameter> parameters = default, ImmutableArray<PgFormat> resultFormats = default,
+        ParameterBuffer parameters = default, ImmutableArray<PgFormat> resultFormats = default,
         ParameterWriterStrategy? parameterWriterStrategy = null)
     {
-        NormalizeAndValidate(ref parameters, ref resultFormats);
+        NormalizeAndValidate(parameters, ref resultFormats);
         var strategy = parameterWriterStrategy ?? ParameterWriterStrategy.Raw;
         var state = BindParameters(parameters, strategy);
         WriteBindPreamble(commandName, portalName, parameters, resultFormats);
@@ -240,10 +240,9 @@ readonly struct PgEncoder
         WriteResultFormats(resultFormats);
     }
 
-    object? BindParameters(ImmutableArray<Parameter> parameters, ParameterWriterStrategy strategy)
+    object? BindParameters(ParameterBuffer parameters, ParameterWriterStrategy strategy)
     {
         object? state = null;
-        Parameter[]? array = null;
         for (var parameterIndex = 0; parameterIndex < parameters.Length; parameterIndex++)
         {
             var parameter = parameters[parameterIndex];
@@ -251,24 +250,20 @@ readonly struct PgEncoder
                 continue;
 
             state ??= _writer.GetParameterWriterState(strategy);
-            // Command construction gives this execution sole ownership of the immutable array.
-            // Binding may therefore fill its transient protocol values without another array.
-            array ??= ImmutableCollectionsMarshal.AsArray(parameters)
-                ?? throw new InvalidOperationException("The parameter array has no backing storage.");
-            array[parameterIndex] = strategy.Bind(state, parameterIndex, in parameter);
+            parameters[parameterIndex] = strategy.Bind(state, parameterIndex, in parameter);
         }
         return state;
     }
 
     void WriteBindPreamble(EncodedString commandName, EncodedString portalName,
-        ImmutableArray<Parameter> parameters, ImmutableArray<PgFormat> resultFormats)
+        ParameterBuffer parameters, ImmutableArray<PgFormat> resultFormats)
     {
         var encoding = ClientEncoding;
         var portalNameBytes = portalName.AsNullTerminatedSpan(encoding);
         var commandNameBytes = commandName.AsNullTerminatedSpan(encoding);
         var parameterCount = checked((ushort)parameters.Length);
         var parameterBytes = sizeof(ushort);
-        foreach (var parameter in parameters)
+        foreach (var parameter in parameters.Span)
         {
             var size = parameter.GetSize();
             parameterBytes = checked(parameterBytes + sizeof(int) + Math.Max(0, size));
@@ -307,11 +302,8 @@ readonly struct PgEncoder
             _writer.WriteUShort((ushort)format);
     }
 
-    static void NormalizeAndValidate(ref ImmutableArray<Parameter> parameters,
-        ref ImmutableArray<PgFormat> resultFormats)
+    static void NormalizeAndValidate(ParameterBuffer parameters, ref ImmutableArray<PgFormat> resultFormats)
     {
-        if (parameters.IsDefault)
-            parameters = ImmutableArray<Parameter>.Empty;
         if (resultFormats.IsDefault)
             resultFormats = ImmutableArray<PgFormat>.Empty;
         if (parameters.Length > ushort.MaxValue)

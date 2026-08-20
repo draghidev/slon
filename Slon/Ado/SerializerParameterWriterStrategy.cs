@@ -63,6 +63,19 @@ sealed class SerializerParameterWriterStrategy : ParameterWriterStrategy
     public override object CreateState(IOutputWriter output, Encoding textEncoding)
         => new PgWriter(output, new() { TextEncoding = textEncoding });
 
+    public override int GetParameterCount(object source) => ((SlonParameters)source).Count;
+    public override PgTypeId GetParameterType(object source, int index)
+        => ((SlonParameters)source).GetResolvedParameterType(index);
+
+    public override void Materialize(object source, Span<Parameter> destination)
+    {
+        var parameters = (SlonParameters)source;
+        if (parameters.Count != destination.Length)
+            ThrowHelper.ThrowInvalidOperation("The parameter source changed during execution.");
+        for (var i = 0; i < destination.Length; i++)
+            destination[i] = parameters.CreateResolvedParameter(i);
+    }
+
     public override Parameter Bind(object state, int parameterIndex, in Parameter parameter)
     {
         if (!parameter.RequiresBinding)

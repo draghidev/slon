@@ -55,6 +55,7 @@ public partial class SlonParameters
 
         /// Either null, an object or an SlonDbParameter, any other derived DbParameter types are not accepted.
         public object? Value => _value;
+        internal ParameterTypeResolution TypeResolution => _typeResolution;
 
         public bool TryGetAsParameter([NotNullWhen(true)]out SlonDbParameter? parameter)
         {
@@ -162,6 +163,15 @@ public partial class SlonParameters
         item = item.WithTypeResolution(resolution,
             resolvedForPreparedType: preparedTypeId is not null);
         return resolution;
+    }
+
+    internal PgTypeId GetResolvedParameterType(int index)
+        => GetItemRef(index).TypeResolution.PgTypeId;
+
+    internal Parameter CreateResolvedParameter(int index)
+    {
+        ref var item = ref GetItemRef(index);
+        return item.TypeResolution.CreateParameter(item.Value, index);
     }
 
     void EnsureParameterResolutionOptions(PgSerializerOptions options)

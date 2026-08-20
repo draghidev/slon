@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Collections.Immutable;
 using System.Text;
 using System.Threading.Tasks.Sources;
 using Slon.Pg;
@@ -684,7 +685,7 @@ public class RecoveryTests : ConnectionCreatingTest
             .CreateParameter(value, parameterIndex: 0);
         var command = Command.Create("select octet_length($1::bytea)", new([parameter])) with
         {
-            Parameters = [parameter]
+            Parameters = ImmutableArray.Create(parameter)
         };
         var faulting = new CommandFlow(async: true, new CommandFlowOptions
         {

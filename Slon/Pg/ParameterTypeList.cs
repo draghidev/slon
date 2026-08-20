@@ -11,14 +11,16 @@ namespace Slon.Pg;
 // Discriminated union over prepared and unprepared parameter types.
 readonly struct ParameterTypeList : IEquatable<ParameterTypeList>
 {
-    readonly Array _typesIdsOrParameters;
+    readonly object _source;
+    readonly ParameterWriterStrategy? _strategy;
 
     public ParameterTypeList(ImmutableArray<PgTypeId> typeIds)
     {
         if (!MemoryMarshal.TryGetArray(typeIds.AsMemory(), out var seg) || seg.Array!.Length != seg.Count)
             ThrowHelper.ThrowArgumentException(nameof(typeIds), "Must be backed by an exact sized array.");
 
-        _typesIdsOrParameters = seg.Array!;
+        _source = seg.Array!;
+        _strategy = null;
     }
 
     public ParameterTypeList(ImmutableArray<Parameter> parameters)
@@ -26,22 +28,35 @@ readonly struct ParameterTypeList : IEquatable<ParameterTypeList>
         if (!MemoryMarshal.TryGetArray(parameters.AsMemory(), out var seg) || seg.Array!.Length != seg.Count)
             ThrowHelper.ThrowArgumentException(nameof(parameters), "Must be backed by an exact sized array.");
 
-        _typesIdsOrParameters = seg.Array!;
+        _source = seg.Array!;
+        _strategy = null;
+    }
+
+    internal ParameterTypeList(object? source, ParameterWriterStrategy strategy)
+    {
+        _source = source!;
+        _strategy = strategy;
     }
 
     public ushort PgCount => checked((ushort)Count);
-    public int Count => _typesIdsOrParameters?.Length ?? 0;
+    public int Count => _source switch
+    {
+        null => 0,
+        Array array => array.Length,
+        var state => _strategy!.GetParameterCount(state)
+    };
 
     public ParameterTypeList Preserve(Func<PgTypeId, Oid>? oidLookup = null)
     {
         // If we already have PgTypeIds, nothing to do.
-        if (_typesIdsOrParameters is PgTypeId[])
+        if (_source is PgTypeId[])
             return this;
 
-        var builder = ImmutableArray.CreateBuilder<PgTypeId>(Count);
+        var array = new PgTypeId[Count];
+        var index = 0;
         foreach (var pgTypeId in this)
-            builder.Add(pgTypeId.IsDataTypeName && oidLookup is not null ? oidLookup(pgTypeId) : pgTypeId);
-        return new(builder.MoveToImmutable());
+            array[index++] = pgTypeId.IsDataTypeName && oidLookup is not null ? oidLookup(pgTypeId) : pgTypeId;
+        return new(ImmutableCollectionsMarshal.AsImmutableArray(array));
     }
 
     public static ParameterTypeList Create(ImmutableArray<Parameter> parameters) => new(parameters);
@@ -52,10 +67,7 @@ readonly struct ParameterTypeList : IEquatable<ParameterTypeList>
         if (Count is 0)
             return default;
 
-        var builder = ImmutableArray.CreateBuilder<Parameter>(Count);
-        for (var i = 0; i < Count; i++)
-            builder.Add(default);
-        return builder.MoveToImmutable();
+        return ImmutableCollectionsMarshal.AsImmutableArray(new Parameter[Count]);
     }
 
     [UnscopedRef]
@@ -75,17 +87,24 @@ readonly struct ParameterTypeList : IEquatable<ParameterTypeList>
             if (_index is -2)
                 return false;
 
-            switch (_list._typesIdsOrParameters)
+            var index = ++_index;
+            switch (_list._source)
             {
-                case Parameter[] parameters when ++_index < parameters.Length:
+                case Parameter[] parameters when index < parameters.Length:
                 {
-                    var pgTypeId = parameters[_index].PgTypeId;
+                    var pgTypeId = parameters[index].PgTypeId;
                     _current = pgTypeId.IsDataTypeName && oidLookup is not null ? oidLookup(pgTypeId) : pgTypeId;
                     return true;
                 }
-                case PgTypeId[] pgTypeIds when ++_index < pgTypeIds.Length:
+                case PgTypeId[] pgTypeIds when index < pgTypeIds.Length:
                 {
-                    var pgTypeId = pgTypeIds[_index];
+                    var pgTypeId = pgTypeIds[index];
+                    _current = pgTypeId.IsDataTypeName && oidLookup is not null ? oidLookup(pgTypeId) : pgTypeId;
+                    return true;
+                }
+                case not null when _list._strategy is { } strategy && index < strategy.GetParameterCount(_list._source):
+                {
+                    var pgTypeId = strategy.GetParameterType(_list._source, index);
                     _current = pgTypeId.IsDataTypeName && oidLookup is not null ? oidLookup(pgTypeId) : pgTypeId;
                     return true;
                 }
@@ -148,7 +167,8 @@ readonly struct ParameterTypeList : IEquatable<ParameterTypeList>
         return true;
     }
 
-    public bool Equals(ParameterTypeList other) => ReferenceEquals(_typesIdsOrParameters, other._typesIdsOrParameters);
+    public bool Equals(ParameterTypeList other)
+        => ReferenceEquals(_source, other._source) && ReferenceEquals(_strategy, other._strategy);
 
     public override bool Equals(object? obj) => obj is ParameterTypeList other && Equals(other);
     public override int GetHashCode() => throw new NotImplementedException();

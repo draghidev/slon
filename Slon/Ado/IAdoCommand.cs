@@ -27,7 +27,8 @@ static class AdoCommandExtensions
 {
     public static (Command, TrackerResult) CreateCommand<TCommand>(this TCommand command, bool enableErrorBarriers,
         CommandBehavior behavior, in TrackerContext trackerContext, DbParameterCollection? dbParameters,
-        TimeSpan timeout, bool preparing, PgSerializerOptions? serializerOptions = null)
+        TimeSpan timeout, bool preparing, PgSerializerOptions? serializerOptions = null,
+        ParameterWriterStrategy? parameterWriterStrategy = null)
         where TCommand : IAdoCommand
     {
         var commandParameters = command.Parameters;
@@ -58,12 +59,11 @@ static class AdoCommandExtensions
                 $"received {dbParameters?.Count ?? 0}.");
         }
 
-        ImmutableArray<Parameter> parameters = [];
+        ParameterSource parameters = default;
         ParameterTypeList parameterTypes = default;
         if (dbParameters?.Count > 0)
         {
-            var parameterArray = preparing ? null : new Parameter[dbParameters.Count];
-            var typeArray = preparing ? new PgTypeId[dbParameters.Count] : null;
+            var parameterArray = serializerOptions is null ? new Parameter[dbParameters.Count] : null;
             using var preparedTypes = preparedParameterTypes.GetEnumerator();
             var parameterIndex = 0;
             foreach (var kv in slonParameters!.GetStructEnumerator())
@@ -81,29 +81,19 @@ static class AdoCommandExtensions
                     var parameter = preparedType is { } type
                         ? Parameter.Create(kv.Value, type)
                         : Parameter.Create(kv.Value);
-                    if (preparing)
-                        typeArray![currentParameterIndex] = parameter.PgTypeId;
-                    else
-                        parameterArray![currentParameterIndex] = parameter;
+                    parameterArray![currentParameterIndex] = parameter;
                     continue;
                 }
 
-                var resolution = slonParameters.GetOrResolveTypeInfo(
+                slonParameters.GetOrResolveTypeInfo(
                     currentParameterIndex, serializerOptions, preparedType, allowUnspecified: preparing);
-                if (preparing)
-                    typeArray![currentParameterIndex] = resolution.PgTypeId;
-                else
-                    parameterArray![currentParameterIndex] = resolution.CreateParameter(
-                        kv.Value, currentParameterIndex);
             }
 
-            if (preparing)
-                parameterTypes = new(ImmutableCollectionsMarshal.AsImmutableArray(typeArray));
+            if (parameterArray is null)
+                parameters = new(slonParameters!);
             else
-            {
                 parameters = ImmutableCollectionsMarshal.AsImmutableArray(parameterArray);
-                parameterTypes = ParameterTypeList.Create(parameters);
-            }
+            parameterTypes = parameters.GetParameterTypes(parameterWriterStrategy ?? ParameterWriterStrategy.Raw);
             Debug.Assert(parameterTypes.Count == dbParameters.Count);
         }
 
