@@ -137,7 +137,6 @@ public readonly record struct SlonDbType
     internal bool IsInfer => _dataTypeName is null;
     internal string DataTypeName => _dataTypeName ?? throw new InvalidOperationException("DbType does not carry a name.");
 
-    // TODO multirange arrays need their own flag.
     internal bool ResolveArrayType { get; init; }
     internal bool ResolveMultirangeType { get; init; }
 
@@ -154,9 +153,16 @@ public readonly record struct SlonDbType
     public SlonDbType MakeMultirangeType() => this with { ResolveMultirangeType = true };
 
     /// <inheritdoc />
-    public override string ToString() => IsInfer
-        ? @"Case = ""Inference"""
-        : $@"Case = ""DataTypeName"", Value = ""{Pg.Types.DataTypeName.CreateFullyQualifiedName(DataTypeName).DisplayName}{(ResolveArrayType ? "[]" : "")}""";
+    public override string ToString()
+    {
+        if (IsInfer)
+            return @"Case = ""Inference""";
+
+        var dataTypeName = Pg.Types.DataTypeName.CreateFullyQualifiedName(DataTypeName);
+        if (ResolveMultirangeType)
+            dataTypeName = dataTypeName.ToDefaultMultirangeName();
+        return $@"Case = ""DataTypeName"", Value = ""{dataTypeName.DisplayName}{(ResolveArrayType ? "[]" : "")}""";
+    }
 
     /// Infer a database type from the parameter value instead of specifying one.
     public static SlonDbType Infer => default;
