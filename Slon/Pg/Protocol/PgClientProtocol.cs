@@ -229,7 +229,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
 
         var score = LoadScore();
         var otherScore = other.LoadScore();
-        return score < otherScore ? -1 : score == otherScore ? 0 : 1;
+        return score.CompareTo(otherScore);
     }
 
     // Estimated wait in ticks: outstanding / throughput, plus serialization and head-age penalties.
