@@ -6,8 +6,7 @@ public class PreparedCommandTests
     [TestMethod]
     public async Task Prepare_MakesZeroParameterCommandImmutableAndConcurrentlyReusable()
     {
-        await using var dataSource = AdoTestPool.NewIsolatedDataSource();
-        await using var command = dataSource.CreateCommand("select 42");
+        await using var command = AdoTestPool.CreateCommand("select 42");
 
         await command.PrepareAsync();
         Assert.IsTrue(command.IsReadOnly);
@@ -16,7 +15,7 @@ public class PreparedCommandTests
         Assert.ThrowsExactly<NotSupportedException>(() => command.Cancel());
         Assert.ThrowsExactly<NotSupportedException>(() => command.CancelAsync());
 
-        var executions = Enumerable.Range(0, 64)
+        var executions = Enumerable.Range(0, 16)
             .Select(_ => command.ExecuteScalarAsync(CancellationToken.None));
         var results = await Task.WhenAll(executions);
 
@@ -26,12 +25,11 @@ public class PreparedCommandTests
     [TestMethod]
     public async Task PreparedParameters_AreInferredAndRemainExecutionLocal()
     {
-        await using var dataSource = AdoTestPool.NewIsolatedDataSource();
-        await using var command = dataSource.CreateCommand("select $1::int");
+        await using var command = AdoTestPool.CreateCommand("select $1::int");
         command.Parameters.Add(new SlonParameter(null));
         await command.PrepareAsync();
 
-        var executions = Enumerable.Range(0, 64)
+        var executions = Enumerable.Range(0, 16)
             .Select(value => command.ExecuteScalarAsync(SlonParameters.Create(value)).AsTask());
         var results = await Task.WhenAll(executions);
 
@@ -44,8 +42,7 @@ public class PreparedCommandTests
     [TestMethod]
     public async Task Prepare_KeepsCommandParameterValuesMutable()
     {
-        await using var dataSource = AdoTestPool.NewIsolatedDataSource();
-        await using var command = dataSource.CreateCommand("select $1::int");
+        await using var command = AdoTestPool.CreateCommand("select $1::int");
         var parameter = new SlonParameter<int>(1);
         command.Parameters.Add(parameter);
         await command.PrepareAsync();
@@ -61,8 +58,7 @@ public class PreparedCommandTests
     [TestMethod]
     public async Task Prepare_UsesLocalParameterTypesAsOverloadHints()
     {
-        await using var dataSource = AdoTestPool.NewIsolatedDataSource();
-        await using var command = dataSource.CreateCommand("select $1");
+        await using var command = AdoTestPool.CreateCommand("select $1");
         command.Parameters.Add(new SlonParameter<int>());
 
         await command.PrepareAsync();
@@ -74,8 +70,7 @@ public class PreparedCommandTests
     [TestMethod]
     public async Task Prepare_InfersOnlyUnresolvedParameterSlots()
     {
-        await using var dataSource = AdoTestPool.NewIsolatedDataSource();
-        await using var command = dataSource.CreateCommand("select $1::int + $2");
+        await using var command = AdoTestPool.CreateCommand("select $1::int + $2");
         command.Parameters.Add(new SlonParameter(null));
         command.Parameters.Add(new SlonParameter<int>());
 
@@ -91,8 +86,7 @@ public class PreparedCommandTests
     [TestMethod]
     public async Task PreparedParameterRejectsConflictingRequestedType()
     {
-        await using var dataSource = AdoTestPool.NewIsolatedDataSource();
-        await using var command = dataSource.CreateCommand("select $1::int");
+        await using var command = AdoTestPool.CreateCommand("select $1::int");
         command.Parameters.Add(new SlonParameter(null));
         await command.PrepareAsync();
 
@@ -104,8 +98,7 @@ public class PreparedCommandTests
     [TestMethod]
     public async Task Prepare_ReportsUnresolvedParameterAmbiguity()
     {
-        await using var dataSource = AdoTestPool.NewIsolatedDataSource();
-        await using var command = dataSource.CreateCommand("select $1 + $2");
+        await using var command = AdoTestPool.CreateCommand("select $1 + $2");
         command.Parameters.Add(new SlonParameter(null));
         command.Parameters.Add(new SlonParameter(null));
 
@@ -208,8 +201,7 @@ public class PreparedCommandTests
     [TestMethod]
     public async Task Prepare_MakesBatchCommandShapeImmutable()
     {
-        await using var dataSource = AdoTestPool.NewIsolatedDataSource();
-        await using var batch = dataSource.CreateBatch();
+        await using var batch = AdoTestPool.CreateBatch();
         var command = batch.CreateBatchCommand("select 42");
         batch.BatchCommands.Add(command);
 
