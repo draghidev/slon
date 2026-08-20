@@ -2,12 +2,12 @@ using Slon.Pg.Types;
 
 namespace Slon.Pg;
 
-// A complete protocol value used directly without a deferred parameter strategy.
+// A complete protocol value used directly without a deferred parameter writer.
 readonly struct Parameter
 {
-    readonly int _sizePlusOne;
-    readonly Oid _oid;
     readonly object? _value;
+    readonly Oid _oid;
+    readonly int _size;
 
     public Oid Oid => _oid;
     public object? Value => _value;
@@ -16,7 +16,7 @@ readonly struct Parameter
     {
         _value = value;
         _oid = oid;
-        _sizePlusOne = checked(size + 1);
+        _size = size;
     }
 
     public static Parameter Create(byte[] value, Oid oid)
@@ -42,7 +42,7 @@ readonly struct Parameter
 
     public static Parameter CreateNull(Oid oid) => new(null, oid, -1);
 
-    public int Size => _sizePlusOne - 1;
+    public int Size => _value is null ? -1 : _size;
 
     static int GetStreamSize(Stream stream)
     {

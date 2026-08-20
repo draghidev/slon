@@ -97,19 +97,19 @@ readonly struct EnqueueArgs<TCommand> where TCommand : IAdoCommand
     public readonly CommandBehavior Behavior;
     public readonly SlonConnection Connection;
     public readonly PgSerializerOptions SerializerOptions;
-    public readonly ParameterWriterStrategy ParameterWriterStrategy;
+    public readonly ParameterWriter ParameterWriter;
     public readonly bool Preparing;
 
     public EnqueueArgs(FieldRef<AdoBatchCore<TCommand>> fieldRef, DbParameterCollection? parameters,
         CommandBehavior behavior, SlonConnection connection, PgSerializerOptions serializerOptions,
-        ParameterWriterStrategy parameterWriterStrategy, bool preparing)
+        ParameterWriter parameterWriter, bool preparing)
     {
         FieldRef = fieldRef;
         Parameters = parameters;
         Behavior = behavior;
         Connection = connection;
         SerializerOptions = serializerOptions;
-        ParameterWriterStrategy = parameterWriterStrategy;
+        ParameterWriter = parameterWriter;
         Preparing = preparing;
     }
 }
@@ -133,7 +133,7 @@ sealed class AdoCommandFlowBindingStrategy<TCommand> : CommandFlowBindingStrateg
             [(DbParameterCollection?)binding.Parameters], (CommandBehavior)binding.Behavior,
             tracker: dependencies.CommandsTracker, pgConnection: connection,
             serializerOptions: dependencies.SerializerOptions,
-            parameterWriterStrategy: dependencies.ParameterWriterStrategy,
+            parameterWriter: dependencies.ParameterWriter,
             pendingTimeout: pendingTimeout, preparing: binding.IsPreparing);
     }
 }
@@ -323,7 +323,7 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
     internal CommandFlowOptions CreateCommandFlowOptions(ReadOnlySpan<DbParameterCollection?> parametersSpan,
         CommandBehavior behavior, SlonConnection? connection = null, CommandTracker? tracker = null,
         PgConnection? pgConnection = null, PgSerializerOptions? serializerOptions = null,
-        ParameterWriterStrategy? parameterWriterStrategy = null, TimeSpan? pendingTimeout = null,
+        ParameterWriter? parameterWriter = null, TimeSpan? pendingTimeout = null,
         bool preparing = false)
     {
         if (_commands.Count is 0)
@@ -370,7 +370,7 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
 
                 var parameters = indexParameters ? parametersSpan[i] : !parametersSpan.IsEmpty ? parametersSpan[0] : null;
                 result = adoCommand.CreateCommand(_enableErrorBarriers, behavior, trackerContext, parameters,
-                    Timeout, preparing, serializerOptions, parameterWriterStrategy);
+                    Timeout, preparing, serializerOptions, parameterWriter);
                 // Refresh the cache when the tracker resolved to a different TC than the one we
                 // passed in (catches workload-tracker recreation via DbDepsRevision++ and similar).
                 if (result.TrackerResult.Tracked is not null && !ReferenceEquals(adoCommand.Tracked, result.TrackerResult.Tracked))
@@ -522,7 +522,6 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
                 ObserverState = observerState,
                 Commands = commandArray is null ? new(result.Command) : new(commandArray, commandCount, isPooled: true),
                 SerializerOptions = serializerOptions ?? connection?.DbDataSource.GetDbDependencies().SerializerOptions,
-                ParameterWriterStrategy = parameterWriterStrategy ?? SerializerParameterWriterStrategy.Instance,
                 PendingTimeout = pendingTimeout
             };
         }
@@ -537,42 +536,61 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
         }
     }
 
-    CommandFlow Enqueue(DbParameterCollection? parameters, CommandBehavior behavior, bool preparing = false)
+    SlonDataSource.PgDbDependencies GetDependencies()
+    {
+        TryGetDataSource(out var dataSource, out var connection);
+        connection ??= dataSource is null ? ThrowConnectionNotInitialized() : null;
+        return (dataSource ?? connection!.DbDataSource).GetDbDependencies();
+    }
+
+    ValueTask<SlonDataSource.PgDbDependencies> GetDependenciesAsync(
+        CancellationToken cancellationToken)
+    {
+        TryGetDataSource(out var dataSource, out var connection);
+        connection ??= dataSource is null ? ThrowConnectionNotInitialized() : null;
+        return (dataSource ?? connection!.DbDataSource).GetDbDependenciesAsync(cancellationToken);
+    }
+
+    CommandFlow Enqueue(DbParameterCollection? parameters, CommandBehavior behavior,
+        SlonDataSource.PgDbDependencies dependencies, bool preparing = false)
     {
         if (TryGetDataSource(out var dataSource, out var connection))
         {
             ThrowIfHasCloseConnection(behavior);
             var pendingTimeout = PendingTimeout;
-            var dependencies = dataSource.GetDbDependencies();
             var binding = CreateDataSourceBinding(parameters, behavior, dependencies, preparing);
             return dataSource.EnqueueCommands(new CommandFlow(async: false, binding, pendingTimeout), pendingTimeout);
         }
 
         connection ??= ThrowConnectionNotInitialized();
-        var connectionDependencies = connection.DbDataSource.GetDbDependencies();
         return connection.Enqueue(
             static (pgConnection, args) =>
             {
                 ref var core = ref args.FieldRef.Invoke();
                 var options = core.CreateCommandFlowOptions([args.Parameters], args.Behavior,
                     args.Connection, tracker: null, pgConnection, args.SerializerOptions,
-                    args.ParameterWriterStrategy, preparing: args.Preparing);
+                    args.ParameterWriter, preparing: args.Preparing);
                 return new CommandFlow(async: false, options);
             },
             new EnqueueArgs<TCommand>(_fieldRef, parameters, behavior, connection,
-                connectionDependencies.SerializerOptions, connectionDependencies.ParameterWriterStrategy,
+                dependencies.SerializerOptions, dependencies.ParameterWriter,
                 preparing));
     }
 
-    ValueTask<CommandFlow> EnqueueAsync(DbParameterCollection? parameters, CommandBehavior behavior,
+    ValueTask<CommandFlow> EnqueueAsync(DbParameterCollection? parameters,
+        CommandBehavior behavior, SlonDataSource.PgDbDependencies dependencies,
         CancellationToken cancellationToken, bool preparing = false)
     {
         if (TryGetDataSource(out var dataSource, out var connection))
-            return DataSourceCore(_fieldRef, dataSource, parameters, behavior, PendingTimeout,
-                cancellationToken, preparing);
+        {
+            ThrowIfHasCloseConnection(behavior);
+            var pendingTimeout = PendingTimeout;
+            var binding = CreateDataSourceBinding(parameters, behavior, dependencies, preparing);
+            return dataSource.EnqueueCommandsAsync(new CommandFlow(async: true, binding, pendingTimeout),
+                pendingTimeout, cancellationToken);
+        }
 
         connection ??= ThrowConnectionNotInitialized();
-        var connectionDependencies = connection.DbDataSource.GetDbDependencies();
         return connection.EnqueueAsync(
             static (pgConnection, args) =>
             {
@@ -582,26 +600,13 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
                 ref var core = ref args.FieldRef.Invoke();
                 var options = core.CreateCommandFlowOptions([args.Parameters], args.Behavior,
                     args.Connection, tracker: null, pgConnection, args.SerializerOptions,
-                    args.ParameterWriterStrategy, preparing: args.Preparing);
+                    args.ParameterWriter, preparing: args.Preparing);
                 return new CommandFlow(async: true, options);
             },
             new EnqueueArgs<TCommand>(_fieldRef, parameters, behavior, connection,
-                connectionDependencies.SerializerOptions, connectionDependencies.ParameterWriterStrategy,
+                dependencies.SerializerOptions, dependencies.ParameterWriter,
                 preparing),
             cancellationToken);
-
-        static async ValueTask<CommandFlow> DataSourceCore(FieldRef<AdoBatchCore<TCommand>> fieldRef,
-            SlonDataSource dataSource, DbParameterCollection? parameters, CommandBehavior behavior,
-            TimeSpan pendingTimeout, CancellationToken cancellationToken, bool preparing)
-        {
-            fieldRef.Invoke().ThrowIfHasCloseConnection(behavior);
-            var dependencies = await dataSource.GetDbDependenciesAsync(cancellationToken).ConfigureAwait(false);
-            ref var core = ref fieldRef.Invoke();
-            var binding = core.CreateDataSourceBinding(parameters, behavior, dependencies, preparing);
-            return await dataSource.EnqueueCommandsAsync(
-                new CommandFlow(async: true, binding, pendingTimeout), pendingTimeout, cancellationToken)
-                .ConfigureAwait(false);
-        }
     }
 
     CommandFlowBinding CreateDataSourceBinding(DbParameterCollection? parameters, CommandBehavior behavior,
@@ -632,7 +637,8 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
         List<(int, Exception)>? exceptions = null;
         try
         {
-            var flow = Enqueue(parameters, CommandBehavior.SchemaOnly, preparing: true);
+            var flow = Enqueue(parameters, CommandBehavior.SchemaOnly, GetDependencies(),
+                preparing: true);
             enumerator = flow.GetEnumerator();
             var span = _commands.AsSpan();
             for (var i = 0; i < span.Length; i++)
@@ -696,8 +702,10 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
         List<(int, Exception)>? exceptions = null;
         try
         {
-            var flow = await thisRef.EnqueueAsync(parameters, CommandBehavior.SchemaOnly, cancellationToken,
-                preparing: true).ConfigureAwait(false);
+            var dependencies = await thisRef.GetDependenciesAsync(cancellationToken)
+                .ConfigureAwait(false);
+            var flow = await fieldRef.Invoke().EnqueueAsync(parameters, CommandBehavior.SchemaOnly,
+                dependencies, cancellationToken, preparing: true).ConfigureAwait(false);
             enumerator = flow.GetAsyncEnumerator(cancellationToken);
             for (var i = 0; i < fieldRef.Invoke()._commands.AsSpan().Length; i++)
             {
@@ -768,7 +776,8 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
     int ExecuteNonQueryCore(DbParameterCollection? parameters)
     {
         var recordsAffected = 0L;
-        foreach (var result in Enqueue(parameters, CommandBehavior.Default))
+        var dependencies = GetDependencies();
+        foreach (var result in Enqueue(parameters, CommandBehavior.Default, dependencies))
         {
             // Drive the result to its CommandComplete so RecordsAffected is populated (we discard any
             // rows - this is ExecuteNonQuery). Only data-modifying statements contribute a non-zero count.
@@ -788,7 +797,10 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
         {
             thisRef.ThrowIfDisposed();
             cancellationToken.ThrowIfCancellationRequested();
-            var flow = await thisRef.EnqueueAsync(parameters, CommandBehavior.Default, cancellationToken).ConfigureAwait(false);
+            var dependencies = await thisRef.GetDependenciesAsync(cancellationToken)
+                .ConfigureAwait(false);
+            var flow = await fieldRef.Invoke().EnqueueAsync(parameters, CommandBehavior.Default,
+                dependencies, cancellationToken).ConfigureAwait(false);
             return checked((int)await flow.ConsumeNonQueryAsync(cancellationToken).ConfigureAwait(false));
         }
         catch (Exception ex)
@@ -820,7 +832,8 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
 
     object? ExecuteScalarCore(DbParameterCollection? parameters)
     {
-        foreach (var result in Enqueue(parameters, CommandBehavior.Default))
+        var dependencies = GetDependencies();
+        foreach (var result in Enqueue(parameters, CommandBehavior.Default, dependencies))
         {
             using var rowEnumerator = result.GetAsyncEnumerator();
             if (rowEnumerator.MoveNext())
@@ -841,7 +854,11 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
         {
             thisRef.ThrowIfDisposed();
             cancellationToken.ThrowIfCancellationRequested();
-            enumerator = (await thisRef.EnqueueAsync(parameters, CommandBehavior.Default, cancellationToken).ConfigureAwait(false)).GetAsyncEnumerator(cancellationToken);
+            var dependencies = await thisRef.GetDependenciesAsync(cancellationToken)
+                .ConfigureAwait(false);
+            enumerator = (await fieldRef.Invoke().EnqueueAsync(parameters, CommandBehavior.Default,
+                dependencies, cancellationToken).ConfigureAwait(false))
+                .GetAsyncEnumerator(cancellationToken);
             while (await enumerator.MoveNextAsync().ConfigureAwait(false))
             {
                 var rowEnumerator = enumerator.Current.GetAsyncEnumerator(cancellationToken);
@@ -903,7 +920,11 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
     }
 
     SlonDataReader ExecuteReaderCore(DbParameterCollection? parameters, CommandBehavior behavior)
-        => SlonDataReader.Create(behavior, Enqueue(parameters, behavior), GetConnectionToClose(behavior));
+    {
+        var dependencies = GetDependencies();
+        return SlonDataReader.Create(behavior, Enqueue(parameters, behavior, dependencies),
+            GetConnectionToClose(behavior));
+    }
 
     SlonConnection? GetConnectionToClose(CommandBehavior behavior)
     {
@@ -944,8 +965,11 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
         try
         {
             var connectionToClose = core.GetConnectionToClose(behavior);
+            var dependencies = await core.GetDependenciesAsync(cancellationToken)
+                .ConfigureAwait(false);
             return await SlonDataReader.CreateAsync<TReader>(behavior,
-                core.EnqueueAsync(parameters, behavior, cancellationToken), cancellationToken, connectionToClose)
+                fieldRef.Invoke().EnqueueAsync(parameters, behavior, dependencies, cancellationToken),
+                cancellationToken, connectionToClose)
                 .ConfigureAwait(false);
         }
         catch (Exception ex)

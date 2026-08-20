@@ -1,9 +1,6 @@
-using System.Buffers;
 using System.Collections.Immutable;
 using System.Runtime.CompilerServices;
-using System.Security.Cryptography;
 using System.Text;
-using Slon.Buffers;
 using Slon.Text;
 using Slon.Transport;
 using static Slon.Pg.Protocol.PgTypes;
@@ -169,7 +166,6 @@ readonly struct PgEncoder
 
     public async ValueTask WriteBindAsync(EncodedString commandName = default, EncodedString portalName = default,
         ParameterSource parameters = default, ImmutableArray<PgFormat> resultFormats = default,
-        ParameterWriterStrategy? parameterWriterStrategy = null,
         CancellationToken cancellationToken = default)
     {
         var parameterCount = parameters.Count;
@@ -184,20 +180,19 @@ readonly struct PgEncoder
         }
         else
         {
-            var strategy = parameterWriterStrategy
-                ?? throw new InvalidOperationException("A deferred parameter source requires a writer strategy.");
+            var writer = parameters.Writer
+                ?? throw new InvalidOperationException("A deferred parameter source requires a parameter writer.");
             var source = parameters.State;
-            using var lease = strategy.BeginWrite(source, parameterCount);
-            var writeState = lease.State;
-            var writerState = BindParameters(source, writeState, parameterCount, strategy, out var parameterBytes);
+            using var lease = writer.BeginWriteCore(source, parameterCount);
+            var writerState = BindParameters(lease, parameterCount, writer, out var parameterBytes);
             WriteBindPreamble(commandName, portalName, parameterCount,
                 parameterBytes, resultFormats);
             for (var i = 0; i < parameterCount; i++)
             {
-                var size = strategy.GetSize(writeState, i);
+                var size = lease.GetSize(i);
                 _writer.WriteInt(size);
                 if (size >= 0)
-                    await strategy.WriteAsync(writerState!, source, writeState, i, cancellationToken)
+                    await lease.WriteAsync(writerState!, i, cancellationToken)
                         .ConfigureAwait(false);
             }
         }
@@ -206,9 +201,8 @@ readonly struct PgEncoder
 
     // See WriteQueryResumable for the contract.
     public ValueTask WriteBindResumable(EncodedString commandName = default, EncodedString portalName = default,
-        ParameterSource parameters = default, ImmutableArray<PgFormat> resultFormats = default,
-        ParameterWriterStrategy? parameterWriterStrategy = null)
-        => WriteBindAsync(commandName, portalName, parameters, resultFormats, parameterWriterStrategy);
+        ParameterSource parameters = default, ImmutableArray<PgFormat> resultFormats = default)
+        => WriteBindAsync(commandName, portalName, parameters, resultFormats);
 
     public void WriteBind(EncodedString commandName)
     {
@@ -223,8 +217,7 @@ readonly struct PgEncoder
     }
 
     public void WriteBind(EncodedString commandName = default, EncodedString portalName = default,
-        ParameterSource parameters = default, ImmutableArray<PgFormat> resultFormats = default,
-        ParameterWriterStrategy? parameterWriterStrategy = null)
+        ParameterSource parameters = default, ImmutableArray<PgFormat> resultFormats = default)
     {
         var parameterCount = parameters.Count;
         NormalizeAndValidate(parameterCount, ref resultFormats);
@@ -238,38 +231,37 @@ readonly struct PgEncoder
         }
         else
         {
-            var strategy = parameterWriterStrategy
-                ?? throw new InvalidOperationException("A deferred parameter source requires a writer strategy.");
+            var writer = parameters.Writer
+                ?? throw new InvalidOperationException("A deferred parameter source requires a parameter writer.");
             var source = parameters.State;
-            using var lease = strategy.BeginWrite(source, parameterCount);
-            var writeState = lease.State;
-            var writerState = BindParameters(source, writeState, parameterCount, strategy, out var parameterBytes);
+            using var lease = writer.BeginWriteCore(source, parameterCount);
+            var writerState = BindParameters(lease, parameterCount, writer, out var parameterBytes);
             WriteBindPreamble(commandName, portalName, parameterCount,
                 parameterBytes, resultFormats);
             for (var i = 0; i < parameterCount; i++)
             {
-                var size = strategy.GetSize(writeState, i);
+                var size = lease.GetSize(i);
                 _writer.WriteInt(size);
                 if (size >= 0)
-                    strategy.Write(writerState!, source, writeState, i);
+                    lease.Write(writerState!, i);
             }
         }
         WriteResultFormats(resultFormats);
     }
 
-    object? BindParameters(object source, object writeState, int parameterCount,
-        ParameterWriterStrategy strategy, out int parameterBytes)
+    object? BindParameters(ParameterWriter.WriteLease lease, int parameterCount,
+        ParameterWriter writer, out int parameterBytes)
     {
         parameterBytes = sizeof(ushort);
         if (parameterCount is 0)
             return null;
 
-        var writerState = _writer.GetParameterWriterState(strategy);
+        var writerState = _writer.GetParameterWriterState(writer);
         for (var parameterIndex = 0; parameterIndex < parameterCount; parameterIndex++)
         {
-            strategy.Bind(writerState, source, writeState, parameterIndex);
+            lease.Bind(writerState, parameterIndex);
             parameterBytes = checked(parameterBytes + sizeof(int)
-                + Math.Max(0, strategy.GetSize(writeState, parameterIndex)));
+                + Math.Max(0, lease.GetSize(parameterIndex)));
         }
         return writerState;
     }

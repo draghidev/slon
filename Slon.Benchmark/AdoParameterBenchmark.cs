@@ -6,6 +6,8 @@ using BenchmarkDotNet.Attributes;
 using Npgsql;
 using Slon.Buffers;
 using Slon.Pg;
+using Slon.Pg.Serialization;
+using Slon.Pg.Types;
 
 namespace Slon.Benchmark;
 
@@ -23,8 +25,12 @@ public class AdoParameterBenchmark : ClientBenchmark
     SlonParameter<int>[] _externalParameterValues = null!;
     SlonParameters _externalParameters = null!;
     ParameterSource _parameterSource;
-    ParameterWriterStrategy _parameterWriterStrategy = null!;
+    ParameterWriter _parameterWriter = null!;
     object _parameterWriterState = null!;
+    PocoValues _pocoValues = null!;
+    PocoParameterWriter _pocoWriter = null!;
+    ParameterSource _pocoSource;
+    object _pocoWriterState = null!;
     int _value;
 
     [Params(1, 10)]
@@ -79,12 +85,18 @@ public class AdoParameterBenchmark : ClientBenchmark
         }
         await _externalCommand.ExecuteScalarAsync(_externalParameters);
 
-        _parameterSource = new(_externalParameters, _externalParameters.Count);
-        _parameterWriterStrategy = _dataSource.GetDbDependencies().ParameterWriterStrategy;
-        _parameterWriterState = _parameterWriterStrategy.CreateWriterState(new BufferOutputWriter(), Encoding.UTF8);
+        _parameterWriter = _dataSource.GetDbDependencies().ParameterWriter;
+        _parameterSource = new(_externalParameters, _parameterWriter);
+        _parameterWriterState = _parameterWriter.CreateWriterStateCore(new BufferOutputWriter(), Encoding.UTF8);
+
+        _pocoValues = new(ParameterCount);
+        _pocoWriter = new(_dataSource.GetDbDependencies().SerializerOptions
+            .GetTypeInfo(typeof(int), pgTypeId: null));
+        _pocoSource = new(_pocoValues, _pocoWriter);
+        _pocoWriterState = _pocoWriter.CreateWriterStateCore(new BufferOutputWriter(), Encoding.UTF8);
 
         // Warm the shared array pool before measuring materialization.
-        using var warmLease = _parameterWriterStrategy.BeginWrite(
+        using var warmLease = _parameterWriter.BeginWriteCore(
             _parameterSource.State!, _parameterSource.Count);
     }
 
@@ -102,7 +114,7 @@ public class AdoParameterBenchmark : ClientBenchmark
     public int BeginParameterWrite()
     {
         var count = _parameterSource.Count;
-        using var lease = _parameterWriterStrategy.BeginWrite(_parameterSource.State!, count);
+        using var lease = _parameterWriter.BeginWriteCore(_parameterSource.State!, count);
         return count;
     }
 
@@ -111,13 +123,12 @@ public class AdoParameterBenchmark : ClientBenchmark
     {
         var source = _parameterSource.State!;
         var count = _parameterSource.Count;
-        using var lease = _parameterWriterStrategy.BeginWrite(source, count);
-        var writeState = lease.State;
+        using var lease = _parameterWriter.BeginWriteCore(source, count);
         var totalSize = 0;
         for (var i = 0; i < count; i++)
         {
-            _parameterWriterStrategy.Bind(_parameterWriterState, source, writeState, i);
-            totalSize += _parameterWriterStrategy.GetSize(writeState, i);
+            lease.Bind(_parameterWriterState, i);
+            totalSize += lease.GetSize(i);
         }
         return totalSize;
     }
@@ -127,6 +138,23 @@ public class AdoParameterBenchmark : ClientBenchmark
     {
         SetValues(_externalParameterValues);
         return BeginAndBindParameterWrite();
+    }
+
+    [Benchmark]
+    public int BeginAndBindPocoChangedValues()
+    {
+        var value = ++_value;
+        _pocoValues.Set(ParameterCount, value);
+        var source = _pocoSource.State!;
+        var count = _pocoSource.Count;
+        using var lease = _pocoWriter.BeginWriteCore(source, count);
+        var totalSize = 0;
+        for (var i = 0; i < count; i++)
+        {
+            lease.Bind(_pocoWriterState, i);
+            totalSize += lease.GetSize(i);
+        }
+        return totalSize;
     }
 
     [Benchmark]
@@ -200,5 +228,47 @@ public class AdoParameterBenchmark : ClientBenchmark
         public Span<byte> GetSpan(int sizeHint = 0) => _writer.GetSpan(sizeHint);
         public void Flush(TimeSpan timeout = default) { }
         public ValueTask FlushAsync(CancellationToken cancellationToken = default) => default;
+    }
+
+    sealed class PocoValues(int count)
+    {
+        internal int Count { get; } = count;
+        internal int P0, P1, P2, P3, P4, P5, P6, P7, P8, P9;
+
+        internal void Set(int count, int value)
+        {
+            if (count is 1)
+            {
+                P0 = value;
+                return;
+            }
+            (P0, P1, P2, P3, P4, P5, P6, P7, P8, P9)
+                = (value, value, value, value, value, value, value, value, value, value);
+        }
+    }
+
+    sealed class PocoParameterWriter(PgTypeInfo typeInfo) : PgSerializerParameterWriter<PocoValues>
+    {
+        public override int GetParameterCount(PocoValues source) => source.Count;
+        public override PgTypeId GetParameterType(PocoValues source, int index) => typeInfo.PgTypeId;
+
+        protected override void ApplyParameter(PocoValues source, int parameterIndex,
+            PgParameterValueOperation operation)
+        {
+            switch (parameterIndex)
+            {
+            case 0: operation.Apply(typeInfo, source.P0); break;
+            case 1: operation.Apply(typeInfo, source.P1); break;
+            case 2: operation.Apply(typeInfo, source.P2); break;
+            case 3: operation.Apply(typeInfo, source.P3); break;
+            case 4: operation.Apply(typeInfo, source.P4); break;
+            case 5: operation.Apply(typeInfo, source.P5); break;
+            case 6: operation.Apply(typeInfo, source.P6); break;
+            case 7: operation.Apply(typeInfo, source.P7); break;
+            case 8: operation.Apply(typeInfo, source.P8); break;
+            case 9: operation.Apply(typeInfo, source.P9); break;
+            default: throw new ArgumentOutOfRangeException(nameof(parameterIndex));
+            }
+        }
     }
 }

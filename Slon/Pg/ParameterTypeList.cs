@@ -12,27 +12,27 @@ namespace Slon.Pg;
 readonly struct ParameterTypeList : IEquatable<ParameterTypeList>
 {
     readonly object _source;
-    readonly ParameterWriterStrategy? _strategy;
+    readonly ParameterWriter? _writer;
     readonly int _count;
 
     public ParameterTypeList(ImmutableArray<PgTypeId> typeIds)
     {
         _source = ImmutableCollectionsMarshal.AsArray(typeIds)!;
-        _strategy = null;
+        _writer = null;
         _count = typeIds.Length;
     }
 
     public ParameterTypeList(ImmutableArray<Parameter> parameters)
     {
         _source = ImmutableCollectionsMarshal.AsArray(parameters)!;
-        _strategy = null;
+        _writer = null;
         _count = parameters.Length;
     }
 
-    public ParameterTypeList(in ParameterSource source, ParameterWriterStrategy strategy)
+    public ParameterTypeList(in ParameterSource source)
     {
         _source = source.State!;
-        _strategy = strategy;
+        _writer = source.Writer;
         _count = source.Count;
     }
 
@@ -92,9 +92,9 @@ readonly struct ParameterTypeList : IEquatable<ParameterTypeList>
                     _current = pgTypeId.IsDataTypeName && oidLookup is not null ? oidLookup(pgTypeId) : pgTypeId;
                     return true;
                 }
-                case not null when _list._strategy is { } strategy && index < _list._count:
+                case not null when _list._writer is { } writer && index < _list._count:
                 {
-                    var pgTypeId = strategy.GetParameterType(_list._source, index);
+                    var pgTypeId = writer.GetParameterTypeCore(_list._source, index);
                     _current = pgTypeId.IsDataTypeName && oidLookup is not null ? oidLookup(pgTypeId) : pgTypeId;
                     return true;
                 }
@@ -160,10 +160,10 @@ readonly struct ParameterTypeList : IEquatable<ParameterTypeList>
     public bool Equals(ParameterTypeList other)
         => _count == other._count
             && ReferenceEquals(_source, other._source)
-            && ReferenceEquals(_strategy, other._strategy);
+            && ReferenceEquals(_writer, other._writer);
 
     public override bool Equals(object? obj) => obj is ParameterTypeList other && Equals(other);
-    public override int GetHashCode() => HashCode.Combine(_source, _strategy, _count);
+    public override int GetHashCode() => HashCode.Combine(_source, _writer, _count);
     public static bool operator ==(ParameterTypeList left, ParameterTypeList right) => left.Equals(right);
     public static bool operator !=(ParameterTypeList left, ParameterTypeList right) => !left.Equals(right);
 }

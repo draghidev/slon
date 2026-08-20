@@ -5,17 +5,18 @@ namespace Slon.Pg;
 readonly struct ParameterSource
 {
     readonly object? _state;
+    readonly ParameterWriter? _writer;
     readonly int _count;
 
-    public ParameterSource(object state, int count)
+    public ParameterSource(object state, ParameterWriter writer)
     {
         ArgumentNullException.ThrowIfNull(state);
-        ArgumentOutOfRangeException.ThrowIfNegative(count);
+        ArgumentNullException.ThrowIfNull(writer);
         if (state is Parameter[])
             ThrowHelper.ThrowArgumentException(nameof(state),
                 $"A {nameof(Parameter)} array must be supplied as an {nameof(ImmutableArray<Parameter>)}.");
         _state = state;
-        _count = count;
+        _writer = writer;
     }
 
     public ParameterSource(ImmutableArray<Parameter> parameters)
@@ -26,6 +27,7 @@ readonly struct ParameterSource
         _count = parameters.Length;
     }
 
-    public int Count => _count;
+    public int Count => _writer is null ? _count : _writer.GetParameterCountCore(_state!);
     public object? State => _state;
+    public ParameterWriter? Writer => _writer;
 }

@@ -1,4 +1,3 @@
-using System.Diagnostics.CodeAnalysis;
 using Slon.Pg.Types;
 
 namespace Slon.Pg.Serialization;
@@ -11,9 +10,11 @@ sealed class PgTypeInfo
 {
     readonly BufferRequirements _binaryRequirements;
     readonly bool _descriptorIsInvariant;
+    readonly bool _converterIsDbNullable;
+    readonly DataFormat? _readFormat;
 
     internal PgTypeInfo(PgSerializerOptions options, PgConverter converter, PgTypeId pgTypeId,
-        Type? requestedType = null)
+        Type? requestedType = null, DataFormat? readFormat = DataFormat.Binary)
     {
         Options = options;
         Converter = converter;
@@ -23,6 +24,8 @@ sealed class PgTypeInfo
         var descriptor = converter.GetDescriptor(new() { ConversionContext = PgConversionContext.Empty });
         _descriptorIsInvariant = descriptor.IsInvariant;
         _binaryRequirements = descriptor.BufferRequirements;
+        _converterIsDbNullable = converter.IsDbNullable;
+        _readFormat = readFormat;
     }
 
     public PgSerializerOptions Options { get; }
@@ -35,33 +38,34 @@ sealed class PgTypeInfo
 
     public PgFieldBinding BindField(PgConversionContext conversionContext, DataFormat format)
     {
-        if (format is not DataFormat.Binary)
+        if (_readFormat is { } supportedFormat && format != supportedFormat)
             throw new NotSupportedException($"Converter for type {Type} does not support {format} format.");
 
         var requirements = ResolveRequirements(conversionContext);
-        return new(format, requirements.Read, Converter, _descriptorIsInvariant);
+        return new(format, requirements.Read, Converter, _descriptorIsInvariant,
+            Converter.RequiresReaderCleanup, Converter.ResultIsColumnLease);
     }
 
-    public PgValueBinding BindParameterValue<T>(PgConversionContext conversionContext, T? value,
-        object? writeState = null)
+    public int BindParameterValue<T>(PgConversionContext conversionContext, T? value,
+        out object? writeState)
     {
         var requirements = ResolveRequirements(conversionContext);
+        writeState = null;
         try
         {
-            if (Converter.IsDbNull(value, writeState))
-                return new(DataFormat.Binary, Size.Zero, null, writeState, Converter,
-                    isBindingInvariant: true);
+            if (_converterIsDbNullable && Converter.IsDbNull(value, writeState))
+                return -1;
 
             var context = BindContext.CreateUnchecked(DataFormat.Binary, requirements.Write,
                 requirements.IsBindOptional, conversionContext);
             var size = Converter.Bind(context, value, ref writeState);
-            return new(DataFormat.Binary, requirements.Write, size, writeState, Converter,
-                _descriptorIsInvariant && requirements.IsBindOptional);
+            return size.Value;
         }
         catch
         {
             (var disposable, writeState) = (writeState, null);
-            (disposable as IDisposable)?.Dispose();
+            if (disposable is not null && disposable is IDisposable disposableState)
+                disposableState.Dispose();
             throw;
         }
     }
@@ -84,24 +88,12 @@ sealed class PgTypeInfo
 }
 
 readonly struct PgFieldBinding(DataFormat dataFormat, Size bufferRequirement, PgConverter converter,
-    bool isBindingInvariant)
+    bool isBindingInvariant, bool requiresReaderCleanup, bool resultIsColumnLease)
 {
     public DataFormat DataFormat { get; } = dataFormat;
     public Size BufferRequirement { get; } = bufferRequirement;
     public PgConverter Converter { get; } = converter;
     public bool IsBindingInvariant { get; } = isBindingInvariant;
-}
-
-readonly struct PgValueBinding(DataFormat dataFormat, Size bufferRequirement, Size? size,
-    object? writeState, PgConverter converter, bool isBindingInvariant)
-{
-    public DataFormat DataFormat { get; } = dataFormat;
-    public Size BufferRequirement { get; } = bufferRequirement;
-    public Size? Size { get; } = size;
-    public object? WriteState { get; } = writeState;
-    public PgConverter Converter { get; } = converter;
-    public bool IsBindingInvariant { get; } = isBindingInvariant;
-
-    [MemberNotNullWhen(false, nameof(Size))]
-    public bool IsDbNullBinding => Size is null;
+    public bool RequiresReaderCleanup { get; } = requiresReaderCleanup;
+    public bool ResultIsColumnLease { get; } = resultIsColumnLease;
 }

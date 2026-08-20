@@ -151,14 +151,14 @@ public partial class SlonParameters
         var value = item.Value;
 
         if (allowUnspecified && value is (null or DBNull))
-            return SerializerParameterWriterStrategy.ResolveTypeInfo(
+            return AdoParameterTypeResolver.Resolve(
                 value, options, preparedTypeId, allowUnspecified);
 
         EnsureParameterResolutionOptions(options);
         if (item.TryGetTypeResolution(options, preparedTypeId, out var resolution))
             return resolution;
 
-        resolution = SerializerParameterWriterStrategy.ResolveTypeInfo(
+        resolution = AdoParameterTypeResolver.Resolve(
             value, options, preparedTypeId, allowUnspecified);
         item = item.WithTypeResolution(resolution,
             resolvedForPreparedType: preparedTypeId is not null);

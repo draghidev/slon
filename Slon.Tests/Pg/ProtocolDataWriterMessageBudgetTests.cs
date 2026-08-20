@@ -184,79 +184,84 @@ public class ProtocolDataWriterMessageBudgetTests
     public void ParameterWriterState_IsCachedPerTokenBearingShell()
     {
         var (writer, _) = NewWriter();
-        var strategy = new CountingParameterWriterStrategy();
+        var writerComponent = new CountingParameterWriter();
 
-        var first = writer.GetParameterWriterState(strategy);
-        var second = writer.GetParameterWriterState(strategy);
+        var first = writer.GetParameterWriterState(writerComponent);
+        var second = writer.GetParameterWriterState(writerComponent);
 
         Assert.AreSame(first, second);
-        Assert.AreEqual(1, strategy.CreateCount);
+        Assert.AreEqual(1, writerComponent.CreateCount);
     }
 
     [TestMethod]
     public void ParameterWriterState_IsRecreatedAfterClientEncodingChanges()
     {
         var (writer, _) = NewWriter();
-        var strategy = new CountingParameterWriterStrategy();
-        var first = writer.GetParameterWriterState(strategy);
+        var writerComponent = new CountingParameterWriter();
+        var first = writer.GetParameterWriterState(writerComponent);
 
         writer.ClientEncoding = Encoding.Latin1;
-        var second = writer.GetParameterWriterState(strategy);
+        var second = writer.GetParameterWriterState(writerComponent);
 
         Assert.AreNotSame(first, second);
-        Assert.AreEqual(2, strategy.CreateCount);
+        Assert.AreEqual(2, writerComponent.CreateCount);
     }
 
     [TestMethod]
     public void LaterBindFailure_ReleasesEarlierParameterWriteState()
     {
         var (writer, _) = NewWriter();
-        var strategy = new FailingBindParameterWriterStrategy();
-        var source = new ParameterSource(strategy, 2);
+        var writerComponent = new FailingBindParameterWriter();
+        var source = new ParameterSource(new object(), writerComponent);
 
         var encoder = new PgEncoder(default, writer);
         Assert.ThrowsExactly<InvalidOperationException>(() =>
-            encoder.WriteBind(parameters: source, parameterWriterStrategy: strategy));
-        Assert.IsTrue(strategy.FirstWriteState.IsDisposed);
+            encoder.WriteBind(parameters: source));
+        Assert.IsTrue(writerComponent.FirstWriteState.IsDisposed);
     }
 
-    sealed class CountingParameterWriterStrategy : ParameterWriterStrategy
+    sealed class CountingParameterWriter : ParameterWriter
     {
         public int CreateCount { get; private set; }
 
-        public override object CreateWriterState(IOutputWriter output, Encoding textEncoding)
+        internal override object CreateWriterStateCore(IOutputWriter output, Encoding textEncoding)
         {
             CreateCount++;
             return new object();
         }
+        internal override int GetParameterCountCore(object source)
+            => throw new NotSupportedException();
 
-        public override PgTypeId GetParameterType(object source, int index)
+        internal override PgTypeId GetParameterTypeCore(object source, int index)
             => throw new NotSupportedException();
-        public override WriteLease BeginWrite(object source, int count)
+        private protected override object BeginWriteStateCore(object source, int count)
             => throw new NotSupportedException();
-        public override int GetSize(object writeState, int parameterIndex)
+        private protected override int GetSizeCore(object writeState, int parameterIndex)
             => throw new NotSupportedException();
-        public override void Write(object writerState, object source, object writeState, int parameterIndex)
+        private protected override void WriteCore(object writerState, object source,
+            object writeState, int parameterIndex)
             => throw new NotSupportedException();
-        public override ValueTask WriteAsync(object writerState, object source, object writeState,
-            int parameterIndex,
+        private protected override ValueTask WriteAsyncCore(object writerState, object source,
+            object writeState, int parameterIndex,
             CancellationToken cancellationToken = default) => throw new NotSupportedException();
     }
 
-    sealed class FailingBindParameterWriterStrategy : ParameterWriterStrategy
+    sealed class FailingBindParameterWriter : ParameterWriter
     {
         public DisposableState FirstWriteState { get; } = new();
 
-        public override object CreateWriterState(IOutputWriter output, Encoding textEncoding) => this;
-        public override PgTypeId GetParameterType(object source, int index)
+        internal override object CreateWriterStateCore(
+            IOutputWriter output, Encoding textEncoding) => this;
+        internal override int GetParameterCountCore(object source) => 2;
+        internal override PgTypeId GetParameterTypeCore(object source, int index)
             => throw new NotSupportedException();
-        public override WriteLease BeginWrite(object source, int count)
-            => new(new BindingState(), count, this);
+        private protected override object BeginWriteStateCore(object source, int count) => new BindingState();
 
-        public override int GetSize(object writeState, int parameterIndex)
+        private protected override int GetSizeCore(object writeState, int parameterIndex)
             => ((BindingState)writeState).Sizes[parameterIndex];
 
-        public override void Bind(object writerState, object source, object writeState, int parameterIndex)
+        private protected override void BindCore(object writerState, object source,
+            object writeState, int parameterIndex)
         {
             if (parameterIndex is 1)
                 throw new InvalidOperationException("Bind failed.");
@@ -265,18 +270,19 @@ public class ProtocolDataWriterMessageBudgetTests
             binding.WriteState = FirstWriteState;
         }
 
-        public override void EndWrite(object writeState, int count)
+        private protected override void EndWriteCore(object writeState, int count)
             => ((BindingState)writeState).WriteState?.Dispose();
 
-        public override void Write(object writerState, object source, object writeState, int parameterIndex)
+        private protected override void WriteCore(object writerState, object source,
+            object writeState, int parameterIndex)
             => throw new AssertFailedException("Writing must not start after Bind fails.");
 
-        public override ValueTask WriteAsync(object writerState, object source, object writeState,
-            int parameterIndex,
+        private protected override ValueTask WriteAsyncCore(object writerState, object source,
+            object writeState, int parameterIndex,
             CancellationToken cancellationToken = default)
             => throw new AssertFailedException("Writing must not start after Bind fails.");
 
-        sealed class BindingState
+        internal sealed class BindingState
         {
             public int[] Sizes { get; } = new int[2];
             public IDisposable? WriteState { get; set; }

@@ -12,6 +12,10 @@ namespace Slon.Pg.Serialization;
 
 public abstract class PgConverter
 {
+    internal virtual bool RequiresReaderCleanup => true;
+    internal bool IsReadViewBased { get; init; }
+    internal virtual bool ResultIsColumnLease => false;
+
     /// <summary>
     /// True when CLR null can reach this converter's API surface.
     /// Auto-derived from <see cref="TypeToConvert"/> (or from an internal wrapper's effective type if passed).

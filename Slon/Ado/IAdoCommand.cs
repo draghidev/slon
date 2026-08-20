@@ -26,7 +26,7 @@ static class AdoCommandExtensions
     public static (Command, TrackerResult) CreateCommand<TCommand>(this TCommand command, bool enableErrorBarriers,
         CommandBehavior behavior, in TrackerContext trackerContext, DbParameterCollection? dbParameters,
         TimeSpan timeout, bool preparing, PgSerializerOptions? serializerOptions = null,
-        ParameterWriterStrategy? parameterWriterStrategy = null)
+        ParameterWriter? parameterWriter = null)
         where TCommand : IAdoCommand
     {
         var commandParameters = command.Parameters;
@@ -79,10 +79,10 @@ static class AdoCommandExtensions
                     currentParameterIndex, serializerOptions, preparedType, allowUnspecified: preparing);
             }
 
-            parameters = new(slonParameters!, slonParameters.Count);
-            parameterTypes = new(parameters,
-                parameterWriterStrategy ?? throw new InvalidOperationException(
-                    "ADO parameter serialization requires a writer strategy."));
+            parameters = new(slonParameters!,
+                parameterWriter ?? throw new InvalidOperationException(
+                    "ADO parameter serialization requires a parameter writer."));
+            parameterTypes = new(parameters);
             Debug.Assert(parameterTypes.Count == dbParameters.Count);
         }
 

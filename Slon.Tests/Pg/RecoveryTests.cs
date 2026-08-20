@@ -682,9 +682,10 @@ public class RecoveryTests : ConnectionCreatingTest
         var value = new SlonParameter<Stream>(new ThrowingReadStream(256 * 1024, 64 * 1024));
         var parameters = new SlonParameters { value };
         parameters.GetOrResolveTypeInfo(0, serializerOptions, preparedTypeId: null, allowUnspecified: false);
-        var parameterSource = new ParameterSource(parameters, parameters.Count);
+        var parameterSource = new ParameterSource(
+            parameters, SerializerParameterWriter.Instance);
         var command = Command.Create("select octet_length($1::bytea)",
-            new ParameterTypeList(parameterSource, SerializerParameterWriterStrategy.Instance)) with
+            new ParameterTypeList(parameterSource)) with
         {
             Parameters = parameterSource
         };
@@ -692,7 +693,6 @@ public class RecoveryTests : ConnectionCreatingTest
         {
             Commands = new(command),
             SerializerOptions = serializerOptions,
-            ParameterWriterStrategy = SerializerParameterWriterStrategy.Instance
         });
         var successor = new CommandFlow(async: true, Command.Create("select 42::int4"));
         scope.Queue(faulting);

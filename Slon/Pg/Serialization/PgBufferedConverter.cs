@@ -6,6 +6,8 @@ namespace Slon.Pg.Serialization;
 
 public abstract class PgBufferedConverter<T> : PgConverter<T>
 {
+    internal sealed override bool RequiresReaderCleanup => false;
+
     protected PgBufferedConverter()
     {
     }

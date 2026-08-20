@@ -13,7 +13,7 @@ readonly struct CommandDescriptor
 
     CommandDescriptor(EncodedString commandName, ParameterTypeList parameterTypes, RowDescription? rowDescription)
     {
-        Debug.Assert(Unsafe.SizeOf<CommandDescriptor>() <= 32);
+        Debug.Assert(Unsafe.SizeOf<CommandDescriptor>() <= 40);
         if (commandName.IsDefault)
             ThrowHelper.ThrowArgumentException(nameof(commandName), "Command name must be provided.");
         CommandName = commandName;

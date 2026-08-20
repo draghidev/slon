@@ -1,5 +1,6 @@
 using System.Data;
 using Slon.Data;
+using Slon.Pg.Serialization;
 
 namespace Slon;
 
@@ -39,12 +40,8 @@ public partial class SlonParameter
 
     private protected virtual SlonParameter CloneCore() => Clone(new SlonParameter { ValueCore = ValueCore });
 
-    internal virtual void Bind(ref SerializerParameterWriterStrategy.ParameterBinder binder)
-        => binder.Bind(_value);
-    internal virtual void Write(ref SerializerParameterWriterStrategy.ParameterWriter writer)
-        => writer.Write(_value);
-    internal virtual void WriteAsync(ref SerializerParameterWriterStrategy.AsyncParameterWriter writer)
-        => writer.Write(_value);
+    internal virtual void Apply(PgTypeInfo typeInfo, PgParameterValueOperation operation)
+        => operation.Apply(typeInfo, _value);
 
 }
 
@@ -88,11 +85,7 @@ public sealed class SlonParameter<T> : SlonParameter, IDbDataParameter<T>
         set => Value = (T?)value;
     }
     private protected override SlonParameter CloneCore() => Clone(new SlonParameter<T> { _value = _value });
-    internal override void Bind(ref SerializerParameterWriterStrategy.ParameterBinder binder)
-        => binder.Bind(_value);
-    internal override void Write(ref SerializerParameterWriterStrategy.ParameterWriter writer)
-        => writer.Write(_value);
-    internal override void WriteAsync(ref SerializerParameterWriterStrategy.AsyncParameterWriter writer)
-        => writer.Write(_value);
+    internal override void Apply(PgTypeInfo typeInfo, PgParameterValueOperation operation)
+        => operation.Apply(typeInfo, _value);
 
 }

@@ -16,7 +16,7 @@ static class CommandExtensions
     // a mode flag through every encoder helper underneath. Keeping the list loop in this state
     // machine avoids one nested async invocation per command while preserving the one-command path.
     public static ValueTask WriteCommandsAsync(this CommandList commands, PgEncoder encoder, bool appendSync,
-        ParameterWriterStrategy? parameterWriterStrategy, CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default)
     {
         for (var i = 0; i < commands.Count; i++)
         {
@@ -24,7 +24,7 @@ static class CommandExtensions
             var descriptor = command.Descriptor;
             if (!descriptor.IsPrepared || command.Parameters.Count is not 0
                 || descriptor.ParameterTypes.Count is not 0 || command.ResultFormats.Length is not 0)
-                return WriteCommandsAsyncCore(commands, encoder, appendSync, parameterWriterStrategy, cancellationToken, i);
+                return WriteCommandsAsyncCore(commands, encoder, appendSync, cancellationToken, i);
 
             encoder.WriteBind(descriptor.CommandName);
             CompletePreparedWrite(command, descriptor, encoder);
@@ -34,7 +34,7 @@ static class CommandExtensions
         return encoder.FlushAsync(cancellationToken);
 
         static async ValueTask WriteCommandsAsyncCore(CommandList commands, PgEncoder encoder, bool appendSync,
-            ParameterWriterStrategy? parameterWriterStrategy, CancellationToken cancellationToken, int startIndex)
+            CancellationToken cancellationToken, int startIndex)
         {
             for (var i = startIndex; i < commands.Count; i++)
             {
@@ -48,17 +48,16 @@ static class CommandExtensions
                     encoder.WriteDescribe(descriptor.CommandName, portalName: false);
                     var parameters = descriptor.ParameterTypes.CreateNullParameters();
                     encoder.WriteBind(descriptor.CommandName,
-                        parameters: parameters, resultFormats: command.ResultFormats,
-                        parameterWriterStrategy: parameterWriterStrategy);
+                        parameters: parameters, resultFormats: command.ResultFormats);
                     encoder.WriteDescribe();
                     if (command.WithSync)
                         encoder.WriteSync();
                 }
                 else if (descriptor.IsPrepared)
                 {
-                    var parameters = ResolveParameters(command, descriptor, parameterWriterStrategy);
+                    var parameters = ResolveParameters(command, descriptor);
                     await encoder.WriteBindAsync(descriptor.CommandName, parameters: parameters,
-                        resultFormats: command.ResultFormats, parameterWriterStrategy: parameterWriterStrategy,
+                        resultFormats: command.ResultFormats,
                         cancellationToken: cancellationToken).ConfigureAwait(false);
                     CompletePreparedWrite(command, descriptor, encoder);
                 }
@@ -68,12 +67,12 @@ static class CommandExtensions
                 }
                 else
                 {
-                    var parameters = ResolveParameters(command, descriptor, parameterWriterStrategy);
+                    var parameters = ResolveParameters(command, descriptor);
 
                     // Extended unprepared.
                     await encoder.WriteParseAsync(descriptor.UnpreparedCommandText, descriptor.CommandName, descriptor.ParameterTypes, cancellationToken: cancellationToken).ConfigureAwait(false);
                     await encoder.WriteBindAsync(descriptor.CommandName, parameters: parameters,
-                        resultFormats: command.ResultFormats, parameterWriterStrategy: parameterWriterStrategy,
+                        resultFormats: command.ResultFormats,
                         cancellationToken: cancellationToken).ConfigureAwait(false);
                     encoder.WriteDescribe();
                     if (!command.DescribeOnly)
@@ -109,7 +108,7 @@ static class CommandExtensions
     // (post-serializer) suspends here. The resumption picks up at the exact same composition
     // point with all state intact. Cf. encoder.WriteQueryResumable for the per-message contract.
     public static async ValueTask WriteCommandsResumable(this CommandList commands, PgEncoder encoder,
-        bool appendSync, ParameterWriterStrategy? parameterWriterStrategy)
+        bool appendSync)
     {
         for (var i = 0; i < commands.Count; i++)
         {
@@ -123,18 +122,16 @@ static class CommandExtensions
                 encoder.WriteDescribe(descriptor.CommandName, portalName: false);
                 var parameters = descriptor.ParameterTypes.CreateNullParameters();
                 encoder.WriteBind(descriptor.CommandName,
-                    parameters: parameters, resultFormats: command.ResultFormats,
-                    parameterWriterStrategy: parameterWriterStrategy);
+                    parameters: parameters, resultFormats: command.ResultFormats);
                 encoder.WriteDescribe();
                 if (command.WithSync)
                     encoder.WriteSync();
             }
             else if (descriptor.IsPrepared)
             {
-                var parameters = ResolveParameters(command, descriptor, parameterWriterStrategy);
+                var parameters = ResolveParameters(command, descriptor);
                 await encoder.WriteBindResumable(descriptor.CommandName, parameters: parameters,
-                    resultFormats: command.ResultFormats,
-                    parameterWriterStrategy: parameterWriterStrategy).ConfigureAwait(false);
+                    resultFormats: command.ResultFormats).ConfigureAwait(false);
 
                 if (command.DescribeOnly)
                     encoder.WriteDescribe();
@@ -155,12 +152,11 @@ static class CommandExtensions
             }
             else
             {
-                var parameters = ResolveParameters(command, descriptor, parameterWriterStrategy);
+                var parameters = ResolveParameters(command, descriptor);
 
                 await encoder.WriteParseResumable(descriptor.UnpreparedCommandText, descriptor.CommandName, descriptor.ParameterTypes).ConfigureAwait(false);
                 await encoder.WriteBindResumable(descriptor.CommandName, parameters: parameters,
-                    resultFormats: command.ResultFormats,
-                    parameterWriterStrategy: parameterWriterStrategy).ConfigureAwait(false);
+                    resultFormats: command.ResultFormats).ConfigureAwait(false);
                 encoder.WriteDescribe();
                 if (!command.DescribeOnly)
                     encoder.WriteExecute();
@@ -173,8 +169,7 @@ static class CommandExtensions
         await encoder.FlushResumable().ConfigureAwait(false);
     }
 
-    static ParameterSource ResolveParameters(in Command command, in CommandDescriptor descriptor,
-        ParameterWriterStrategy? strategy)
+    static ParameterSource ResolveParameters(in Command command, in CommandDescriptor descriptor)
     {
         var parameters = command.Parameters;
         if (parameters.Count == descriptor.ParameterTypes.Count)
