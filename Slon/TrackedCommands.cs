@@ -3,16 +3,13 @@ using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
 using Slon.Pg;
-using Slon.Runtime.CompilerServices;
 
 namespace Slon;
 
 sealed class TrackedCommands(int maxAuto, int autoMinimumUses, Action<TrackedCommand>? onEvict = null)
 {
     readonly ConcurrentDictionary<string, TrackedCommand?[]> _commands = new(concurrencyLevel: 1, capacity: 1);
-    // Candidate set keyed by SQL text content (so callers aggregate) with weak-key lifetime
-    // (so dropped SQL strings clean themselves up).
-    readonly WeakKeyedTable<string, StrongBox<int>> _candidates = new();
+    readonly AutoPrepareCandidates? _candidates = maxAuto is 0 ? null : new();
     // Admission/eviction is serialized. Readers (Find) stay lockless.
     readonly Lock _admissionLock = new();
     int _nameCounter; // monotonic, names never collide
@@ -54,9 +51,9 @@ sealed class TrackedCommands(int maxAuto, int autoMinimumUses, Action<TrackedCom
         bool Core(CommandDescriptor descriptor, [NotNullWhen(true)]out TrackedCommand? tracked)
         {
             var commandText = descriptor.UnpreparedCommandText;
-            var box = _candidates.GetOrAdd(commandText, static _ => new StrongBox<int>());
+            var candidate = _candidates!.Observe(commandText);
 
-            if (Interlocked.Increment(ref box.Value) < autoMinimumUses)
+            if (candidate.Uses < autoMinimumUses)
             {
                 tracked = null;
                 return false;
@@ -68,7 +65,7 @@ sealed class TrackedCommands(int maxAuto, int autoMinimumUses, Action<TrackedCom
                 if (Find(TrackedCommandKind.Auto, descriptor) is { } existing)
                 {
                     tracked = existing;
-                    _candidates.Remove(commandText);
+                    _candidates.Remove(commandText, candidate);
                     return true;
                 }
 
@@ -83,9 +80,111 @@ sealed class TrackedCommands(int maxAuto, int autoMinimumUses, Action<TrackedCom
                 var added = TryAdd(newTracked);
                 Debug.Assert(added, "Re-check under lock should have caught a peer admission.");
                 _autoCount++;
-                _candidates.Remove(commandText);
+                _candidates.Remove(commandText, candidate);
                 tracked = newTracked;
                 return true;
+            }
+        }
+    }
+
+    sealed class AutoPrepareCandidates
+    {
+        // Candidate evidence is deliberately stronger than the caller's SQL string. Short-lived
+        // equal strings should accumulate uses rather than lose their entry to a Gen0 collection.
+        static readonly TimeSpan NormalRetention = TimeSpan.FromMinutes(1);
+
+        CandidateSet _set = new();
+
+        internal AutoPrepareCandidates() => _ = new Gen2GcCallback(this);
+
+        internal Candidate Observe(string commandText)
+        {
+            var now = Stopwatch.GetTimestamp();
+            var set = Volatile.Read(ref _set);
+            var candidate = set.Entries.GetOrAdd(
+                commandText, static (_, timestamp) => new Candidate(timestamp), now);
+            Volatile.Write(ref candidate.LastObservedTimestamp, now);
+            if (Interlocked.Increment(ref candidate.Uses) is 1)
+                UpdateMaximum(ref set.MaximumCount, set.Entries.Count);
+            return candidate;
+        }
+
+        void Trim(TimeSpan retention)
+        {
+            var now = Stopwatch.GetTimestamp();
+            var set = Volatile.Read(ref _set);
+            foreach (var entry in set.Entries)
+            {
+                if (Stopwatch.GetElapsedTime(Volatile.Read(ref entry.Value.LastObservedTimestamp), now)
+                    >= retention)
+                    set.Entries.TryRemove(entry);
+            }
+
+            var count = set.Entries.Count;
+            if ((long)count * 2 >= Volatile.Read(ref set.MaximumCount))
+                return;
+
+            var replacement = new CandidateSet();
+            foreach (var entry in set.Entries)
+                replacement.Entries.TryAdd(entry.Key, entry.Value);
+            replacement.MaximumCount = replacement.Entries.Count;
+            Interlocked.CompareExchange(ref _set, replacement, set);
+        }
+
+        internal bool Remove(string commandText, Candidate candidate)
+            => Volatile.Read(ref _set).Entries.TryRemove(KeyValuePair.Create(commandText, candidate));
+
+        static void UpdateMaximum(ref int maximum, int value)
+        {
+            var current = Volatile.Read(ref maximum);
+            while (value > current)
+            {
+                var observed = Interlocked.CompareExchange(ref maximum, value, current);
+                if (observed == current)
+                    return;
+                current = observed;
+            }
+        }
+
+        internal sealed class CandidateSet
+        {
+            public readonly ConcurrentDictionary<string, Candidate> Entries = new(concurrencyLevel: 1, capacity: 1);
+            public int MaximumCount;
+        }
+
+        internal sealed class Candidate(long lastObservedTimestamp)
+        {
+            public long LastObservedTimestamp = lastObservedTimestamp;
+            public int Uses;
+        }
+
+        sealed class Gen2GcCallback
+        {
+            readonly WeakReference<AutoPrepareCandidates> _owner;
+            int _gen2Count = GC.CollectionCount(2);
+            long _lastGen2Timestamp;
+
+            internal Gen2GcCallback(AutoPrepareCandidates owner) => _owner = new(owner);
+
+            ~Gen2GcCallback()
+            {
+                if (!_owner.TryGetTarget(out var owner))
+                    return;
+
+                var gen2Count = GC.CollectionCount(2);
+                if (gen2Count != _gen2Count)
+                {
+                    _gen2Count = gen2Count;
+                    var now = Stopwatch.GetTimestamp();
+                    var retention = _lastGen2Timestamp is 0
+                        ? NormalRetention
+                        : Stopwatch.GetElapsedTime(_lastGen2Timestamp, now);
+                    if (retention > NormalRetention)
+                        retention = NormalRetention;
+                    _lastGen2Timestamp = now;
+                    owner.Trim(retention);
+                }
+                GC.ReRegisterForFinalize(this);
             }
         }
     }

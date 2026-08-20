@@ -1,3 +1,5 @@
+using System.Runtime.CompilerServices;
+
 namespace Slon.Tests;
 
 [TestClass]
@@ -196,6 +198,25 @@ public class PreparedCommandTests
         Assert.IsNotNull(first);
         Assert.IsNotNull(second);
         Assert.AreNotEqual(first.CommandName, second.CommandName);
+    }
+
+    [TestMethod]
+    public void AutoPreparationCandidateSurvivesGen0Collection()
+    {
+        using var tracker = new CommandTracker(maxAuto: 1, autoMinimumUses: 2);
+
+        ObserveTransientCommand(tracker);
+        GC.Collect(0, GCCollectionMode.Forced, blocking: true);
+
+        var descriptor = Slon.Pg.CommandDescriptor.Create(new string("select 42".ToCharArray()));
+        Assert.IsNotNull(tracker.Track(descriptor).Tracked);
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        static void ObserveTransientCommand(CommandTracker tracker)
+        {
+            var descriptor = Slon.Pg.CommandDescriptor.Create(new string("select 42".ToCharArray()));
+            Assert.IsNull(tracker.Track(descriptor).Tracked);
+        }
     }
 
     [TestMethod]
