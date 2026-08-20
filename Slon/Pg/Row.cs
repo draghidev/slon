@@ -7,17 +7,22 @@ using System.Text;
 using Slon.Buffers;
 using Slon.Pg.Protocol;
 using Slon.Pg.Serialization;
+using Slon.Pg.Types;
 using Slon.Runtime.CompilerServices;
 
 namespace Slon.Pg;
 
-sealed class Row
+sealed class Row : PgFieldReader
 {
     BackendMessage.Accessor _messageAccessor;
     RowDescription _rowDescription = null!;
     BackendMessageBodyReader? _bodyReader;
     IColumnLease? _columnLease;
+    ReadOnlyMemory<byte> _bufferedBody;
     int _leasedOrdinal;
+    int _lastBufferedOrdinal = -1;
+    int _lastBufferedOffset;
+    int _lastBufferedLength;
 
     int _column = -1;
     int _columnOffset;
@@ -54,20 +59,88 @@ sealed class Row
     {
         RevokeColumnLease();
         EnsureBuffered();
-        if (TryGetFieldSpan(ordinal, out var field))
-            return RawFieldDecoder.Read<T>(field, textEncoding);
+        if (TryGetFieldMemory(ordinal, out var field))
+            return BootstrapFieldDecoder.Read<T>(field.Span, textEncoding);
 
         return GetValueSlow<T>(ordinal, textEncoding);
     }
 
-    internal T GetValue<T, TReader>(int ordinal, ref TReader fieldReader)
-        where TReader : struct, IFieldReader<T>
-        => fieldReader.Read(new PgField(this, ordinal));
+    internal T ReadField<T, TDecoder, TState>(int ordinal, FieldReadMode mode, TState state)
+        where TDecoder : IFieldDecoder<T, TState>
+    {
+        PgFieldReader reader;
+        if ((mode & FieldReadMode.BufferedView) != 0 && _bodyReader is null)
+            return TDecoder.Read(OpenFieldViewReader(ordinal), state);
+        if ((mode & FieldReadMode.SkipCleanupWhenBuffered) != 0 && _bodyReader is null)
+            return TDecoder.Read(OpenFieldReader(ordinal), state);
 
-    internal ValueTask<T> GetValueAsync<T, TReader>(int ordinal, TReader fieldReader,
-        CancellationToken cancellationToken = default)
-        where TReader : struct, IFieldReader<T>
-        => fieldReader.ReadAsync(new PgField(this, ordinal), cancellationToken);
+        reader = OpenFieldReader(ordinal);
+        var leased = false;
+        try
+        {
+            var result = TDecoder.Read(reader, state);
+            if ((mode & FieldReadMode.ResultIsLease) != 0)
+            {
+                LeaseColumn(ordinal, (IColumnLease)(object)result!);
+                leased = true;
+            }
+            else if (reader.HasActiveView)
+            {
+                LeaseColumn(ordinal, reader.ActiveViewLease);
+                leased = true;
+            }
+            else
+            {
+                CompleteFieldReader(ordinal);
+            }
+            return result;
+        }
+        finally
+        {
+            if (!leased)
+                reader.Dispose();
+        }
+    }
+
+    internal async ValueTask<T> ReadFieldAsync<T, TDecoder, TState>(int ordinal,
+        FieldReadMode mode, TState state, CancellationToken cancellationToken)
+        where TDecoder : IFieldDecoder<T, TState>
+    {
+        await PrepareFieldReaderAsync(ordinal, cancellationToken).ConfigureAwait(false);
+        if ((mode & FieldReadMode.BufferedView) != 0 && _bodyReader is null)
+            return await TDecoder.ReadAsync(OpenFieldViewReader(ordinal), state, cancellationToken)
+                .ConfigureAwait(false);
+        if ((mode & FieldReadMode.SkipCleanupWhenBuffered) != 0 && _bodyReader is null)
+            return await TDecoder.ReadAsync(OpenFieldReader(ordinal), state, cancellationToken)
+                .ConfigureAwait(false);
+        var reader = OpenFieldReader(ordinal);
+        var leased = false;
+        try
+        {
+            var result = await TDecoder.ReadAsync(reader, state, cancellationToken)
+                .ConfigureAwait(false);
+            if ((mode & FieldReadMode.ResultIsLease) != 0)
+            {
+                LeaseColumn(ordinal, (IColumnLease)(object)result!);
+                leased = true;
+            }
+            else if (reader.HasActiveView)
+            {
+                LeaseColumn(ordinal, reader.ActiveViewLease);
+                leased = true;
+            }
+            else
+            {
+                await CompleteFieldReaderAsync(ordinal).ConfigureAwait(false);
+            }
+            return result;
+        }
+        finally
+        {
+            if (!leased)
+                await reader.DisposeAsync().ConfigureAwait(false);
+        }
+    }
 
     internal ref readonly RowDescriptionField GetFieldMetadata(int ordinal)
         => ref _rowDescription[ordinal];
@@ -114,92 +187,85 @@ sealed class Row
         return length < 0;
     }
 
-    internal ReadOnlySequence<byte> GetBufferedField(int ordinal)
-    {
-        EnsureBuffered();
-        return GetFieldSequence(ordinal);
-    }
-
-    internal ValueTask<ReadOnlySequence<byte>> GetBufferedFieldAsync(int ordinal,
-        CancellationToken cancellationToken = default)
-    {
-        if (_bodyReader is null)
-            return new(GetFieldSequence(ordinal));
-        return Core(ordinal, cancellationToken);
-
-        async ValueTask<ReadOnlySequence<byte>> Core(int fieldOrdinal, CancellationToken token)
-        {
-            await _bodyReader.BufferAllAsync(token).ConfigureAwait(false);
-            _bodyReader = null;
-            return GetFieldSequence(fieldOrdinal);
-        }
-    }
-
-    internal PgReader OpenFieldReader(int ordinal, PgConversionContext conversionContext)
+    internal PgFieldReader OpenFieldReader(int ordinal)
     {
         RevokeColumnLease();
         if (_bodyReader is null)
-            return new(GetFieldSequence(ordinal), conversionContext);
+        {
+            if (TryGetFieldMemory(ordinal, out var field))
+            {
+                Initialize(field);
+                return this;
+            }
+            Initialize(GetFieldSequence(ordinal));
+            return this;
+        }
         if (ordinal < _column)
             throw new InvalidOperationException(
                 "A field preceding the sequential row cursor is no longer available.");
 
         while (_column < ordinal)
             SkipLiveField();
-        return OpenCurrentLiveField(conversionContext);
+        return OpenCurrentLiveField();
     }
 
-    internal ValueTask<PgReader> OpenFieldReaderAsync(int ordinal,
-        PgConversionContext conversionContext, CancellationToken cancellationToken = default)
+    internal PgFieldReader OpenFieldViewReader(int ordinal)
+    {
+        RevokeColumnLease();
+        if (_bodyReader is not null)
+            throw new InvalidOperationException("The row is not buffered.");
+        if (ordinal == _lastBufferedOrdinal)
+            return this;
+        if (TryGetFieldMemory(ordinal, out var field))
+            Initialize(field);
+        else
+            Initialize(GetFieldSequence(ordinal));
+        return this;
+    }
+
+    internal ValueTask PrepareFieldReaderAsync(int ordinal,
+        CancellationToken cancellationToken = default)
     {
         if (_columnLease is not null)
-            return RevokeAndOpenFieldReaderAsync(ordinal, conversionContext, cancellationToken);
+            return RevokeAndPrepareFieldReaderAsync(ordinal, cancellationToken);
         if (_bodyReader is null)
-            return new(new PgReader(GetFieldSequence(ordinal), conversionContext));
+            return default;
         if (ordinal < _column)
             throw new InvalidOperationException(
                 "A field preceding the sequential row cursor is no longer available.");
-        return Core(ordinal, conversionContext, cancellationToken);
+        return Core(ordinal, cancellationToken);
 
-        async ValueTask<PgReader> Core(int fieldOrdinal, PgConversionContext context,
-            CancellationToken token)
+        async ValueTask Core(int fieldOrdinal, CancellationToken token)
         {
             while (_column < fieldOrdinal)
                 await SkipLiveFieldAsync(token).ConfigureAwait(false);
-            return await OpenCurrentLiveFieldAsync(context, token).ConfigureAwait(false);
+            await EnsureLiveHeaderAsync(_bodyReader!, token).ConfigureAwait(false);
         }
     }
 
-    async ValueTask<PgReader> RevokeAndOpenFieldReaderAsync(int ordinal,
-        PgConversionContext conversionContext, CancellationToken cancellationToken)
+    async ValueTask RevokeAndPrepareFieldReaderAsync(int ordinal,
+        CancellationToken cancellationToken)
     {
         await RevokeColumnLeaseAsync().ConfigureAwait(false);
-        return await OpenFieldReaderAsync(ordinal, conversionContext, cancellationToken)
-            .ConfigureAwait(false);
+        await PrepareFieldReaderAsync(ordinal, cancellationToken).ConfigureAwait(false);
     }
 
-    internal void CompleteFieldReader(int ordinal, PgReader reader)
+    internal void CompleteFieldReader(int ordinal)
     {
-        var offset = reader.CompleteField();
-        if (offset >= 0)
-            _columnOffset = offset;
+        CompleteField();
+        SynchronizeColumnOffset();
         _column = ordinal + 1;
     }
 
-    internal async ValueTask CompleteFieldReaderAsync(int ordinal, PgReader reader)
+    internal async ValueTask CompleteFieldReaderAsync(int ordinal)
     {
-        var offset = await reader.CompleteFieldAsync().ConfigureAwait(false);
-        if (offset >= 0)
-            _columnOffset = offset;
+        await CompleteFieldAsync().ConfigureAwait(false);
+        SynchronizeColumnOffset();
         _column = ordinal + 1;
     }
 
-    internal bool TryGetColumnLease<T>(int ordinal, [NotNullWhen(true)] out T? lease)
-        where T : class, IColumnLease
-    {
-        lease = _leasedOrdinal == ordinal ? _columnLease as T : null;
-        return lease is not null;
-    }
+    internal IColumnLease? GetColumnLease(int ordinal)
+        => _leasedOrdinal == ordinal ? _columnLease : null;
 
     internal void LeaseColumn(int ordinal, IColumnLease lease)
     {
@@ -215,9 +281,9 @@ sealed class Row
             return;
         _columnLease = null;
         var ordinal = _leasedOrdinal;
-        var offset = lease.Revoke();
-        if (offset >= 0)
-            _columnOffset = offset;
+        lease.Revoke();
+        RevokeField();
+        SynchronizeColumnOffset();
         _column = ordinal + 1;
     }
 
@@ -227,15 +293,20 @@ sealed class Row
             return;
         _columnLease = null;
         var ordinal = _leasedOrdinal;
-        var offset = await lease.RevokeAsync().ConfigureAwait(false);
-        if (offset >= 0)
-            _columnOffset = offset;
+        lease.Revoke();
+        await RevokeFieldAsync().ConfigureAwait(false);
+        SynchronizeColumnOffset();
         _column = ordinal + 1;
     }
 
-    internal bool HasColumnLease => _columnLease is not null;
+    void SynchronizeColumnOffset()
+    {
+        if (_bodyReader is { } source)
+            _columnOffset = source.ContinuationOffset;
+    }
 
-    PgReader OpenCurrentLiveField(PgConversionContext conversionContext)
+    internal bool HasColumnLease => _columnLease is not null;
+    PgFieldReader OpenCurrentLiveField()
     {
         var source = _bodyReader!;
         EnsureLiveHeader(source);
@@ -244,20 +315,8 @@ sealed class Row
         if (length < 0)
             ThrowHelper.ThrowInvalidOperation("Field is null.");
         var dataOffset = checked(_columnOffset + sizeof(int));
-        return new(source, buffer.Slice(dataOffset), length, dataOffset, conversionContext);
-    }
-
-    async ValueTask<PgReader> OpenCurrentLiveFieldAsync(PgConversionContext conversionContext,
-        CancellationToken cancellationToken)
-    {
-        var source = _bodyReader!;
-        await EnsureLiveHeaderAsync(source, cancellationToken).ConfigureAwait(false);
-        var buffer = source.Buffer;
-        var length = ReadFieldLength(buffer, _columnOffset);
-        if (length < 0)
-            ThrowHelper.ThrowInvalidOperation("Field is null.");
-        var dataOffset = checked(_columnOffset + sizeof(int));
-        return new(source, buffer.Slice(dataOffset), length, dataOffset, conversionContext);
+        Initialize(source, buffer.Slice(dataOffset), length, dataOffset);
+        return this;
     }
 
     void SkipLiveField()
@@ -267,10 +326,9 @@ sealed class Row
         var buffer = source.Buffer;
         var length = ReadFieldLength(buffer, _columnOffset);
         var dataOffset = checked(_columnOffset + sizeof(int));
-        using var reader = new PgReader(source, buffer.Slice(dataOffset), Math.Max(0, length),
-            dataOffset, PgConversionContext.Empty);
-        reader.Consume();
-        CompleteFieldReader(_column, reader);
+        source.Consume(dataOffset, Math.Max(0, length));
+        _columnOffset = source.ContinuationOffset;
+        _column++;
     }
 
     async ValueTask SkipLiveFieldAsync(CancellationToken cancellationToken)
@@ -280,17 +338,10 @@ sealed class Row
         var buffer = source.Buffer;
         var length = ReadFieldLength(buffer, _columnOffset);
         var dataOffset = checked(_columnOffset + sizeof(int));
-        var reader = new PgReader(source, buffer.Slice(dataOffset), Math.Max(0, length),
-            dataOffset, PgConversionContext.Empty);
-        try
-        {
-            await reader.ConsumeAsync(cancellationToken: cancellationToken).ConfigureAwait(false);
-            await CompleteFieldReaderAsync(_column, reader).ConfigureAwait(false);
-        }
-        finally
-        {
-            await reader.DisposeAsync().ConfigureAwait(false);
-        }
+        await source.ConsumeAsync(dataOffset, Math.Max(0, length), cancellationToken)
+            .ConfigureAwait(false);
+        _columnOffset = source.ContinuationOffset;
+        _column++;
     }
 
     static int ReadFieldLength(in ReadOnlySequence<byte> buffer, int offset)
@@ -356,21 +407,30 @@ sealed class Row
         if (length < 0 || reader.Remaining < length)
             ThrowHelper.ThrowInvalidOperation();
         if (reader.CurrentSpan.Length - reader.CurrentSpanIndex >= length)
-            return RawFieldDecoder.Read<T>(reader.CurrentSpan.Slice(reader.CurrentSpanIndex, length), textEncoding);
+            return BootstrapFieldDecoder.Read<T>(
+                reader.CurrentSpan.Slice(reader.CurrentSpanIndex, length), textEncoding);
         var sequence = reader.Sequence.Slice(reader.Consumed, length);
-        return RawFieldDecoder.Read<T>(sequence, textEncoding);
+        return BootstrapFieldDecoder.Read<T>(sequence, textEncoding);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    bool TryGetFieldSpan(int ordinal, out ReadOnlySpan<byte> field)
+    bool TryGetFieldMemory(int ordinal, out ReadOnlyMemory<byte> field)
     {
+        if (ordinal == _lastBufferedOrdinal)
+        {
+            field = _bufferedBody.Slice(_lastBufferedOffset, _lastBufferedLength);
+            return true;
+        }
+
         var columnIndex = _column <= ordinal ? _column : 0;
         var columnOffset = _column <= ordinal ? _columnOffset : sizeof(short);
-        if (!Message.TryGetFirstSpan(columnOffset, out var remaining))
+        if ((uint)columnOffset > (uint)_bufferedBody.Length)
         {
             field = default;
             return false;
         }
+        var remainingMemory = _bufferedBody.Slice(columnOffset);
+        var remaining = remainingMemory.Span;
 
         while (columnIndex++ < ordinal)
         {
@@ -389,6 +449,7 @@ sealed class Row
             }
 
             remaining = remaining.Slice(fieldSize);
+            remainingMemory = remainingMemory.Slice(fieldSize);
             columnOffset += fieldSize;
         }
 
@@ -407,7 +468,10 @@ sealed class Row
 
         _column = columnIndex;
         _columnOffset = columnOffset + sizeof(int) + fieldLength;
-        field = remaining.Slice(sizeof(int), fieldLength);
+        _lastBufferedOrdinal = ordinal;
+        _lastBufferedOffset = columnOffset + sizeof(int);
+        _lastBufferedLength = fieldLength;
+        field = remainingMemory.Slice(sizeof(int), fieldLength);
         return true;
     }
 
@@ -422,6 +486,7 @@ sealed class Row
         {
             await _bodyReader.BufferAllAsync(cancellationToken).ConfigureAwait(false);
             _bodyReader = null;
+            CaptureBufferedBody();
             return GetValue<T>(ordinal);
         }
     }
@@ -436,6 +501,7 @@ sealed class Row
         {
             await _bodyReader.BufferAllAsync(token).ConfigureAwait(false);
             _bodyReader = null;
+            CaptureBufferedBody();
         }
     }
 
@@ -481,7 +547,7 @@ sealed class Row
 
             var field = _remaining.Slice(sizeof(int), length);
             _remaining = _remaining.Slice(sizeof(int) + length);
-            return RawFieldDecoder.Read<T>(field);
+            return BootstrapFieldDecoder.Read<T>(field);
         }
     }
 
@@ -498,7 +564,9 @@ sealed class Row
         _bodyReader = row.Buffered ? null : row.OpenBodyReader();
         _column = 0;
         _columnOffset = sizeof(short);
+        _lastBufferedOrdinal = -1;
         BackendMessage.Accessor.WriteGranularly(ref _messageAccessor, row.GetAccessor());
+        CaptureBufferedBody();
     }
 
     void EnsureBuffered()
@@ -507,6 +575,15 @@ sealed class Row
             return;
         _bodyReader.BufferAll();
         _bodyReader = null;
+        CaptureBufferedBody();
+    }
+
+    void CaptureBufferedBody()
+    {
+        if (_bodyReader is null && Message.TryGetFirstMemory(0, out var body))
+            _bufferedBody = body;
+        else
+            _bufferedBody = default;
     }
 
     // Returns false when the seek was exhausted, true if positioned correctly, and throws if the seek is invalid.

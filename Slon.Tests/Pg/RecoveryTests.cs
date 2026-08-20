@@ -692,7 +692,6 @@ public class RecoveryTests : ConnectionCreatingTest
         var faulting = new CommandFlow(async: true, new CommandFlowOptions
         {
             Commands = new(command),
-            SerializerOptions = serializerOptions,
         });
         var successor = new CommandFlow(async: true, Command.Create("select 42::int4"));
         scope.Queue(faulting);

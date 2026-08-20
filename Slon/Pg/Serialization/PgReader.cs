@@ -1,236 +1,93 @@
 using System.Buffers;
-using System.Buffers.Binary;
+using System.Runtime.CompilerServices;
 using System.Text;
 using Slon.Buffers;
 
 namespace Slon.Pg.Serialization;
 
-// Field-bounded serializer cursor over either buffered memory or a live protocol body.
-public sealed class PgReader : IDisposable, IAsyncDisposable
+// Serializer vocabulary over Row's reusable, transport-neutral field cursor. The value wrapper
+// keeps serialization out of wire ownership without allocating a cursor for every field.
+public readonly struct PgReader : IDisposable, IAsyncDisposable
 {
-    ReadOnlySequence<byte> _buffer;
-    IInputReader? _source;
-    long _position;
-    int _fieldSize;
-    int _released;
-    int _releasePrefix;
-    byte[]? _pooledArray;
-    IReaderView? _activeView;
-    bool _revoked;
+    readonly PgFieldReader _reader;
 
     internal PgReader(ReadOnlyMemory<byte> buffer, PgConversionContext? conversionContext = null)
-        : this(new ReadOnlySequence<byte>(buffer), conversionContext) { }
+        : this(new PgFieldReader(buffer), conversionContext ?? PgConversionContext.Empty) { }
 
-    internal PgReader(in ReadOnlySequence<byte> buffer, PgConversionContext? conversionContext = null)
-    {
-        _buffer = buffer;
-        _fieldSize = checked((int)buffer.Length);
-        ConversionContext = conversionContext ?? PgConversionContext.Empty;
-    }
+    internal PgReader(in ReadOnlySequence<byte> buffer,
+        PgConversionContext? conversionContext = null)
+        : this(new PgFieldReader(buffer), conversionContext ?? PgConversionContext.Empty) { }
 
     internal PgReader(IInputReader source, int fieldSize,
         PgConversionContext? conversionContext = null)
-        : this(source, source.Buffer, fieldSize, releasePrefix: 0, conversionContext) { }
+        : this(new PgFieldReader(source, fieldSize), conversionContext ?? PgConversionContext.Empty) { }
 
     internal PgReader(IInputReader source, in ReadOnlySequence<byte> buffer, int fieldSize,
         int releasePrefix, PgConversionContext? conversionContext = null)
+        : this(new PgFieldReader(source, buffer, fieldSize, releasePrefix),
+            conversionContext ?? PgConversionContext.Empty) { }
+
+    internal PgReader(PgFieldReader reader, PgConversionContext conversionContext,
+        bool sequential = false)
     {
-        ArgumentOutOfRangeException.ThrowIfNegative(fieldSize);
-        ArgumentOutOfRangeException.ThrowIfNegative(releasePrefix);
-        _source = source;
-        _buffer = buffer;
-        _fieldSize = fieldSize;
-        _releasePrefix = releasePrefix;
-        ConversionContext = conversionContext ?? PgConversionContext.Empty;
+        _reader = reader;
+        ConversionContext = conversionContext;
+        IsSequential = sequential;
     }
 
     public PgConversionContext ConversionContext { get; }
-    public int CurrentRemaining => _fieldSize - checked(_released + (int)_position);
-    internal int FieldSize => _fieldSize;
-    internal int FieldOffset => checked(_released + (int)_position);
+    internal bool IsSequential { get; }
+    public int CurrentRemaining => _reader.CurrentRemaining;
+    internal int FieldSize => _reader.FieldSize;
+    internal int FieldOffset => _reader.FieldOffset;
+    internal bool TryGetReadView(out PgReadView view) => _reader.TryGetReadView(out view);
 
-    internal void Seek(int offset)
-    {
-        ArgumentOutOfRangeException.ThrowIfNegative(offset);
-        if (offset > _fieldSize)
-            throw new ArgumentOutOfRangeException(nameof(offset));
+    internal void Seek(int offset) => _reader.Seek(offset);
 
-        var current = FieldOffset;
-        if (offset < current)
-        {
-            if (_source is not null || _released != 0)
-                throw new InvalidOperationException(
-                    "Attempted to read a position in a sequential column which has already been consumed.");
-            _position = offset;
-            return;
-        }
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public byte ReadByte() => _reader.ReadByte();
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public short ReadInt16() => _reader.ReadInt16();
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public int ReadInt32() => _reader.ReadInt32();
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public long ReadInt64() => _reader.ReadInt64();
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public ushort ReadUInt16() => _reader.ReadUInt16();
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public uint ReadUInt32() => _reader.ReadUInt32();
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public ulong ReadUInt64() => _reader.ReadUInt64();
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public float ReadFloat() => _reader.ReadFloat();
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public double ReadDouble() => _reader.ReadDouble();
 
-        Consume(offset - current);
-    }
-
-    public byte ReadByte()
-    {
-        Span<byte> bytes = stackalloc byte[sizeof(byte)];
-        ReadFixed(bytes);
-        return bytes[0];
-    }
-
-    public short ReadInt16()
-    {
-        Span<byte> bytes = stackalloc byte[sizeof(short)];
-        ReadFixed(bytes);
-        var value = BinaryPrimitives.ReadInt16BigEndian(bytes);
-        return value;
-    }
-
-    public int ReadInt32()
-    {
-        Span<byte> bytes = stackalloc byte[sizeof(int)];
-        ReadFixed(bytes);
-        var value = BinaryPrimitives.ReadInt32BigEndian(bytes);
-        return value;
-    }
-
-    public long ReadInt64()
-    {
-        Span<byte> bytes = stackalloc byte[sizeof(long)];
-        ReadFixed(bytes);
-        var value = BinaryPrimitives.ReadInt64BigEndian(bytes);
-        return value;
-    }
-
-    public ushort ReadUInt16()
-    {
-        Span<byte> bytes = stackalloc byte[sizeof(ushort)];
-        ReadFixed(bytes);
-        return BinaryPrimitives.ReadUInt16BigEndian(bytes);
-    }
-
-    public uint ReadUInt32()
-    {
-        Span<byte> bytes = stackalloc byte[sizeof(uint)];
-        ReadFixed(bytes);
-        return BinaryPrimitives.ReadUInt32BigEndian(bytes);
-    }
-
-    public ulong ReadUInt64()
-    {
-        Span<byte> bytes = stackalloc byte[sizeof(ulong)];
-        ReadFixed(bytes);
-        return BinaryPrimitives.ReadUInt64BigEndian(bytes);
-    }
-
-    public float ReadFloat()
-    {
-        Span<byte> bytes = stackalloc byte[sizeof(float)];
-        ReadFixed(bytes);
-        return BinaryPrimitives.ReadSingleBigEndian(bytes);
-    }
-
-    public double ReadDouble()
-    {
-        Span<byte> bytes = stackalloc byte[sizeof(double)];
-        ReadFixed(bytes);
-        return BinaryPrimitives.ReadDoubleBigEndian(bytes);
-    }
-
-    public ReadOnlySequence<byte> ReadBytes(int count)
-    {
-        CheckBounds(count);
-        if (_buffer.Length - _position >= count)
-        {
-            var result = _buffer.Slice(_position, count);
-            _position += count;
-            return result;
-        }
-
-        var array = RentArray(count);
-        Read(array.AsSpan(0, count));
-        return new(array, 0, count);
-    }
-
-    public async ValueTask<ReadOnlySequence<byte>> ReadBytesAsync(int count,
+    public ReadOnlySequence<byte> ReadBytes(int count) => _reader.ReadBytes(count);
+    public ValueTask<ReadOnlySequence<byte>> ReadBytesAsync(int count,
         CancellationToken cancellationToken = default)
-    {
-        CheckBounds(count);
-        if (_buffer.Length - _position >= count)
-        {
-            var result = _buffer.Slice(_position, count);
-            _position += count;
-            return result;
-        }
-
-        var array = RentArray(count);
-        await ReadBytesAsync(array.AsMemory(0, count), cancellationToken).ConfigureAwait(false);
-        return new(array, 0, count);
-    }
-
-    public void Read(Span<byte> destination)
-    {
-        CheckBounds(destination.Length);
-        while (!destination.IsEmpty)
-        {
-            if (_buffer.Length == _position)
-                Refill();
-            var available = _buffer.Slice(_position);
-            var count = (int)Math.Min(destination.Length, available.Length);
-            available.Slice(0, count).CopyTo(destination);
-            _position += count;
-            destination = destination.Slice(count);
-        }
-    }
-
+        => _reader.ReadBytesAsync(count, cancellationToken);
+    public void Read(Span<byte> destination) => _reader.Read(destination);
     public ValueTask ReadBytesAsync(Memory<byte> destination,
         CancellationToken cancellationToken = default)
-    {
-        CheckBounds(destination.Length);
-        if (destination.IsEmpty)
-            return default;
-        return Core(destination, cancellationToken);
-
-        async ValueTask Core(Memory<byte> remaining, CancellationToken token)
-        {
-            while (!remaining.IsEmpty)
-            {
-                if (_buffer.Length == _position)
-                    await RefillAsync(token).ConfigureAwait(false);
-                var available = _buffer.Slice(_position);
-                var count = (int)Math.Min(remaining.Length, available.Length);
-                available.Slice(0, count).CopyTo(remaining.Span);
-                _position += count;
-                remaining = remaining.Slice(count);
-            }
-        }
-    }
-
+        => _reader.ReadBytesAsync(destination, cancellationToken);
     public bool TryReadBytes(int count, out ReadOnlySpan<byte> bytes)
-    {
-        CheckBounds(count);
-        var unread = _buffer.Slice(_position);
-        if (unread.FirstSpan.Length < count)
-        {
-            bytes = default;
-            return false;
-        }
-        bytes = unread.FirstSpan.Slice(0, count);
-        _position += count;
-        return true;
-    }
-
+        => _reader.TryReadBytes(count, out bytes);
     public Stream GetStream(int? length = null)
     {
-        ObjectDisposedException.ThrowIf(_revoked, this);
-        if (_activeView is { IsDisposed: false })
-            throw new InvalidOperationException("Only one temporary view may be active for a column.");
         var count = length ?? CurrentRemaining;
-        CheckBounds(count);
-        return (ReaderStream)(_activeView = new ReaderStream(this, count));
+        _reader.CheckBounds(count);
+        var stream = new ReaderStream(_reader, count);
+        _reader.RegisterView(stream);
+        return stream;
     }
 
     public TextReader GetTextReader(Encoding encoding)
     {
-        var stream = (ReaderStream)GetStream();
-        return (ReaderTextReader)(_activeView = new ReaderTextReader(stream, encoding));
+        var stream = new ReaderStream(_reader, CurrentRemaining);
+        var reader = new ReaderTextReader(stream, encoding);
+        _reader.RegisterView(reader);
+        return reader;
     }
 
     public ValueTask<TextReader> GetTextReaderAsync(Encoding encoding,
@@ -239,250 +96,48 @@ public sealed class PgReader : IDisposable, IAsyncDisposable
         cancellationToken.ThrowIfCancellationRequested();
         return new(GetTextReader(encoding));
     }
-
-    public void Consume(int? count = null)
-    {
-        var remaining = count ?? CurrentRemaining;
-        CheckBounds(remaining);
-        while (remaining > 0)
-        {
-            if (_buffer.Length == _position)
-                Refill();
-            var consumed = (int)Math.Min(remaining, _buffer.Length - _position);
-            _position += consumed;
-            remaining -= consumed;
-        }
-    }
-
-    public ValueTask ConsumeAsync(int? count = null, CancellationToken cancellationToken = default)
-    {
-        var remaining = count ?? CurrentRemaining;
-        CheckBounds(remaining);
-        if (remaining == 0)
-            return default;
-        return Core(remaining, cancellationToken);
-
-        async ValueTask Core(int bytesRemaining, CancellationToken token)
-        {
-            while (bytesRemaining > 0)
-            {
-                if (_buffer.Length == _position)
-                    await RefillAsync(token).ConfigureAwait(false);
-                var consumed = (int)Math.Min(bytesRemaining, _buffer.Length - _position);
-                _position += consumed;
-                bytesRemaining -= consumed;
-            }
-        }
-    }
-
-    public void Rewind(int count)
-    {
-        ArgumentOutOfRangeException.ThrowIfNegative(count);
-        if (count > _position)
-            throw new InvalidOperationException("Cannot rewind into an input window that has already been released.");
-        _position -= count;
-    }
+    public void Consume(int? count = null) => _reader.Consume(count);
+    public ValueTask ConsumeAsync(int? count = null,
+        CancellationToken cancellationToken = default)
+        => _reader.ConsumeAsync(count, cancellationToken);
+    public void Rewind(int count) => _reader.Rewind(count);
 
     public NestedReadScope BeginNestedRead(int size, Size bufferRequirement)
-        => BeginNestedReadCore(size, bufferRequirement, async: false);
+        => new(_reader.BeginNestedRead(size,
+            consumeRemainder: bufferRequirement.Kind is SizeKind.UpperBound));
 
-    public ValueTask<NestedReadScope> BeginNestedReadAsync(int size, Size bufferRequirement,
-        CancellationToken cancellationToken = default)
+    public async ValueTask<NestedReadScope> BeginNestedReadAsync(int size,
+        Size bufferRequirement, CancellationToken cancellationToken = default)
+        => new(await _reader.BeginNestedReadAsync(size,
+                consumeRemainder: bufferRequirement.Kind is SizeKind.UpperBound, cancellationToken)
+            .ConfigureAwait(false));
+
+    internal void CompleteField() => _reader.CompleteField();
+    internal ValueTask CompleteFieldAsync() => _reader.CompleteFieldAsync();
+    internal bool HasActiveView => _reader.HasActiveView;
+    internal IColumnLease ActiveViewLease => _reader.ActiveViewLease;
+
+    public void Dispose() => _reader.Dispose();
+    public ValueTask DisposeAsync() => _reader.DisposeAsync();
+
+    public readonly struct NestedReadScope : IDisposable, IAsyncDisposable
     {
-        cancellationToken.ThrowIfCancellationRequested();
-        return new(BeginNestedReadCore(size, bufferRequirement, async: true));
+        readonly PgFieldReader.NestedReadScope _scope;
+
+        internal NestedReadScope(PgFieldReader.NestedReadScope scope) => _scope = scope;
+
+        public void Dispose() => _scope.Dispose();
+        public ValueTask DisposeAsync() => _scope.DisposeAsync();
     }
 
-    NestedReadScope BeginNestedReadCore(int size, Size bufferRequirement, bool async)
+    sealed class ReaderStream : Stream, IColumnLease
     {
-        ArgumentOutOfRangeException.ThrowIfNegative(size);
-        CheckBounds(size);
-        var previousEnd = _fieldSize;
-        var nestedEnd = checked(_released + (int)_position + size);
-        _fieldSize = nestedEnd;
-        return new(this, previousEnd, nestedEnd, bufferRequirement, async);
-    }
-
-    ValueTask EndNestedRead(int previousEnd, int nestedEnd, Size bufferRequirement, bool async)
-    {
-        if (_fieldSize != nestedEnd)
-            throw new InvalidOperationException("Nested read scopes must be disposed in reverse order.");
-
-        var remaining = CurrentRemaining;
-        _fieldSize = previousEnd;
-        if (remaining == 0)
-            return default;
-        if (bufferRequirement.Kind is not SizeKind.UpperBound)
-            throw new InvalidOperationException(
-                $"Nested converter left {remaining} bytes unread from an exact field value.");
-        return async ? ConsumeAsync(remaining) : ConsumeSynchronously(remaining);
-
-        ValueTask ConsumeSynchronously(int count)
-        {
-            Consume(count);
-            return default;
-        }
-    }
-
-    void ReadFixed(Span<byte> destination)
-    {
-        Read(destination);
-    }
-
-    void CheckBounds(int count)
-    {
-        if ((uint)count > (uint)CurrentRemaining)
-            throw new IndexOutOfRangeException("Attempt to read past the end of the field.");
-    }
-
-    void Refill()
-    {
-        var source = _source ?? throw new EndOfStreamException();
-        if (source.IsComplete)
-            throw new EndOfStreamException();
-        ReleaseWindow(source);
-        source.Read();
-        Publish(source);
-    }
-
-    async ValueTask RefillAsync(CancellationToken cancellationToken)
-    {
-        var source = _source ?? throw new EndOfStreamException();
-        if (source.IsComplete)
-            throw new EndOfStreamException();
-        ReleaseWindow(source);
-        await source.ReadAsync(cancellationToken).ConfigureAwait(false);
-        Publish(source);
-    }
-
-    void ReleaseWindow(IInputReader source)
-    {
-        var consumed = _position;
-        var position = _buffer.GetPosition(consumed);
-        source.AdvanceTo(position, checked(_releasePrefix + consumed));
-        _released = checked(_released + (int)consumed);
-    }
-
-    void Publish(IInputReader source)
-    {
-        _buffer = source.Buffer;
-        _position = 0;
-        _releasePrefix = 0;
-        if (_buffer.IsEmpty && !source.IsComplete)
-            throw new InvalidOperationException("Input source published an empty incomplete window.");
-    }
-
-    internal int CompleteField()
-    {
-        if (CurrentRemaining != 0)
-            throw new InvalidOperationException($"Converter left {CurrentRemaining} field bytes unread.");
-        return ReleaseFieldWindow(async: false).GetAwaiter().GetResult();
-    }
-
-    internal ValueTask<int> CompleteFieldAsync()
-    {
-        if (CurrentRemaining != 0)
-            throw new InvalidOperationException($"Converter left {CurrentRemaining} field bytes unread.");
-        return ReleaseFieldWindow(async: true);
-    }
-
-    internal bool HasActiveView => _activeView is { IsDisposed: false };
-    internal IColumnLease ActiveViewLease
-        => _activeView is { IsDisposed: false } view
-            ? view
-            : throw new InvalidOperationException("No temporary column view is active.");
-
-    internal int RevokeField()
-    {
-        if (_revoked)
-            throw new InvalidOperationException("The column lease has already been revoked.");
-        _activeView?.DisposeView();
-        Consume();
-        var offset = CompleteField();
-        _revoked = true;
-        Dispose();
-        return offset;
-    }
-
-    internal async ValueTask<int> RevokeFieldAsync()
-    {
-        if (_revoked)
-            throw new InvalidOperationException("The column lease has already been revoked.");
-        if (_activeView is { } view)
-            await view.DisposeViewAsync().ConfigureAwait(false);
-        await ConsumeAsync().ConfigureAwait(false);
-        var offset = await CompleteFieldAsync().ConfigureAwait(false);
-        _revoked = true;
-        Dispose();
-        return offset;
-    }
-
-    async ValueTask<int> ReleaseFieldWindow(bool async)
-    {
-        var source = _source;
-        if (source is null)
-            return -1;
-        if (source.IsComplete)
-            return checked(_releasePrefix + (int)_position);
-
-        ReleaseWindow(source);
-        if (async)
-            await source.ReadAsync().ConfigureAwait(false);
-        else
-            source.Read();
-        Publish(source);
-        return 0;
-    }
-
-    byte[] RentArray(int count)
-    {
-        if (_pooledArray is { } previous)
-            ArrayPool<byte>.Shared.Return(previous);
-        return _pooledArray = ArrayPool<byte>.Shared.Rent(count);
-    }
-
-    public void Dispose()
-    {
-        if (_activeView is { IsDisposed: false } view)
-            view.DisposeView();
-        if (_pooledArray is { } array)
-        {
-            _pooledArray = null;
-            ArrayPool<byte>.Shared.Return(array);
-        }
-    }
-
-    public ValueTask DisposeAsync()
-    {
-        if (_activeView is { IsDisposed: false })
-            return DisposeAsyncCore();
-        Dispose();
-        return default;
-    }
-
-    async ValueTask DisposeAsyncCore()
-    {
-        await _activeView!.DisposeViewAsync().ConfigureAwait(false);
-        Dispose();
-    }
-
-    interface IReaderView : IColumnLease
-    {
-        bool IsDisposed { get; }
-        void DisposeView();
-        ValueTask DisposeViewAsync();
-    }
-
-    sealed class ReaderStream : Stream, IReaderView
-    {
-        readonly PgReader _reader;
+        readonly PgFieldReader _reader;
         readonly int _length;
         int _remaining;
         bool _disposed;
 
-        public bool IsDisposed => _disposed;
-
-        internal ReaderStream(PgReader reader, int length)
+        internal ReaderStream(PgFieldReader reader, int length)
         {
             _reader = reader;
             _length = _remaining = length;
@@ -512,7 +167,8 @@ public sealed class PgReader : IDisposable, IAsyncDisposable
             var count = Math.Min(buffer.Length, _remaining);
             if (count == 0)
                 return 0;
-            await _reader.ReadBytesAsync(buffer.Slice(0, count), cancellationToken).ConfigureAwait(false);
+            await _reader.ReadBytesAsync(buffer.Slice(0, count), cancellationToken)
+                .ConfigureAwait(false);
             _remaining -= count;
             return count;
         }
@@ -529,6 +185,7 @@ public sealed class PgReader : IDisposable, IAsyncDisposable
                 _remaining = 0;
             }
             _disposed = true;
+            _reader.ReleaseView(this);
             base.Dispose(disposing);
         }
 
@@ -539,16 +196,18 @@ public sealed class PgReader : IDisposable, IAsyncDisposable
                 await _reader.ConsumeAsync(_remaining).ConfigureAwait(false);
                 _remaining = 0;
                 _disposed = true;
+                _reader.ReleaseView(this);
             }
             GC.SuppressFinalize(this);
         }
 
-        public void DisposeView() => Dispose();
+        void IColumnLease.Revoke()
+        {
+            _disposed = true;
+            _reader.ReleaseView(this);
+        }
 
-        public ValueTask DisposeViewAsync() => DisposeAsync();
-
-        int IColumnLease.Revoke() => _reader.RevokeField();
-        ValueTask<int> IColumnLease.RevokeAsync() => _reader.RevokeFieldAsync();
+        internal void ReleaseOwner(IColumnLease owner) => _reader.ReleaseView(owner);
 
         public override bool CanRead => !_disposed;
         public override bool CanSeek => false;
@@ -565,7 +224,7 @@ public sealed class PgReader : IDisposable, IAsyncDisposable
         public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
     }
 
-    sealed class ReaderTextReader : TextReader, IReaderView
+    sealed class ReaderTextReader : TextReader, IColumnLease
     {
         readonly ReaderStream _stream;
         readonly StreamReader _reader;
@@ -577,8 +236,6 @@ public sealed class PgReader : IDisposable, IAsyncDisposable
             _reader = new(stream, encoding, detectEncodingFromByteOrderMarks: false,
                 bufferSize: 1024, leaveOpen: false);
         }
-
-        public bool IsDisposed => _disposed;
 
         void ThrowIfDisposed() => ObjectDisposedException.ThrowIf(_disposed, this);
 
@@ -609,58 +266,15 @@ public sealed class PgReader : IDisposable, IAsyncDisposable
             if (!_disposed && disposing)
                 _reader.Dispose();
             _disposed = true;
+            _stream.ReleaseOwner(this);
             base.Dispose(disposing);
         }
 
-        ValueTask DisposeAsyncCore()
+        void IColumnLease.Revoke()
         {
-            Dispose();
-            return default;
+            _disposed = true;
+            ((IColumnLease)_stream).Revoke();
+            _stream.ReleaseOwner(this);
         }
-
-        public void DisposeView() => Dispose();
-        public ValueTask DisposeViewAsync() => DisposeAsyncCore();
-
-        int IColumnLease.Revoke()
-        {
-            Dispose();
-            return ((IColumnLease)_stream).Revoke();
-        }
-
-        async ValueTask<int> IColumnLease.RevokeAsync()
-        {
-            await DisposeAsyncCore().ConfigureAwait(false);
-            return await ((IColumnLease)_stream).RevokeAsync().ConfigureAwait(false);
-        }
-    }
-
-    public readonly struct NestedReadScope : IDisposable, IAsyncDisposable
-    {
-        readonly PgReader _reader;
-        readonly int _previousEnd;
-        readonly int _nestedEnd;
-        readonly Size _bufferRequirement;
-        readonly bool _async;
-
-        internal NestedReadScope(PgReader reader, int previousEnd, int nestedEnd,
-            Size bufferRequirement, bool async)
-        {
-            _reader = reader;
-            _previousEnd = previousEnd;
-            _nestedEnd = nestedEnd;
-            _bufferRequirement = bufferRequirement;
-            _async = async;
-        }
-
-        public void Dispose()
-        {
-            if (_async)
-                throw new InvalidOperationException("An asynchronous nested read scope must be disposed asynchronously.");
-            _reader.EndNestedRead(_previousEnd, _nestedEnd, _bufferRequirement, async: false)
-                .GetAwaiter().GetResult();
-        }
-
-        public ValueTask DisposeAsync()
-            => _reader.EndNestedRead(_previousEnd, _nestedEnd, _bufferRequirement, async: true);
     }
 }

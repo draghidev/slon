@@ -19,12 +19,12 @@ namespace Slon.Tests.Pg;
 public class BackendMessageParsingTests
 {
     [TestMethod]
-    public void RawFieldDecoder_UsesTheSuppliedExecutionEncoding()
+    public void BootstrapFieldDecoder_UsesTheSuppliedExecutionEncoding()
     {
         ReadOnlySpan<byte> latin1 = [0x63, 0x61, 0x66, 0xE9];
 
-        Assert.AreEqual("café", RawFieldDecoder.Read<string>(latin1, Encoding.Latin1));
-        Assert.AreNotEqual("café", RawFieldDecoder.Read<string>(latin1),
+        Assert.AreEqual("café", BootstrapFieldDecoder.Read<string>(latin1, Encoding.Latin1));
+        Assert.AreNotEqual("café", BootstrapFieldDecoder.Read<string>(latin1),
             "the bootstrap decoder must not silently fall back to UTF-8 when an execution snapshot was supplied");
     }
 

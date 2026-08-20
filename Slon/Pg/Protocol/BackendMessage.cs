@@ -130,6 +130,35 @@ readonly struct BackendMessage
         return false;
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public bool TryGetFirstMemory(int offset, out ReadOnlyMemory<byte> memory)
+    {
+        EnsureBodyWindowAvailable();
+        offset += BackendHeader.ByteCount;
+        ref var buffer = ref Unsafe.AsRef(in _buffer);
+        var startObject = StartObject(ref buffer);
+        ReadOnlyMemory<byte> firstMemory;
+        if (startObject is not null && startObject.GetType() == typeof(byte[]))
+        {
+            Debug.Assert(buffer.IsSingleSegment);
+            var start = StartInteger(ref buffer);
+            firstMemory = new(Unsafe.As<byte[]>(startObject), start,
+                buffer.End.GetInteger() - start);
+        }
+        else
+        {
+            firstMemory = buffer.First;
+        }
+        if ((uint)offset <= (uint)firstMemory.Length)
+        {
+            memory = firstMemory.Slice(offset);
+            return true;
+        }
+
+        memory = default;
+        return false;
+    }
+
     [UnsafeAccessor(UnsafeAccessorKind.Field, Name = "_startObject")]
     static extern ref object? StartObject(ref ReadOnlySequence<byte> buffer);
 

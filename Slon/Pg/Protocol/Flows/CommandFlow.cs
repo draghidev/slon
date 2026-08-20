@@ -2,7 +2,6 @@ using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Threading.Tasks.Sources;
 using Slon.Runtime.CompilerServices;
-using Slon.Pg.Serialization;
 // A unique result type distinguishes the caller gate from this flow's other IValueTaskSource faces.
 using FlowCallerInteractionCoreResult = System.ValueTuple;
 
@@ -20,9 +19,6 @@ readonly struct CommandFlowOptions
     public CommandFlowObserver? Observer { get; init; }
     public object? ObserverState { get; init; }
     public CommandList Commands { get; init; }
-    // Captured while the ADO command is bound. Catalog reload publishes a new options instance,
-    // while this flow continues against the immutable revision it resolved with.
-    public PgSerializerOptions? SerializerOptions { get; init; }
     // Optional per-flow override for time spent waiting in the protocol backlog.
     public TimeSpan? PendingTimeout { get; init; }
 }
@@ -208,7 +204,6 @@ sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
         _options = new()
         {
             Commands = options.Commands,
-            SerializerOptions = options.SerializerOptions,
             PendingTimeout = options.PendingTimeout
         };
         options.Observer?.OnStarted(this, options.ObserverState);
@@ -600,8 +595,7 @@ sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
                             _requestedRowDescription?.Preserve());
                     }
                     result.Initialize(_commandIndex, descriptor, _requestedRowDescription,
-                        !resultCommand.DescribeOnly, resultCommand.IsSimple(), _options.SerializerOptions,
-                        _decoder.ClientEncoding, _pgError);
+                        !resultCommand.DescribeOnly, resultCommand.IsSimple(), _pgError);
                 }
                 ((CommandFlowObserver?)GetObserver(out var observerState))
                     ?.OnCommandResult(this, result, observerState);

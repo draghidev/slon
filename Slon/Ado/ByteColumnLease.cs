@@ -21,17 +21,26 @@ sealed class ByteColumnLease(PgReader reader, bool sequential) : IColumnLease
         return count;
     }
 
-    int IColumnLease.Revoke()
+    void IColumnLease.Revoke()
     {
         ObjectDisposedException.ThrowIf(_revoked, this);
         _revoked = true;
-        return reader.RevokeField();
     }
+}
 
-    async ValueTask<int> IColumnLease.RevokeAsync()
-    {
-        ObjectDisposedException.ThrowIf(_revoked, this);
-        _revoked = true;
-        return await reader.RevokeFieldAsync().ConfigureAwait(false);
-    }
+sealed class ByteColumnLeaseConverter : PgStreamingConverter<ByteColumnLease>
+{
+    internal override bool ResultIsColumnLease => true;
+    public override ConverterDescriptor GetDescriptor(in DescriptorContext context)
+        => ConverterDescriptor.Invariant with { BufferRequirements = BufferRequirements.Streaming };
+
+    public override ByteColumnLease Read(PgReader reader) => new(reader, reader.IsSequential);
+    public override ValueTask<ByteColumnLease> ReadAsync(PgReader reader,
+        CancellationToken cancellationToken = default) => new(Read(reader));
+    protected override Size BindValue(in BindContext context, ByteColumnLease value,
+        ref object? writeState) => throw new NotSupportedException();
+    public override void Write(PgWriter writer, ByteColumnLease value) => throw new NotSupportedException();
+    public override ValueTask WriteAsync(PgWriter writer, ByteColumnLease value,
+        CancellationToken cancellationToken = default)
+        => ValueTask.FromException(new NotSupportedException());
 }

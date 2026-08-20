@@ -3,8 +3,6 @@ using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
 using Slon.Pg.Protocol;
-using Slon.Pg.Serialization;
-using System.Text;
 
 namespace Slon.Pg;
 
@@ -18,8 +16,6 @@ abstract class CommandResult : IDisposable, IAsyncDisposable, IEnumerable<Row>, 
 
     readonly Row _row = new();
     RowDescription? _rowDescription;
-    PgSerializerOptions? _serializerOptions;
-    PgConversionContext _conversionContext = PgConversionContext.Empty;
     int _index;
     CommandDescriptor _descriptor;
     bool _requestedExecution;
@@ -35,8 +31,7 @@ abstract class CommandResult : IDisposable, IAsyncDisposable, IEnumerable<Row>, 
 
     // The requested row description is what was returned for this exact command (i.e. commands that requested a describe).
     protected void Initialize(int index, CommandDescriptor descriptor, RowDescription? requestedRowDescription,
-        bool requestedExecution, bool simpleProtocol, PgSerializerOptions? serializerOptions = null,
-        Encoding? textEncoding = null, PgError? error = null)
+        bool requestedExecution, bool simpleProtocol, PgError? error = null)
     {
         _index = index;
         _descriptor = descriptor;
@@ -69,85 +64,6 @@ abstract class CommandResult : IDisposable, IAsyncDisposable, IEnumerable<Row>, 
         _describeCompleted = false;
         _completionAction = null;
         _completionActionState = null;
-        _serializerOptions = serializerOptions;
-        _conversionContext = textEncoding is null
-            ? PgConversionContext.Empty
-            : new PgConversionContext { TextEncoding = textEncoding };
-    }
-
-    internal T ReadField<T>(Row row, int ordinal)
-    {
-        var reader = new PgSerializerFieldReader<T>(
-            _serializerOptions ?? throw new InvalidOperationException("No serializer was attached to this result."),
-            _conversionContext);
-        return row.GetValue<T, PgSerializerFieldReader<T>>(ordinal, ref reader);
-    }
-
-    internal ValueTask<T> ReadFieldAsync<T>(Row row, int ordinal,
-        CancellationToken cancellationToken = default)
-    {
-        var reader = new PgSerializerFieldReader<T>(
-            _serializerOptions ?? throw new InvalidOperationException("No serializer was attached to this result."),
-            _conversionContext);
-        return row.GetValueAsync<T, PgSerializerFieldReader<T>>(ordinal, reader, cancellationToken);
-    }
-
-    internal PgConversionContext ConversionContext => _conversionContext;
-
-    internal string GetName(int ordinal) => GetField(ordinal).Name;
-
-    internal int GetOrdinal(string name)
-    {
-        var rowDescription = _rowDescription
-            ?? throw new InvalidOperationException("The current result has no row description.");
-        return rowDescription.GetFieldIndex(name);
-    }
-
-    internal string GetDataTypeName(int ordinal)
-        => GetSerializerOptions().GetDataTypeName(GetField(ordinal).TypeOid).DisplayName;
-
-    internal Type GetFieldType(int ordinal)
-        => GetSerializerOptions().GetTypeInfo(type: null, GetField(ordinal).TypeOid).Type;
-
-    internal object ReadObject(Row row, int ordinal)
-        => IsDBNull(row, ordinal) ? DBNull.Value : ReadField<object>(row, ordinal);
-
-    internal async ValueTask<object> ReadObjectAsync(Row row, int ordinal,
-        CancellationToken cancellationToken = default)
-        => await IsDBNullAsync(row, ordinal, cancellationToken).ConfigureAwait(false)
-            ? DBNull.Value
-            : await ReadFieldAsync<object>(row, ordinal, cancellationToken).ConfigureAwait(false);
-
-    internal bool IsDBNull(Row row, int ordinal)
-    {
-        _ = GetField(ordinal);
-        return row.IsDBNull(ordinal);
-    }
-
-    internal ValueTask<bool> IsDBNullAsync(Row row, int ordinal,
-        CancellationToken cancellationToken = default)
-    {
-        _ = GetField(ordinal);
-        return row.IsDBNullAsync(ordinal, cancellationToken);
-    }
-
-    ref readonly RowDescriptionField GetField(int ordinal)
-    {
-        if (_rowDescription is null)
-            throw new InvalidOperationException("The current result has no row description.");
-        return ref _rowDescription[ordinal];
-    }
-
-    PgSerializerOptions GetSerializerOptions()
-        => _serializerOptions
-            ?? throw new InvalidOperationException("No serializer was attached to this result.");
-
-    internal CharsColumnLease ReadChars(Row row, int ordinal, bool sequential)
-    {
-        var reader = new GetCharsFieldReader(
-            _serializerOptions ?? throw new InvalidOperationException("No serializer was attached to this result."),
-            _conversionContext, sequential);
-        return row.GetValue<CharsColumnLease, GetCharsFieldReader>(ordinal, ref reader);
     }
 
     /// Returns all metadata known about the command after execution has taken place.
@@ -547,10 +463,9 @@ sealed class CommandResult<TEnumerator>(TEnumerator enumerator) : CommandResult
     TEnumerator _messageEnumerator = enumerator;
 
     internal new void Initialize(int index, CommandDescriptor descriptor, RowDescription? requestedRowDescription,
-        bool requestedExecution, bool simpleProtocol, PgSerializerOptions? serializerOptions = null,
-        Encoding? textEncoding = null, PgError? error = null)
+        bool requestedExecution, bool simpleProtocol, PgError? error = null)
         => base.Initialize(index, descriptor, requestedRowDescription, requestedExecution, simpleProtocol,
-            serializerOptions, textEncoding, error);
+            error);
 
     protected override BackendMessage GetCurrentMessage()
     {

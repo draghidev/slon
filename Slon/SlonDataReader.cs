@@ -8,6 +8,7 @@ using System.Runtime.CompilerServices;
 using System.Runtime.ExceptionServices;
 using Slon.Pg;
 using Slon.Pg.Protocol.Flows;
+using Slon.Pg.Serialization;
 
 namespace Slon;
 
@@ -39,18 +40,21 @@ public sealed partial class SlonDataReader
         bool _enumeratedSingleRow;
         public bool _currentErrorObserved;
         CommandResult.RowEnumerator _rowEnumerator;
+        public PgSerializerFieldReader _fieldReader;
 
         // Public for CreateAsync which holds an inline copy of NextResultAsync to avoid an extra state machine.
         public int _remainingResults;
         public CommandFlow.Enumerator _enumerator;
 
-        public Core(CommandFlow.Enumerator enumerator, CommandBehavior behavior, int commandCount, bool asyncExecute)
+        public Core(CommandFlow.Enumerator enumerator, CommandBehavior behavior, int commandCount,
+            bool asyncExecute, PgSerializerOptions serializerOptions)
         {
             _enumerator = enumerator;
             var singleRow = _singleRowBehavior = behavior.HasFlag(CommandBehavior.SingleRow);
             var remaining = _remainingResults = singleRow || behavior.HasFlag(CommandBehavior.SingleResult) ? 1 : commandCount;
             _remainingReflectsActual = commandCount == remaining;
             _asyncExecute = asyncExecute;
+            _fieldReader = new(serializerOptions);
             _rowBuffering = behavior.HasFlag(CommandBehavior.SequentialAccess)
                 ? CommandResult.RowBuffering.Streaming
                 : CommandResult.RowBuffering.Buffered;
@@ -75,6 +79,7 @@ public sealed partial class SlonDataReader
             Debug.Assert(_remainingResults is > 0);
             if (Current is not { } current)
                 return false;
+            _fieldReader.Initialize(current);
 
             _remainingResults--;
             _currentErrorObserved = false;
@@ -239,12 +244,14 @@ public sealed partial class SlonDataReader
     }
 
     internal static SlonDataReader Create(CommandBehavior behavior, CommandFlow flow,
+        PgSerializerOptions serializerOptions,
         SlonConnection? connectionToClose = null)
     {
         var enumerator = flow.GetEnumerator();
         try
         {
-            var core = new Core(enumerator, behavior, flow.VisibleCommandCount, asyncExecute: false);
+            var core = new Core(enumerator, behavior, flow.VisibleCommandCount, asyncExecute: false,
+                serializerOptions);
             core.NextResult();
             // TODO now that we don't need a DataReader while we wait for the first result we can pool the reader on the connection.
             return new SlonDataReader
@@ -262,7 +269,8 @@ public sealed partial class SlonDataReader
     }
 
     internal static async ValueTask<TReader> CreateAsync<TReader>(CommandBehavior behavior,
-        ValueTask<CommandFlow> flowTask, CancellationToken cancellationToken = default,
+        ValueTask<CommandFlow> flowTask, PgSerializerOptions serializerOptions,
+        CancellationToken cancellationToken = default,
         SlonConnection? connectionToClose = null)
         where TReader: DbDataReader
     {
@@ -271,7 +279,8 @@ public sealed partial class SlonDataReader
         var enumerator = flow.GetEnumerator();
         try
         {
-            var core = new Core(enumerator, behavior, flow.VisibleCommandCount, asyncExecute: true);
+            var core = new Core(enumerator, behavior, flow.VisibleCommandCount, asyncExecute: true,
+                serializerOptions);
 
             // This is an inline copy of NextResultAsync (minus the 'Current' check) to avoid an extra state machine.
             var next = false;
@@ -327,6 +336,12 @@ public sealed partial class SlonDataReader
             ThrowInvalidState(State, returnException: false);
 
         return row!;
+    }
+
+    RowDescription GetRowDescriptionOrThrow()
+    {
+        _ = _core.Current ?? throw new InvalidOperationException("Reader is not on a result.");
+        return _core._fieldReader.RowDescription;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -716,29 +731,33 @@ public sealed partial class SlonDataReader : DbDataReader, IDbColumnSchemaGenera
 
     /// <inheritdoc/>
     public override string GetDataTypeName(int ordinal)
-        => (_core.Current ?? throw new InvalidOperationException("Reader is not on a result."))
-            .GetDataTypeName(ordinal);
+    {
+        _ = _core.Current ?? throw new InvalidOperationException("Reader is not on a result.");
+        return _core._fieldReader.GetDataTypeName(ordinal);
+    }
 
     /// <inheritdoc/>
     [return: DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicProperties | DynamicallyAccessedMemberTypes.PublicFields)]
     public override Type GetFieldType(int ordinal)
-        => (_core.Current ?? throw new InvalidOperationException("Reader is not on a result."))
-            .GetFieldType(ordinal);
+    {
+        _ = _core.Current ?? throw new InvalidOperationException("Reader is not on a result.");
+        return _core._fieldReader.GetFieldType(ordinal);
+    }
 
     /// <inheritdoc/>
     public override string GetName(int ordinal)
-        => (_core.Current ?? throw new InvalidOperationException("Reader is not on a result."))
-            .GetName(ordinal);
+        => GetRowDescriptionOrThrow()[ordinal].Name;
 
     /// <inheritdoc/>
     public override int GetOrdinal(string name)
-        => (_core.Current ?? throw new InvalidOperationException("Reader is not on a result."))
-            .GetOrdinal(name);
+        => GetRowDescriptionOrThrow().GetFieldIndex(name);
 
     /// <inheritdoc/>
     public override bool IsDBNull(int ordinal)
-        => (_core.Current ?? throw new InvalidOperationException("Reader is not on a result."))
-            .IsDBNull(GetRowOrThrow(), ordinal);
+    {
+        _ = GetRowDescriptionOrThrow()[ordinal];
+        return GetRowOrThrow().IsDBNull(ordinal);
+    }
 
     /// <inheritdoc/>
     public override Task<bool> IsDBNullAsync(int ordinal, CancellationToken cancellationToken)
@@ -748,9 +767,9 @@ public sealed partial class SlonDataReader : DbDataReader, IDbColumnSchemaGenera
     {
         try
         {
-            return await (_core.Current
-                    ?? throw new InvalidOperationException("Reader is not on a result."))
-                .IsDBNullAsync(GetRowOrThrow(), ordinal, cancellationToken).ConfigureAwait(false);
+            _ = GetRowDescriptionOrThrow()[ordinal];
+            return await GetRowOrThrow().IsDBNullAsync(ordinal, cancellationToken)
+                .ConfigureAwait(false);
         }
         catch (Exception ex) { AdoException.Throw(ex); return default; }
     }
@@ -771,8 +790,8 @@ public sealed partial class SlonDataReader : DbDataReader, IDbColumnSchemaGenera
     {
         var result = _core.Current ?? throw new InvalidOperationException("Reader is not on a result.");
         return typeof(T) == typeof(object)
-            ? (T)result.ReadObject(GetRowOrThrow(), ordinal)
-            : result.ReadField<T>(GetRowOrThrow(), ordinal);
+            ? (T)_core._fieldReader.ReadObject(GetRowOrThrow(), ordinal)
+            : _core._fieldReader.Read<T>(GetRowOrThrow(), ordinal);
     }
 
     // Non-gvm helper to make inlining GetTextReaderAsync etc possible.
@@ -784,12 +803,14 @@ public sealed partial class SlonDataReader : DbDataReader, IDbColumnSchemaGenera
 
         var result = _core.Current ?? throw new InvalidOperationException("Reader is not on a result.");
         if (typeof(T) == typeof(object))
-            return ReadObjectAsync<T>(result, row, ordinal, cancellationToken);
-        return result.ReadFieldAsync<T>(row, ordinal, cancellationToken);
+            return ReadObjectAsync<T>(_core._fieldReader, row, ordinal, cancellationToken);
+        return _core._fieldReader.ReadAsync<T>(row, ordinal, cancellationToken);
 
-        static async ValueTask<TResult> ReadObjectAsync<TResult>(CommandResult result, Row row, int ordinal,
+        static async ValueTask<TResult> ReadObjectAsync<TResult>(PgSerializerFieldReader reader,
+            Row row, int ordinal,
             CancellationToken cancellationToken)
-            => (TResult)await result.ReadObjectAsync(row, ordinal, cancellationToken).ConfigureAwait(false);
+            => (TResult)await reader.ReadObjectAsync(row, ordinal, cancellationToken)
+                .ConfigureAwait(false);
     }
 
     public byte[] GetBytes(int ordinal)
@@ -825,17 +846,7 @@ public sealed partial class SlonDataReader : DbDataReader, IDbColumnSchemaGenera
         }
 
         var row = GetRowOrThrow();
-        var result = _core.Current ?? throw new InvalidOperationException("Reader is not on a result.");
-        var field = new PgField(row, ordinal);
-        if (!field.TryGetLease<ByteColumnLease>(out var lease))
-        {
-            if (_core.IsSequential && field.IsPast)
-                throw new InvalidOperationException(
-                    "Attempted to read a column preceding the sequential row cursor.");
-            var fieldReader = field.OpenReader(result.ConversionContext);
-            lease = new ByteColumnLease(fieldReader, _core.IsSequential);
-            field.Lease(lease);
-        }
+        var lease = _core._fieldReader.Read<ByteColumnLease>(row, ordinal, _core.IsSequential);
 
         if (buffer is null)
             return lease.Length;
@@ -859,8 +870,8 @@ public sealed partial class SlonDataReader : DbDataReader, IDbColumnSchemaGenera
             ArgumentOutOfRangeException.ThrowIfGreaterThan(length, buffer.Length - bufferOffset);
         }
 
-        var lease = (_core.Current ?? throw new InvalidOperationException("Reader is not on a result."))
-            .ReadChars(GetRowOrThrow(), ordinal, _core.IsSequential);
+        var lease = _core._fieldReader.Read<CharsColumnLease>(GetRowOrThrow(), ordinal,
+            _core.IsSequential);
         return lease.Read(buffer is null ? 0 : checked((int)dataOffset),
             buffer is null ? default : buffer.AsSpan(bufferOffset, length), buffer is null);
     }

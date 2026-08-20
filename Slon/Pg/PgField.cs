@@ -1,4 +1,3 @@
-using System.Buffers;
 using System.Diagnostics.CodeAnalysis;
 using Slon.Pg.Serialization;
 
@@ -6,36 +5,33 @@ namespace Slon.Pg;
 
 interface IColumnLease
 {
-    int Revoke();
-    ValueTask<int> RevokeAsync();
+    void Revoke();
 }
 
-// A tenure-bound field handle. Strategies choose buffered access today; incremental cursor access
-// can be added here without exposing the protocol reader or changing Row's generic dispatch seam.
+// A tenure-bound field handle. Consumers provide a decoder; this layer owns the reusable cursor
+// and any view or column lease retained from it.
 readonly struct PgField(Row row, int ordinal)
 {
     public ref readonly RowDescriptionField Metadata => ref row.GetFieldMetadata(ordinal);
     public bool IsPast => row.IsColumnPast(ordinal);
 
-    public ReadOnlySequence<byte> GetBuffered() => row.GetBufferedField(ordinal);
+    public T Read<T, TDecoder, TState>(FieldReadMode mode, TState state)
+        where TDecoder : IFieldDecoder<T, TState>
+        => row.ReadField<T, TDecoder, TState>(ordinal, mode, state);
 
-    public ValueTask<ReadOnlySequence<byte>> GetBufferedAsync(CancellationToken cancellationToken = default)
-        => row.GetBufferedFieldAsync(ordinal, cancellationToken);
-
-    public PgReader OpenReader(PgConversionContext conversionContext)
-        => row.OpenFieldReader(ordinal, conversionContext);
-
-    public ValueTask<PgReader> OpenReaderAsync(PgConversionContext conversionContext,
+    public ValueTask<T> ReadAsync<T, TDecoder, TState>(FieldReadMode mode, TState state,
         CancellationToken cancellationToken = default)
-        => row.OpenFieldReaderAsync(ordinal, conversionContext, cancellationToken);
+        where TDecoder : IFieldDecoder<T, TState>
+        => row.ReadFieldAsync<T, TDecoder, TState>(ordinal, mode, state, cancellationToken);
 
-    public void CompleteReader(PgReader reader) => row.CompleteFieldReader(ordinal, reader);
-
-    public ValueTask CompleteReaderAsync(PgReader reader)
-        => row.CompleteFieldReaderAsync(ordinal, reader);
-
-    public bool TryGetLease<T>([NotNullWhen(true)] out T? lease) where T : class, IColumnLease
-        => row.TryGetColumnLease(ordinal, out lease);
-
-    public void Lease(IColumnLease lease) => row.LeaseColumn(ordinal, lease);
+    public bool TryGetLease<T>([MaybeNullWhen(false)] out T lease)
+    {
+        if (row.GetColumnLease(ordinal) is T typed)
+        {
+            lease = typed;
+            return true;
+        }
+        lease = default;
+        return false;
+    }
 }

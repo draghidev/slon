@@ -6,7 +6,7 @@ namespace Slon.Pg.Serialization;
 /// <summary>
 /// Datasource-scoped serializer resolution over one immutable PostgreSQL type catalog.
 /// </summary>
-sealed class PgSerializerOptions
+sealed partial class PgSerializerOptions
 {
     readonly Dictionary<Type, Mapping> _byClrType = new();
     readonly Dictionary<PgTypeId, Mapping> _byPgTypeId = new();
@@ -33,6 +33,7 @@ sealed class PgSerializerOptions
     }
 
     readonly PgTypeCatalog _typeCatalog;
+    internal PgConversionContext ConversionContext { get; } = PgConversionContext.Empty;
     internal bool PortableTypeIds => _typeCatalog.IsPortable;
 
     internal PgTypeId GetCanonicalTypeId(PgTypeId typeId)
@@ -42,8 +43,13 @@ sealed class PgSerializerOptions
 
     internal DataTypeName GetDataTypeName(PgTypeId typeId) => _typeCatalog.GetDataTypeName(typeId);
 
-    public PgTypeInfo GetTypeInfo(Type? type, PgTypeId? pgTypeId = null)
+    public PgTypeInfo GetTypeInfo(Type? type, PgTypeId? pgTypeId = null,
+        DataFormat? fieldFormat = null)
     {
+        if (type is not null && pgTypeId is { } adoTypeId && fieldFormat is { } adoFormat
+            && IsAdoFieldProjection(type))
+            return GetAdoFieldTypeInfo(type, adoTypeId, adoFormat);
+
         Mapping? mapping = null;
         if (type?.IsEnum is true)
         {
@@ -85,6 +91,8 @@ sealed class PgSerializerOptions
             => GetCanonicalTypeId(candidate.DataTypeName) == GetCanonicalTypeId(requestedTypeId);
     }
 
+    private static partial bool IsAdoFieldProjection(Type type);
+
     void Add<T>(PgConverter<T> converter, DataTypeName dataTypeName, bool defaultForPgType = true,
         bool defaultForClrType = true)
     {
@@ -93,17 +101,32 @@ sealed class PgSerializerOptions
         if (!_typeCatalog.TryGetIdentifiers(dataTypeName.Value, out var canonicalTypeId, out _))
             return;
 
-        var mapping = new Mapping(typeof(T), converter, dataTypeName);
+        var mapping = new Mapping(this, typeof(T), converter, dataTypeName);
         if (defaultForClrType)
             _byClrType.Add(typeof(T), mapping);
         if (defaultForPgType)
             _byPgTypeId.Add(canonicalTypeId, mapping);
     }
 
-    sealed record Mapping(Type ClrType, PgConverter Converter, DataTypeName DataTypeName)
+    sealed class Mapping
     {
+        readonly PgTypeInfo _defaultTypeInfo;
+
+        internal Mapping(PgSerializerOptions options, Type clrType, PgConverter converter,
+            DataTypeName dataTypeName)
+        {
+            ClrType = clrType;
+            Converter = converter;
+            DataTypeName = dataTypeName;
+            _defaultTypeInfo = new(options, converter, dataTypeName);
+        }
+
+        internal Type ClrType { get; }
+        internal PgConverter Converter { get; }
+        internal DataTypeName DataTypeName { get; }
+
         public PgTypeInfo Create(PgSerializerOptions options, Type? requestedType)
-            => new(options, Converter, DataTypeName, requestedType);
+            => requestedType is null ? _defaultTypeInfo : new(options, Converter, DataTypeName, requestedType);
     }
 
 }

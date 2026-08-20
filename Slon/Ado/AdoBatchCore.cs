@@ -521,7 +521,6 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
                 Observer = observer,
                 ObserverState = observerState,
                 Commands = commandArray is null ? new(result.Command) : new(commandArray, commandCount, isPooled: true),
-                SerializerOptions = serializerOptions ?? connection?.DbDataSource.GetDbDependencies().SerializerOptions,
                 PendingTimeout = pendingTimeout
             };
         }
@@ -833,11 +832,17 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
     object? ExecuteScalarCore(DbParameterCollection? parameters)
     {
         var dependencies = GetDependencies();
+        var fieldReader = new PgSerializerFieldReader(dependencies.SerializerOptions);
         foreach (var result in Enqueue(parameters, CommandBehavior.Default, dependencies))
         {
             using var rowEnumerator = result.GetAsyncEnumerator();
             if (rowEnumerator.MoveNext())
-                return result.FieldCount is not 0 ? result.ReadObject(rowEnumerator.Current, 0) : null;
+            {
+                fieldReader.Initialize(result);
+                return result.FieldCount is not 0
+                    ? fieldReader.ReadObject(rowEnumerator.Current, 0)
+                    : null;
+            }
             // No row from this result: surface a failed command (stored ErrorResponse) instead of
             // silently returning null.
             result.GetCommandComplete();
@@ -856,6 +861,7 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
             cancellationToken.ThrowIfCancellationRequested();
             var dependencies = await thisRef.GetDependenciesAsync(cancellationToken)
                 .ConfigureAwait(false);
+            var fieldReader = new PgSerializerFieldReader(dependencies.SerializerOptions);
             enumerator = (await fieldRef.Invoke().EnqueueAsync(parameters, CommandBehavior.Default,
                 dependencies, cancellationToken).ConfigureAwait(false))
                 .GetAsyncEnumerator(cancellationToken);
@@ -865,10 +871,14 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
                 try
                 {
                     if (await rowEnumerator.MoveNextAsync(cancellationToken).ConfigureAwait(false))
+                    {
+                        fieldReader.Initialize(enumerator.Current);
                         return enumerator.Current.FieldCount is not 0
-                            ? await enumerator.Current.ReadObjectAsync(rowEnumerator.Current, 0, cancellationToken)
+                            ? await fieldReader.ReadObjectAsync(rowEnumerator.Current, 0,
+                                cancellationToken)
                                 .ConfigureAwait(false)
                             : null;
+                    }
                 }
                 finally
                 {
@@ -923,7 +933,7 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
     {
         var dependencies = GetDependencies();
         return SlonDataReader.Create(behavior, Enqueue(parameters, behavior, dependencies),
-            GetConnectionToClose(behavior));
+            dependencies.SerializerOptions, GetConnectionToClose(behavior));
     }
 
     SlonConnection? GetConnectionToClose(CommandBehavior behavior)
@@ -969,7 +979,7 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
                 .ConfigureAwait(false);
             return await SlonDataReader.CreateAsync<TReader>(behavior,
                 fieldRef.Invoke().EnqueueAsync(parameters, behavior, dependencies, cancellationToken),
-                cancellationToken, connectionToClose)
+                dependencies.SerializerOptions, cancellationToken, connectionToClose)
                 .ConfigureAwait(false);
         }
         catch (Exception ex)

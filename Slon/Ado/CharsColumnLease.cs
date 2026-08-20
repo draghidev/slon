@@ -4,7 +4,7 @@ using Slon.Pg.Types;
 
 namespace Slon;
 
-sealed class CharsColumnLease(TextReader reader, IColumnLease fieldLease, bool sequential)
+sealed class CharsColumnLease(TextReader reader, bool sequential)
     : IColumnLease
 {
     string? _buffered;
@@ -66,89 +66,46 @@ sealed class CharsColumnLease(TextReader reader, IColumnLease fieldLease, bool s
         return total;
     }
 
-    int IColumnLease.Revoke()
+    void IColumnLease.Revoke()
     {
         ObjectDisposedException.ThrowIf(_revoked, this);
         _revoked = true;
-        return fieldLease.Revoke();
-    }
-
-    async ValueTask<int> IColumnLease.RevokeAsync()
-    {
-        ObjectDisposedException.ThrowIf(_revoked, this);
-        _revoked = true;
-        return await fieldLease.RevokeAsync().ConfigureAwait(false);
     }
 }
 
-readonly struct GetCharsFieldReader(PgSerializerOptions options,
-    PgConversionContext conversionContext, bool sequential) : IFieldReader<CharsColumnLease>
+static class AdoCharsConverters
 {
-    static readonly PgConverter<CharsColumnLease> Text = new GetCharsTextConverter(sequential: false);
-    static readonly PgConverter<CharsColumnLease> SequentialText = new GetCharsTextConverter(sequential: true);
+    internal static readonly PgConverter<CharsColumnLease> Text = new GetCharsTextConverter();
     static readonly PgConverter<CharsColumnLease> VersionedText =
-        new VersionPrefixedGetCharsConverter(version: 1, new GetCharsTextConverter(sequential: false));
-    static readonly PgConverter<CharsColumnLease> SequentialVersionedText =
-        new VersionPrefixedGetCharsConverter(version: 1, new GetCharsTextConverter(sequential: true));
+        new VersionPrefixedGetCharsConverter(version: 1, new GetCharsTextConverter());
 
-    public CharsColumnLease Read(PgField field)
-    {
-        if (field.TryGetLease<CharsColumnLease>(out var existing))
-            return existing;
-        if (sequential && field.IsPast)
-            throw new InvalidOperationException(
-                "Attempted to read a column preceding the sequential row cursor.");
-
-        ref readonly var metadata = ref field.Metadata;
-        var converter = CreateConverter(options.GetDataTypeName(metadata.TypeOid), metadata.Format,
-            sequential);
-        var reader = field.OpenReader(conversionContext);
-        var leased = false;
-        try
-        {
-            var result = converter.Read(reader);
-            field.Lease(result);
-            leased = true;
-            return result;
-        }
-        finally
-        {
-            if (!leased)
-                reader.Dispose();
-        }
-    }
-
-    public ValueTask<CharsColumnLease> ReadAsync(PgField field,
-        CancellationToken cancellationToken = default)
-        => ValueTask.FromException<CharsColumnLease>(
-            new NotSupportedException("DbDataReader.GetChars has no asynchronous form."));
-
-    static PgConverter<CharsColumnLease> CreateConverter(DataTypeName dataTypeName,
-        PgFormat format, bool sequential)
+    internal static PgConverter<CharsColumnLease> Get(DataTypeName dataTypeName,
+        DataFormat format)
     {
         if ((dataTypeName == DataTypeNames.Jsonb || dataTypeName == DataTypeNames.Jsonpath)
-            && format is PgFormat.Binary)
-            return sequential ? SequentialVersionedText : VersionedText;
+            && format is DataFormat.Binary)
+            return VersionedText;
         if (dataTypeName == DataTypeNames.Text || dataTypeName == DataTypeNames.Varchar
             || dataTypeName == DataTypeNames.Bpchar || dataTypeName == DataTypeNames.Json
             || dataTypeName == DataTypeNames.Jsonb || dataTypeName == DataTypeNames.Jsonpath
             || dataTypeName == DataTypeNames.Xml || dataTypeName == DataTypeNames.Name
             || dataTypeName == DataTypeNames.RefCursor || dataTypeName.UnqualifiedName == "citext")
-            return sequential ? SequentialText : Text;
+            return Text;
         throw new InvalidCastException(
             $"PostgreSQL type '{dataTypeName}' does not expose an ADO character projection.");
     }
 }
 
-sealed class GetCharsTextConverter(bool sequential) : PgStreamingConverter<CharsColumnLease>
+sealed class GetCharsTextConverter : PgStreamingConverter<CharsColumnLease>
 {
+    internal override bool ResultIsColumnLease => true;
     public override ConverterDescriptor GetDescriptor(in DescriptorContext context)
         => ConverterDescriptor.Invariant with { BufferRequirements = BufferRequirements.Streaming };
 
     public override CharsColumnLease Read(PgReader reader)
     {
         var textReader = reader.GetTextReader(reader.ConversionContext.TextEncoding);
-        return new(textReader, reader.ActiveViewLease, sequential);
+        return new(textReader, reader.IsSequential);
     }
 
     public override ValueTask<CharsColumnLease> ReadAsync(PgReader reader,

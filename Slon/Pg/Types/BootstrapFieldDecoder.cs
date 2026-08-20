@@ -2,9 +2,11 @@ using System.Buffers;
 using System.Buffers.Binary;
 using System.Text;
 
-namespace Slon.Pg.Serialization;
+namespace Slon.Pg.Types;
 
-static class RawFieldDecoder
+// Primitive field decoding used while the PostgreSQL type catalog—and therefore the serializer
+// graph needed by normal field readers—is still being constructed.
+static class BootstrapFieldDecoder
 {
     public static T Read<T>(ReadOnlySpan<byte> field, Encoding? textEncoding = null)
     {

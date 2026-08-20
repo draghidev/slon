@@ -17,6 +17,7 @@ sealed class BackendMessageBodyReader : IInputReader
     ReadOnlySequence<byte> _buffer;
     SequencePosition _consumed;
     long _consumedLength;
+    int _continuationOffset;
     bool _initial = true;
     bool _advanced;
 
@@ -33,10 +34,11 @@ sealed class BackendMessageBodyReader : IInputReader
 
     public ReadOnlySequence<byte> Buffer => _buffer;
     public bool IsComplete { get; private set; }
+    internal int ContinuationOffset => _continuationOffset;
 
     public void AdvanceTo(SequencePosition consumed, long consumedLength)
     {
-        if (_advanced || IsComplete)
+        if (_advanced)
             ThrowHelper.ThrowInvalidOperation();
         if (consumedLength < 0 || consumedLength > _buffer.Length)
             throw new ArgumentOutOfRangeException(nameof(consumedLength));
@@ -44,6 +46,9 @@ sealed class BackendMessageBodyReader : IInputReader
             "The consumed position and consumed length must identify the same byte.");
 
         _consumed = consumed;
+        _continuationOffset = checked((int)consumedLength);
+        if (IsComplete)
+            return;
         _consumedLength = consumedLength + (_initial ? _segmentOffset + BackendHeader.ByteCount : 0);
         _advanced = true;
     }
@@ -116,6 +121,53 @@ sealed class BackendMessageBodyReader : IInputReader
             Extend();
     }
 
+    internal void Consume(int offset, int count)
+    {
+        while (true)
+        {
+            var consumed = (int)Math.Min(count, _buffer.Length - offset);
+            offset += consumed;
+            count -= consumed;
+            AdvanceTo(_buffer.GetPosition(offset), offset);
+            if (!IsComplete)
+            {
+                Read();
+                offset = 0;
+            }
+            else if (count != 0)
+            {
+                throw new EndOfStreamException();
+            }
+
+            if (count == 0)
+                return;
+        }
+    }
+
+    internal async ValueTask ConsumeAsync(int offset, int count,
+        CancellationToken cancellationToken = default)
+    {
+        while (true)
+        {
+            var consumed = (int)Math.Min(count, _buffer.Length - offset);
+            offset += consumed;
+            count -= consumed;
+            AdvanceTo(_buffer.GetPosition(offset), offset);
+            if (!IsComplete)
+            {
+                await ReadAsync(cancellationToken).ConfigureAwait(false);
+                offset = 0;
+            }
+            else if (count != 0)
+            {
+                throw new EndOfStreamException();
+            }
+
+            if (count == 0)
+                return;
+        }
+    }
+
     public ValueTask BufferAllAsync(CancellationToken cancellationToken = default)
     {
         if (IsComplete)
@@ -147,7 +199,10 @@ sealed class BackendMessageBodyReader : IInputReader
         _buffer = result.Buffer;
         IsComplete = result.IsComplete;
         if (!retained)
+        {
             _initial = false;
+            _continuationOffset = 0;
+        }
         _advanced = false;
     }
 }
