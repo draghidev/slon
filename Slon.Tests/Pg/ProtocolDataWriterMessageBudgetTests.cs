@@ -5,6 +5,7 @@ using Slon.Buffers;
 using Slon.Pg;
 using Slon.Pg.Protocol;
 using Slon.Pg.Serialization;
+using Slon.Pg.Types;
 
 namespace Slon.Tests.Pg;
 
@@ -208,6 +209,25 @@ public class ProtocolDataWriterMessageBudgetTests
         Assert.AreEqual(2, strategy.CreateCount);
     }
 
+    [TestMethod]
+    public void LaterBindFailure_ReleasesEarlierParameterWriteState()
+    {
+        var (writer, _) = NewWriter();
+        var strategy = new FailingBindParameterWriterStrategy();
+        var source = new ParameterSource(strategy);
+
+        {
+            using var lease = source.Materialize(strategy);
+            var encoder = new PgEncoder(default, writer);
+
+            Assert.ThrowsExactly<InvalidOperationException>(() =>
+                encoder.WriteBind(parameters: lease.Buffer, parameterWriterStrategy: strategy));
+            Assert.IsFalse(strategy.FirstWriteState.IsDisposed);
+        }
+
+        Assert.IsTrue(strategy.FirstWriteState.IsDisposed);
+    }
+
     sealed class CountingParameterWriterStrategy : ParameterWriterStrategy
     {
         public int CreateCount { get; private set; }
@@ -222,5 +242,40 @@ public class ProtocolDataWriterMessageBudgetTests
             => throw new NotSupportedException();
         public override ValueTask WriteAsync(object state, int parameterIndex, Parameter parameter,
             CancellationToken cancellationToken = default) => throw new NotSupportedException();
+    }
+
+    sealed class FailingBindParameterWriterStrategy : ParameterWriterStrategy
+    {
+        public DisposableState FirstWriteState { get; } = new();
+
+        public override object CreateState(IOutputWriter output, Encoding textEncoding) => this;
+        public override int GetParameterCount(object source) => 2;
+
+        public override void Materialize(object source, Span<Parameter> destination)
+        {
+            var typeId = new PgTypeId(DataTypeNames.Int4);
+            destination[0] = Parameter.CreateUnbound(1, typeId, this);
+            destination[1] = Parameter.CreateUnbound(2, typeId, this);
+        }
+
+        public override Parameter Bind(object state, int parameterIndex, in Parameter parameter)
+        {
+            if (parameterIndex is 1)
+                throw new InvalidOperationException("Bind failed.");
+            return parameter.WithBinding(sizeof(int), FirstWriteState);
+        }
+
+        public override void Write(object state, int parameterIndex, in Parameter parameter)
+            => throw new AssertFailedException("Writing must not start after Bind fails.");
+
+        public override ValueTask WriteAsync(object state, int parameterIndex, Parameter parameter,
+            CancellationToken cancellationToken = default)
+            => throw new AssertFailedException("Writing must not start after Bind fails.");
+    }
+
+    sealed class DisposableState : IDisposable
+    {
+        public bool IsDisposed { get; private set; }
+        public void Dispose() => IsDisposed = true;
     }
 }
