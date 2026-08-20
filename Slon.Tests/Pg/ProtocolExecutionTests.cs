@@ -70,6 +70,7 @@ public class ProtocolExecutionTests
 
         Assert.IsTrue(await results.MoveNextAsync());
         var metadata = results.Current.GetMetadata();
+        Assert.IsTrue(results.Current.IsComplete);
         Assert.AreEqual(1, metadata.ParameterTypes.Count);
         Assert.AreEqual(PgFormat.Binary, metadata.RowDescription![0].Format);
         Assert.AreEqual(PgFormat.Text, metadata.RowDescription[1].Format);

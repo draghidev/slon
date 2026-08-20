@@ -25,7 +25,6 @@ abstract class CommandResult : IDisposable, IAsyncDisposable, IEnumerable<Row>, 
     long _recordsAffected;
     CommandCompleteMessage? _commandCompleteMessage;
     PgError? _errorMessage;
-    bool _describeCompleted;
     Action<CommandResult, object?>? _completionAction;
     object? _completionActionState;
 
@@ -61,7 +60,6 @@ abstract class CommandResult : IDisposable, IAsyncDisposable, IEnumerable<Row>, 
         _recordsAffected = default;
         _commandCompleteMessage = null;
         _errorMessage = error;
-        _describeCompleted = false;
         _completionAction = null;
         _completionActionState = null;
     }
@@ -140,9 +138,10 @@ abstract class CommandResult : IDisposable, IAsyncDisposable, IEnumerable<Row>, 
             return _requestedExecution && CanHaveRows && (_firstRowEnumerated || !TryGetCommandComplete(out _));
         }
     }
-    // True once the command reached its terminal: an already-read setup error, completed description,
-    // or a consumed Execute terminal (CommandComplete / EmptyQueryResponse / ErrorResponse).
-    public bool IsComplete => _describeCompleted || _commandCompleteMessage is not null || _errorMessage is not null;
+    // A description-only result is published after its RowDescription/NoData or ErrorResponse has
+    // already been read, and has no Execute terminal of its own. Executing results become complete
+    // when their CommandComplete / EmptyQueryResponse / ErrorResponse is consumed.
+    public bool IsComplete => !_requestedExecution || _commandCompleteMessage is not null || _errorMessage is not null;
 
     internal PgError? Error => _errorMessage;
 
@@ -156,14 +155,6 @@ abstract class CommandResult : IDisposable, IAsyncDisposable, IEnumerable<Row>, 
         Debug.Assert(_completionAction is null);
         _completionAction = action;
         _completionActionState = state;
-    }
-
-    internal void CompleteDescribe(PgError? error)
-    {
-        Debug.Assert(_commandCompleteMessage is null && _errorMessage is null);
-        _errorMessage = error;
-        _describeCompleted = true;
-        InvokeCompletionAction();
     }
 
     // RecordsAffected is only known once the command has run to its CommandComplete / ErrorResponse.

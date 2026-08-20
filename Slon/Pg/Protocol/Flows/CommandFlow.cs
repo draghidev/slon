@@ -694,9 +694,6 @@ sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
                     completeError = resultEnumerator.CompleteError;
                 }
 
-                if (_options.Commands.ItemRef(_commandIndex).DescribeOnly && _pgError is null)
-                    result.CompleteDescribe(completeError?.Error);
-
                 var resultErrorIsOwnCancellation = result.Error is { } resultError
                     && IsOwnCancellation(resultError);
                 if (suppressEnumeration && result.Error is { } suppressedError
