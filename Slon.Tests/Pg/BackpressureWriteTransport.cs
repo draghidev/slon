@@ -32,7 +32,7 @@ sealed class BackpressureWriteTransport : TransportConnection
 
     public override PipeReader Reader => _toClient.Reader;
     public override PipeWriter Writer => _toServer.Writer;
-    public override void WaitWritable() { }
+    public override void WaitUntilWritable(TimeSpan timeout) { }
 
     // Server -> client: release a pre-scripted response segment (the handshake is already out).
     public void ReleaseSegment(byte[] bytes)

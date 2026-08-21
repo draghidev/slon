@@ -290,7 +290,7 @@ public class StoppingTokenInMemoryTests
 
         public override PipeReader Reader { get; }
         public override PipeWriter Writer { get; }
-        public override void WaitWritable() { }
+        public override void WaitUntilWritable(TimeSpan timeout) { }
     }
 
     // Records every byte READ from the socket (the raw server stream), in order. Stream-level teeing
@@ -375,7 +375,7 @@ public class StoppingTokenInMemoryTests
 
         public override PipeReader Reader => _reader;
         public override PipeWriter Writer => _toServer.Writer;
-        public override void WaitWritable() { }
+        public override void WaitUntilWritable(TimeSpan timeout) { }
 
         public GatedReplayTransport(byte[] handshake)
         {

@@ -23,7 +23,7 @@ public class ProtocolDataWriterMessageBudgetTests
         var sink = new BufferOutputWriter();
         // control is only reached on the abort-cancelled async/sync flush path, none of which these
         // sync budget tests exercise (the throw precedes the flush; success cases leave abort unset).
-        var writer = new ProtocolDataWriter(sink, Encoding.UTF8, static () => { }, default, null!);
+        var writer = new ProtocolDataWriter(sink, Encoding.UTF8, static _ => { }, default, null!);
         return (writer, sink);
     }
 

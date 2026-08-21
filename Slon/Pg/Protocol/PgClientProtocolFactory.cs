@@ -1,6 +1,8 @@
 using System.Net.Security;
 using System.Net.Sockets;
+using System.Security.Cryptography.X509Certificates;
 using Microsoft.Extensions.Logging;
+using Slon.Pg.Protocol.Flows;
 using Slon.Runtime;
 using Slon.Transport;
 
@@ -15,7 +17,7 @@ sealed class PgClientProtocolFactory
     readonly TransportConnection.Factory _transportConnectionFactory;
     readonly Action<PgClientProtocolOptions>? _configureOptions;
     readonly PgClientProtocolOptions? _sharedOptions;
-    readonly ILogger _logger;
+    readonly ILogger _cancellationLogger;
 
     public PgClientProtocolFactory(PgClientOptions clientOptions,
         TransportConnection.Factory transportConnectionFactory,
@@ -24,7 +26,7 @@ sealed class PgClientProtocolFactory
         _clientOptions = clientOptions;
         _transportConnectionFactory = transportConnectionFactory;
         _configureOptions = configureOptions;
-        _logger = clientOptions.LoggerFactory.CreateLogger("Slon.Pg.Cancellation");
+        _cancellationLogger = clientOptions.LoggerFactory.CreateLogger("Slon.Pg.Cancellation");
         if (configureOptions is null)
             _sharedOptions = new(clientOptions) { CancelSender = SendCancelAsync };
     }
@@ -39,27 +41,21 @@ sealed class PgClientProtocolFactory
     }
 
     public PgClientProtocol Create(TimeSpan timeout = default)
-        => Create(static (protocolOptions, clientOptions, transport, remaining, upgrade, started) =>
+        => Create(static startup =>
         {
-            var protocol = PgClientProtocol.Create(protocolOptions);
-            protocol.Start(clientOptions, transport, timeout: remaining, upgradeTransport: upgrade);
-            started();
-            return protocol;
+            startup.Start();
+            return startup.Protocol;
         }, timeout);
 
     public ValueTask<PgClientProtocol> CreateAsync(CancellationToken cancellationToken = default)
-        => CreateAsync(static async (protocolOptions, clientOptions, transport, token, upgrade, started) =>
+        => CreateAsync(static async (startup, token) =>
         {
-            var protocol = PgClientProtocol.Create(protocolOptions);
-            await protocol.StartAsync(clientOptions, transport, cancellationToken: token,
-                upgradeTransport: upgrade).ConfigureAwait(false);
-            started();
-            return protocol;
+            await startup.StartAsync(cancellationToken: token).ConfigureAwait(false);
+            return startup.Protocol;
         }, cancellationToken);
 
     internal TResult Create<TResult>(
-        Func<PgClientProtocolOptions, PgClientOptions, TransportConnection, TimeSpan,
-            Func<TransportConnection, TimeSpan, TransportConnection>, Action, TResult> start,
+        Func<PgClientProtocol.Startup, TResult> create,
         TimeSpan timeout = default)
     {
         var deadline = new Deadline(timeout == default ? _clientOptions.ConnectionTimeout : timeout);
@@ -80,27 +76,38 @@ sealed class PgClientProtocolFactory
 
         TResult CreateAttempt(PgClientOptions options)
         {
-            var transport = Connect(options, deadline, () => encrypted = true);
+            X509Certificate? remoteCertificate = null;
+            var transport = Connect(options, deadline, OnTlsEstablished);
             connected = true;
             try
             {
-                return start(protocolOptions, options, transport, deadline.GetRemaining(),
-                    (connection, remaining) => Upgrade(
-                        options, connection, remaining, () => encrypted = true),
-                    () => protocolStarted = true);
+                if (options.Ssl.ShouldNegotiateTls(options.EndPoint)
+                    && PgClientProtocol.NegotiateSsl(
+                        transport, options.Ssl.Mode, deadline.GetRemaining()))
+                    transport = Upgrade(options, transport, deadline.GetRemaining(), OnTlsEstablished);
+
+                var startup = new StartupFlow(async: false, options, remoteCertificate,
+                    deadline.GetRemaining());
+                var protocol = PgClientProtocol.Create(protocolOptions);
+                return create(new(protocol, transport, startup,
+                    () => protocolStarted = true));
             }
             catch (Exception ex)
             {
                 ReleaseTransport(transport, ex);
                 throw;
             }
+
+            void OnTlsEstablished(X509Certificate? certificate)
+            {
+                encrypted = true;
+                remoteCertificate = certificate;
+            }
         }
     }
 
     internal async ValueTask<TResult> CreateAsync<TResult>(
-        Func<PgClientProtocolOptions, PgClientOptions, TransportConnection, CancellationToken,
-            Func<TransportConnection, CancellationToken, ValueTask<TransportConnection>>, Action,
-            ValueTask<TResult>> start,
+        Func<PgClientProtocol.Startup, CancellationToken, ValueTask<TResult>> create,
         CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
@@ -125,15 +132,23 @@ sealed class PgClientProtocolFactory
         async ValueTask<TResult> CreateAttemptAsync(PgClientOptions options)
         {
             TransportConnection? transport = null;
+            X509Certificate? remoteCertificate = null;
             try
             {
-                transport = await ConnectAsync(options, token, () => encrypted = true)
+                transport = await ConnectAsync(options, token, OnTlsEstablished)
                     .ConfigureAwait(false);
                 connected = true;
-                return await start(protocolOptions, options, transport, token,
-                    (connection, ct) => UpgradeAsync(
-                        options, connection, ct, () => encrypted = true),
-                    () => protocolStarted = true).ConfigureAwait(false);
+                if (options.Ssl.ShouldNegotiateTls(options.EndPoint)
+                    && await PgClientProtocol.NegotiateSslAsync(
+                        transport, options.Ssl.Mode, token).ConfigureAwait(false))
+                    transport = await UpgradeAsync(options, transport, token, OnTlsEstablished)
+                        .ConfigureAwait(false);
+
+                var startup = new StartupFlow(async: true, options, remoteCertificate,
+                    options.ConnectionTimeout);
+                var protocol = PgClientProtocol.Create(protocolOptions);
+                return await create(new(protocol, transport, startup,
+                    () => protocolStarted = true), token).ConfigureAwait(false);
             }
             catch (Exception ex)
             {
@@ -145,6 +160,12 @@ sealed class PgClientProtocolFactory
                     token.ThrowIfCancellationRequested();
                 }
                 throw;
+            }
+
+            void OnTlsEstablished(X509Certificate? certificate)
+            {
+                encrypted = true;
+                remoteCertificate = certificate;
             }
         }
     }
@@ -159,18 +180,18 @@ sealed class PgClientProtocolFactory
         TransportConnection? transport = null;
         try
         {
-            transport = await ConnectAsync(_clientOptions, token, static () => { }).ConfigureAwait(false);
+            transport = await ConnectAsync(_clientOptions, token, static _ => { }).ConfigureAwait(false);
             if (_clientOptions.Ssl.ShouldNegotiateTls(_clientOptions.EndPoint)
                 && await PgClientProtocol.NegotiateSslAsync(
                     transport, _clientOptions.Ssl.Mode, token).ConfigureAwait(false))
                 transport = await UpgradeAsync(
-                    _clientOptions, transport, token, static () => { }).ConfigureAwait(false);
+                    _clientOptions, transport, token, static _ => { }).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
             if (!cancellationToken.IsCancellationRequested)
                 SlonLogMessages.CancellationRequestFailed(
-                    _logger, ex, CancelRequestState.NotSent);
+                    _cancellationLogger, ex, CancelRequestState.NotSent);
             if (transport is not null)
             {
                 transport.Abort();
@@ -191,7 +212,7 @@ sealed class PgClientProtocolFactory
             sendError = ex;
             delivery = CancelRequestState.Unknown;
             if (!cancellationToken.IsCancellationRequested)
-                SlonLogMessages.CancellationRequestFailed(_logger, ex, delivery);
+                SlonLogMessages.CancellationRequestFailed(_cancellationLogger, ex, delivery);
         }
         finally
         {
@@ -214,7 +235,7 @@ sealed class PgClientProtocolFactory
     }
 
     TransportConnection Connect(
-        PgClientOptions options, Deadline deadline, Action onTlsEstablished)
+        PgClientOptions options, Deadline deadline, Action<X509Certificate?> onTlsEstablished)
     {
         if (!options.Ssl.ShouldUseDirectTls(options.EndPoint))
             return _transportConnectionFactory.Connect(deadline.GetRemaining());
@@ -224,11 +245,11 @@ sealed class PgClientProtocolFactory
             ssl = new SslStream(stream, leaveInnerStreamOpen: false), deadline.GetRemaining());
         try
         {
-            var remaining = ToStreamTimeout(deadline.GetRemaining());
+            var remaining = deadline.GetRemainingMilliseconds();
             ssl!.ReadTimeout = remaining;
             ssl.WriteTimeout = remaining;
             ssl.AuthenticateAsClient(options.Ssl.CreateAuthenticationOptions(options.EndPoint));
-            onTlsEstablished();
+            onTlsEstablished(ssl.RemoteCertificate);
             return transport;
         }
         catch (Exception ex)
@@ -239,7 +260,8 @@ sealed class PgClientProtocolFactory
     }
 
     async ValueTask<TransportConnection> ConnectAsync(
-        PgClientOptions options, CancellationToken cancellationToken, Action onTlsEstablished)
+        PgClientOptions options, CancellationToken cancellationToken,
+        Action<X509Certificate?> onTlsEstablished)
     {
         if (!options.Ssl.ShouldUseDirectTls(options.EndPoint))
             return await _transportConnectionFactory.ConnectAsync(cancellationToken).ConfigureAwait(false);
@@ -253,7 +275,7 @@ sealed class PgClientProtocolFactory
             await ssl!.AuthenticateAsClientAsync(
                 options.Ssl.CreateAuthenticationOptions(options.EndPoint), cancellationToken)
                 .ConfigureAwait(false);
-            onTlsEstablished();
+            onTlsEstablished(ssl.RemoteCertificate);
             return transport;
         }
         catch (Exception ex)
@@ -264,18 +286,18 @@ sealed class PgClientProtocolFactory
     }
 
     TransportConnection Upgrade(PgClientOptions options, TransportConnection connection,
-        TimeSpan timeout, Action onTlsEstablished)
+        TimeSpan timeout, Action<X509Certificate?> onTlsEstablished)
     {
         SslStream? ssl = null;
         var upgraded = _transportConnectionFactory.Upgrade(connection, stream =>
             ssl = new SslStream(stream, leaveInnerStreamOpen: false));
         try
         {
-            var timeoutMilliseconds = ToStreamTimeout(timeout);
+            var timeoutMilliseconds = Deadline.ToTimeoutMilliseconds(timeout);
             ssl!.ReadTimeout = timeoutMilliseconds;
             ssl.WriteTimeout = timeoutMilliseconds;
             ssl.AuthenticateAsClient(options.Ssl.CreateAuthenticationOptions(options.EndPoint));
-            onTlsEstablished();
+            onTlsEstablished(ssl.RemoteCertificate);
             return upgraded;
         }
         catch (Exception ex)
@@ -287,7 +309,7 @@ sealed class PgClientProtocolFactory
 
     async ValueTask<TransportConnection> UpgradeAsync(PgClientOptions options,
         TransportConnection connection, CancellationToken cancellationToken,
-        Action onTlsEstablished)
+        Action<X509Certificate?> onTlsEstablished)
     {
         SslStream? ssl = null;
         var upgraded = _transportConnectionFactory.Upgrade(connection, stream =>
@@ -297,7 +319,7 @@ sealed class PgClientProtocolFactory
             await ssl!.AuthenticateAsClientAsync(
                 options.Ssl.CreateAuthenticationOptions(options.EndPoint), cancellationToken)
                 .ConfigureAwait(false);
-            onTlsEstablished();
+            onTlsEstablished(ssl.RemoteCertificate);
             return upgraded;
         }
         catch (Exception ex)
@@ -306,11 +328,6 @@ sealed class PgClientProtocolFactory
             throw;
         }
     }
-
-    static int ToStreamTimeout(TimeSpan timeout)
-        => timeout == Timeout.InfiniteTimeSpan
-            ? Timeout.Infinite
-            : (int)Math.Clamp(Math.Ceiling(timeout.TotalMilliseconds), 1, int.MaxValue);
 
     // Fallback applies only after the socket connected and before protocol startup completed.
     // Prefer retries only after a completed TLS handshake; Allow starts plaintext.

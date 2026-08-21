@@ -197,7 +197,7 @@ public class ConcurrentHandoffInMemoryTests
         public StreamTransport(PipeReader reader, PipeWriter writer) { Reader = reader; Writer = writer; }
         public override PipeReader Reader { get; }
         public override PipeWriter Writer { get; }
-        public override void WaitWritable() { }
+        public override void WaitUntilWritable(TimeSpan timeout) { }
     }
 
     // Records every byte read from the server stream (for capture).
@@ -245,7 +245,7 @@ public class ConcurrentHandoffInMemoryTests
         readonly PipeReader _clientReader;
         public override PipeReader Reader => _clientReader;
         public override PipeWriter Writer => _toServer.Writer;
-        public override void WaitWritable() { }
+        public override void WaitUntilWritable(TimeSpan timeout) { }
 
         public EchoServerTransport(byte[] handshake, byte[] response)
         {

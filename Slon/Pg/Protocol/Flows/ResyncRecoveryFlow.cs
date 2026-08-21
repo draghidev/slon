@@ -199,7 +199,7 @@ sealed class ResyncRecoveryFlow : PgClientFlow
             return WriteResyncAsync(encoder);
 
         ValueTask task;
-        using (encoder.BeginResumableScope())
+        using (encoder.BeginResumableWriteScope())
             task = WriteResyncAsync(encoder);
         return task.IsCompleted ? task : encoder.RunResumableTask(task);
     }

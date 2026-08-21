@@ -26,7 +26,6 @@ sealed class ExclusiveAccessFlow : PgClientFlow
 
     // Stable state shared across reusable scope tenures.
     readonly PgClientProtocol _protocol;
-    readonly PgClientProtocol.Control _innerControl;
     readonly PgClientProtocol.ExclusiveScopeState _state;
     readonly Func<Exception?, ValueTask> _completeInner;
     // Acquired only after activation, when the inner executor is started.
@@ -48,7 +47,6 @@ sealed class ExclusiveAccessFlow : PgClientFlow
     internal ExclusiveAccessFlow(PgClientProtocol protocol, PgClientProtocol.Control innerControl, PgClientProtocol.ExclusiveScopeState state, Func<Exception?, ValueTask> completeInner)
     {
         _protocol = protocol;
-        _innerControl = innerControl;
         _state = state;
         _completeInner = completeInner;
     }
@@ -110,7 +108,7 @@ sealed class ExclusiveAccessFlow : PgClientFlow
             return;
         }
         var cancelTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        using var reg = cancellationToken.UnsafeRegister(static (s, ct) => ((TaskCompletionSource)s!).TrySetCanceled(ct), cancelTcs);
+        await using var reg = cancellationToken.UnsafeRegister(static (s, ct) => ((TaskCompletionSource)s!).TrySetCanceled(ct), cancelTcs).ConfigureAwait(false);
         var winner = await Task.WhenAny(_handoffReady.Task, cancelTcs.Task).ConfigureAwait(false);
         if (winner == _handoffReady.Task)
         {

@@ -230,7 +230,7 @@ public class ShutdownStressTests
         public override PipeReader Reader => _toClient.Reader;
         public override PipeWriter Writer => _toServer.Writer;
         public Task Aborted => _aborted.Task;
-        public override void WaitWritable() { }
+        public override void WaitUntilWritable(TimeSpan timeout) { }
         public override void Abort()
         {
             _aborted.TrySetResult();

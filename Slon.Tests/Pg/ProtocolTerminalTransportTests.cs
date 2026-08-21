@@ -200,7 +200,7 @@ public class ProtocolTerminalTransportTests
         public Task ReadParked => _reader.ReadParked;
         public override PipeReader Reader => _reader;
         public override PipeWriter Writer => _writer;
-        public override void WaitWritable() { }
+        public override void WaitUntilWritable(TimeSpan timeout) { }
 
         public int ConnectionLostChecks { get; private set; }
         public int RecoveryMessagesAfterConnectionLost => _writer.RecoveryMessagesAfterConnectionLost;

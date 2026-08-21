@@ -229,7 +229,7 @@ public class FlushBatchingTests
         public readonly CountingWriter Counter;
         public override PipeReader Reader => _toClient.Reader;
         public override PipeWriter Writer => Counter;
-        public override void WaitWritable() { }
+        public override void WaitUntilWritable(TimeSpan timeout) { }
 
         public FlushCountingTransport(byte[] handshake)
         {

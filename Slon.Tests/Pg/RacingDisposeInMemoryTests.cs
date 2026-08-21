@@ -759,7 +759,7 @@ public class RacingDisposeInMemoryTests
 
         public override PipeReader Reader { get; }
         public override PipeWriter Writer { get; }
-        public override void WaitWritable() { }
+        public override void WaitUntilWritable(TimeSpan timeout) { }
     }
 
     sealed class RecordingStream : Stream
@@ -840,7 +840,7 @@ public class RacingDisposeInMemoryTests
 
         public override PipeReader Reader => _reader;
         public override PipeWriter Writer => _writer;
-        public override void WaitWritable() { }
+        public override void WaitUntilWritable(TimeSpan timeout) { }
         public override void Abort()
         {
             try { _toClient.Writer.Complete(new IOException("The in-memory transport was aborted.")); }

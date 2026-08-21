@@ -6,9 +6,14 @@ using Slon.Runtime;
 
 namespace Slon.Pipelines;
 
+// Optional shared owner for two pipe endpoints over one stream. Implementations must make disposal
+// idempotent; either endpoint may complete first.
+interface IStreamOwner : IDisposable, IAsyncDisposable { }
+
 abstract class StreamPipeReader : PipeReader
 {
     readonly ValueTaskSourcePromise<ReadResult> _readAsyncCorePromise = new();
+    readonly IStreamOwner? _streamOwner;
     int _isReadActive;
     int _readerCompleted;
     int _readerDisposed;
@@ -31,12 +36,15 @@ abstract class StreamPipeReader : PipeReader
     /// <param name="readingStream">The stream to read from.</param>
     /// <param name="options">The options to use.</param>
     /// <param name="supportCancelPending">Whether cancellation handling for CancelPendingRead() gets registered on reads.</param>
-    protected StreamPipeReader(Stream readingStream, StreamPipeReaderOptions options, bool supportCancelPending = true)
+    /// <param name="streamOwner">An optional shared owner completed instead of disposing the stream directly.</param>
+    protected StreamPipeReader(Stream readingStream, StreamPipeReaderOptions options,
+        bool supportCancelPending = true, IStreamOwner? streamOwner = null)
     {
         ArgumentNullException.ThrowIfNull(readingStream);
         ArgumentNullException.ThrowIfNull(options);
 
         Stream = readingStream;
+        _streamOwner = streamOwner;
         Segments = new(options.Pool, options.BufferSize, options.MinimumReadSize,
             retainBufferOnEmpty: !options.UseZeroByteReads);
         LeaveOpen = options.LeaveOpen;
@@ -84,7 +92,9 @@ abstract class StreamPipeReader : PipeReader
 
         PendingReadTokenSource?.Dispose();
         Segments.Dispose();
-        if (!LeaveOpen)
+        if (_streamOwner is { } owner)
+            owner.Dispose();
+        else if (!LeaveOpen)
             Stream.Dispose();
     }
 
@@ -99,7 +109,9 @@ abstract class StreamPipeReader : PipeReader
 
         PendingReadTokenSource?.Dispose();
         Segments.Dispose();
-        return !LeaveOpen ? Stream.DisposeAsync() : new();
+        return _streamOwner is { } owner
+            ? owner.DisposeAsync()
+            : !LeaveOpen ? Stream.DisposeAsync() : new();
     }
 
     void BeginCompletion()
@@ -306,9 +318,7 @@ abstract class StreamPipeReader : PipeReader
         {
             // Now that we have acquired 'exclusive' access we can change the timeout on the stream, if necessary.
             if (CanTimeout)
-            {
-                Stream.ReadTimeout = (int)deadline.GetRemaining().TotalMilliseconds;
-            }
+                Stream.ReadTimeout = deadline.GetRemainingMilliseconds();
 
             // This optimization only makes sense if we don't have anything buffered
             if (Segments.BufferedBytes is 0 && UseZeroByteReads)
@@ -644,4 +654,6 @@ abstract class StreamPipeReader : PipeReader
         => throw new InvalidOperationException("Concurrent reads are not supported.");
 }
 
-sealed class DefaultStreamPipeReader(Stream readingStream, StreamPipeReaderOptions options, bool supportCancelPending = true) : StreamPipeReader(readingStream, options, supportCancelPending);
+sealed class DefaultStreamPipeReader(Stream readingStream, StreamPipeReaderOptions options,
+    bool supportCancelPending = true, IStreamOwner? streamOwner = null)
+    : StreamPipeReader(readingStream, options, supportCancelPending, streamOwner);

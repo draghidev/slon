@@ -10,6 +10,7 @@ namespace Slon.Pipelines;
 abstract class StreamPipeWriter : PipeWriter, IOutputWriter
 {
     readonly ValueTaskSourcePromise<FlushResult> _flushAsyncCorePromise = new();
+    readonly IStreamOwner? _streamOwner;
     bool _isFlushActive;
 
     // Null when CancelPendingFlush is not supported: the caller's token then threads
@@ -28,7 +29,9 @@ abstract class StreamPipeWriter : PipeWriter, IOutputWriter
     /// <param name="writingStream">The stream to write to.</param>
     /// <param name="options">The options to use.</param>
     /// <param name="supportCancelPending">Whether cancellation handling for CancelPendingFlush() gets registered on flushes.</param>
-    protected StreamPipeWriter(Stream writingStream, StreamPipeWriterOptions options, bool supportCancelPending = true)
+    /// <param name="streamOwner">An optional shared owner completed instead of disposing the stream directly.</param>
+    protected StreamPipeWriter(Stream writingStream, StreamPipeWriterOptions options,
+        bool supportCancelPending = true, IStreamOwner? streamOwner = null)
     {
         ArgumentNullException.ThrowIfNull(writingStream);
         ArgumentNullException.ThrowIfNull(options);
@@ -36,6 +39,7 @@ abstract class StreamPipeWriter : PipeWriter, IOutputWriter
         PendingFlushTokenSource = supportCancelPending ? new() : null;
         Segments = new SegmentChainBuilder(options.Pool, options.MinimumBufferSize);
         Stream = writingStream;
+        _streamOwner = streamOwner;
         LeaveOpen = options.LeaveOpen;
         var canTimeout = CanTimeout = writingStream.CanTimeout;
         // Reading this can be somewhat expensive so we cache it if leave open is false, as it conveys some amount of ownership (admittedly it's not perfect).
@@ -99,7 +103,9 @@ abstract class StreamPipeWriter : PipeWriter, IOutputWriter
         {
             PendingFlushTokenSource?.Dispose();
             Segments.Dispose();
-            if (!LeaveOpen)
+            if (_streamOwner is { } owner)
+                owner.Dispose();
+            else if (!LeaveOpen)
                 Stream.Dispose();
         }
     }
@@ -126,7 +132,9 @@ abstract class StreamPipeWriter : PipeWriter, IOutputWriter
         {
             PendingFlushTokenSource?.Dispose();
             Segments.Dispose();
-            if (!LeaveOpen)
+            if (_streamOwner is { } owner)
+                await owner.DisposeAsync().ConfigureAwait(false);
+            else if (!LeaveOpen)
                 await Stream.DisposeAsync().ConfigureAwait(false);
         }
     }
@@ -218,7 +226,7 @@ abstract class StreamPipeWriter : PipeWriter, IOutputWriter
             // Now that we have acquired 'exclusive' access we can change the timeout on the stream, if necessary.
             if (writeToStream && CanTimeout)
             {
-                Stream.WriteTimeout = (int)deadline.GetRemaining().TotalMilliseconds;
+                Stream.WriteTimeout = deadline.GetRemainingMilliseconds();
             }
 
             var didWrite = false;
@@ -452,4 +460,6 @@ abstract class StreamPipeWriter : PipeWriter, IOutputWriter
         => throw new InvalidOperationException("Concurrent flushes are not supported.");
 }
 
-sealed class DefaultStreamPipeWriter(Stream writingStream, StreamPipeWriterOptions options, bool supportCancelPending = true) : StreamPipeWriter(writingStream, options, supportCancelPending);
+sealed class DefaultStreamPipeWriter(Stream writingStream, StreamPipeWriterOptions options,
+    bool supportCancelPending = true, IStreamOwner? streamOwner = null)
+    : StreamPipeWriter(writingStream, options, supportCancelPending, streamOwner);

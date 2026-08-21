@@ -1,6 +1,4 @@
 using System.IO.Pipelines;
-using System.Security.Cryptography.X509Certificates;
-using Slon.Runtime;
 
 namespace Slon.Transport;
 
@@ -13,40 +11,32 @@ class TransportConnectionOptions
 
 abstract class TransportConnection
 {
-    internal const int DefaultReaderSegmentSize = 65536;
-    internal const int DefaultWriterSegmentSize = DefaultReaderSegmentSize;
+    public readonly struct ResumableWrite(ResumeSignal? signal, TimeSpan timeout)
+    {
+        public ResumeSignal? Signal { get; } = signal;
+        public TimeSpan Timeout { get; } = timeout;
+    }
 
-    // Set by ResumableScope to request synchronous non-blocking writes. On WouldBlock, the
-    // transport returns a pending task backed by this caller-owned signal; only the caller resumes it.
-    [ThreadStatic]
-    public static WriteResumeSignal? SyncNonBlockingSignal;
+    protected internal const int DefaultReaderSegmentSize = 65536;
+    protected internal const int DefaultWriterSegmentSize = DefaultReaderSegmentSize;
 
-    // Optional deadline for synchronous polling under the same scope. Null means infinite.
-    [ThreadStatic]
-    public static Deadline? SyncNonBlockingDeadline;
+    // Enables the resumable-write path for the current thread. The transport attempts an async write
+    // synchronously and parks it with a fresh deadline when the wire blocks.
+    [field: ThreadStatic]
+    public static ResumableWrite CurrentResumableWrite { get; set; }
 
-    // The protocol owns read-result tenure and completes these endpoints only after every borrowed
-    // buffer has been retired. Abort must make outstanding physical I/O settle so that join can finish.
+    // The protocol completes both endpoints after all borrowed buffers have been returned.
     public abstract PipeReader Reader { get; }
     public abstract PipeWriter Writer { get; }
 
-    public virtual X509Certificate? RemoteCertificate => null;
-
-    // A true verdict means the established byte stream cannot be recovered. Timeout, cancellation,
-    // and local-abort translation happen before the protocol asks this question. Transports with a
-    // different I/O error surface classify their own exceptions here.
+    // Classifies transport-specific exceptions that mean the established byte stream was lost.
     public virtual bool IsConnectionLost(Exception exception) => false;
 
-    // Parks the calling thread until the transport is writable.
-    public abstract void WaitWritable();
+    // Waits up to the supplied remaining timeout for the parked resumable write to become writable.
+    public abstract void WaitUntilWritable(TimeSpan timeout = default);
 
-    // Faults parked I/O terminally without blocking and without releasing the reader/writer buffers
-    // (a parked read may hold a reserved segment; those go on the later Complete). Generic finalize
-    // stays on the reader/writer's Complete - this is only the "break it now, with a reason the other
-    // end understands" step that a graceful close can't do safely (it can hang on a wedged peer).
-    // Socket transports do a 0-linger abortive close (RST). A pipe transport overrides to Complete its
-    // end with a sentinel exception the read end recognizes as an abort - the in-memory analogue of the
-    // RST. Default no-op: our async transports unblock off AbortToken and never take the sync path.
+    // Breaks outstanding physical I/O without completing the endpoints; endpoint completion remains
+    // the protocol's responsibility after borrowed buffers have been returned.
     public virtual void Abort() { }
 
     public abstract class Factory(TransportConnectionOptions? options = null)
@@ -54,7 +44,6 @@ abstract class TransportConnection
         static readonly Func<Stream, Stream> IdentityTransform = static stream => stream;
 
         public TransportConnectionOptions Options { get; } = options ?? new();
-        public abstract bool SupportsSynchronousIO { get; }
 
         public TransportConnection Connect(TimeSpan timeout = default)
             => ConnectTransformed(IdentityTransform, timeout);

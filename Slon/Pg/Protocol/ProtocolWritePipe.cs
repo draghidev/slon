@@ -16,7 +16,7 @@ namespace Slon.Pg.Protocol;
 // length tracking and BufferingWriter are safe to share. Token-bearing concerns (CTS, abort
 // translation and abort-aware flush wrappers) live in the shell, not here; the pipe exposes
 // only token-free flush primitives.
-sealed class ProtocolWritePipe(IOutputWriter writer, Encoding clientEncoding, Action waitWritable)
+sealed class ProtocolWritePipe(IOutputWriter writer, Encoding clientEncoding, Action<TimeSpan> waitUntilWritable)
 {
     BufferingWriter _bufferingWriter = new(writer);
 
@@ -30,10 +30,10 @@ sealed class ProtocolWritePipe(IOutputWriter writer, Encoding clientEncoding, Ac
     int _messageBytesFlushed;
 
     // Per-connection cached signal. The flow parks this in
-    // TransportConnection.SyncNonBlockingSignal around each Resumable call, the transport
+    // TransportConnection.CurrentResumableWrite around each resumable write, the transport
     // returns it on WouldBlock as the pending source, the flow's driver fires it via
     // Signal. Reused across operations thanks to auto-reset on consumption.
-    public WriteResumeSignal ResumeSignal { get; } = new();
+    public ResumeSignal ResumeSignal { get; } = new();
 
     // Maps a thrown exception to a SocketError, or null when the exception isn't recognizable
     // as a transport-level socket error. Handles the .NET socket-stack path. NetworkStream and
@@ -49,10 +49,10 @@ sealed class ProtocolWritePipe(IOutputWriter writer, Encoding clientEncoding, Ac
 
     // Driver hooks for the sync wrappers and higher-composition sync drivers. Signal
     // fires the cached writable signal, releasing any coroutine awaiter that captured it on
-    // WouldBlock. WaitWritable forwards to the transport's wait callback (typically
+    // WouldBlock. WaitUntilWritable forwards to the transport's wait callback (typically
     // Socket.Poll on a SelectMode.SelectWrite), parking the calling thread until writable.
     public void ResumeWrite(Exception? exception = null) => ResumeSignal.Signal(exception);
-    public void WaitWritable() => waitWritable();
+    public void WaitUntilWritable(TimeSpan timeout = default) => waitUntilWritable(timeout);
 
     internal Func<PgTypeId, Oid> OidLookup { get; } = static pgTypeId => PgTypeCatalog.Default.GetOid(pgTypeId);
     internal Encoding ClientEncoding { get; set; } = clientEncoding;

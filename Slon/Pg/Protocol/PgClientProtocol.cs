@@ -51,6 +51,7 @@ sealed class PgClientProtocolOptions
     {
         DefaultClientEncoding = options.Encoding;
         ReadTimeout = options.ReadTimeout;
+        WriteTimeout = options.WriteTimeout;
         HeartbeatInterval = options.HeartbeatInterval;
         TimeProvider = options.TimeProvider;
         CancellationTimeout = options.CancellationTimeout;
@@ -77,6 +78,7 @@ sealed class PgClientProtocolOptions
     public TimeSpan FlowActivationTimeout { get; set; }
     public TimeSpan HeartbeatInterval { get; set; } = Heartbeat.DefaultInterval;
     public TimeSpan ReadTimeout { get; set; } = PgClientOptions.DefaultReadTimeout;
+    public TimeSpan WriteTimeout { get; set; } = TimeSpan.FromSeconds(10);
     // Allocation-free grace before starting a backend CancelRequest. Heartbeat supplies the clock.
     public TimeSpan CancelRequestDelay { get; set; }
     public TimeSpan CancellationTimeout { get; set; } = TimeSpan.FromSeconds(10);
@@ -101,6 +103,71 @@ sealed class PgClientProtocolOptions
 
 sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
 {
+    internal abstract class LoadObserver
+    {
+        internal abstract void OnFlowQueued(bool stallsPipeline);
+        internal abstract void OnFlowActivated();
+        internal abstract void OnFlowReleased(bool stallsPipeline);
+    }
+
+    internal readonly struct Hosting
+    {
+        Hosting(bool drivesHeartbeat, Action? admissionAvailable, LoadObserver? loadObserver)
+        {
+            DrivesHeartbeat = drivesHeartbeat;
+            AdmissionAvailable = admissionAvailable;
+            LoadObserver = loadObserver;
+        }
+
+        public bool DrivesHeartbeat { get; }
+        public Action? AdmissionAvailable { get; }
+        public LoadObserver? LoadObserver { get; }
+
+        public static Hosting Connection { get; } = new(
+            drivesHeartbeat: true, admissionAvailable: null, loadObserver: null);
+
+        public static Hosting Pooled(Action admissionAvailable, LoadObserver loadObserver)
+        {
+            ArgumentNullException.ThrowIfNull(admissionAvailable);
+            ArgumentNullException.ThrowIfNull(loadObserver);
+            return new(drivesHeartbeat: true, admissionAvailable, loadObserver);
+        }
+    }
+
+    internal readonly struct Startup
+    {
+        readonly PgClientProtocol _protocol;
+        readonly TransportConnection _transport;
+        readonly StartupFlow _flow;
+        readonly Action _onStarted;
+
+        internal Startup(PgClientProtocol protocol, TransportConnection transport, StartupFlow flow,
+            Action onStarted)
+        {
+            _protocol = protocol;
+            _transport = transport;
+            _flow = flow;
+            _onStarted = onStarted;
+        }
+
+        internal PgClientProtocol Protocol => _protocol;
+        internal PgClientOptions Options => _flow.Options;
+
+        internal void Start(Hosting hosting = default)
+        {
+            _protocol.Start(_transport, _flow, hosting);
+            _onStarted();
+        }
+
+        internal async ValueTask StartAsync(Hosting hosting = default,
+            CancellationToken cancellationToken = default)
+        {
+            await _protocol.StartAsync(_transport, _flow, hosting, cancellationToken)
+                .ConfigureAwait(false);
+            _onStarted();
+        }
+    }
+
     readonly PgClientProtocolOptions _options;
     readonly PgSessionResetOptions _sessionReset;
     readonly ILogger _logger;
@@ -110,18 +177,9 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
     PipeSegmentEnumerator<BackendMessageBatch.Segmenter, BackendMessageBatch> _pipeSegmentEnumerator = null!;
     PgDecoder _pgDecoder = null!;
 
-    int _pipelineStalls;
-    // Standalone protocols do not maintain pool-scoring inputs.
-    bool _scoringEnabled;
-    // Heartbeat ticks provide a coarse scoring clock without hot-path time reads.
-    int _heartbeatTick;
-    // Completion rate is heartbeat-smoothed; head age detects a long-running active flow.
-    int _completionCount;
-    int _lastTickCompletions;
-    double _throughputPerTick;
-    int _currentFlowStartTick;
+    LoadObserver? _loadObserver;
     Heartbeat? _heartbeat;
-    Action<bool>? _poolConnectionAvailabilitySignal;
+    Action? _admissionAvailable;
     PipelineScheduler _executionScheduler = null!;
     PipelineScheduler _activationScheduler = null!;
 
@@ -221,39 +279,10 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
     // Raw shutdown cause, or null after clean completion.
     internal Exception? CompletionException => _close.Reason?.InnerException;
     internal string? SessionResetCommand => _sessionResetCommand;
-    internal int CompareTo(PgClientProtocol? other)
-    {
-        // Empty slots are preferred.
-        if (other is null)
-            return 1;
-
-        var score = LoadScore();
-        var otherScore = other.LoadScore();
-        return score.CompareTo(otherScore);
-    }
-
-    // Estimated wait in ticks: outstanding / throughput, plus serialization and head-age penalties.
-    // Power-of-two selection needs directional accuracy rather than a precise latency model.
-    double LoadScore()
-    {
-        var outstanding = Outstanding;
-        if (outstanding == 0)
-            return 0;
-
-        const double RateFloor = 0.5, StallWeight = 2, AgePenalty = 5;
-        const int AgeThresholdTicks = 3;
-
-        var rate = Math.Max(_throughputPerTick, RateFloor);
-        var score = outstanding / rate + _pipelineStalls * StallWeight;
-        if (_heartbeatTick - _currentFlowStartTick > AgeThresholdTicks)
-            score += AgePenalty;
-        return score;
-    }
-
     public static PgClientProtocol Create(PgClientProtocolOptions protocolOptions)
         => new(protocolOptions);
 
-    void Initialize(TransportConnection connection, Action<bool>? onAvailability)
+    void Initialize(TransportConnection connection, Hosting hosting)
     {
         _executionScheduler = _options.ExecutionScheduler
             ?? PipelineScheduler.ThreadPool;
@@ -262,47 +291,46 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
 
         _connection = connection;
         _pipeWriter = connection.Writer as IOutputWriter ?? new PipeOutputWriter(connection.Writer);
-        _protocolDataWriter = new(_pipeWriter, PgClientOptions.PreStartupEncoding, connection.WaitWritable, AbortToken, FlowControl);
+        _protocolDataWriter = new(_pipeWriter, PgClientOptions.PreStartupEncoding,
+            connection.WaitUntilWritable, AbortToken, FlowControl, _options.WriteTimeout);
         _pipeSegmentEnumerator = new(connection.Reader,
             new(_options.DataRowStreamingThreshold), ownsReader: true);
         _pgDecoder = new(_pipeSegmentEnumerator, AbortToken, _options.ReadTimeout, _options.ReadTimeoutArmed);
+        _admissionAvailable = hosting.AdmissionAvailable;
+        _loadObserver = hosting.LoadObserver;
 
-        // Scoring is a pool concern: only maintain its inputs when an orchestrator drives us.
-        _scoringEnabled = onAvailability is not null;
-
-        // A non-null availability callback means an external orchestrator drives us,
-        // including the heartbeat tick. When null, we run our own heartbeat so standalone
-        // consumers get working flow activation timeouts.
-        if (onAvailability is null)
+        if (!hosting.DrivesHeartbeat)
         {
             _heartbeat = new(_options.HeartbeatInterval, _options.TimeProvider, _logger);
             _heartbeat.Register(period => Heartbeat(period));
         }
-        else
-        {
-            _poolConnectionAvailabilitySignal = onAvailability;
-        }
     }
 
     public void Start(PgClientOptions options, TransportConnection connection,
-        Action<bool>? onAvailability = null, TimeSpan timeout = default,
-        Func<TransportConnection, TimeSpan, TransportConnection>? upgradeTransport = null)
+        TimeSpan timeout = default)
+        => StartCore(options, connection, default, timeout);
+
+    internal void Start(PgClientOptions options, TransportConnection connection,
+        Hosting hosting, TimeSpan timeout = default)
+        => StartCore(options, connection, hosting, timeout);
+
+    void StartCore(PgClientOptions options, TransportConnection connection,
+        Hosting hosting, TimeSpan timeout)
+    {
+        var deadline = new Deadline(timeout == default ? options.ConnectionTimeout : timeout);
+        Start(connection, new StartupFlow(async: false, options, null, deadline.GetRemaining()),
+            hosting);
+    }
+
+    internal void Start(TransportConnection connection, StartupFlow flow,
+        Hosting hosting = default)
     {
         try
         {
             if (connection.Reader is not StreamPipeReader || connection.Writer is not StreamPipeWriter)
                 ThrowHelper.ThrowInvalidOperation("Transport does not support synchronous I/O.");
 
-            var deadline = new Deadline(timeout == default ? options.ConnectionTimeout : timeout);
-            if (options.Ssl.ShouldNegotiateTls(options.EndPoint))
-            {
-                if (upgradeTransport is null)
-                    throw new InvalidOperationException("The transport does not support PostgreSQL TLS negotiation.");
-                if (NegotiateSsl(connection, options.Ssl.Mode, deadline.GetRemaining()))
-                    connection = upgradeTransport(connection, deadline.GetRemaining());
-            }
-            Initialize(connection, onAvailability);
-            var flow = new StartupFlow(async: false, options, connection.RemoteCertificate, deadline.GetRemaining());
+            Initialize(connection, hosting);
             var task = StartAsync(flow, flow.WaitForComplete());
             Debug.Assert(task.IsCompleted);
             task.AsTask().GetAwaiter().GetResult();
@@ -314,21 +342,26 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         }
     }
 
-    public async ValueTask StartAsync(PgClientOptions options, TransportConnection connection,
-        Action<bool>? onAvailability = null, CancellationToken cancellationToken = default,
-        Func<TransportConnection, CancellationToken, ValueTask<TransportConnection>>? upgradeTransport = null)
+    public ValueTask StartAsync(PgClientOptions options, TransportConnection connection,
+        CancellationToken cancellationToken = default)
+        => StartAsyncCore(options, connection, default, cancellationToken);
+
+    internal ValueTask StartAsync(PgClientOptions options, TransportConnection connection,
+        Hosting hosting, CancellationToken cancellationToken = default)
+        => StartAsyncCore(options, connection, hosting, cancellationToken);
+
+    ValueTask StartAsyncCore(PgClientOptions options, TransportConnection connection,
+        Hosting hosting, CancellationToken cancellationToken)
+        => StartAsync(connection,
+            new StartupFlow(async: true, options, null, options.ConnectionTimeout),
+            hosting, cancellationToken);
+
+    internal async ValueTask StartAsync(TransportConnection connection, StartupFlow flow,
+        Hosting hosting = default, CancellationToken cancellationToken = default)
     {
         try
         {
-            if (options.Ssl.ShouldNegotiateTls(options.EndPoint))
-            {
-                if (upgradeTransport is null)
-                    throw new InvalidOperationException("The transport does not support PostgreSQL TLS negotiation.");
-                if (await NegotiateSslAsync(connection, options.Ssl.Mode, cancellationToken).ConfigureAwait(false))
-                    connection = await upgradeTransport(connection, cancellationToken).ConfigureAwait(false);
-            }
-            Initialize(connection, onAvailability);
-            var flow = new StartupFlow(async: true, options, connection.RemoteCertificate, options.ConnectionTimeout);
+            Initialize(connection, hosting);
             await StartAsync(flow, flow.WaitForComplete(cancellationToken), cancellationToken).ConfigureAwait(false);
         }
         catch (Exception ex) when (Status is ProtocolStatus.Created)
@@ -490,7 +523,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         }
 
         if (becameReady && IsSchedulable)
-            _poolConnectionAvailabilitySignal?.Invoke(Outstanding is 0);
+            NotifyAdmissionAvailable();
     }
 
     void SignalDraining()
@@ -515,15 +548,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         }
 
         if (signal)
-        {
-            try { _poolConnectionAvailabilitySignal?.Invoke(Outstanding is 0); }
-            catch (Exception ex)
-            {
-                SlonLogMessages.UnobservedCallbackException(
-                    _logger, ex, "the pool availability callback");
-                FailProtocol(ex);
-            }
-        }
+            NotifyAdmissionAvailable();
     }
 
     void ReleaseWireCapacity()
@@ -531,11 +556,17 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         if (!_source.ReleaseCapacity() || !IsSchedulable)
             return;
 
-        try { _poolConnectionAvailabilitySignal?.Invoke(Outstanding is 0); }
+        NotifyAdmissionAvailable();
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    void NotifyAdmissionAvailable()
+    {
+        try { _admissionAvailable?.Invoke(); }
         catch (Exception ex)
         {
             SlonLogMessages.UnobservedCallbackException(
-                _logger, ex, "the pool availability callback");
+                _logger, ex, "the admission-availability callback");
             FailProtocol(ex);
         }
     }
@@ -578,8 +609,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
             var control = flow.GetExecutionControl(FlowControl);
             if (flow.NeedsSyncHandoff && flow.DefersSyncHandoff)
                 _source.SignalExecutor();
-            if (_scoringEnabled && control.StallsPipeline)
-                Interlocked.Increment(ref _pipelineStalls);
+            _loadObserver?.OnFlowQueued(control.StallsPipeline);
         }
         catch (Exception ex)
         {
@@ -667,8 +697,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
                 enqueue.Execute(runContinuationsAsynchronously: true);
 
             var control = flow.GetExecutionControl(FlowControl);
-            if (_scoringEnabled && control.StallsPipeline)
-                Interlocked.Increment(ref _pipelineStalls);
+            _loadObserver?.OnFlowQueued(control.StallsPipeline);
         }
         catch (Exception ex)
         {
@@ -1073,17 +1102,6 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
 
     internal ValueTask Heartbeat(TimeSpan period)
     {
-        if (_scoringEnabled)
-        {
-            _heartbeatTick++;
-            // Completions since last tick = throughput-per-tick; fold into the EWMA. Single writer (this
-            // handler), so plain arithmetic; the score reads the smoothed value.
-            var completedThisTick = _completionCount - _lastTickCompletions;
-            _lastTickCompletions = _completionCount;
-            const double Alpha = 0.3;
-            _throughputPerTick = Alpha * completedThisTick + (1 - Alpha) * _throughputPerTick;
-        }
-
         OnCancellationHeartbeat(period);
         PropagateFlowHeartbeat(period);
         return new();
@@ -1769,10 +1787,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         internal void BindDecoder(PgClientFlow flow)
         {
             PublishCancellationActivation(flow);
-            // Stamp the head flow's start tick at activation (this is the active reader). currentTick
-            // minus it gives the head's running age for the load score.
-            if (protocol._scoringEnabled)
-                protocol._currentFlowStartTick = protocol._heartbeatTick;
+            protocol._loadObserver?.OnFlowActivated();
             Decoder.Initialize(this);
             protocol.OnFlowActivated(flow);
         }
@@ -1805,18 +1820,11 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
             protocol._serverParameterState.CommitFlow();
             ClearCancellationActivation(flow);
             protocol.OnFlowReleased(flow, poolFacing && remainingDepth is 0);
-            // Scoring inputs maintained at retirement (the universal completion point, fires for every
-            // flow including ones faulted before bind). Throughput: every retirement counts. Stalls: a
-            // non-pipelined flow held the wire serialized from queue until its RFQ here (not just until
-            // bind), so decrement here - measures the serialization window, never orphans an increment.
-            // Pool-facing only: an inner (exclusive-flow) subflow's retirement isn't a pool-unit event,
-            // so it neither feeds the load score nor signals pool idle below.
-            if (poolFacing && protocol._scoringEnabled)
-            {
-                Interlocked.Increment(ref protocol._completionCount);
-                if (flow.GetExecutionControl(this).StallsPipeline)
-                    Interlocked.Decrement(ref protocol._pipelineStalls);
-            }
+            // Inner exclusive-scope subflows are not pool load units; only the outer pipeline reports
+            // admission-to-retirement lifetimes to its host.
+            if (poolFacing)
+                protocol._loadObserver?.OnFlowReleased(
+                    flow.GetExecutionControl(this).StallsPipeline);
 
             // At pipeline park release the rooted read-state buffers. Pool idle is published only
             // after Release fires the reusable flow's terminal observer; depth zero here is not yet
@@ -1833,20 +1841,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
             if (protocol.Outstanding is not 0)
                 return;
 
-            if (protocol._poolConnectionAvailabilitySignal is { } signal)
-                SignalPoolAvailability(signal);
-        }
-
-        [MethodImpl(MethodImplOptions.NoInlining)]
-        void SignalPoolAvailability(Action<bool> signal)
-        {
-            try { signal(true); }
-            catch (Exception ex)
-            {
-                SlonLogMessages.UnobservedCallbackException(
-                    protocol._logger, ex, "the pool availability callback");
-                protocol.FailProtocol(ex);
-            }
+            protocol.NotifyAdmissionAvailable();
         }
 
         CommandFlow.ReadState _commandFlowReadState = new();

@@ -293,7 +293,7 @@ partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSour
             }
             else
             {
-                using (encoder.BeginResumableScope())
+                using (encoder.BeginResumableWriteScope())
                     writeTask = _options.Commands.WriteCommandsResumable(encoder, appendSync);
             }
 

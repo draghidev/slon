@@ -44,6 +44,18 @@ sealed class PgConnection : IPoolConnection<PgConnection>
     {
         internal PgConnection Connection { get; } = connection;
     }
+
+    sealed class ProtocolLoadObserver(PgConnection connection) : PgClientProtocol.LoadObserver
+    {
+        internal override void OnFlowQueued(bool stallsPipeline)
+            => connection.OnFlowQueued(stallsPipeline);
+
+        internal override void OnFlowActivated()
+            => connection.OnFlowActivated();
+
+        internal override void OnFlowReleased(bool stallsPipeline)
+            => connection.OnFlowReleased(stallsPipeline);
+    }
     readonly PgClientProtocol _protocol;
     readonly CommandTracker? _tracker;
     readonly ILogger _logger;
@@ -64,6 +76,12 @@ sealed class PgConnection : IPoolConnection<PgConnection>
     IDisposable? _poolHeartbeatRegistration;
     int _sessionLifetimeReleased;
     ConnectionPool<PgConnection>.Registration _poolRegistration;
+    int _pipelineStalls;
+    int _heartbeatTick;
+    int _completionCount;
+    int _lastTickCompletions;
+    double _throughputPerTick;
+    int _currentFlowStartTick;
     // Session-wide explicit-prepare names remain unique across successive leases.
     int _connectionPrepareCounter;
 
@@ -92,66 +110,119 @@ sealed class PgConnection : IPoolConnection<PgConnection>
 
     // Creates a fully open but unpublished connection. Start enables idle publication only after
     // the pool commits the initial lease. Heartbeats route through this wrapper for maintenance.
-    public static PgConnection Create(PgClientProtocolOptions protocolOptions, PgClientOptions clientOptions, TransportConnection transport, CommandTracker? tracker = null, ConnectionPoolContext<PgConnection>? poolContext = null, TimeSpan timeout = default, Func<TransportConnection, TimeSpan, TransportConnection>? upgradeTransport = null, Action? onProtocolStarted = null)
+    public static PgConnection Create(PgClientProtocolOptions protocolOptions,
+        PgClientOptions clientOptions, TransportConnection transport,
+        CommandTracker? tracker = null, ConnectionPoolContext<PgConnection>? poolContext = null,
+        TimeSpan timeout = default)
     {
         var protocol = PgClientProtocol.Create(protocolOptions);
-        var conn = new PgConnection(protocol, tracker, clientOptions.MaintenanceInterval,
-            clientOptions.LoggerFactory.CreateLogger("Slon.Pg.Connection"));
-        conn._poolContext = poolContext;
-        if (poolContext is not null)
-            protocol.SetFlowMigration(conn.TryMigrateFlow);
-        protocol.Start(clientOptions, transport,
-            conn.SignalAvailabilityIfStarted,
-            timeout, upgradeTransport);
-        onProtocolStarted?.Invoke();
-        try
-        {
-            conn._tracker?.Register(conn);
-            conn.WireHeartbeat(clientOptions, poolContext);
-        }
-        catch (Exception ex)
-        {
-            protocol.CompleteAsync(ex).GetAwaiter().GetResult();
-            // Nothing armed the release yet. Tear down whatever wiring installed before surfacing.
-            conn.ReleaseSessionLifetime();
-            throw;
-        }
-        conn.ArmSessionLifetimeRelease();
+        var conn = CreateUnstarted(protocol, clientOptions, tracker, poolContext);
+        protocol.Start(clientOptions, transport, conn.CreateProtocolHosting(), timeout);
+        conn.CompleteStart(clientOptions);
         return conn;
     }
 
-    public static async ValueTask<PgConnection> CreateAsync(PgClientProtocolOptions protocolOptions, PgClientOptions clientOptions, TransportConnection transport, CommandTracker? tracker = null, ConnectionPoolContext<PgConnection>? poolContext = null, CancellationToken cancellationToken = default, Func<TransportConnection, CancellationToken, ValueTask<TransportConnection>>? upgradeTransport = null, Action? onProtocolStarted = null)
+    static PgConnection CreateUnstarted(PgClientProtocol protocol,
+        PgClientOptions clientOptions, CommandTracker? tracker = null,
+        ConnectionPoolContext<PgConnection>? poolContext = null)
     {
-        var protocol = PgClientProtocol.Create(protocolOptions);
         var conn = new PgConnection(protocol, tracker, clientOptions.MaintenanceInterval,
-            clientOptions.LoggerFactory.CreateLogger("Slon.Pg.Connection"));
-        conn._poolContext = poolContext;
+            clientOptions.LoggerFactory.CreateLogger("Slon.Pg.Connection"))
+        {
+            _poolContext = poolContext
+        };
         if (poolContext is not null)
+        {
             protocol.SetFlowMigration(conn.TryMigrateFlow);
-        await protocol.StartAsync(clientOptions, transport,
-            conn.SignalAvailabilityIfStarted,
-            cancellationToken, upgradeTransport).ConfigureAwait(false);
-        onProtocolStarted?.Invoke();
-        try
-        {
-            conn._tracker?.Register(conn);
-            conn.WireHeartbeat(clientOptions, poolContext);
         }
-        catch (Exception ex)
-        {
-            await protocol.CompleteAsync(ex).ConfigureAwait(false);
-            // Nothing armed the release yet. Tear down whatever wiring installed before surfacing.
-            conn.ReleaseSessionLifetime();
-            throw;
-        }
-        conn.ArmSessionLifetimeRelease();
         return conn;
     }
 
-    void SignalAvailabilityIfStarted(bool isIdle)
+    internal static PgConnection Create(PgClientProtocol.Startup startup,
+        CommandTracker? tracker = null,
+        ConnectionPoolContext<PgConnection>? poolContext = null)
     {
-        if (_poolContext is not null && Volatile.Read(ref _isStarted) != 0)
-            _poolRegistration.SignalAvailability(isIdle);
+        var conn = CreateUnstarted(startup.Protocol, startup.Options, tracker, poolContext);
+        startup.Start(conn.CreateProtocolHosting());
+        conn.CompleteStart(startup.Options);
+        return conn;
+    }
+
+    internal static async ValueTask<PgConnection> CreateAsync(PgClientProtocol.Startup startup,
+        CommandTracker? tracker = null,
+        ConnectionPoolContext<PgConnection>? poolContext = null,
+        CancellationToken cancellationToken = default)
+    {
+        var conn = CreateUnstarted(startup.Protocol, startup.Options, tracker, poolContext);
+        await startup.StartAsync(conn.CreateProtocolHosting(), cancellationToken).ConfigureAwait(false);
+        await conn.CompleteStartAsync(startup.Options).ConfigureAwait(false);
+        return conn;
+    }
+
+    void CompleteStart(PgClientOptions clientOptions)
+    {
+        try
+        {
+            _tracker?.Register(this);
+            WireHeartbeat(clientOptions, _poolContext);
+        }
+        catch (Exception ex)
+        {
+            _protocol.CompleteAsync(ex).GetAwaiter().GetResult();
+            // Nothing armed the release yet. Tear down whatever wiring installed before surfacing.
+            ReleaseSessionLifetime();
+            throw;
+        }
+        ArmSessionLifetimeRelease();
+    }
+
+    public static ValueTask<PgConnection> CreateAsync(PgClientProtocolOptions protocolOptions,
+        PgClientOptions clientOptions, TransportConnection transport,
+        CommandTracker? tracker = null, ConnectionPoolContext<PgConnection>? poolContext = null,
+        CancellationToken cancellationToken = default)
+    {
+        var protocol = PgClientProtocol.Create(protocolOptions);
+        var conn = CreateUnstarted(protocol, clientOptions, tracker, poolContext);
+        return CompleteAsync(protocol, conn, clientOptions, transport, cancellationToken);
+
+        static async ValueTask<PgConnection> CompleteAsync(PgClientProtocol protocol,
+            PgConnection conn, PgClientOptions clientOptions, TransportConnection transport,
+            CancellationToken cancellationToken)
+        {
+            await protocol.StartAsync(clientOptions, transport,
+                conn.CreateProtocolHosting(), cancellationToken).ConfigureAwait(false);
+            await conn.CompleteStartAsync(clientOptions).ConfigureAwait(false);
+            return conn;
+        }
+    }
+
+    PgClientProtocol.Hosting CreateProtocolHosting()
+        => _poolContext is null
+            ? PgClientProtocol.Hosting.Connection
+            : PgClientProtocol.Hosting.Pooled(
+                SignalAvailabilityIfStarted, new ProtocolLoadObserver(this));
+
+    async ValueTask CompleteStartAsync(PgClientOptions clientOptions)
+    {
+        try
+        {
+            _tracker?.Register(this);
+            WireHeartbeat(clientOptions, _poolContext);
+        }
+        catch (Exception ex)
+        {
+            await _protocol.CompleteAsync(ex).ConfigureAwait(false);
+            // Nothing armed the release yet. Tear down whatever wiring installed before surfacing.
+            ReleaseSessionLifetime();
+            throw;
+        }
+        ArmSessionLifetimeRelease();
+    }
+
+    void SignalAvailabilityIfStarted()
+    {
+        if (_poolContext is not null && Volatile.Read(ref _isStarted) != 0 && _protocol.IsSchedulable)
+            _poolRegistration.SignalAvailability(_protocol.Outstanding is 0);
     }
 
     // Enables depth-to-zero publication after installation. The unopened slot future still owns
@@ -182,6 +253,15 @@ sealed class PgConnection : IPoolConnection<PgConnection>
     // Starts due maintenance before advancing protocol heartbeat duties.
     ValueTask OnHeartbeat(TimeSpan interval)
     {
+        if (_poolContext is not null)
+        {
+            _heartbeatTick++;
+            var completedThisTick = _completionCount - _lastTickCompletions;
+            _lastTickCompletions = _completionCount;
+            const double Alpha = 0.3;
+            _throughputPerTick = Alpha * completedThisTick + (1 - Alpha) * _throughputPerTick;
+        }
+
         _maintenanceAccum += interval;
         if (_maintenanceAccum >= _maintenanceInterval)
         {
@@ -197,8 +277,47 @@ sealed class PgConnection : IPoolConnection<PgConnection>
     bool IPoolConnection<PgConnection>.IsSchedulable => _protocol.IsSchedulable;
     public Task Completion => _protocol.Completion;
     public Exception? CompletionException => _protocol.CompletionException;
-    int IPoolConnection<PgConnection>.CompareTo(PgConnection? other) => _protocol.CompareTo(other?._protocol);
+    int IPoolConnection<PgConnection>.CompareTo(PgConnection? other)
+    {
+        if (other is null)
+            return 1;
+        return LoadScore().CompareTo(other.LoadScore());
+    }
     public Task CompleteAsync(Exception? exception = null) => _protocol.CompleteAsync(exception);
+
+    // Estimated wait in ticks: outstanding / throughput, plus serialization and head-age penalties.
+    // Power-of-two selection needs directional accuracy rather than a precise latency model.
+    double LoadScore()
+    {
+        var outstanding = _protocol.Outstanding;
+        if (outstanding == 0)
+            return 0;
+
+        const double RateFloor = 0.5, StallWeight = 2, AgePenalty = 5;
+        const int AgeThresholdTicks = 3;
+
+        var rate = Math.Max(_throughputPerTick, RateFloor);
+        var score = outstanding / rate + _pipelineStalls * StallWeight;
+        if (_heartbeatTick - _currentFlowStartTick > AgeThresholdTicks)
+            score += AgePenalty;
+        return score;
+    }
+
+    void OnFlowQueued(bool stallsPipeline)
+    {
+        if (stallsPipeline)
+            Interlocked.Increment(ref _pipelineStalls);
+    }
+
+    void OnFlowActivated()
+        => _currentFlowStartTick = _heartbeatTick;
+
+    void OnFlowReleased(bool stallsPipeline)
+    {
+        Interlocked.Increment(ref _completionCount);
+        if (stallsPipeline)
+            Interlocked.Decrement(ref _pipelineStalls);
+    }
     internal void ReportUnobservedCallback(Exception exception, string callback)
         => SlonLogMessages.UnobservedCallbackException(_logger, exception, callback);
     internal void ReportMaintenanceError(string sqlState, string messageText)

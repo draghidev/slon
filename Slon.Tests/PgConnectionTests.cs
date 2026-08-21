@@ -23,7 +23,7 @@ public class PgConnectionTests
 
         public override PipeReader Reader => _read.Reader;
         public override PipeWriter Writer => _write.Writer;
-        public override void WaitWritable() { }
+        public override void WaitUntilWritable(TimeSpan timeout) { }
     }
 
     static PgClientOptions NewOptions() => new()

@@ -1,6 +1,7 @@
 using System.Collections.Immutable;
 using System.Runtime.CompilerServices;
 using System.Text;
+using Slon.Runtime;
 using Slon.Text;
 using Slon.Transport;
 using static Slon.Pg.Protocol.PgTypes;
@@ -9,6 +10,21 @@ namespace Slon.Pg.Protocol;
 
 readonly struct PgEncoder
 {
+    public readonly ref struct ResumableWriteScope
+    {
+        readonly TransportConnection.ResumableWrite _previous;
+
+        public ResumableWriteScope(ResumeSignal signal) : this(signal, default) { }
+
+        public ResumableWriteScope(ResumeSignal signal, TimeSpan timeout)
+        {
+            _previous = TransportConnection.CurrentResumableWrite;
+            TransportConnection.CurrentResumableWrite = new(signal, timeout);
+        }
+
+        public void Dispose() => TransportConnection.CurrentResumableWrite = _previous;
+    }
+
     readonly PgClientFlow.ExecutionControl _executionControl;
     readonly ProtocolDataWriter _writer;
 
@@ -22,46 +38,46 @@ readonly struct PgEncoder
 
     public bool LastMessageInducesRfq => _executionControl.LastMessageInducesRfq;
 
-    // Cached writable signal the flow parks in the transport TLS slot around a Resumable
+    // Cached writable signal the flow parks in the transport TLS slot around a resumable-write
     // call. Cached on the writer (per-connection) so each call reuses one instance, no
     // per-op allocation. Auto-reset on consumption keeps it ready for the next WouldBlock
     // cycle.
-    public WriteResumeSignal ResumeSignal => _writer.ResumeSignal;
+    public ResumeSignal ResumeSignal => _writer.ResumeSignal;
 
     // Opens a scope that places the writer's cached signal in the transport's TLS slot for
-    // the scope's lifetime, restoring on Dispose. Use this from a Resumable-driving caller
+    // the scope's lifetime, restoring on Dispose. Use this from a resumable-write caller
     // (flow body or sync wrapper) so the transport sees the signal underneath. Lets the
     // caller stay agnostic to the TLS plumbing.
-    public ResumableScope BeginResumableScope() => new(_writer.ResumeSignal);
+    public ResumableWriteScope BeginResumableWriteScope() => new(_writer.ResumeSignal, _writer.WriteTimeout);
 
     // Forwards to the underlying writer so the sync encoder variants and higher-composition
     // sync drivers can park and signal without reaching into the transport directly.
-    void WaitWritable() => _writer.WaitWritable();
+    void WaitUntilWritable() => _writer.WaitUntilWritable(_writer.ResumeSignal.GetRemainingTimeout());
     void ResumeWrite(Exception? exception = null) => _writer.ResumeWrite(exception);
     Exception TranslateAbort(Exception ex) => _writer.TranslateAbort(ex);
 
-    // Dispatches a pending Resumable's driver loop to a LongRunning thread. Caller is
+    // Dispatches a pending resumable write's driver loop to a LongRunning thread. Caller is
     // expected to have already observed that the resumable isn't completed (so the shunt is
-    // needed). The LongRunning delegate opens its own ResumableScope so the transport's TLS
+    // needed). The LongRunning delegate opens its own ResumableWriteScope so the transport's TLS
     // slot stays populated through the resumption thread's lifetime, then runs the same
     // driver body the sync wrappers use inline
-    // (while (!t.IsCompleted) { WaitWritable, Signal }, then GetResult).
+    // (while (!t.IsCompleted) { WaitUntilWritable, Signal }, then GetResult).
     public ValueTask RunResumableTask(ValueTask resumable)
     {
         var encoder = this;
         return new ValueTask(Task.Factory.StartNew(static state =>
         {
             var (e, t) = ((PgEncoder, ValueTask))state!;
-            using var _ = e.BeginResumableScope();
+            using var _ = e.BeginResumableWriteScope();
             while (!t.IsCompleted)
             {
                 try
                 {
-                    e.WaitWritable();
+                    e.WaitUntilWritable();
                 }
                 catch (Exception ex)
                 {
-                    // A WaitWritable throw (deadline expiry, abort) would otherwise strand the parked
+                    // A WaitUntilWritable throw (deadline expiry, abort) would otherwise strand the parked
                     // write coroutine and leak the exception onto this side task. Route it through the
                     // signal's fault path so the coroutine unwinds and the abort-translated exception
                     // reaches the flow's execute path.
@@ -90,14 +106,14 @@ readonly struct PgEncoder
         return new();
     }
 
-    // Names the caller's intent: "I have a ResumableScope open, drive my returned task."
+    // Names the caller's intent: "I have a ResumableWriteScope open, drive my returned task."
     // Body is just the Async variant. Transport reads the TLS signal and translates WouldBlock
     // into a pending ValueTask backed by it. Kept as a separate method so call sites stay
     // self-documenting and the Async / Resumable bodies can diverge later if serializer
     // auto-flush needs different scheduling.
     public ValueTask WriteQueryResumable(string commandText) => WriteQueryAsync(commandText);
 
-    // Sync core. Back-pressure is handled at the transport layer via the TLS-armed Resumable
+    // Sync core. Back-pressure is handled at the transport layer via the TLS-armed resumable-write
     // path, not at the encoder level, so this is just the buffer fill.
     public void WriteQuery(string commandText)
     {
@@ -479,12 +495,12 @@ readonly struct PgEncoder
     }
 
     // Calls FlushAsync expecting the caller (flow level) to have opened an
-    // EncoderResumableScope so the writer's signal is in the transport TLS slot. The
+    // ResumableWriteScope so the writer's signal is in the transport TLS slot. The
     // transport picks up the TLS signal, does sync non-blocking syscalls, and translates
     // WouldBlock into a pending ValueTask backed by that signal. No exception, just a
     // pending shape that propagates faithfully through SslStream, NetworkStream, and any
     // other async wrapper in between. The flow's driver (inline or shunted to LongRunning)
-    // holds the signal reference and drives it externally via WaitWritable plus
+    // holds the signal reference and drives it externally via WaitUntilWritable plus
     // signal.Signal. No try/catch at this layer, the transport is the coroutine, the flow
     // is the driver.
 

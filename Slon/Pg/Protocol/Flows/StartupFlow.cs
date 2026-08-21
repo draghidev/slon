@@ -29,6 +29,7 @@ sealed partial class StartupFlow : PgClientFlow
     // safe "not received" sentinel; SecretKey is opaque 32-bit so ProcessId is the indicator).
     internal int BackendProcessId { get; private set; }
     internal int BackendSecretKey { get; private set; }
+    internal PgClientOptions Options => _options;
 
     public StartupFlow(bool async, PgClientOptions options, X509Certificate? remoteCertificate,
         TimeSpan startupTimeout = default)

@@ -1,8 +1,6 @@
 using System.IO.Pipelines;
 using System.Net;
 using System.Net.Sockets;
-using System.Net.Security;
-using System.Security.Cryptography.X509Certificates;
 using Slon.Pipelines;
 using Slon.Runtime;
 
@@ -15,7 +13,7 @@ sealed class SocketStreamConnection : TransportConnection
     readonly TransportConnectionOptions _options;
     DefaultStreamPipeReader _reader;
     DefaultStreamPipeWriter _writer;
-    DisposalStream _disposalStream;
+    PipeStreamOwner _pipeStreamOwner;
     Stream _stream;
     bool _aborted;
 
@@ -25,20 +23,20 @@ sealed class SocketStreamConnection : TransportConnection
         _networkStream = networkStream;
         _stream = stream;
         _options = options;
-        (_reader, _writer, _disposalStream) = CreatePipes(stream, options);
+        (_reader, _writer, _pipeStreamOwner) = CreatePipes(stream, options);
     }
 
-    static (DefaultStreamPipeReader Reader, DefaultStreamPipeWriter Writer, DisposalStream DisposalStream) CreatePipes(Stream stream, TransportConnectionOptions options)
+    static (DefaultStreamPipeReader Reader, DefaultStreamPipeWriter Writer, PipeStreamOwner Owner) CreatePipes(Stream stream, TransportConnectionOptions options)
     {
-        var disposalStream = new DisposalStream(stream);
+        var owner = new PipeStreamOwner(stream);
         // NetworkStream cancels natively from the token passed to Read/Write, so
         // CancelPending* (and its per-op token-source registration) is dead weight here.
-        var reader = new DefaultStreamPipeReader(disposalStream, new StreamPipeReaderOptions(bufferSize: options.ReaderSegmentSize, useZeroByteReads: options.UseZeroByteReads), supportCancelPending: false);
-        var writer = new DefaultStreamPipeWriter(disposalStream, new StreamPipeWriterOptions(minimumBufferSize: options.WriterSegmentSize), supportCancelPending: false)
+        var reader = new DefaultStreamPipeReader(stream, new StreamPipeReaderOptions(bufferSize: options.ReaderSegmentSize, useZeroByteReads: options.UseZeroByteReads), supportCancelPending: false, owner);
+        var writer = new DefaultStreamPipeWriter(stream, new StreamPipeWriterOptions(minimumBufferSize: options.WriterSegmentSize), supportCancelPending: false, owner)
         {
             RetainBuffer = !options.UseZeroByteReads
         };
-        return (reader, writer, disposalStream);
+        return (reader, writer, owner);
     }
 
     static Socket CreateUnconnectedSocket(AddressFamily addressFamily)
@@ -59,10 +57,9 @@ sealed class SocketStreamConnection : TransportConnection
 
     public override PipeReader Reader => _reader;
     public override PipeWriter Writer => _writer;
-    public override X509Certificate? RemoteCertificate => (_stream as SslStream)?.RemoteCertificate;
     public override bool IsConnectionLost(Exception exception)
-        => exception is SocketException || exception is IOException { InnerException: SocketException };
-    public override void WaitWritable() => _networkStream.WaitWritable();
+        => exception is SocketException or IOException { InnerException: SocketException };
+    public override void WaitUntilWritable(TimeSpan timeout = default) => _networkStream.WaitUntilWritable(timeout);
 
     public static Factory CreateFactory(EndPoint endPoint, TransportConnectionOptions? options = null) => new(endPoint, options);
 
@@ -92,7 +89,7 @@ sealed class SocketStreamConnection : TransportConnection
         }
         var write = new List<Socket> {socket};
         var error = new List<Socket> {socket};
-        Socket.Select(null, write, error, checked((int)timeout.Ticks / (int)TimeSpan.TicksPerMicrosecond));
+        Socket.Select(null, write, error, Deadline.ToTimeoutMicroseconds(timeout));
         var errorCode = (int) socket.GetSocketOption(SocketOptionLevel.Socket, SocketOptionName.Error)!;
         if (errorCode != 0)
             throw new SocketException(errorCode);
@@ -145,8 +142,6 @@ sealed class SocketStreamConnection : TransportConnection
             _endPoint = endPoint;
         }
 
-        public override bool SupportsSynchronousIO => true;
-
         public override TransportConnection ConnectTransformed(Func<Stream, Stream> transform, TimeSpan timeout = default)
         {
             ArgumentNullException.ThrowIfNull(transform);
@@ -198,10 +193,10 @@ sealed class SocketStreamConnection : TransportConnection
             var transformed = ApplyTransform(socketConnection._stream, transform);
             try
             {
-                socketConnection._disposalStream.LeaveOpen();
+                socketConnection._pipeStreamOwner.LeaveOpen();
                 socketConnection._reader.Complete();
                 socketConnection._writer.Complete();
-                (socketConnection._reader, socketConnection._writer, socketConnection._disposalStream) = CreatePipes(transformed, socketConnection._options);
+                (socketConnection._reader, socketConnection._writer, socketConnection._pipeStreamOwner) = CreatePipes(transformed, socketConnection._options);
                 socketConnection._stream = transformed;
                 return socketConnection;
             }
@@ -222,47 +217,20 @@ sealed class SocketStreamConnection : TransportConnection
             => transform(stream) ?? throw new InvalidOperationException("The connection transform returned null.");
     }
 
-    sealed class DisposalStream(Stream stream) : Stream
+    sealed class PipeStreamOwner(Stream stream) : IStreamOwner
     {
         bool _leaveOpen;
         int _disposed;
 
         internal void LeaveOpen() => _leaveOpen = true;
 
-        public override bool CanRead => stream.CanRead;
-        public override bool CanSeek => stream.CanSeek;
-        public override bool CanTimeout => stream.CanTimeout;
-        public override bool CanWrite => stream.CanWrite;
-        public override long Length => stream.Length;
-        public override long Position { get => stream.Position; set => stream.Position = value; }
-        public override int ReadTimeout { get => stream.ReadTimeout; set => stream.ReadTimeout = value; }
-        public override int WriteTimeout { get => stream.WriteTimeout; set => stream.WriteTimeout = value; }
-
-        public override void Flush() => stream.Flush();
-        public override Task FlushAsync(CancellationToken cancellationToken) => stream.FlushAsync(cancellationToken);
-        public override int Read(byte[] buffer, int offset, int count) => stream.Read(buffer, offset, count);
-        public override int Read(Span<byte> buffer) => stream.Read(buffer);
-        public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
-            => stream.ReadAsync(buffer, offset, count, cancellationToken);
-        public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
-            => stream.ReadAsync(buffer, cancellationToken);
-        public override long Seek(long offset, SeekOrigin origin) => stream.Seek(offset, origin);
-        public override void SetLength(long value) => stream.SetLength(value);
-        public override void Write(byte[] buffer, int offset, int count) => stream.Write(buffer, offset, count);
-        public override void Write(ReadOnlySpan<byte> buffer) => stream.Write(buffer);
-        public override Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
-            => stream.WriteAsync(buffer, offset, count, cancellationToken);
-        public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default)
-            => stream.WriteAsync(buffer, cancellationToken);
-
-        protected override void Dispose(bool disposing)
+        public void Dispose()
         {
-            if (disposing && Interlocked.Exchange(ref _disposed, 1) is 0 && !_leaveOpen)
+            if (Interlocked.Exchange(ref _disposed, 1) is 0 && !_leaveOpen)
                 stream.Dispose();
-            base.Dispose(disposing);
         }
 
-        public override ValueTask DisposeAsync()
+        public ValueTask DisposeAsync()
         {
             if (Interlocked.Exchange(ref _disposed, 1) is not 0 || _leaveOpen)
                 return default;
@@ -270,7 +238,7 @@ sealed class SocketStreamConnection : TransportConnection
         }
     }
 
-    // Reads TransportConnection.SyncNonBlockingSignal to decide whether WriteAsync does sync
+    // Reads TransportConnection.CurrentResumableWrite to decide whether WriteAsync does sync
     // non-blocking syscalls. With a signal set it returns a pending ValueTask backed by that
     // signal on WouldBlock, never throwing. Without one it falls through to base
     // NetworkStream's normal async I/O. The "lie" lets SslStream and any other async wrappers
@@ -281,17 +249,17 @@ sealed class SocketStreamConnection : TransportConnection
         public SealedNetworkStream(Socket socket, bool ownsSocket) : base(socket, ownsSocket)
         {
             // NetworkStream's constructor validates that socket.Blocking is true and refuses
-            // non-blocking sockets. Flip it AFTER base construction so our WriteAsync override
-            // gets non-blocking semantics. The read path needs the same treatment before this
-            // is safe for full integration use, but it works for the write-only tests below.
+            // non-blocking sockets. Flip it after base construction; the synchronous Read/Write
+            // overrides below turn WouldBlock into readiness waits.
             socket.Blocking = false;
         }
 
         public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default)
         {
-            // No TLS signal == normal async I/O path (TP completion via SocketAsyncEngine).
+            // No TLS binding == normal async I/O path (TP completion via SocketAsyncEngine).
             // This is the async-flow path, unaffected by the coroutine pattern.
-            var signal = SyncNonBlockingSignal;
+            var resumableWrite = CurrentResumableWrite;
+            var signal = resumableWrite.Signal;
             if (signal is null)
                 return base.WriteAsync(buffer, cancellationToken);
 
@@ -305,7 +273,8 @@ sealed class SocketStreamConnection : TransportConnection
                     // Cold path: rest of the buffer needs to suspend. Hand off to the coroutine
                     // capturing the signal (so the flow's driver can clear TLS after this
                     // initial call returns without affecting the in-flight coroutine).
-                    return WriteAsyncCoroutine(buffer, signal, cancellationToken);
+                    return WriteAsyncCoroutine(buffer, signal,
+                        ResumeSignal.CreateDeadline(resumableWrite.Timeout), cancellationToken);
                 }
                 if (errorCode != SocketError.Success)
                     return ValueTask.FromException(new SocketException((int)errorCode));
@@ -314,14 +283,15 @@ sealed class SocketStreamConnection : TransportConnection
             return ValueTask.CompletedTask;
         }
 
-        async ValueTask WriteAsyncCoroutine(ReadOnlyMemory<byte> buffer, WriteResumeSignal signal, CancellationToken cancellationToken)
+        async ValueTask WriteAsyncCoroutine(ReadOnlyMemory<byte> buffer, ResumeSignal signal,
+            Deadline? deadline, CancellationToken cancellationToken)
         {
             while (buffer.Length > 0)
             {
                 var sent = Socket.Send(buffer.Span, SocketFlags.None, out var errorCode);
                 if (errorCode == SocketError.WouldBlock)
                 {
-                    await signal.Pending().ConfigureAwait(false);
+                    await signal.Pending(deadline).ConfigureAwait(false);
                     continue;
                 }
                 if (errorCode != SocketError.Success)
@@ -330,16 +300,13 @@ sealed class SocketStreamConnection : TransportConnection
             }
         }
 
-        // Exposed so the flow-level driver can park its thread until the kernel reports
-        // writability. Honors the TLS-carried SyncNonBlockingDeadline set by ResumableScope
-        // so per-command timeouts work end-to-end without a separate signature. Throws
-        // TimeoutException on expiry so a dead peer doesn't park the driver thread forever.
-        public void WaitWritable() => PollWritableOrThrow(SyncNonBlockingDeadline);
+        public void WaitUntilWritable(TimeSpan timeout = default)
+            => PollOrThrow(timeout, SelectMode.SelectWrite, "Write");
 
         // Sync Write. The socket is non-blocking (set at construction), so we own the local
         // reactor loop here. Sources the deadline from the Stream's WriteTimeout property
         // (the standard sync-stream timeout knob) rather than the TLS slot, since sync Write
-        // callers aren't going through ResumableScope. One Deadline per Write call so the
+        // callers aren't going through ResumableWriteScope. One Deadline per Write call so the
         // whole operation must complete within WriteTimeout, matching the NetworkStream
         // contract.
         public override void Write(ReadOnlySpan<byte> buffer)
@@ -397,24 +364,11 @@ sealed class SocketStreamConnection : TransportConnection
         void PollWritableOrThrow(Deadline? deadline) => PollOrThrow(deadline, SelectMode.SelectWrite, "Write");
 
         void PollOrThrow(Deadline? deadline, SelectMode mode, string opName)
+            => PollOrThrow(deadline?.GetRemaining() ?? Timeout.InfiniteTimeSpan, mode, opName);
+
+        void PollOrThrow(TimeSpan timeout, SelectMode mode, string opName)
         {
-            // Null deadline means infinite. Otherwise compute remaining (which itself throws
-            // TimeoutException if already elapsed). Socket.Poll uses -1 for infinite and
-            // positive value as microseconds. Clamp ms-to-us conversion at int.MaxValue for
-            // very large remaining intervals.
-            int pollUs;
-            if (deadline is { } d)
-            {
-                var remaining = d.GetRemaining();
-                pollUs = remaining == Timeout.InfiniteTimeSpan
-                    ? -1
-                    : (int)Math.Min((long)remaining.TotalMilliseconds * 1000, int.MaxValue);
-            }
-            else
-            {
-                pollUs = -1;
-            }
-            if (!Socket.Poll(pollUs, mode))
+            if (!Socket.Poll(Deadline.ToTimeoutMicroseconds(timeout), mode))
                 throw new IOException($"{opName} timed out waiting for socket readiness.", new SocketException((int)SocketError.TimedOut));
         }
     }

@@ -2,28 +2,41 @@ using System.Net;
 using System.Net.Security;
 using System.Net.Sockets;
 using System.Security.Cryptography.X509Certificates;
+using Slon.Pg.Protocol;
+using Slon.Runtime;
 using Slon.Transport;
 
 namespace Slon.Tests.Transport;
 
-// Unit tests for the non-blocking transport primitives in isolation: the WriteResumeSignal
-// auto-reset cycle and inline-continuation guarantee, the ResumableScope TLS lifecycle,
+// Unit tests for the non-blocking transport primitives in isolation: the ResumeSignal
+// auto-reset cycle and inline-continuation guarantee, the ResumableWriteScope TLS lifecycle,
 // and end-to-end byte delivery through SocketStreamConnection and SslStream.
 [TestClass]
 public class TransportTests
 {
     [TestMethod]
-    public void WriteResumeSignal_Pending_IsPending_BeforeSignal()
+    public void Deadline_TimeoutConversionsPreserveInfiniteAndRoundUp()
     {
-        var signal = new WriteResumeSignal();
+        Assert.AreEqual(Timeout.Infinite, Deadline.ToTimeoutMilliseconds(default));
+        Assert.AreEqual(Timeout.Infinite, Deadline.ToTimeoutMicroseconds(Timeout.InfiniteTimeSpan));
+        Assert.AreEqual(1, Deadline.ToTimeoutMilliseconds(TimeSpan.FromTicks(1)));
+        Assert.AreEqual(2, Deadline.ToTimeoutMilliseconds(TimeSpan.FromMilliseconds(1) + TimeSpan.FromTicks(1)));
+        Assert.AreEqual(1, Deadline.ToTimeoutMicroseconds(TimeSpan.FromTicks(1)));
+        Assert.ThrowsExactly<ArgumentOutOfRangeException>(() => new Deadline(TimeSpan.FromTicks(-1)));
+    }
+
+    [TestMethod]
+    public void ResumeSignal_Pending_IsPending_BeforeSignal()
+    {
+        var signal = new ResumeSignal();
         var t = signal.Pending();
         Assert.IsFalse(t.IsCompleted, "Pending() before Signal should be pending");
     }
 
     [TestMethod]
-    public void WriteResumeSignal_Signal_CompletesPending()
+    public void ResumeSignal_Signal_CompletesPending()
     {
-        var signal = new WriteResumeSignal();
+        var signal = new ResumeSignal();
         var t = signal.Pending();
         signal.Signal();
         Assert.IsTrue(t.IsCompleted);
@@ -31,9 +44,9 @@ public class TransportTests
     }
 
     [TestMethod]
-    public void WriteResumeSignal_AutoResets_OnConsumption_AllowsNewCycle()
+    public void ResumeSignal_AutoResets_OnConsumption_AllowsNewCycle()
     {
-        var signal = new WriteResumeSignal();
+        var signal = new ResumeSignal();
 
         var t1 = signal.Pending();
         signal.Signal();
@@ -48,9 +61,9 @@ public class TransportTests
     }
 
     [TestMethod]
-    public async Task WriteResumeSignal_Continuation_RunsInline_OnSignalThread()
+    public async Task ResumeSignal_Continuation_RunsInline_OnSignalThread()
     {
-        var signal = new WriteResumeSignal();
+        var signal = new ResumeSignal();
         var continuationThreadId = 0;
 
         var awaitTask = AwaitSignal();
@@ -69,35 +82,56 @@ public class TransportTests
     }
 
     [TestMethod]
-    public void ResumableScope_Sets_AndRestores_TLS()
+    public void ResumableWriteScope_Sets_AndRestores_TLS()
     {
-        Assert.IsNull(TransportConnection.SyncNonBlockingSignal, "TLS should start null");
+        Assert.IsNull(TransportConnection.CurrentResumableWrite.Signal, "TLS should start empty");
 
-        var signal = new WriteResumeSignal();
-        using (new ResumableScope(signal))
+        var signal = new ResumeSignal();
+        using (new PgEncoder.ResumableWriteScope(signal))
         {
-            Assert.AreSame(signal, TransportConnection.SyncNonBlockingSignal);
+            Assert.AreSame(signal, TransportConnection.CurrentResumableWrite.Signal);
         }
-        Assert.IsNull(TransportConnection.SyncNonBlockingSignal, "TLS should restore to null after Dispose");
+        Assert.IsNull(TransportConnection.CurrentResumableWrite.Signal, "TLS should restore after Dispose");
     }
 
     [TestMethod]
-    public void ResumableScope_Nests_AndRestores_OuterValue()
+    public void ResumableWriteScope_Nests_AndRestores_OuterValue()
     {
-        var outer = new WriteResumeSignal();
-        var inner = new WriteResumeSignal();
+        var outer = new ResumeSignal();
+        var inner = new ResumeSignal();
 
-        using (new ResumableScope(outer))
+        using (new PgEncoder.ResumableWriteScope(outer))
         {
-            Assert.AreSame(outer, TransportConnection.SyncNonBlockingSignal);
-            using (new ResumableScope(inner))
+            Assert.AreSame(outer, TransportConnection.CurrentResumableWrite.Signal);
+            using (new PgEncoder.ResumableWriteScope(inner))
             {
-                Assert.AreSame(inner, TransportConnection.SyncNonBlockingSignal);
+                Assert.AreSame(inner, TransportConnection.CurrentResumableWrite.Signal);
             }
-            Assert.AreSame(outer, TransportConnection.SyncNonBlockingSignal,
+            Assert.AreSame(outer, TransportConnection.CurrentResumableWrite.Signal,
                 "Inner scope dispose should restore outer signal, not null");
         }
-        Assert.IsNull(TransportConnection.SyncNonBlockingSignal);
+        Assert.IsNull(TransportConnection.CurrentResumableWrite.Signal);
+    }
+
+    [TestMethod]
+    public void ResumeSignal_CarriesWriteDeadlineBeyondScope()
+    {
+        var signal = new ResumeSignal();
+        ValueTask pending;
+
+        using (new PgEncoder.ResumableWriteScope(signal, TimeSpan.FromSeconds(1)))
+        {
+            var resumableWrite = TransportConnection.CurrentResumableWrite;
+            pending = signal.Pending(ResumeSignal.CreateDeadline(resumableWrite.Timeout));
+        }
+
+        Assert.IsNull(TransportConnection.CurrentResumableWrite.Signal);
+        Assert.IsTrue(signal.GetRemainingTimeout() > TimeSpan.Zero
+            && signal.GetRemainingTimeout() <= TimeSpan.FromSeconds(1));
+
+        signal.Signal();
+        pending.GetAwaiter().GetResult();
+        Assert.AreEqual(Timeout.InfiniteTimeSpan, signal.GetRemainingTimeout());
     }
 
     // End-to-end: loopback TCP listener accepts a connection, we wrap our side in a
@@ -116,12 +150,12 @@ public class TransportTests
 
         var payload = new byte[] { 0x01, 0x02, 0x03, 0x04, 0x05 };
 
-        // Open the ResumableScope so the transport's WriteAsync takes the sync non-blocking
-        // path. ResumableScope is a ref struct, can't cross awaits, only the scope-internal
+        // Open the ResumableWriteScope so the transport's WriteAsync takes the sync non-blocking
+        // path. ResumableWriteScope is a ref struct, can't cross awaits, only the scope-internal
         // call lives inside. The flush should sync-complete because 5 bytes fit in any
         // reasonable send buffer with no WouldBlock.
         ValueTask<System.IO.Pipelines.FlushResult> writeAndFlush;
-        using (new ResumableScope(new WriteResumeSignal()))
+        using (new PgEncoder.ResumableWriteScope(new ResumeSignal()))
             writeAndFlush = WriteAndFlush(conn, payload);
 
         var flushResult = await writeAndFlush;
@@ -173,7 +207,7 @@ public class TransportTests
 
         var payload = new byte[] { 0x10, 0x20, 0x30, 0x40 };
         ValueTask writeTask;
-        using (new ResumableScope(new WriteResumeSignal()))
+        using (new PgEncoder.ResumableWriteScope(new ResumeSignal()))
             writeTask = clientSsl.WriteAsync(payload);
         await writeTask;
         await clientSsl.FlushAsync();
@@ -207,9 +241,9 @@ public class TransportTests
 
         var payload = new byte[payloadLength];
         Random.Shared.NextBytes(payload);
-        var signal = new WriteResumeSignal();
+        var signal = new ResumeSignal();
         ValueTask writeTask;
-        using (new ResumableScope(signal))
+        using (new PgEncoder.ResumableWriteScope(signal))
             writeTask = clientSsl.WriteAsync(payload);
 
         Assert.IsFalse(writeTask.IsCompleted,
@@ -223,7 +257,7 @@ public class TransportTests
                 spin.SpinOnce();
             if (writeTask.IsCompleted)
                 break;
-            inner.WaitWritable();
+            inner.WaitUntilWritable();
             signal.Signal();
         }
         await writeTask;

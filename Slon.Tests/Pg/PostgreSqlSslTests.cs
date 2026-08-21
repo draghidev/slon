@@ -634,8 +634,6 @@ public class PostgreSqlSslTests
     sealed class FailingTransportFactory : TransportConnection.Factory
     {
         public int Attempts { get; private set; }
-        public override bool SupportsSynchronousIO => true;
-
         public override TransportConnection ConnectTransformed(Func<Stream, Stream> transform, TimeSpan timeout = default)
         {
             Attempts++;
@@ -656,8 +654,6 @@ public class PostgreSqlSslTests
     sealed class CountingTransportFactory(TransportConnection.Factory inner) : TransportConnection.Factory
     {
         public int Attempts { get; private set; }
-        public override bool SupportsSynchronousIO => inner.SupportsSynchronousIO;
-
         public override TransportConnection ConnectTransformed(Func<Stream, Stream> transform,
             TimeSpan timeout = default)
         {

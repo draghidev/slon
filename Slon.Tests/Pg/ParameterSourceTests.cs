@@ -15,7 +15,7 @@ public class ParameterSourceTests
     static (PgEncoder Encoder, ProtocolDataWriter Writer, BufferOutputWriter Output) NewEncoder()
     {
         var output = new BufferOutputWriter();
-        var writer = new ProtocolDataWriter(output, Encoding.UTF8, static () => { }, default, null!);
+        var writer = new ProtocolDataWriter(output, Encoding.UTF8, static _ => { }, default, null!);
         var flow = new CommandFlow(async: false, ReadOnlySpan<Command>.Empty);
         return (new(flow.GetExecutionControl(null!), writer), writer, output);
     }

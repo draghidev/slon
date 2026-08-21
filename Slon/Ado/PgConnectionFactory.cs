@@ -13,21 +13,17 @@ sealed class PgConnectionFactory(
     Action<PgClientProtocolOptions>? configureOptions = null)
     : IPoolConnectionFactory<PgConnection>
 {
-    readonly PgClientProtocolFactory _protocolFactory = new(clientOptions, transportConnectionFactory, configureOptions);
+    readonly PgClientProtocolFactory _protocolFactory = new(
+        clientOptions, transportConnectionFactory, configureOptions);
 
     PgConnection Create(ConnectionPoolContext<PgConnection>? poolContext, TimeSpan timeout = default)
-        => _protocolFactory.Create(
-            (protocolOptions, clientOptions, transport, remaining, upgrade, started) =>
-                PgConnection.Create(protocolOptions, clientOptions, transport, tracker, poolContext,
-                    remaining, upgrade, started),
-            timeout);
+        => _protocolFactory.Create(startup =>
+            PgConnection.Create(startup, tracker, poolContext), timeout);
 
     ValueTask<PgConnection> CreateAsync(ConnectionPoolContext<PgConnection>? poolContext,
         CancellationToken cancellationToken = default)
         => _protocolFactory.CreateAsync(
-            (protocolOptions, clientOptions, transport, token, upgrade, started) =>
-                PgConnection.CreateAsync(protocolOptions, clientOptions, transport, tracker,
-                    poolContext, token, upgrade, started),
+            (startup, token) => PgConnection.CreateAsync(startup, tracker, poolContext, token),
             cancellationToken);
 
     public PgConnection Create(TimeSpan timeout = default)

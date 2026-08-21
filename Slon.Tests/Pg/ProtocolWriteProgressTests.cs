@@ -3,6 +3,7 @@ using System.Text;
 using Slon.Pg;
 using Slon.Pg.Protocol;
 using Slon.Pg.Protocol.Flows;
+using Slon.Transport;
 
 namespace Slon.Tests.Pg;
 
@@ -121,7 +122,7 @@ public class ProtocolWriteProgressTests
     }
 
     [TestMethod]
-    public async Task RunResumableTask_WaitWritableThrowsUnderAbort_RoutesClosedToAwaiter()
+    public async Task RunResumableTask_WaitUntilWritableThrowsUnderAbort_RoutesClosedToAwaiter()
     {
         // A real protocol, driven to closed, just to obtain the canonical ClosedException.
         var closedProtocol = await PgTestPool.NewIsolatedAsync();
@@ -129,20 +130,33 @@ public class ProtocolWriteProgressTests
         var control = new PgClientProtocol.Control(closedProtocol, poolFacing: true);
         Assert.IsNotNull(control.ClosedException, "protocol should be closed after DisposeAsync");
 
-        // WaitWritable stands in for the parked sync write's deadline/abort fault. A pre-cancelled
+        // WaitUntilWritable stands in for the parked sync write's deadline/abort fault. A pre-cancelled
         // abort token drives TranslateAbort to the closed exception (decoupled from the disposed CTS).
-        Action waitWritable = () => throw new TimeoutException("simulated write-deadline expiry");
+        TimeSpan? observedTimeout = null;
+        Action<TimeSpan> waitUntilWritable = timeout =>
+        {
+            observedTimeout = timeout;
+            throw new TimeoutException("simulated write-deadline expiry");
+        };
         var writer = new ProtocolDataWriter(
-            new BufferOutputWriter(), Encoding.UTF8, waitWritable, new CancellationToken(canceled: true), control);
+            new BufferOutputWriter(), Encoding.UTF8, waitUntilWritable,
+            new CancellationToken(canceled: true), control, TimeSpan.FromSeconds(1));
         var encoder = new PgEncoder(default, writer);
 
         // The "write coroutine": parks on the signal exactly as FlushResumable does on WouldBlock.
-        async ValueTask Park() => await writer.ResumeSignal.Pending();
-        var body = Park();
+        async ValueTask Park()
+        {
+            var resumableWrite = TransportConnection.CurrentResumableWrite;
+            await writer.ResumeSignal.Pending(ResumeSignal.CreateDeadline(resumableWrite.Timeout));
+        }
+        ValueTask body;
+        using (encoder.BeginResumableWriteScope())
+            body = Park();
         Assert.IsFalse(body.IsCompleted, "the coroutine should be parked on the signal");
 
         var driver = encoder.RunResumableTask(body);
 
         await Assert.ThrowsExactlyAsync<PgClientClosedException>(async () => await driver);
+        Assert.IsTrue(observedTimeout > TimeSpan.Zero && observedTimeout <= TimeSpan.FromSeconds(1));
     }
 }

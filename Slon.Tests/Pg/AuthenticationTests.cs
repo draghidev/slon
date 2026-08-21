@@ -188,7 +188,6 @@ public class AuthenticationTests
     {
         // Construct the internal options directly to bypass public validation and pin the flow's
         // defense in depth: no credential may leave even with an impossible configuration.
-        var certificate = TlsTestCertificate.Instance;
         var options = new PgClientOptions
         {
             EndPoint = new DnsEndPoint("localhost", 5432),
@@ -201,8 +200,7 @@ public class AuthenticationTests
                 ChannelBinding = PostgreSqlChannelBinding.Require
             }
         };
-        var transport = new StartupTransport(Authentication(authenticationType, authenticationType == 5 ? new byte[4] : []),
-            certificate);
+        var transport = new StartupTransport(Authentication(authenticationType, authenticationType == 5 ? new byte[4] : []));
         var protocol = PgClientProtocol.Create(new(options));
 
         await AssertChannelBindingRejectedAsync(protocol.StartAsync(options, transport));
@@ -214,7 +212,6 @@ public class AuthenticationTests
     public async Task ChannelBindingRequired_DoesNotSendOAuthBearerToken()
     {
         // Deliberately bypass public validation to exercise the flow-level downgrade guard.
-        var certificate = TlsTestCertificate.Instance;
         var providerCalls = 0;
         var options = new PgClientOptions
         {
@@ -234,7 +231,7 @@ public class AuthenticationTests
                 ChannelBinding = PostgreSqlChannelBinding.Require
             }
         };
-        var transport = new StartupTransport(Authentication(10, "OAUTHBEARER\0\0"u8), certificate);
+        var transport = new StartupTransport(Authentication(10, "OAUTHBEARER\0\0"u8));
         var protocol = PgClientProtocol.Create(new(options));
 
         await AssertChannelBindingRejectedAsync(protocol.StartAsync(options, transport));
@@ -586,20 +583,16 @@ public class AuthenticationTests
     sealed class StartupTransport : TransportConnection
     {
         readonly MemoryStream _written = new();
-        readonly X509Certificate? _remoteCertificate;
-
-        public StartupTransport(byte[] responses, X509Certificate? remoteCertificate = null)
+        public StartupTransport(byte[] responses)
         {
-            _remoteCertificate = remoteCertificate;
             Reader = new DefaultStreamPipeReader(new MemoryStream(responses, writable: false),
                 new StreamPipeReaderOptions(useZeroByteReads: false), supportCancelPending: false);
             Writer = new DefaultStreamPipeWriter(_written, new StreamPipeWriterOptions(), supportCancelPending: false);
         }
 
         public byte[] WrittenBytes => _written.ToArray();
-        public override X509Certificate? RemoteCertificate => _remoteCertificate;
         public override PipeReader Reader { get; }
         public override PipeWriter Writer { get; }
-        public override void WaitWritable() { }
+        public override void WaitUntilWritable(TimeSpan timeout) { }
     }
 }

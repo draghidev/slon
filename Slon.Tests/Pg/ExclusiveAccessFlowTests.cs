@@ -560,7 +560,7 @@ public class ExclusiveAccessFlowTests : ConnectionCreatingTest
 
         public override PipeReader Reader => _toClient.Reader;
         public override PipeWriter Writer { get; }
-        public override void WaitWritable() { }
+        public override void WaitUntilWritable(TimeSpan timeout) { }
 
         public Task HeldWriteEntered => _stream.HeldWriteEntered;
 
@@ -578,7 +578,7 @@ public class ExclusiveAccessFlowTests : ConnectionCreatingTest
 
         using var scopeAbort = new CancellationTokenSource();
         var sink = new ParkOnFlushSink();
-        var baseWriter = new ProtocolDataWriter(sink, Encoding.UTF8, static () => { }, default, control);
+        var baseWriter = new ProtocolDataWriter(sink, Encoding.UTF8, static _ => { }, default, control);
         var scopeWriter = ProtocolDataWriter.CreateScopeShell(baseWriter, scopeAbort.Token, control);
         var flush = scopeWriter.FlushAsync(CancellationToken.None);
         Assert.IsFalse(flush.IsCompleted);

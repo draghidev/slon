@@ -17,36 +17,41 @@ sealed class ProtocolDataWriter : IOutputWriter
     readonly ProtocolWritePipe _pipe;
     readonly CancellationToken _abortToken;
     readonly PgClientProtocol.Control _control;
+    readonly TimeSpan _writeTimeout;
     CancellationTokenSource _cts;
     ParameterWriter? _parameterWriter;
     object? _parameterWriterState;
     Encoding? _parameterWriterEncoding;
 
-    ProtocolDataWriter(ProtocolWritePipe pipe, CancellationToken abortToken, PgClientProtocol.Control control)
+    ProtocolDataWriter(ProtocolWritePipe pipe, CancellationToken abortToken,
+        PgClientProtocol.Control control, TimeSpan writeTimeout)
     {
         _pipe = pipe;
         _abortToken = abortToken;
         _control = control;
+        _writeTimeout = writeTimeout;
         _cts = CancellationTokenSource.CreateLinkedTokenSource(abortToken);
     }
 
-    public ProtocolDataWriter(IOutputWriter writer, Encoding clientEncoding, Action waitWritable, CancellationToken abortToken, PgClientProtocol.Control control)
-        : this(new ProtocolWritePipe(writer, clientEncoding, waitWritable), abortToken, control)
+    public ProtocolDataWriter(IOutputWriter writer, Encoding clientEncoding, Action<TimeSpan> waitUntilWritable,
+        CancellationToken abortToken, PgClientProtocol.Control control, TimeSpan writeTimeout = default)
+        : this(new ProtocolWritePipe(writer, clientEncoding, waitUntilWritable), abortToken, control, writeTimeout)
     {
     }
 
     // Builds a scope-bound shell over the shared pipe with the scope's abort token.
     public static ProtocolDataWriter CreateScopeShell(ProtocolDataWriter baseShell, CancellationToken abortToken, PgClientProtocol.Control control)
-        => new(baseShell._pipe, abortToken, control);
+        => new(baseShell._pipe, abortToken, control, baseShell._writeTimeout);
 
     public ProtocolWritePipe Pipe => _pipe;
 
-    public WriteResumeSignal ResumeSignal => _pipe.ResumeSignal;
+    public ResumeSignal ResumeSignal => _pipe.ResumeSignal;
+    public TimeSpan WriteTimeout => _writeTimeout;
 
     public SocketError? GetSocketError(Exception ex) => _pipe.GetSocketError(ex);
 
     public void ResumeWrite(Exception? exception = null) => _pipe.ResumeWrite(exception);
-    public void WaitWritable() => _pipe.WaitWritable();
+    public void WaitUntilWritable(TimeSpan timeout = default) => _pipe.WaitUntilWritable(timeout);
 
     // Abort-to-typed-exception translation shared by the sync flush catch and the resumable driver:
     // the flow-termination verdict once the abort token has fired, else the original. The protocol's
