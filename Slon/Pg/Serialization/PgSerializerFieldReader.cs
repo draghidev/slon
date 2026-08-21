@@ -44,13 +44,21 @@ struct PgSerializerFieldReader
         return row.IsDBNull(ordinal) ? DBNull.Value : Read<object>(row, ordinal);
     }
 
-    internal async ValueTask<object> ReadObjectAsync(Row row, int ordinal,
+    internal ValueTask<object> ReadObjectAsync(Row row, int ordinal,
         CancellationToken cancellationToken = default)
     {
         _ = GetField(ordinal);
-        return await row.IsDBNullAsync(ordinal, cancellationToken).ConfigureAwait(false)
-            ? DBNull.Value
-            : await ReadAsync<object>(row, ordinal, cancellationToken).ConfigureAwait(false);
+        ref readonly var binding = ref GetBinding<object>(ordinal);
+        return ReadObjectAsync(row.IsDBNullAsync(ordinal, cancellationToken),
+            new(row, ordinal), binding, _conversionContext, cancellationToken);
+
+        static async ValueTask<object> ReadObjectAsync(ValueTask<bool> isDbNull,
+            PgField field, PgFieldBinding binding, PgConversionContext conversionContext,
+            CancellationToken cancellationToken)
+            => await isDbNull.ConfigureAwait(false)
+                ? DBNull.Value
+                : await ReadAsync<object>(field, binding, conversionContext, cancellationToken)
+                    .ConfigureAwait(false);
     }
 
     internal string GetDataTypeName(int ordinal)
@@ -58,6 +66,9 @@ struct PgSerializerFieldReader
 
     internal Type GetFieldType(int ordinal)
         => GetOptions().GetTypeInfo(type: null, GetField(ordinal).TypeOid).Type;
+
+    internal SlonDbType GetSlonDbType(int ordinal)
+        => new(GetOptions().GetDataTypeName(GetField(ordinal).TypeOid));
 
     internal RowDescription RowDescription
         => _rowDescription
@@ -91,8 +102,13 @@ struct PgSerializerFieldReader
     }
 
     ref readonly RowDescriptionField GetField(int ordinal)
-        => ref (_rowDescription
-            ?? throw new InvalidOperationException("The current result has no row description."))[ordinal];
+    {
+        var description = _rowDescription
+            ?? throw new InvalidOperationException("The current result has no row description.");
+        if (description.FieldCount is 0)
+            throw new InvalidOperationException("The current result has no columns.");
+        return ref description[ordinal];
+    }
 
     PgSerializerOptions GetOptions()
         => _options

@@ -185,6 +185,67 @@ abstract class CommandResult : IDisposable, IAsyncDisposable, IEnumerable<Row>, 
 
     public int FieldCount => _rowDescription?.FieldCount ?? 0;
 
+    internal void Complete()
+    {
+        if (IsComplete)
+            return;
+
+        _row.RevokeColumnLease();
+        while (MoveNextMessage())
+        {
+            var message = GetCurrentMessage();
+            if (message.Header.Type is PgTypes.BackendType.DataRow)
+                continue;
+
+            CompleteTerminal(message);
+            return;
+        }
+
+        EnsureComplete();
+    }
+
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
+    internal async ValueTask CompleteAsync()
+    {
+        if (IsComplete)
+            return;
+
+        await _row.RevokeColumnLeaseAsync().ConfigureAwait(false);
+        while (await MoveNextMessageAsync().ConfigureAwait(false))
+        {
+            var message = GetCurrentMessage();
+            if (message.Header.Type is PgTypes.BackendType.DataRow)
+                continue;
+
+            CompleteTerminal(message);
+            return;
+        }
+
+        EnsureComplete();
+    }
+
+    void EnsureComplete()
+    {
+        if (_requestedExecution && !IsComplete)
+            ThrowHelper.ThrowInvalidOperation("Underlying message enumerator completed before CommandComplete was returned.");
+    }
+
+    void CompleteTerminal(in BackendMessage message)
+    {
+        switch (message.Header.Type)
+        {
+            case PgTypes.BackendType.EmptyQueryResponse:
+            case PgTypes.BackendType.CommandComplete:
+            case PgTypes.BackendType.ErrorResponse:
+                CompleteCommand(message);
+                return;
+            case PgTypes.BackendType.PortalSuspended when !_simpleProtocol:
+            default:
+                ThrowHelper.ThrowUnhandledCase(message.Header.Type);
+                return;
+        }
+    }
+
     // Disposing the CommandResult skips going through our enumerator, the results won't be accessed anyway.
     // We do expose disposal methods so any I/O can easily be done the way the user expects it (sync or async)
     public abstract void Dispose();
@@ -287,7 +348,7 @@ abstract class CommandResult : IDisposable, IAsyncDisposable, IEnumerable<Row>, 
             // If a caller cancels we just unblock their task, the command will continue to wait until an I/O timeout is hit.
             // This produces better behavior when unrelated pipelined commands are enqueued, as the pipeline won't be frivolously aborted.
             var task = MoveNextAsync();
-            return cancellationToken.CanBeCanceled
+            return cancellationToken.CanBeCanceled && !task.IsCompleted
                 ? new(task.AsTask().WaitAsync(cancellationToken))
                 : task;
         }
@@ -408,34 +469,12 @@ abstract class CommandResult : IDisposable, IAsyncDisposable, IEnumerable<Row>, 
         {
             if (instance is null)
                 return;
-
-            while (MoveNext()) { }
+            instance.Complete();
         }
 
         // We enumerate all so we always get to store the error or command complete message.
         public ValueTask DisposeAsync()
-        {
-            if (instance is null)
-                return new();
-
-            var task = MoveNextAsync();
-            if (task.IsCompletedSuccessfully)
-            {
-                if (!task.Result)
-                    return new();
-
-                task = new(true);
-            }
-
-            return DisposeAsyncCore(task);
-        }
-
-        [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
-        async ValueTask DisposeAsyncCore(ValueTask<bool>? task)
-        {
-            if (task is not null && await task.GetValueOrDefault().ConfigureAwait(false))
-                while (await MoveNextAsync().ConfigureAwait(false)) { }
-        }
+            => instance?.CompleteAsync() ?? default;
 
         object IEnumerator.Current => Current;
         void IEnumerator.Reset() => throw new NotSupportedException();

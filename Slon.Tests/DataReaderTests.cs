@@ -1,10 +1,84 @@
 namespace Slon.Tests;
 
 using System.Data;
+using System.Data.Common;
+using System.Reflection;
 
 [TestClass]
 public class DataReaderTests
 {
+    [TestMethod]
+    public async Task ColumnSchema_ProjectsProtocolAndSerializerMetadata()
+    {
+        await using var command = AdoTestPool.CreateCommand("select 1::integer as value, 'x'::text as label");
+        await using var reader = await command.ExecuteReaderAsync(CancellationToken.None);
+
+        var columns = reader.GetColumnSchema();
+        Assert.HasCount(2, columns);
+        Assert.AreEqual("value", columns[0].ColumnName);
+        Assert.AreEqual(0, columns[0].ColumnOrdinal);
+        Assert.AreEqual(typeof(int), columns[0].DataType);
+        Assert.AreEqual("integer", columns[0].DataTypeName);
+        Assert.AreEqual(SlonDbTypes.Int4, columns[0].SlonDbType);
+        Assert.AreEqual("label", columns[1].ColumnName);
+        Assert.AreEqual(typeof(string), columns[1].DataType);
+        Assert.AreEqual("text", columns[1].DataTypeName);
+        Assert.AreEqual(SlonDbTypes.Text, columns[1].SlonDbType);
+
+        var providerIndependent = ((IDbColumnSchemaGenerator)reader).GetColumnSchema();
+        Assert.HasCount(2, providerIndependent);
+        Assert.IsInstanceOfType<SlonDbColumn>(providerIndependent[0]);
+
+        var asyncColumns = await reader.GetColumnSchemaAsync(CancellationToken.None);
+        Assert.HasCount(2, asyncColumns);
+
+        var schemaTable = reader.GetSchemaTable();
+        Assert.IsNotNull(schemaTable);
+        Assert.HasCount(2, schemaTable.Rows);
+        Assert.AreEqual(typeof(int), schemaTable.Rows[0]["ProviderSpecificDataType"]);
+    }
+
+    [TestMethod]
+    public async Task EnumerateCommandResults_ExposesResultsWithoutRows()
+    {
+        await using var batch = AdoTestPool.CreateBatch();
+        batch.BatchCommands.Add(batch.CreateBatchCommand("set application_name = 'slon-enumerate-command-results'"));
+        batch.BatchCommands.Add(batch.CreateBatchCommand("select 42"));
+
+        await using var reader = await batch.ExecuteReaderAsync((CommandBehavior)64,
+            CancellationToken.None);
+        Assert.AreEqual(0, reader.FieldCount);
+        Assert.IsFalse(await reader.ReadAsync(CancellationToken.None));
+
+        Assert.IsTrue(await reader.NextResultAsync(CancellationToken.None));
+        Assert.AreEqual(1, reader.FieldCount);
+        Assert.IsTrue(await reader.ReadAsync(CancellationToken.None));
+        Assert.AreEqual(42, reader.GetInt32(0));
+        Assert.IsFalse(await reader.ReadAsync(CancellationToken.None));
+        Assert.IsFalse(await reader.NextResultAsync(CancellationToken.None));
+
+        await using var reflectedBatch = AdoTestPool.CreateBatch();
+        reflectedBatch.BatchCommands.Add(reflectedBatch.CreateBatchCommand("select 1"));
+        reflectedBatch.BatchCommands.Add(reflectedBatch.CreateBatchCommand("set application_name = 'slon-reflected-command-results'"));
+        reflectedBatch.BatchCommands.Add(reflectedBatch.CreateBatchCommand("select 2"));
+
+        await using var reflectedReader = await reflectedBatch.ExecuteReaderAsync(CancellationToken.None);
+        typeof(SlonDataReader).GetProperty("EnumerateCommandResults",
+                BindingFlags.Instance | BindingFlags.NonPublic)!
+            .SetValue(reflectedReader, true);
+        Assert.IsTrue(await reflectedReader.ReadAsync(CancellationToken.None));
+        Assert.AreEqual(1, reflectedReader.GetInt32(0));
+        Assert.IsFalse(await reflectedReader.ReadAsync(CancellationToken.None));
+
+        Assert.IsTrue(await reflectedReader.NextResultAsync(CancellationToken.None));
+        Assert.AreEqual(0, reflectedReader.FieldCount);
+        Assert.IsFalse(await reflectedReader.ReadAsync(CancellationToken.None));
+
+        Assert.IsTrue(await reflectedReader.NextResultAsync(CancellationToken.None));
+        Assert.IsTrue(await reflectedReader.ReadAsync(CancellationToken.None));
+        Assert.AreEqual(2, reflectedReader.GetInt32(0));
+    }
+
     [TestMethod]
     public async Task ConcurrentDataSourceBatches_ExposeEveryResult()
     {
@@ -103,8 +177,8 @@ public class DataReaderTests
     public async Task ExecuteNonQuery_NonDataModifying_IsZero()
     {
         // SELECT / DDL don't count toward RecordsAffected.
-        Assert.AreEqual(0, await AdoTestPool.ExecuteNonQueryAsync("SELECT 1"), "SELECT");
-        Assert.AreEqual(0, await AdoTestPool.ExecuteNonQueryAsync("SELECT generate_series(1, 10)"), "SELECT 10 rows");
+        Assert.AreEqual(-1, await AdoTestPool.ExecuteNonQueryAsync("SELECT 1"), "SELECT");
+        Assert.AreEqual(-1, await AdoTestPool.ExecuteNonQueryAsync("SELECT generate_series(1, 10)"), "SELECT 10 rows");
     }
 
     [TestMethod]

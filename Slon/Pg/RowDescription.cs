@@ -32,7 +32,8 @@ sealed class RowDescription
     {
         get
         {
-            ArgumentOutOfRangeException.ThrowIfGreaterThanOrEqual(ordinal, _fieldCount);
+            if ((uint)ordinal >= (uint)_fieldCount)
+                throw new IndexOutOfRangeException($"Column ordinal {ordinal} is out of range.");
             return ref _fields[ordinal];
         }
     }

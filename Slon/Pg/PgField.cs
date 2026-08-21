@@ -1,5 +1,4 @@
 using System.Diagnostics.CodeAnalysis;
-using Slon.Pg.Serialization;
 
 namespace Slon.Pg;
 

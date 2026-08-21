@@ -1,14 +1,10 @@
-using System;
 using System.Buffers;
 using System.Buffers.Binary;
 using System.Diagnostics;
-using System.IO;
 using System.Text;
-using Microsoft.VisualStudio.TestTools.UnitTesting;
 using Slon.Pg;
 using Slon.Pg.Protocol;
 using Slon.Pg.Protocol.Flows;
-using Slon.Pg.Serialization;
 using Slon.Pg.Types;
 
 namespace Slon.Tests.Pg;
@@ -315,7 +311,7 @@ public class BackendMessageParsingTests
         description.Initialize(new SequenceReader<byte>(new ReadOnlySequence<byte>(RowDescriptionBody(256))));
         description.PrepareForReuse();
         Assert.AreEqual(0, description.FieldCount);
-        Assert.ThrowsExactly<ArgumentOutOfRangeException>(() => _ = description[0]);
+        Assert.ThrowsExactly<IndexOutOfRangeException>(() => _ = description[0]);
 
         description.Initialize(new SequenceReader<byte>(new ReadOnlySequence<byte>(RowDescriptionBody(257))));
         description.PrepareForReuse();

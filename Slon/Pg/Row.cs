@@ -1,12 +1,10 @@
 using System.Buffers;
 using System.Buffers.Binary;
 using System.Diagnostics;
-using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
 using System.Text;
 using Slon.Buffers;
 using Slon.Pg.Protocol;
-using Slon.Pg.Serialization;
 using Slon.Pg.Types;
 using Slon.Runtime.CompilerServices;
 

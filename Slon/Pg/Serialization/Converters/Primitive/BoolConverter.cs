@@ -1,4 +1,4 @@
-using Slon.Pg.Serialization;
+
 // ReSharper disable once CheckNamespace
 namespace Slon.Pg.Serialization.Converters;
 

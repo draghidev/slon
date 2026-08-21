@@ -15,232 +15,348 @@ namespace Slon;
 // Implementation
 public sealed partial class SlonDataReader
 {
-    Core _core;
+    const CommandBehavior EnumerateCommandResultsBehavior = (CommandBehavior)64;
+
+    int _state;
+    ReaderState State
+    {
+        get => (ReaderState)Volatile.Read(ref _state);
+        set => Volatile.Write(ref _state, (int)value);
+    }
+
     SlonConnection? _connectionToClose;
 
-    ReaderState State { get; set; }
+    bool _singleRowBehavior;
+    CommandResult.RowBuffering _rowBuffering;
+    bool EnumerateCommandResults { get; set; }
 
-    SlonDataReader() {}
+    // We use this to prevent users doing any concurrent Dispose calls, at which point we throw.
+    bool _closing;
 
-    int FieldCountCore => _core.Current?.FieldCount ?? 0;
-    bool HasRowsCore => _core.Current?.HasRows ?? false;
-    long? RecordsAffectedCore => _core._recordsAffected;
+    bool _singleRowConsumed;
+    bool _hasPrefetchedRow;
+    bool _currentCompletionApplied;
+    bool _currentErrorObserved;
+    RowPresence _rowPresence;
 
-    struct Core
+    CommandResult.RowEnumerator _rowEnumerator;
+    PgSerializerFieldReader _fieldReader;
+    int _remainingResults;
+    CommandFlow.Enumerator _enumerator;
+    long? _recordsAffected;
+
+    SlonDataReader() { }
+
+    void Initialize(CommandFlow.Enumerator enumerator, CommandBehavior behavior, int remainingResults,
+        PgSerializerOptions serializerOptions, SlonConnection? connectionToClose,
+        long? recordsAffected, bool hasCurrent)
     {
-        // Will be set during initialization.
-        readonly bool _singleRowBehavior;
-        readonly bool _remainingReflectsActual;
-        readonly bool _asyncExecute;
-        readonly CommandResult.RowBuffering _rowBuffering;
+        if (Interlocked.CompareExchange(ref _state, (int)ReaderState.Initializing,
+                (int)ReaderState.Uninitialized) is not (int)ReaderState.Uninitialized)
+            ThrowHelper.ThrowInvalidOperation("Reader is already initialized.");
 
-        // We use this to prevent users doing any concurrent Dispose calls, at which point we throw.
-        bool _closing;
+        _enumerator = enumerator;
+        _connectionToClose = connectionToClose;
+        _singleRowBehavior = behavior.HasFlag(CommandBehavior.SingleRow);
+        EnumerateCommandResults = ShouldEnumerateCommandResults(behavior);
+        _remainingResults = remainingResults;
+        _fieldReader = new(serializerOptions);
+        _rowBuffering = behavior.HasFlag(CommandBehavior.SequentialAccess)
+            ? CommandResult.RowBuffering.Streaming
+            : CommandResult.RowBuffering.Buffered;
+        _recordsAffected = recordsAffected;
 
-        bool _enumeratedSingleRow;
-        public bool _currentErrorObserved;
-        CommandResult.RowEnumerator _rowEnumerator;
-        public PgSerializerFieldReader _fieldReader;
+        _closing = false;
+        _singleRowConsumed = false;
+        _hasPrefetchedRow = false;
+        _currentCompletionApplied = false;
+        _currentErrorObserved = false;
+        _rowPresence = RowPresence.Unknown;
+        _rowEnumerator = default;
 
-        // Public for CreateAsync which holds an inline copy of NextResultAsync to avoid an extra state machine.
-        public int _remainingResults;
-        public CommandFlow.Enumerator _enumerator;
-
-        public Core(CommandFlow.Enumerator enumerator, CommandBehavior behavior, int commandCount,
-            bool asyncExecute, PgSerializerOptions serializerOptions)
+        if (hasCurrent)
         {
-            _enumerator = enumerator;
-            var singleRow = _singleRowBehavior = behavior.HasFlag(CommandBehavior.SingleRow);
-            var remaining = _remainingResults = singleRow || behavior.HasFlag(CommandBehavior.SingleResult) ? 1 : commandCount;
-            _remainingReflectsActual = commandCount == remaining;
-            _asyncExecute = asyncExecute;
-            _fieldReader = new(serializerOptions);
-            _rowBuffering = behavior.HasFlag(CommandBehavior.SequentialAccess)
-                ? CommandResult.RowBuffering.Streaming
-                : CommandResult.RowBuffering.Buffered;
+            var processed = ProcessCurrent();
+            Debug.Assert(processed);
+        }
+        State = ReaderState.Active;
+    }
+
+    static int GetResultLimit(CommandBehavior behavior, int commandCount)
+        => behavior.HasFlag(CommandBehavior.SingleRow) || behavior.HasFlag(CommandBehavior.SingleResult)
+            ? 1
+            : commandCount;
+
+    static bool ShouldEnumerateCommandResults(CommandBehavior behavior)
+        => (behavior & EnumerateCommandResultsBehavior) is not 0;
+
+    static SlonDataReader CreateReader(CommandFlow.Enumerator enumerator, CommandBehavior behavior,
+        int remainingResults, PgSerializerOptions serializerOptions,
+        SlonConnection? connectionToClose, long? recordsAffected, bool hasCurrent)
+    {
+        var reader = new SlonDataReader();
+        reader.Initialize(enumerator, behavior, remainingResults, serializerOptions,
+            connectionToClose, recordsAffected, hasCurrent);
+        return reader;
+    }
+
+    static void ApplyPendingCompletion(CommandResult current, ref long? recordsAffected)
+    {
+        current.TryGetCommandComplete(out _);
+        if (current.Error is null)
+            recordsAffected += current.RecordsAffected;
+    }
+
+    int FieldCountCore => Current?.FieldCount ?? 0;
+    bool HasRowsCore => HasAnyRows;
+    long? RecordsAffectedCore => _recordsAffected;
+
+    ref PgSerializerFieldReader FieldReader => ref _fieldReader;
+    CommandResult? Current => _enumerator.Current;
+    bool CompletionApplied => _currentCompletionApplied;
+    bool IsSequential => _rowBuffering is CommandResult.RowBuffering.Streaming;
+
+    SlonConnection? TakeConnectionToClose()
+        => Interlocked.Exchange(ref _connectionToClose, null);
+
+    Row? CurrentRow => _rowEnumerator.Current;
+
+    /// <summary>
+    /// Processes the current enumerator result and updates relevant information on this instance.
+    /// </summary>
+    /// <returns>True if the current enumerator result is a suitable target for NextResult{Async}, false if it should be stepped over.</returns>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    bool ProcessCurrent()
+    {
+        Debug.Assert(_remainingResults is > 0);
+        if (Current is not { } current)
+            return false;
+        _fieldReader.Initialize(current);
+
+        _remainingResults--;
+        _singleRowConsumed = false;
+        _hasPrefetchedRow = false;
+        _currentCompletionApplied = false;
+        _currentErrorObserved = false;
+        _rowPresence = RowPresence.Unknown;
+        if (!current.CanHaveRows)
+        {
+            _rowEnumerator = default;
+            return EnumerateCommandResults;
         }
 
-        public long? _recordsAffected;
+        _rowEnumerator = current.GetEnumerator(_rowBuffering);
+        return true;
+    }
 
-        bool EnumerateCommands => false; // _behavior.HasFlag((CommandBehavior)64);
+    bool MoveToNextResult()
+    {
+        CompleteAndApplyCurrent();
 
-        public CommandResult? Current => _enumerator.Current;
-        public bool IsSequential => _rowBuffering is CommandResult.RowBuffering.Streaming;
-
-        public Row? CurrentRow => _rowEnumerator.Current;
-
-        /// <summary>
-        /// Processes the current enumerator result and updates relevant information on this instance.
-        /// </summary>
-        /// <returns>True if the current enumerator result is a suitable target for NextResult{Async}, false if it should be stepped over.</returns>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public bool ProcessCurrent()
+        var next = false;
+        while (_remainingResults > 0 && (next = _enumerator.MoveNext()) && !ProcessCurrent())
+            CompleteAndApplyCurrent();
+        if (!next)
         {
-            Debug.Assert(_remainingResults is > 0);
-            if (Current is not { } current)
-                return false;
-            _fieldReader.Initialize(current);
+            // Release the flow as soon as its results end.
+            DisposeEnumerator();
+        }
+        return next;
+    }
 
-            _remainingResults--;
-            _currentErrorObserved = false;
-            if (!current.CanHaveRows)
-            {
-                // Prefer completing the reader over detecting a practically unreachable row-count overflow.
-                _recordsAffected += current.RecordsAffected;
-                _rowEnumerator = default;
-                return EnumerateCommands;
-            }
+    void CompleteAndApplyCurrent()
+    {
+        if (_currentCompletionApplied || Current is not { } current)
+            return;
+        if (!current.IsComplete)
+            current.Complete();
+        ApplyCompletion(current);
+    }
 
-            _rowEnumerator = current.GetEnumerator(_rowBuffering);
+    void ApplyCompletion(CommandResult current)
+    {
+        if (!_currentErrorObserved)
+            current.TryGetCommandComplete(out _);
+        if (current.Error is null)
+            _recordsAffected += current.RecordsAffected;
+        _currentCompletionApplied = true;
+    }
+
+    void ObserveCurrentError()
+    {
+        if (Current?.Error is not null)
+            _currentErrorObserved = true;
+    }
+
+    bool ReadRow()
+    {
+        Debug.Assert(_singleRowBehavior && _remainingResults is 0 || !_singleRowBehavior);
+        if (_hasPrefetchedRow)
+        {
+            _hasPrefetchedRow = false;
+            if (_singleRowBehavior)
+                _singleRowConsumed = true;
             return true;
         }
 
-        public bool NextResult()
+        if (_singleRowBehavior)
         {
-            if (Current is { } current)
+            // After one row, normal result disposal drains the remainder.
+            if (!_singleRowConsumed && _rowEnumerator.MoveNext())
             {
-                if (!current.IsComplete)
-                    current.Dispose();
-                if (!_currentErrorObserved)
-                    current.TryGetCommandComplete(out _);
-            }
-
-            var next = false;
-            while (_remainingResults > 0 && (next = _enumerator.MoveNext()) && !ProcessCurrent());
-            if (!next)
-            {
-                // Release the flow as soon as its results end.
-                DisposeEnumerator();
-            }
-            return next;
-        }
-
-        public void ObserveCurrentError()
-        {
-            if (Current?.Error is not null)
-                _currentErrorObserved = true;
-        }
-
-        public bool Read()
-        {
-            Debug.Assert(_singleRowBehavior && _remainingResults is 0 || !_singleRowBehavior);
-            if (_singleRowBehavior)
-            {
-                // After one row, normal result disposal drains the remainder.
-                if (!_enumeratedSingleRow && _rowEnumerator.MoveNext())
-                {
-                    _enumeratedSingleRow = true;
-                    return true;
-                }
-
-                if (!_enumeratedSingleRow)
-                    Current?.GetCommandComplete();
-            }
-            else
-            {
-                if (_rowEnumerator.MoveNext())
-                    return true;
-
-                Current?.GetCommandComplete();
-            }
-
-            return false;
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public Task<bool> ReadAsync(CancellationToken cancellationToken)
-        {
-            if (_singleRowBehavior)
-                return SingleRowCore(cancellationToken);
-
-            var task = cancellationToken.CanBeCanceled
-                ? _rowEnumerator.MoveNextAsync(cancellationToken)
-                : _rowEnumerator.MoveNextAsync();
-            if (!task.IsCompletedSuccessfully)
-                return CompleteReadAsync(task, Current);
-
-            var result = task.Result;
-            if (!result)
-                Current?.GetCommandComplete();
-            return Task.FromResult(result);
-
-            static async Task<bool> CompleteReadAsync(ValueTask<bool> pending, CommandResult? current)
-            {
-                var result = await pending.ConfigureAwait(false);
-                if (!result)
-                    current?.GetCommandComplete();
-                return result;
-            }
-        }
-
-        [MethodImpl(MethodImplOptions.NoInlining)]
-        async Task<bool> SingleRowCore(CancellationToken cancellationToken)
-        {
-            if (!_enumeratedSingleRow && await _rowEnumerator.MoveNextAsync(cancellationToken).ConfigureAwait(false))
-            {
-                _enumeratedSingleRow = true;
+                _singleRowConsumed = true;
+                _rowPresence = RowPresence.Present;
                 return true;
             }
-
-            if (!_enumeratedSingleRow)
-                Current?.GetCommandComplete();
-
-            await DisposeEnumeratorAsync().ConfigureAwait(false);
-            return false;
+        }
+        else if (_rowEnumerator.MoveNext())
+        {
+            _rowPresence = RowPresence.Present;
+            return true;
         }
 
-        public void DisposeEnumerator()
-        {
-            if (Interlocked.CompareExchange(ref _closing, true, false))
-                ThrowHelper.ThrowInvalidOperation("Invalid concurrent call.");
+        CompleteRowEnumeration();
+        return false;
+    }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    ValueTask<bool> ReadRowAsync(CancellationToken cancellationToken)
+    {
+        if (_hasPrefetchedRow)
+        {
+            _hasPrefetchedRow = false;
+            if (_singleRowBehavior)
+                _singleRowConsumed = true;
+            return ValueTask.FromResult(true);
+        }
+        if (_singleRowBehavior && _singleRowConsumed)
+            return ValueTask.FromResult(false);
+
+        return _rowEnumerator.MoveNextAsync(cancellationToken);
+    }
+
+    bool ProcessReadResult(bool hasRow)
+    {
+        if (hasRow)
+        {
+            _rowPresence = RowPresence.Present;
+            if (_singleRowBehavior)
+                _singleRowConsumed = true;
+            return true;
+        }
+
+        CompleteRowEnumeration();
+        return false;
+    }
+
+    bool HasAnyRows
+    {
+        get
+        {
+            if (_rowPresence is not RowPresence.Unknown)
+                return _rowPresence is RowPresence.Present;
+            if (Current is null)
+                return false;
+
+            var hasRows = _rowEnumerator.MoveNext();
+            _rowPresence = hasRows ? RowPresence.Present : RowPresence.Empty;
+            _hasPrefetchedRow = hasRows;
+            if (!hasRows)
+                CompleteRowEnumeration();
+            return hasRows;
+        }
+    }
+
+    void CompleteRowEnumeration()
+    {
+        var current = Current;
+        if (_remainingResults is not 0)
+        {
+            if (current is not null)
+            {
+                if (!current.IsComplete)
+                    current.Complete();
+                current.GetCommandComplete();
+            }
+            return;
+        }
+
+        try
+        {
+            if (current is not null)
+            {
+                if (!current.IsComplete)
+                    current.Complete();
+                else
+                    current.GetCommandComplete();
+                ApplyCompletion(current);
+            }
+        }
+        finally
+        {
+            DisposeEnumerator();
+        }
+    }
+
+    void DisposeEnumerator()
+    {
+        if (Interlocked.CompareExchange(ref _closing, true, false))
+            ThrowHelper.ThrowInvalidOperation("Invalid concurrent call.");
+
+        try
+        {
+            var rowEnumerator = _rowEnumerator;
+            var enumerator = _enumerator;
+            _enumerator = default;
+            _rowEnumerator = default;
             try
             {
-                var rowEnumerator = _rowEnumerator;
-                var enumerator = _enumerator;
-                _enumerator = default;
-                _rowEnumerator = default;
-                try
-                {
-                    rowEnumerator.RevokeColumnLease();
-                }
-                finally
-                {
-                    enumerator.Dispose();
-                }
+                rowEnumerator.RevokeColumnLease();
             }
             finally
             {
-                Volatile.Write(ref _closing, false);
+                enumerator.Dispose();
             }
         }
-
-        [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
-        public async ValueTask DisposeEnumeratorAsync()
+        finally
         {
-            if (Interlocked.CompareExchange(ref _closing, true, false))
-                ThrowHelper.ThrowInvalidOperation("Invalid concurrent call.");
+            Volatile.Write(ref _closing, false);
+        }
+    }
 
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
+    async ValueTask DisposeEnumeratorAsync()
+    {
+        if (Interlocked.CompareExchange(ref _closing, true, false))
+            ThrowHelper.ThrowInvalidOperation("Invalid concurrent call.");
+
+        var rowEnumerator = _rowEnumerator;
+        var enumerator = _enumerator;
+        _enumerator = default;
+        _rowEnumerator = default;
+
+        try
+        {
             try
             {
-                var rowEnumerator = _rowEnumerator;
-                var enumerator = _enumerator;
-                _enumerator = default;
-                _rowEnumerator = default;
-                try
-                {
-                    await rowEnumerator.RevokeColumnLeaseAsync().ConfigureAwait(false);
-                }
-                finally
-                {
-                    await enumerator.DisposeAsync().ConfigureAwait(false);
-                }
+                await rowEnumerator.RevokeColumnLeaseAsync().ConfigureAwait(false);
             }
             finally
             {
-                Volatile.Write(ref _closing, false);
+                await enumerator.DisposeAsync().ConfigureAwait(false);
             }
         }
+        finally
+        {
+            Volatile.Write(ref _closing, false);
+        }
+    }
+
+    enum RowPresence : byte
+    {
+        Unknown,
+        Empty,
+        Present
     }
 
     internal static SlonDataReader Create(CommandBehavior behavior, CommandFlow flow,
@@ -250,16 +366,11 @@ public sealed partial class SlonDataReader
         var enumerator = flow.GetEnumerator();
         try
         {
-            var core = new Core(enumerator, behavior, flow.VisibleCommandCount, asyncExecute: false,
-                serializerOptions);
-            core.NextResult();
-            // TODO now that we don't need a DataReader while we wait for the first result we can pool the reader on the connection.
-            return new SlonDataReader
-            {
-                State = ReaderState.Active,
-                _core = core,
-                _connectionToClose = connectionToClose
-            };
+            var reader = CreateReader(enumerator, behavior,
+                GetResultLimit(behavior, flow.VisibleCommandCount), serializerOptions,
+                connectionToClose, recordsAffected: null, hasCurrent: false);
+            reader.MoveToNextResult();
+            return reader;
         }
         catch (Exception)
         {
@@ -271,42 +382,59 @@ public sealed partial class SlonDataReader
     internal static async ValueTask<TReader> CreateAsync<TReader>(CommandBehavior behavior,
         ValueTask<CommandFlow> flowTask, PgSerializerOptions serializerOptions,
         CancellationToken cancellationToken = default,
-        SlonConnection? connectionToClose = null)
-        where TReader: DbDataReader
+        SlonConnection? connectionToClose = null, Activity? activity = null)
+        where TReader : DbDataReader
     {
         Debug.Assert(typeof(TReader) == typeof(SlonDataReader) || typeof(TReader) == typeof(DbDataReader));
-        var flow = await flowTask.ConfigureAwait(false);
-        var enumerator = flow.GetEnumerator();
+        CommandFlow.Enumerator enumerator = default;
         try
         {
-            var core = new Core(enumerator, behavior, flow.VisibleCommandCount, asyncExecute: true,
-                serializerOptions);
+            var flow = await flowTask.ConfigureAwait(false);
+            enumerator = flow.GetEnumerator();
+            var remainingResults = GetResultLimit(behavior, flow.VisibleCommandCount);
+            long? recordsAffected = null;
 
-            // This is an inline copy of NextResultAsync (minus the 'Current' check) to avoid an extra state machine.
-            var next = false;
-            while (core._remainingResults > 0
-                && (next = await (cancellationToken.CanBeCanceled
-                    ? core._enumerator.MoveNextAsync(cancellationToken)
-                    : core._enumerator.MoveNextAsync()).ConfigureAwait(false))
-                && !core.ProcessCurrent());
-            if (!next)
+            // Advance to the first row-bearing result before allocating the reader.
+            while (remainingResults > 0)
             {
-                // Dispose the enumerator right away to allow the pipeline to handle next commands.
-                // This also has the benefit Close/Dispose doesn't have to go async if the user exhausted the reader properly.
-                await core.DisposeEnumeratorAsync().ConfigureAwait(false);
+                if (!await enumerator.MoveNextAsync(cancellationToken).ConfigureAwait(false))
+                    break;
+                if (enumerator.Current.CanHaveRows || ShouldEnumerateCommandResults(behavior))
+                    return (TReader)(object)CreateReader(enumerator, behavior, remainingResults,
+                        serializerOptions, connectionToClose, recordsAffected, hasCurrent: true);
+
+                remainingResults--;
+                if (!enumerator.Current.IsComplete)
+                    await enumerator.Current.CompleteAsync().ConfigureAwait(false);
+                ApplyPendingCompletion(enumerator.Current, ref recordsAffected);
             }
-            // TODO now that we don't need a DataReader while we wait for the first result we can pool the reader on the connection.
-            return (TReader)(object)new SlonDataReader
-            {
-                State = ReaderState.Active,
-                _core = core,
-                _connectionToClose = connectionToClose
-            };
+
+            // Dispose the enumerator right away to allow the pipeline to handle next commands.
+            // This also has the benefit Close/Dispose doesn't have to go async if the user exhausted the reader properly.
+            var enumeratorToDispose = enumerator;
+            enumerator = default;
+            await enumeratorToDispose.DisposeAsync().ConfigureAwait(false);
+            return (TReader)(object)CreateReader(default, behavior, remainingResults,
+                serializerOptions, connectionToClose, recordsAffected, hasCurrent: false);
         }
-        catch (Exception)
+        catch (Exception ex)
         {
-            await enumerator.DisposeAsync().ConfigureAwait(false);
-            throw;
+            try
+            {
+                await enumerator.DisposeAsync().ConfigureAwait(false);
+            }
+            catch (Exception cleanupException)
+            {
+                ex = cleanupException;
+            }
+
+            SlonTracing.RecordException(activity, ex);
+            AdoException.Throw(ex);
+            return default!;
+        }
+        finally
+        {
+            activity?.Dispose();
         }
     }
 
@@ -331,7 +459,7 @@ public sealed partial class SlonDataReader
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     Row GetRowOrThrow()
     {
-        var row = _core.CurrentRow;
+        var row = CurrentRow;
         if (row is null)
             ThrowInvalidState(State, returnException: false);
 
@@ -340,14 +468,19 @@ public sealed partial class SlonDataReader
 
     RowDescription GetRowDescriptionOrThrow()
     {
-        _ = _core.Current ?? throw new InvalidOperationException("Reader is not on a result.");
-        return _core._fieldReader.RowDescription;
+        if (Current is null)
+            throw new InvalidOperationException("Reader is not on a result.");
+
+        var description = FieldReader.RowDescription;
+        return description.FieldCount is 0
+            ? throw new InvalidOperationException("The current result has no columns.")
+            : description;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     Row GetRowOrException(out Exception? exception)
     {
-        var row = _core.CurrentRow;
+        var row = CurrentRow;
         if (row is null)
         {
             exception = ThrowInvalidState(State, returnException: true);
@@ -367,7 +500,7 @@ public sealed partial class SlonDataReader
         {
             ReaderState.Uninitialized or ReaderState.Disposed => new ObjectDisposedException(nameof(SlonDataReader)),
             ReaderState.Closed => new InvalidOperationException("Reader is closed."),
-            _ when _core.CurrentRow is null => new InvalidOperationException("Reader is not on a row."),
+            _ when CurrentRow is null => new InvalidOperationException("Reader is not on a row."),
             _ => null
         };
 
@@ -379,25 +512,47 @@ public sealed partial class SlonDataReader
 
     void CloseCore()
     {
-        try { _core.DisposeEnumerator(); }
-        finally { Interlocked.Exchange(ref _connectionToClose, null)?.Close(); }
+        try
+        {
+            DisposeEnumerator();
+        }
+        finally
+        {
+            TakeConnectionToClose()?.Close();
+        }
     }
 
     async ValueTask CloseAsyncCore()
     {
-        try { await _core.DisposeEnumeratorAsync().ConfigureAwait(false); }
+        try
+        {
+            await DisposeEnumeratorAsync().ConfigureAwait(false);
+        }
         finally
         {
-            if (Interlocked.Exchange(ref _connectionToClose, null) is { } connection)
+            if (TakeConnectionToClose() is { } connection)
                 await connection.CloseAsync().ConfigureAwait(false);
         }
     }
 
     void Reset()
     {
-        // TODO make pooling work again.
-        // _core = default;
-        // State = ReaderState.Uninitialized;
+        _connectionToClose = null;
+        _singleRowBehavior = false;
+        _rowBuffering = default;
+        EnumerateCommandResults = false;
+        _closing = false;
+        _singleRowConsumed = false;
+        _hasPrefetchedRow = false;
+        _currentCompletionApplied = false;
+        _currentErrorObserved = false;
+        _rowPresence = RowPresence.Unknown;
+        _rowEnumerator = default;
+        _fieldReader = default;
+        _remainingResults = 0;
+        _enumerator = default;
+        _recordsAffected = null;
+        State = ReaderState.Uninitialized;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -410,32 +565,6 @@ public sealed partial class SlonDataReader
         finally
         {
             Reset();
-        }
-    }
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    ValueTask DisposeAsyncCore()
-    {
-        if (CloseAsyncCore() is var closeTask && closeTask.IsCompletedSuccessfully)
-        {
-            closeTask.GetAwaiter().GetResult();
-            Reset();
-            return new();
-        }
-
-        return Core(closeTask);
-
-        [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
-        async ValueTask Core(ValueTask closeTask)
-        {
-            try
-            {
-                await closeTask.ConfigureAwait(false);
-            }
-            finally
-            {
-                Reset();
-            }
         }
     }
 
@@ -501,6 +630,7 @@ public sealed partial class SlonDataReader
             row["IsHidden"] = column.IsHidden == true;
             row["IsLong"] = column.IsLong == true;
             row["IsReadOnly"] = column.IsReadOnly == true;
+            row["ProviderSpecificDataType"] = column.DataType;
             row["DataTypeName"] = column.DataTypeName;
 
             table.Rows.Add(row);
@@ -512,12 +642,137 @@ public sealed partial class SlonDataReader
     ValueTask<ReadOnlyCollection<TColumn>> GetColumnSchemaCore<TColumn>(bool async, CancellationToken cancellationToken = default) where TColumn : DbColumn
     {
         Debug.Assert(typeof(TColumn) == typeof(DbColumn) || typeof(TColumn) == typeof(SlonDbColumn));
-        throw new NotImplementedException();
+        if (cancellationToken.IsCancellationRequested)
+            return ValueTask.FromCanceled<ReadOnlyCollection<TColumn>>(cancellationToken);
+
+        if (Current is null || FieldCountCore is 0)
+            return ValueTask.FromResult(new ReadOnlyCollection<TColumn>([]));
+
+        var description = FieldReader.RowDescription;
+        var columns = new TColumn[description.FieldCount];
+        for (var i = 0; i < columns.Length; i++)
+        {
+            ref readonly var field = ref description[i];
+            columns[i] = (TColumn)(DbColumn)new SlonDbColumn(field.Name, i,
+                FieldReader.GetFieldType(i), FieldReader.GetDataTypeName(i),
+                FieldReader.GetSlonDbType(i));
+        }
+        return ValueTask.FromResult(new ReadOnlyCollection<TColumn>(columns));
+    }
+
+    async Task<bool> NextResultAsyncCore(CancellationToken cancellationToken)
+    {
+        try
+        {
+            if (!CompletionApplied && Current is { } current)
+            {
+                if (!current.IsComplete)
+                    await current.CompleteAsync().ConfigureAwait(false);
+                ApplyCompletion(current);
+            }
+
+            var next = false;
+            while (_remainingResults > 0
+                && (next = await _enumerator.MoveNextAsync(cancellationToken).ConfigureAwait(false))
+                && !ProcessCurrent())
+            {
+                current = Current!;
+                if (!current.IsComplete)
+                    await current.CompleteAsync().ConfigureAwait(false);
+                ApplyCompletion(current);
+            }
+            if (!next)
+                await DisposeEnumeratorAsync().ConfigureAwait(false);
+            return next;
+        }
+        catch (Exception ex)
+        {
+            ObserveCurrentError();
+            AdoException.Throw(ex);
+            return default;
+        }
+    }
+
+    async Task<bool> ReadAsyncCore(CancellationToken cancellationToken)
+    {
+        try
+        {
+            if (await ReadRowAsync(cancellationToken).ConfigureAwait(false))
+                return ProcessReadResult(hasRow: true);
+
+            if (Current is not null && !Current.IsComplete)
+                await Current.CompleteAsync().ConfigureAwait(false);
+            if (_remainingResults is 0
+                && !CompletionApplied
+                && Current is not null)
+            {
+                try
+                {
+                    ApplyCompletion(Current);
+                }
+                finally
+                {
+                    DisposeEnumerator();
+                }
+                return false;
+            }
+            return ProcessReadResult(hasRow: false);
+        }
+        catch (Exception ex)
+        {
+            ObserveCurrentError();
+            AdoException.Throw(ex);
+            return default;
+        }
+    }
+
+    async Task<bool> IsDBNullAsyncCore(int ordinal, CancellationToken cancellationToken)
+    {
+        try
+        {
+            _ = GetRowDescriptionOrThrow()[ordinal];
+            return await GetRowOrThrow().IsDBNullAsync(ordinal, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            AdoException.Throw(ex);
+            return default;
+        }
+    }
+
+    // Non-gvm helper to make inlining GetBoolean GetString etc possible.
+    T GetFieldValueCore<T>(int ordinal)
+    {
+        var row = GetRowOrThrow();
+        return typeof(T) == typeof(object)
+            ? (T)FieldReader.ReadObject(row, ordinal)
+            : FieldReader.Read<T>(row, ordinal);
+    }
+
+    // Non-gvm helper to make inlining GetTextReaderAsync etc possible.
+    ValueTask<T> GetFieldValueCoreAsync<T>(int ordinal, CancellationToken cancellationToken)
+    {
+        if (cancellationToken.IsCancellationRequested)
+            return ValueTask.FromCanceled<T>(cancellationToken);
+
+        var row = GetRowOrException(out var exception);
+        if (exception is not null)
+            return ValueTask.FromException<T>(exception);
+
+        if (typeof(T) == typeof(object))
+            return ReadObjectAsync<T>(FieldReader.ReadObjectAsync(row, ordinal, cancellationToken));
+        return FieldReader.ReadAsync<T>(row, ordinal, cancellationToken);
+
+        static async ValueTask<TResult> ReadObjectAsync<TResult>(ValueTask<object> task)
+            => (TResult)await task
+                .ConfigureAwait(false);
     }
 
     enum ReaderState
     {
         Uninitialized = 0,
+        Initializing,
         Active,
         Closed,
         Disposed
@@ -549,24 +804,13 @@ public sealed partial class SlonDataReader : DbDataReader, IDbColumnSchemaGenera
     /// <returns>The number of rows changed, inserted, or deleted. -1 for SELECT statements. 0 if no rows were affected or the statement failed.</returns>
     /// <remarks>When the value is too large to be represented by an Int32, int.MinValue is returned and LongRecordsAffected should be consulted instead.</remarks>
     public override int RecordsAffected
-    {
-        get
-        {
-            ThrowIfClosedOrDisposed();
-            return RecordsAffectedCore is null ? -1 : RecordsAffectedCore > int.MaxValue ? int.MinValue : (int)RecordsAffectedCore;
-        }
-    }
+        => RecordsAffectedCore is null
+            ? -1 : RecordsAffectedCore > int.MaxValue
+                ? int.MinValue : (int)RecordsAffectedCore;
 
     /// <summary>Gets the number of rows changed, inserted, or deleted by execution of the SQL statement.</summary>
     /// <returns>The number of rows changed, inserted, or deleted. -1 for SELECT statements. 0 if no rows were affected or the statement failed.</returns>
-    public long LongRecordsAffected
-    {
-        get
-        {
-            ThrowIfClosedOrDisposed();
-            return RecordsAffectedCore ?? -1;
-        }
-    }
+    public long LongRecordsAffected => RecordsAffectedCore ?? -1;
 
     /// <inheritdoc/>
     public override bool HasRows
@@ -619,10 +863,9 @@ public sealed partial class SlonDataReader : DbDataReader, IDbColumnSchemaGenera
         return GetColumnSchemaCore<DbColumn>(async: true, cancellationToken).AsTask();
     }
 
-    // DbDataReader cannot specialize GetColumnSchemaAsync's return type, so expose typed counterparts.
     /// <summary>Gets the column schema (<see cref="T:Slon.SlonDbColumn" /> collection).</summary>
     /// <returns>The column schema (<see cref="T:Slon.SlonDbColumn" /> collection).</returns>
-    public ReadOnlyCollection<SlonDbColumn> GetSlonColumnSchema()
+    public ReadOnlyCollection<SlonDbColumn> GetColumnSchema()
     {
         ThrowIfClosedOrDisposed();
         var task = GetColumnSchemaCore<SlonDbColumn>(async: false);
@@ -630,24 +873,17 @@ public sealed partial class SlonDataReader : DbDataReader, IDbColumnSchemaGenera
         return task.Result;
     }
 
-    /// <summary>Gets the column schema (<see cref="T:Slon.SlonDbColumn" /> collection).</summary>
-    /// <returns>The column schema (<see cref="T:Slon.SlonDbColumn" /> collection).</returns>
-    public Task<ReadOnlyCollection<SlonDbColumn>> GetSlonColumnSchemaAsync(CancellationToken cancellationToken = default)
-    {
-        if (GetExceptionIfClosedOrDisposed() is { } exception)
-            return Task.FromException<ReadOnlyCollection<SlonDbColumn>>(exception);
-
-        return GetColumnSchemaCore<SlonDbColumn>(async: true, cancellationToken).AsTask();
-    }
-
     /// <inheritdoc/>
     public override bool NextResult()
     {
         ThrowIfClosedOrDisposed();
-        try { return _core.NextResult(); }
+        try
+        {
+            return MoveToNextResult();
+        }
         catch (Exception ex)
         {
-            _core.ObserveCurrentError();
+            ObserveCurrentError();
             AdoException.Throw(ex);
             return default;
         }
@@ -662,44 +898,17 @@ public sealed partial class SlonDataReader : DbDataReader, IDbColumnSchemaGenera
         return NextResultAsyncCore(cancellationToken);
     }
 
-    async Task<bool> NextResultAsyncCore(CancellationToken cancellationToken)
-    {
-        try
-        {
-            if (_core.Current is { } current)
-            {
-                if (!current.IsComplete)
-                    await current.DisposeAsync().ConfigureAwait(false);
-                if (!_core._currentErrorObserved)
-                    current.TryGetCommandComplete(out _);
-            }
-
-            var next = false;
-            while (_core._remainingResults > 0
-                && (next = await (cancellationToken.CanBeCanceled
-                    ? _core._enumerator.MoveNextAsync(cancellationToken)
-                    : _core._enumerator.MoveNextAsync()).ConfigureAwait(false))
-                && !_core.ProcessCurrent()) { }
-            if (!next)
-                await _core.DisposeEnumeratorAsync().ConfigureAwait(false);
-            return next;
-        }
-        catch (Exception ex)
-        {
-            _core.ObserveCurrentError();
-            AdoException.Throw(ex);
-            return default;
-        }
-    }
-
     /// <inheritdoc/>
     public override bool Read()
     {
         ThrowIfClosedOrDisposed();
-        try { return _core.Read(); }
+        try
+        {
+            return ReadRow();
+        }
         catch (Exception ex)
         {
-            _core.ObserveCurrentError();
+            ObserveCurrentError();
             AdoException.Throw(ex);
             return default;
         }
@@ -715,33 +924,22 @@ public sealed partial class SlonDataReader : DbDataReader, IDbColumnSchemaGenera
         return ReadAsyncCore(cancellationToken);
     }
 
-    async Task<bool> ReadAsyncCore(CancellationToken cancellationToken)
-    {
-        try { return await _core.ReadAsync(cancellationToken).ConfigureAwait(false); }
-        catch (Exception ex)
-        {
-            _core.ObserveCurrentError();
-            AdoException.Throw(ex);
-            return default;
-        }
-    }
-
     /// <inheritdoc/>
     public override IEnumerator GetEnumerator() => new DbEnumerator(this, closeReader: false);
 
     /// <inheritdoc/>
     public override string GetDataTypeName(int ordinal)
     {
-        _ = _core.Current ?? throw new InvalidOperationException("Reader is not on a result.");
-        return _core._fieldReader.GetDataTypeName(ordinal);
+        _ = GetRowDescriptionOrThrow()[ordinal];
+        return FieldReader.GetDataTypeName(ordinal);
     }
 
     /// <inheritdoc/>
     [return: DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicProperties | DynamicallyAccessedMemberTypes.PublicFields)]
     public override Type GetFieldType(int ordinal)
     {
-        _ = _core.Current ?? throw new InvalidOperationException("Reader is not on a result.");
-        return _core._fieldReader.GetFieldType(ordinal);
+        _ = GetRowDescriptionOrThrow()[ordinal];
+        return FieldReader.GetFieldType(ordinal);
     }
 
     /// <inheritdoc/>
@@ -761,57 +959,20 @@ public sealed partial class SlonDataReader : DbDataReader, IDbColumnSchemaGenera
 
     /// <inheritdoc/>
     public override Task<bool> IsDBNullAsync(int ordinal, CancellationToken cancellationToken)
-        => IsDBNullAsyncCore(ordinal, cancellationToken);
-
-    async Task<bool> IsDBNullAsyncCore(int ordinal, CancellationToken cancellationToken)
-    {
-        try
-        {
-            _ = GetRowDescriptionOrThrow()[ordinal];
-            return await GetRowOrThrow().IsDBNullAsync(ordinal, cancellationToken)
-                .ConfigureAwait(false);
-        }
-        catch (Exception ex) { AdoException.Throw(ex); return default; }
-    }
+        => cancellationToken.IsCancellationRequested
+            ? Task.FromCanceled<bool>(cancellationToken)
+            : IsDBNullAsyncCore(ordinal, cancellationToken);
 
     /// <summary>Returns a nested data reader for the requested column.</summary>
     /// <param name="ordinal">The zero-based column ordinal.</param>
-    /// <exception cref="T:System.IndexOutOfRangeException">The column index is out of range.</exception>
+    /// <exception cref="T:System.NotSupportedException">Nested data readers are not supported.</exception>
     /// <returns>A data reader.</returns>
     public new SlonDataReader GetData(int ordinal)
-        => throw new NotImplementedException();
+        => throw new NotSupportedException("Nested data readers are not supported.");
 
     /// <inheritdoc/>
     protected override DbDataReader GetDbDataReader(int ordinal)
         => GetData(ordinal);
-
-    // Non-gvm helper to make inlining GetBoolean GetString etc possible.
-    T GetFieldValueCore<T>(int ordinal)
-    {
-        var result = _core.Current ?? throw new InvalidOperationException("Reader is not on a result.");
-        return typeof(T) == typeof(object)
-            ? (T)_core._fieldReader.ReadObject(GetRowOrThrow(), ordinal)
-            : _core._fieldReader.Read<T>(GetRowOrThrow(), ordinal);
-    }
-
-    // Non-gvm helper to make inlining GetTextReaderAsync etc possible.
-    ValueTask<T> GetFieldValueCoreAsync<T>(int ordinal, CancellationToken cancellationToken)
-    {
-        var row = GetRowOrException(out var exception);
-        if (exception is not null)
-            return ValueTask.FromException<T>(exception);
-
-        var result = _core.Current ?? throw new InvalidOperationException("Reader is not on a result.");
-        if (typeof(T) == typeof(object))
-            return ReadObjectAsync<T>(_core._fieldReader, row, ordinal, cancellationToken);
-        return _core._fieldReader.ReadAsync<T>(row, ordinal, cancellationToken);
-
-        static async ValueTask<TResult> ReadObjectAsync<TResult>(PgSerializerFieldReader reader,
-            Row row, int ordinal,
-            CancellationToken cancellationToken)
-            => (TResult)await reader.ReadObjectAsync(row, ordinal, cancellationToken)
-                .ConfigureAwait(false);
-    }
 
     public byte[] GetBytes(int ordinal)
         => GetFieldValueCore<byte[]>(ordinal);
@@ -846,10 +1007,12 @@ public sealed partial class SlonDataReader : DbDataReader, IDbColumnSchemaGenera
         }
 
         var row = GetRowOrThrow();
-        var lease = _core._fieldReader.Read<ByteColumnLease>(row, ordinal, _core.IsSequential);
+        var lease = FieldReader.Read<ByteColumnLease>(row, ordinal, IsSequential);
 
         if (buffer is null)
             return lease.Length;
+        if (dataOffset >= lease.Length)
+            return 0;
         return lease.Read(checked((int)dataOffset), buffer.AsSpan(bufferOffset, length));
     }
 
@@ -870,8 +1033,8 @@ public sealed partial class SlonDataReader : DbDataReader, IDbColumnSchemaGenera
             ArgumentOutOfRangeException.ThrowIfGreaterThan(length, buffer.Length - bufferOffset);
         }
 
-        var lease = _core._fieldReader.Read<CharsColumnLease>(GetRowOrThrow(), ordinal,
-            _core.IsSequential);
+        var lease = FieldReader.Read<CharsColumnLease>(GetRowOrThrow(), ordinal,
+            IsSequential);
         return lease.Read(buffer is null ? 0 : checked((int)dataOffset),
             buffer is null ? default : buffer.AsSpan(bufferOffset, length), buffer is null);
     }
@@ -927,12 +1090,12 @@ public sealed partial class SlonDataReader : DbDataReader, IDbColumnSchemaGenera
     /// <inheritdoc/>
     public override int GetValues(object[] values)
     {
-        _ = GetRowOrThrow();
         ArgumentNullException.ThrowIfNull(values);
 
-        var count = Math.Min(FieldCount, values.Length);
+        var row = GetRowOrThrow();
+        var count = Math.Min(FieldCountCore, values.Length);
         for (var i = 0; i < count; i++)
-            values[i] = GetValue(i);
+            values[i] = FieldReader.ReadObject(row, i);
         return count;
     }
 
@@ -943,8 +1106,14 @@ public sealed partial class SlonDataReader : DbDataReader, IDbColumnSchemaGenera
             return;
 
         State = ReaderState.Closed;
-        try { CloseCore(); }
-        catch (Exception ex) { AdoException.Throw(ex); }
+        try
+        {
+            CloseCore();
+        }
+        catch (Exception ex)
+        {
+            AdoException.Throw(ex);
+        }
     }
 
     /// <inheritdoc/>
@@ -954,7 +1123,7 @@ public sealed partial class SlonDataReader : DbDataReader, IDbColumnSchemaGenera
             return Task.CompletedTask;
 
         State = ReaderState.Closed;
-        return CloseAsyncProjected().AsTask();
+        return CloseAsyncProjected();
     }
 
     /// <inheritdoc/>
@@ -964,8 +1133,14 @@ public sealed partial class SlonDataReader : DbDataReader, IDbColumnSchemaGenera
             return;
 
         State = ReaderState.Disposed;
-        try { DisposeCore(); }
-        catch (Exception ex) { AdoException.Throw(ex); }
+        try
+        {
+            DisposeCore();
+        }
+        catch (Exception ex)
+        {
+            AdoException.Throw(ex);
+        }
     }
 
     /// <inheritdoc/>
@@ -978,15 +1153,60 @@ public sealed partial class SlonDataReader : DbDataReader, IDbColumnSchemaGenera
         return DisposeAsyncProjected();
     }
 
-    async ValueTask CloseAsyncProjected()
+    async Task CloseAsyncProjected()
     {
-        try { await CloseAsyncCore().ConfigureAwait(false); }
-        catch (Exception ex) { AdoException.Throw(ex); }
+        try
+        {
+            await CloseAsyncCore().ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            AdoException.Throw(ex);
+        }
     }
 
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
     async ValueTask DisposeAsyncProjected()
     {
-        try { await DisposeAsyncCore().ConfigureAwait(false); }
-        catch (Exception ex) { AdoException.Throw(ex); }
+        var ownsCleanup = false;
+        try
+        {
+            if (Interlocked.CompareExchange(ref _closing, true, false))
+                ThrowHelper.ThrowInvalidOperation("Invalid concurrent call.");
+            ownsCleanup = true;
+
+            var rowEnumerator = _rowEnumerator;
+            var enumerator = _enumerator;
+            _enumerator = default;
+            _rowEnumerator = default;
+
+            try
+            {
+                try
+                {
+                    await rowEnumerator.RevokeColumnLeaseAsync().ConfigureAwait(false);
+                }
+                finally
+                {
+                    await enumerator.DisposeAsync().ConfigureAwait(false);
+                }
+            }
+            finally
+            {
+                Volatile.Write(ref _closing, false);
+            }
+
+            if (TakeConnectionToClose() is { } connection)
+                await new ValueTask(connection.CloseAsync()).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            AdoException.Throw(ex);
+        }
+        finally
+        {
+            if (ownsCleanup)
+                Reset();
+        }
     }
 }

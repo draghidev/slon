@@ -1,7 +1,3 @@
-using System;
-using System.Threading;
-using System.Threading.Tasks;
-
 namespace Slon.Pg.Serialization;
 
 public abstract class PgBufferedConverter<T> : PgConverter<T>

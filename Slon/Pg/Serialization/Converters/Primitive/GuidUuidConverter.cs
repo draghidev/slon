@@ -1,8 +1,3 @@
-using System;
-using System.Buffers.Binary;
-using System.Runtime.InteropServices;
-using Slon.Pg.Serialization;
-
 namespace Slon.Pg.Serialization.Converters;
 
 sealed class GuidUuidConverter : PgBufferedConverter<Guid>
