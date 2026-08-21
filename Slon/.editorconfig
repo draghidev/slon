@@ -12,7 +12,15 @@ dotnet_diagnostic.CA2007.severity = error;
 
 # Public ADO and configuration APIs must be documented.
 dotnet_diagnostic.CS1591.severity = error
+dotnet_diagnostic.RS0016.severity = error
+dotnet_diagnostic.RS0017.severity = error
+
+# The established API intentionally mixes convenience overloads with optional parameters.
+dotnet_diagnostic.RS0026.severity = none
+dotnet_diagnostic.RS0027.severity = none
 
 # The lower-level protocol and serializer surface remains experimental.
 [Pg/**/*.cs]
 dotnet_diagnostic.CS1591.severity = none
+dotnet_diagnostic.RS0016.severity = none
+dotnet_diagnostic.RS0022.severity = none

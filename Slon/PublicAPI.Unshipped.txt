@@ -1,0 +1,543 @@
+#nullable enable
+override sealed Slon.SlonParameter.DbType.get -> System.Data.DbType
+override sealed Slon.SlonParameter.DbType.set -> void
+override sealed Slon.SlonParameter.Direction.get -> System.Data.ParameterDirection
+override sealed Slon.SlonParameter.Direction.set -> void
+override sealed Slon.SlonParameter.IsNullable.get -> bool
+override sealed Slon.SlonParameter.IsNullable.set -> void
+override sealed Slon.SlonParameter.ParameterName.get -> string!
+override sealed Slon.SlonParameter.ParameterName.set -> void
+override sealed Slon.SlonParameter.Precision.get -> byte
+override sealed Slon.SlonParameter.Precision.set -> void
+override sealed Slon.SlonParameter.ResetDbType() -> void
+override sealed Slon.SlonParameter.Scale.get -> byte
+override sealed Slon.SlonParameter.Scale.set -> void
+override sealed Slon.SlonParameter.Size.get -> int
+override sealed Slon.SlonParameter.Size.set -> void
+override sealed Slon.SlonParameter.SourceColumn.get -> string!
+override sealed Slon.SlonParameter.SourceColumn.set -> void
+override sealed Slon.SlonParameter.SourceColumnNullMapping.get -> bool
+override sealed Slon.SlonParameter.SourceColumnNullMapping.set -> void
+override sealed Slon.SlonParameter.SourceVersion.get -> System.Data.DataRowVersion
+override sealed Slon.SlonParameter.SourceVersion.set -> void
+override sealed Slon.SlonParameter.Value.get -> object?
+override sealed Slon.SlonParameter.Value.set -> void
+override Slon.PostgreSqlException.IsTransient.get -> bool
+override Slon.PostgreSqlException.SqlState.get -> string!
+override Slon.PostgreSqlOAuthToken.ToString() -> string!
+override Slon.SlonBatch.Cancel() -> void
+override Slon.SlonBatch.Dispose() -> void
+override Slon.SlonBatch.DisposeAsync() -> System.Threading.Tasks.ValueTask
+override Slon.SlonBatch.ExecuteNonQuery() -> int
+override Slon.SlonBatch.ExecuteNonQueryAsync(System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<int>!
+override Slon.SlonBatch.ExecuteScalar() -> object?
+override Slon.SlonBatch.ExecuteScalarAsync(System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<object?>!
+override Slon.SlonBatch.Prepare() -> void
+override Slon.SlonBatch.PrepareAsync(System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task!
+override Slon.SlonBatch.Timeout.get -> int
+override Slon.SlonBatch.Timeout.set -> void
+override Slon.SlonBatchCommand.CanCreateParameter.get -> bool
+override Slon.SlonBatchCommand.CommandText.get -> string!
+override Slon.SlonBatchCommand.CommandText.set -> void
+override Slon.SlonBatchCommand.CommandType.get -> System.Data.CommandType
+override Slon.SlonBatchCommand.CommandType.set -> void
+override Slon.SlonBatchCommand.CreateParameter() -> Slon.SlonParameter!
+override Slon.SlonBatchCommand.RecordsAffected.get -> int
+override Slon.SlonBatchCommands.Add(System.Data.Common.DbBatchCommand! item) -> void
+override Slon.SlonBatchCommands.Clear() -> void
+override Slon.SlonBatchCommands.Contains(System.Data.Common.DbBatchCommand! item) -> bool
+override Slon.SlonBatchCommands.CopyTo(System.Data.Common.DbBatchCommand![]! array, int arrayIndex) -> void
+override Slon.SlonBatchCommands.Count.get -> int
+override Slon.SlonBatchCommands.GetEnumerator() -> System.Collections.Generic.IEnumerator<System.Data.Common.DbBatchCommand!>!
+override Slon.SlonBatchCommands.IndexOf(System.Data.Common.DbBatchCommand! item) -> int
+override Slon.SlonBatchCommands.Insert(int index, System.Data.Common.DbBatchCommand! item) -> void
+override Slon.SlonBatchCommands.IsReadOnly.get -> bool
+override Slon.SlonBatchCommands.Remove(System.Data.Common.DbBatchCommand! item) -> bool
+override Slon.SlonBatchCommands.RemoveAt(int index) -> void
+override Slon.SlonCommand.Cancel() -> void
+override Slon.SlonCommand.CommandText.get -> string!
+override Slon.SlonCommand.CommandText.set -> void
+override Slon.SlonCommand.CommandTimeout.get -> int
+override Slon.SlonCommand.CommandTimeout.set -> void
+override Slon.SlonCommand.CommandType.get -> System.Data.CommandType
+override Slon.SlonCommand.CommandType.set -> void
+override Slon.SlonCommand.DesignTimeVisible.get -> bool
+override Slon.SlonCommand.DesignTimeVisible.set -> void
+override Slon.SlonCommand.DisposeAsync() -> System.Threading.Tasks.ValueTask
+override Slon.SlonCommand.ExecuteNonQuery() -> int
+override Slon.SlonCommand.ExecuteNonQueryAsync(System.Threading.CancellationToken cancellationToken) -> System.Threading.Tasks.Task<int>!
+override Slon.SlonCommand.ExecuteScalar() -> object?
+override Slon.SlonCommand.ExecuteScalarAsync(System.Threading.CancellationToken cancellationToken) -> System.Threading.Tasks.Task<object?>!
+override Slon.SlonCommand.Prepare() -> void
+override Slon.SlonCommand.PrepareAsync(System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task!
+override Slon.SlonCommand.UpdatedRowSource.get -> System.Data.UpdateRowSource
+override Slon.SlonCommand.UpdatedRowSource.set -> void
+override Slon.SlonConnection.CanCreateBatch.get -> bool
+override Slon.SlonConnection.ChangeDatabase(string! databaseName) -> void
+override Slon.SlonConnection.ChangeDatabaseAsync(string! databaseName, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task!
+override Slon.SlonConnection.Close() -> void
+override Slon.SlonConnection.CloseAsync() -> System.Threading.Tasks.Task!
+override Slon.SlonConnection.ConnectionString.get -> string!
+override Slon.SlonConnection.ConnectionString.set -> void
+override Slon.SlonConnection.ConnectionTimeout.get -> int
+override Slon.SlonConnection.Database.get -> string!
+override Slon.SlonConnection.DataSource.get -> string!
+override Slon.SlonConnection.DisposeAsync() -> System.Threading.Tasks.ValueTask
+override Slon.SlonConnection.GetSchema() -> System.Data.DataTable!
+override Slon.SlonConnection.GetSchema(string? collectionName) -> System.Data.DataTable!
+override Slon.SlonConnection.GetSchema(string? collectionName, string?[]? restrictions) -> System.Data.DataTable!
+override Slon.SlonConnection.GetSchemaAsync(string! collectionName, string?[]? restrictions, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<System.Data.DataTable!>!
+override Slon.SlonConnection.GetSchemaAsync(string! collectionName, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<System.Data.DataTable!>!
+override Slon.SlonConnection.GetSchemaAsync(System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<System.Data.DataTable!>!
+override Slon.SlonConnection.Open() -> void
+override Slon.SlonConnection.OpenAsync(System.Threading.CancellationToken cancellationToken) -> System.Threading.Tasks.Task!
+override Slon.SlonConnection.ServerVersion.get -> string!
+override Slon.SlonConnection.State.get -> System.Data.ConnectionState
+override Slon.SlonConnection.StateChange -> System.Data.StateChangeEventHandler?
+override Slon.SlonDataReader.Close() -> void
+override Slon.SlonDataReader.CloseAsync() -> System.Threading.Tasks.Task!
+override Slon.SlonDataReader.Depth.get -> int
+override Slon.SlonDataReader.DisposeAsync() -> System.Threading.Tasks.ValueTask
+override Slon.SlonDataReader.FieldCount.get -> int
+override Slon.SlonDataReader.GetBoolean(int ordinal) -> bool
+override Slon.SlonDataReader.GetByte(int ordinal) -> byte
+override Slon.SlonDataReader.GetBytes(int ordinal, long dataOffset, byte[]? buffer, int bufferOffset, int length) -> long
+override Slon.SlonDataReader.GetChar(int ordinal) -> char
+override Slon.SlonDataReader.GetChars(int ordinal, long dataOffset, char[]? buffer, int bufferOffset, int length) -> long
+override Slon.SlonDataReader.GetColumnSchemaAsync(System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<System.Collections.ObjectModel.ReadOnlyCollection<System.Data.Common.DbColumn!>!>!
+override Slon.SlonDataReader.GetDataTypeName(int ordinal) -> string!
+override Slon.SlonDataReader.GetDateTime(int ordinal) -> System.DateTime
+override Slon.SlonDataReader.GetDecimal(int ordinal) -> decimal
+override Slon.SlonDataReader.GetDouble(int ordinal) -> double
+override Slon.SlonDataReader.GetEnumerator() -> System.Collections.IEnumerator!
+override Slon.SlonDataReader.GetFieldType(int ordinal) -> System.Type!
+override Slon.SlonDataReader.GetFieldValue<T>(int ordinal) -> T
+override Slon.SlonDataReader.GetFieldValueAsync<T>(int ordinal, System.Threading.CancellationToken cancellationToken) -> System.Threading.Tasks.Task<T>!
+override Slon.SlonDataReader.GetFloat(int ordinal) -> float
+override Slon.SlonDataReader.GetGuid(int ordinal) -> System.Guid
+override Slon.SlonDataReader.GetInt16(int ordinal) -> short
+override Slon.SlonDataReader.GetInt32(int ordinal) -> int
+override Slon.SlonDataReader.GetInt64(int ordinal) -> long
+override Slon.SlonDataReader.GetName(int ordinal) -> string!
+override Slon.SlonDataReader.GetOrdinal(string! name) -> int
+override Slon.SlonDataReader.GetSchemaTable() -> System.Data.DataTable?
+override Slon.SlonDataReader.GetSchemaTableAsync(System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task<System.Data.DataTable?>!
+override Slon.SlonDataReader.GetStream(int ordinal) -> System.IO.Stream!
+override Slon.SlonDataReader.GetString(int ordinal) -> string!
+override Slon.SlonDataReader.GetTextReader(int ordinal) -> System.IO.TextReader!
+override Slon.SlonDataReader.GetValue(int ordinal) -> object!
+override Slon.SlonDataReader.GetValues(object![]! values) -> int
+override Slon.SlonDataReader.HasRows.get -> bool
+override Slon.SlonDataReader.IsClosed.get -> bool
+override Slon.SlonDataReader.IsDBNull(int ordinal) -> bool
+override Slon.SlonDataReader.IsDBNullAsync(int ordinal, System.Threading.CancellationToken cancellationToken) -> System.Threading.Tasks.Task<bool>!
+override Slon.SlonDataReader.NextResult() -> bool
+override Slon.SlonDataReader.NextResultAsync(System.Threading.CancellationToken cancellationToken) -> System.Threading.Tasks.Task<bool>!
+override Slon.SlonDataReader.Read() -> bool
+override Slon.SlonDataReader.ReadAsync(System.Threading.CancellationToken cancellationToken) -> System.Threading.Tasks.Task<bool>!
+override Slon.SlonDataReader.RecordsAffected.get -> int
+override Slon.SlonDataReader.this[int ordinal].get -> object!
+override Slon.SlonDataReader.this[string! name].get -> object!
+override Slon.SlonDataSource.ConnectionString.get -> string!
+override Slon.SlonDataSourceOptions.ToString() -> string!
+override Slon.SlonDbType.ToString() -> string!
+override Slon.SlonException.IsTransient.get -> bool
+override Slon.SlonParameters.Add(object! value) -> int
+override Slon.SlonParameters.AddRange(System.Array! values) -> void
+override Slon.SlonParameters.Clear() -> void
+override Slon.SlonParameters.Contains(object? value) -> bool
+override Slon.SlonParameters.Contains(string? parameterName) -> bool
+override Slon.SlonParameters.CopyTo(System.Array! array, int arrayIndex) -> void
+override Slon.SlonParameters.Count.get -> int
+override Slon.SlonParameters.GetEnumerator() -> System.Collections.IEnumerator!
+override Slon.SlonParameters.IndexOf(object? value) -> int
+override Slon.SlonParameters.IndexOf(string? parameterName) -> int
+override Slon.SlonParameters.Insert(int index, object? value) -> void
+override Slon.SlonParameters.IsFixedSize.get -> bool
+override Slon.SlonParameters.IsReadOnly.get -> bool
+override Slon.SlonParameters.IsSynchronized.get -> bool
+override Slon.SlonParameters.Remove(object? value) -> void
+override Slon.SlonParameters.RemoveAt(int index) -> void
+override Slon.SlonParameters.RemoveAt(string! parameterName) -> void
+override Slon.SlonParameters.SyncRoot.get -> object!
+override Slon.SlonTransaction.Commit() -> void
+override Slon.SlonTransaction.CommitAsync(System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task!
+override Slon.SlonTransaction.DisposeAsync() -> System.Threading.Tasks.ValueTask
+override Slon.SlonTransaction.IsolationLevel.get -> System.Data.IsolationLevel
+override Slon.SlonTransaction.Rollback() -> void
+override Slon.SlonTransaction.RollbackAsync(System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task!
+Slon.PostgreSqlAuthenticationOptions
+Slon.PostgreSqlAuthenticationOptions.AllowInsecureTransport.get -> bool
+Slon.PostgreSqlAuthenticationOptions.AllowInsecureTransport.init -> void
+Slon.PostgreSqlAuthenticationOptions.PostgreSqlAuthenticationOptions() -> void
+Slon.PostgreSqlChannelBinding
+Slon.PostgreSqlChannelBinding.Disable = 0 -> Slon.PostgreSqlChannelBinding
+Slon.PostgreSqlChannelBinding.Prefer = 1 -> Slon.PostgreSqlChannelBinding
+Slon.PostgreSqlChannelBinding.Require = 2 -> Slon.PostgreSqlChannelBinding
+Slon.PostgreSqlCompatibilityFeatures
+Slon.PostgreSqlCompatibilityFeatures.AdvisoryLocks = 2048 -> Slon.PostgreSqlCompatibilityFeatures
+Slon.PostgreSqlCompatibilityFeatures.All = Slon.PostgreSqlCompatibilityFeatures.RangeTypes | Slon.PostgreSqlCompatibilityFeatures.MultirangeTypes | Slon.PostgreSqlCompatibilityFeatures.EnumTypes | Slon.PostgreSqlCompatibilityFeatures.EnumSortOrder | Slon.PostgreSqlCompatibilityFeatures.TypeCategory | Slon.PostgreSqlCompatibilityFeatures.IntegerDateTimes | Slon.PostgreSqlCompatibilityFeatures.DiscardTemp | Slon.PostgreSqlCompatibilityFeatures.Unlisten | Slon.PostgreSqlCompatibilityFeatures.CloseAll | Slon.PostgreSqlCompatibilityFeatures.ResetAll | Slon.PostgreSqlCompatibilityFeatures.SessionAuthorization | Slon.PostgreSqlCompatibilityFeatures.AdvisoryLocks | Slon.PostgreSqlCompatibilityFeatures.Listen | Slon.PostgreSqlCompatibilityFeatures.Notifications -> Slon.PostgreSqlCompatibilityFeatures
+Slon.PostgreSqlCompatibilityFeatures.CloseAll = 256 -> Slon.PostgreSqlCompatibilityFeatures
+Slon.PostgreSqlCompatibilityFeatures.DiscardTemp = 64 -> Slon.PostgreSqlCompatibilityFeatures
+Slon.PostgreSqlCompatibilityFeatures.EnumSortOrder = 8 -> Slon.PostgreSqlCompatibilityFeatures
+Slon.PostgreSqlCompatibilityFeatures.EnumTypes = 4 -> Slon.PostgreSqlCompatibilityFeatures
+Slon.PostgreSqlCompatibilityFeatures.IntegerDateTimes = 32 -> Slon.PostgreSqlCompatibilityFeatures
+Slon.PostgreSqlCompatibilityFeatures.Listen = 4096 -> Slon.PostgreSqlCompatibilityFeatures
+Slon.PostgreSqlCompatibilityFeatures.MultirangeTypes = 2 -> Slon.PostgreSqlCompatibilityFeatures
+Slon.PostgreSqlCompatibilityFeatures.None = 0 -> Slon.PostgreSqlCompatibilityFeatures
+Slon.PostgreSqlCompatibilityFeatures.Notifications = 8192 -> Slon.PostgreSqlCompatibilityFeatures
+Slon.PostgreSqlCompatibilityFeatures.RangeTypes = 1 -> Slon.PostgreSqlCompatibilityFeatures
+Slon.PostgreSqlCompatibilityFeatures.ResetAll = 512 -> Slon.PostgreSqlCompatibilityFeatures
+Slon.PostgreSqlCompatibilityFeatures.SessionAuthorization = 1024 -> Slon.PostgreSqlCompatibilityFeatures
+Slon.PostgreSqlCompatibilityFeatures.TypeCategory = 16 -> Slon.PostgreSqlCompatibilityFeatures
+Slon.PostgreSqlCompatibilityFeatures.Unlisten = 128 -> Slon.PostgreSqlCompatibilityFeatures
+Slon.PostgreSqlCompatibilityProfile
+Slon.PostgreSqlCompatibilityProfile.CompleteSessionResetCommand.get -> string?
+Slon.PostgreSqlCompatibilityProfile.CompleteSessionResetCommand.init -> void
+Slon.PostgreSqlCompatibilityProfile.Features.get -> Slon.PostgreSqlCompatibilityFeatures?
+Slon.PostgreSqlCompatibilityProfile.Features.init -> void
+Slon.PostgreSqlCompatibilityProfile.LoadTypesFromCatalog.get -> bool
+Slon.PostgreSqlCompatibilityProfile.LoadTypesFromCatalog.init -> void
+Slon.PostgreSqlException
+Slon.PostgreSqlException.ColumnName.get -> string?
+Slon.PostgreSqlException.ConstraintName.get -> string?
+Slon.PostgreSqlException.Detail.get -> string?
+Slon.PostgreSqlException.Hint.get -> string?
+Slon.PostgreSqlException.IsCollateralCancellation.get -> bool
+Slon.PostgreSqlException.MessageText.get -> string!
+Slon.PostgreSqlException.Position.get -> int
+Slon.PostgreSqlException.SchemaName.get -> string?
+Slon.PostgreSqlException.Severity.get -> string!
+Slon.PostgreSqlException.TableName.get -> string?
+Slon.PostgreSqlException.Where.get -> string?
+Slon.PostgreSqlIntegratedSecurityOptions
+Slon.PostgreSqlIntegratedSecurityOptions.AllowNtlm.get -> bool
+Slon.PostgreSqlIntegratedSecurityOptions.AllowNtlm.init -> void
+Slon.PostgreSqlIntegratedSecurityOptions.ConfigureAuthenticationOptions.get -> System.Action<System.Net.Security.NegotiateAuthenticationClientOptions!>?
+Slon.PostgreSqlIntegratedSecurityOptions.ConfigureAuthenticationOptions.init -> void
+Slon.PostgreSqlIntegratedSecurityOptions.Credential.get -> System.Net.NetworkCredential!
+Slon.PostgreSqlIntegratedSecurityOptions.Credential.init -> void
+Slon.PostgreSqlIntegratedSecurityOptions.PostgreSqlIntegratedSecurityOptions() -> void
+Slon.PostgreSqlIntegratedSecurityOptions.ServiceName.get -> string!
+Slon.PostgreSqlIntegratedSecurityOptions.ServiceName.init -> void
+Slon.PostgreSqlIntegratedSecurityOptions.TargetName.get -> string?
+Slon.PostgreSqlIntegratedSecurityOptions.TargetName.init -> void
+Slon.PostgreSqlOAuthContext
+Slon.PostgreSqlOAuthContext.Database.get -> string?
+Slon.PostgreSqlOAuthContext.Database.init -> void
+Slon.PostgreSqlOAuthContext.EndPoint.get -> System.Net.EndPoint!
+Slon.PostgreSqlOAuthContext.EndPoint.init -> void
+Slon.PostgreSqlOAuthContext.PostgreSqlOAuthContext() -> void
+Slon.PostgreSqlOAuthContext.PostgreSqlOAuthContext(System.Net.EndPoint! EndPoint, string! Username, string? Database) -> void
+Slon.PostgreSqlOAuthContext.Username.get -> string!
+Slon.PostgreSqlOAuthContext.Username.init -> void
+Slon.PostgreSqlOAuthOptions
+Slon.PostgreSqlOAuthOptions.PostgreSqlOAuthOptions() -> void
+Slon.PostgreSqlOAuthOptions.RefreshBeforeExpiration.get -> System.TimeSpan
+Slon.PostgreSqlOAuthOptions.RefreshBeforeExpiration.init -> void
+Slon.PostgreSqlOAuthOptions.TokenProvider.get -> System.Func<Slon.PostgreSqlOAuthContext, System.Threading.CancellationToken, System.Threading.Tasks.ValueTask<Slon.PostgreSqlOAuthToken>>?
+Slon.PostgreSqlOAuthOptions.TokenProvider.init -> void
+Slon.PostgreSqlOAuthToken
+Slon.PostgreSqlOAuthToken.AccessToken.get -> string!
+Slon.PostgreSqlOAuthToken.AccessToken.init -> void
+Slon.PostgreSqlOAuthToken.ExpiresAt.get -> System.DateTimeOffset?
+Slon.PostgreSqlOAuthToken.ExpiresAt.init -> void
+Slon.PostgreSqlOAuthToken.PostgreSqlOAuthToken() -> void
+Slon.PostgreSqlOAuthToken.PostgreSqlOAuthToken(string! AccessToken, System.DateTimeOffset? ExpiresAt = null) -> void
+Slon.PostgreSqlSslMode
+Slon.PostgreSqlSslMode.Allow = 1 -> Slon.PostgreSqlSslMode
+Slon.PostgreSqlSslMode.Disable = 0 -> Slon.PostgreSqlSslMode
+Slon.PostgreSqlSslMode.Prefer = 2 -> Slon.PostgreSqlSslMode
+Slon.PostgreSqlSslMode.Require = 3 -> Slon.PostgreSqlSslMode
+Slon.PostgreSqlSslMode.VerifyCA = 4 -> Slon.PostgreSqlSslMode
+Slon.PostgreSqlSslMode.VerifyFull = 5 -> Slon.PostgreSqlSslMode
+Slon.PostgreSqlSslNegotiation
+Slon.PostgreSqlSslNegotiation.Automatic = 0 -> Slon.PostgreSqlSslNegotiation
+Slon.PostgreSqlSslNegotiation.Direct = 2 -> Slon.PostgreSqlSslNegotiation
+Slon.PostgreSqlSslNegotiation.PostgreSql = 1 -> Slon.PostgreSqlSslNegotiation
+Slon.PostgreSqlSslOptions
+Slon.PostgreSqlSslOptions.ChannelBinding.get -> Slon.PostgreSqlChannelBinding
+Slon.PostgreSqlSslOptions.ChannelBinding.set -> void
+Slon.PostgreSqlSslOptions.ConfigureClientAuthenticationOptions.get -> System.Action<System.Net.Security.SslClientAuthenticationOptions!>?
+Slon.PostgreSqlSslOptions.ConfigureClientAuthenticationOptions.set -> void
+Slon.PostgreSqlSslOptions.EndpointVersion.get -> System.Version?
+Slon.PostgreSqlSslOptions.EndpointVersion.set -> void
+Slon.PostgreSqlSslOptions.Mode.get -> Slon.PostgreSqlSslMode
+Slon.PostgreSqlSslOptions.Mode.set -> void
+Slon.PostgreSqlSslOptions.Negotiation.get -> Slon.PostgreSqlSslNegotiation
+Slon.PostgreSqlSslOptions.Negotiation.set -> void
+Slon.PostgreSqlSslOptions.PostgreSqlSslOptions() -> void
+Slon.SlonBatch
+Slon.SlonBatch.BatchCommands.get -> Slon.SlonBatchCommands!
+Slon.SlonBatch.CancelAsync(System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task!
+Slon.SlonBatch.Connection.get -> Slon.SlonConnection?
+Slon.SlonBatch.Connection.set -> void
+Slon.SlonBatch.CreateBatchCommand() -> Slon.SlonBatchCommand!
+Slon.SlonBatch.CreateBatchCommand(string! commandText) -> Slon.SlonBatchCommand!
+Slon.SlonBatch.EnableErrorBarriers.get -> bool
+Slon.SlonBatch.EnableErrorBarriers.set -> void
+Slon.SlonBatch.ExecuteReader(System.Data.CommandBehavior behavior = System.Data.CommandBehavior.Default) -> Slon.SlonDataReader!
+Slon.SlonBatch.ExecuteReader(System.Data.Common.DbParameterCollection! parameters) -> Slon.SlonDataReader!
+Slon.SlonBatch.ExecuteReaderAsync(System.Data.CommandBehavior behavior, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.ValueTask<Slon.SlonDataReader!>
+Slon.SlonBatch.ExecuteReaderAsync(System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.ValueTask<Slon.SlonDataReader!>
+Slon.SlonBatch.ExecuteScalar(System.Data.Common.DbParameterCollection! parameters) -> object?
+Slon.SlonBatch.IsReadOnly.get -> bool
+Slon.SlonBatch.PendingTimeout.get -> System.TimeSpan
+Slon.SlonBatch.PendingTimeout.set -> void
+Slon.SlonBatch.SlonBatch() -> void
+Slon.SlonBatch.SlonBatch(Slon.SlonConnection! conn) -> void
+Slon.SlonBatch.Transaction.get -> Slon.SlonTransaction?
+Slon.SlonBatchCommand
+Slon.SlonBatchCommand.AppendErrorBarrier.get -> bool
+Slon.SlonBatchCommand.AppendErrorBarrier.set -> void
+Slon.SlonBatchCommand.Clone() -> Slon.SlonBatchCommand!
+Slon.SlonBatchCommand.DisableAutoPreparation.get -> bool
+Slon.SlonBatchCommand.DisableAutoPreparation.set -> void
+Slon.SlonBatchCommand.LongRecordsAffected.get -> long
+Slon.SlonBatchCommand.Parameters.get -> Slon.SlonParameters!
+Slon.SlonBatchCommand.SlonBatchCommand() -> void
+Slon.SlonBatchCommands
+Slon.SlonBatchCommands.Add(Slon.SlonBatchCommand! item) -> void
+Slon.SlonBatchCommands.Contains(Slon.SlonBatchCommand! item) -> bool
+Slon.SlonBatchCommands.CopyTo(Slon.SlonBatchCommand![]! array, int arrayIndex) -> void
+Slon.SlonBatchCommands.IndexOf(Slon.SlonBatchCommand! item) -> int
+Slon.SlonBatchCommands.Insert(int index, Slon.SlonBatchCommand! item) -> void
+Slon.SlonBatchCommands.Remove(Slon.SlonBatchCommand! item) -> bool
+Slon.SlonBatchCommands.this[int index].get -> Slon.SlonBatchCommand!
+Slon.SlonBatchCommands.this[int index].set -> void
+Slon.SlonCommand
+Slon.SlonCommand.CancelAsync(System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task!
+Slon.SlonCommand.CreateParameter() -> Slon.SlonParameter!
+Slon.SlonCommand.DisableAutoPreparation.get -> bool
+Slon.SlonCommand.DisableAutoPreparation.set -> void
+Slon.SlonCommand.ExecuteNonQuery(System.Data.Common.DbParameterCollection! parameters) -> int
+Slon.SlonCommand.ExecuteNonQueryAsync(System.Data.Common.DbParameterCollection! parameters, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.ValueTask<int>
+Slon.SlonCommand.ExecuteReader() -> Slon.SlonDataReader!
+Slon.SlonCommand.ExecuteReader(System.Data.CommandBehavior behavior) -> Slon.SlonDataReader!
+Slon.SlonCommand.ExecuteReader(System.Data.Common.DbParameterCollection! parameters) -> Slon.SlonDataReader!
+Slon.SlonCommand.ExecuteReader(System.Data.Common.DbParameterCollection! parameters, System.Data.CommandBehavior behavior) -> Slon.SlonDataReader!
+Slon.SlonCommand.ExecuteReaderAsync(System.Data.CommandBehavior behavior, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.ValueTask<Slon.SlonDataReader!>
+Slon.SlonCommand.ExecuteReaderAsync(System.Data.Common.DbParameterCollection! parameters, System.Data.CommandBehavior behavior, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.ValueTask<Slon.SlonDataReader!>
+Slon.SlonCommand.ExecuteReaderAsync(System.Data.Common.DbParameterCollection! parameters, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.ValueTask<Slon.SlonDataReader!>
+Slon.SlonCommand.ExecuteReaderAsync(System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.ValueTask<Slon.SlonDataReader!>
+Slon.SlonCommand.ExecuteScalar(System.Data.Common.DbParameterCollection! parameters) -> object?
+Slon.SlonCommand.ExecuteScalarAsync(System.Data.Common.DbParameterCollection! parameters, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.ValueTask<object?>
+Slon.SlonCommand.IsReadOnly.get -> bool
+Slon.SlonCommand.Parameters.get -> Slon.SlonParameters!
+Slon.SlonCommand.PendingTimeout.get -> System.TimeSpan
+Slon.SlonCommand.PendingTimeout.set -> void
+Slon.SlonCommand.SlonCommand() -> void
+Slon.SlonCommand.SlonCommand(Slon.SlonConnection! connection) -> void
+Slon.SlonCommand.SlonCommand(Slon.SlonConnection! connection, string! commandText) -> void
+Slon.SlonCommand.SlonCommand(Slon.SlonDataSource! dataSource, string! commandText) -> void
+Slon.SlonCommand.SlonCommand(string! commandText) -> void
+Slon.SlonCommand.Transaction.get -> Slon.SlonTransaction?
+Slon.SlonConnection
+Slon.SlonConnection.BeginTransaction() -> Slon.SlonTransaction!
+Slon.SlonConnection.BeginTransaction(System.Data.IsolationLevel level) -> Slon.SlonTransaction!
+Slon.SlonConnection.BeginTransactionAsync(System.Data.IsolationLevel level, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.ValueTask<Slon.SlonTransaction!>
+Slon.SlonConnection.BeginTransactionAsync(System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.ValueTask<Slon.SlonTransaction!>
+Slon.SlonConnection.Clone() -> Slon.SlonConnection!
+Slon.SlonConnection.CreateBatch() -> Slon.SlonBatch!
+Slon.SlonConnection.CreateCommand() -> Slon.SlonCommand!
+Slon.SlonConnection.CreateCommand(string! commandText) -> Slon.SlonCommand!
+Slon.SlonConnection.Open(Slon.SlonConnectionOptions options) -> void
+Slon.SlonConnection.OpenAsync(Slon.SlonConnectionOptions options, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task!
+Slon.SlonConnection.UnprepareAll() -> void
+Slon.SlonConnection.UnprepareAllAsync() -> System.Threading.Tasks.ValueTask
+Slon.SlonConnectionOptions
+Slon.SlonConnectionOptions.LongRunning = 1 -> Slon.SlonConnectionOptions
+Slon.SlonConnectionOptions.None = 0 -> Slon.SlonConnectionOptions
+Slon.SlonDataReader
+Slon.SlonDataReader.GetBytes(int ordinal) -> byte[]!
+Slon.SlonDataReader.GetColumnSchema() -> System.Collections.ObjectModel.ReadOnlyCollection<Slon.SlonDbColumn!>!
+Slon.SlonDataReader.GetData(int ordinal) -> Slon.SlonDataReader!
+Slon.SlonDataReader.LongRecordsAffected.get -> long
+Slon.SlonDataSource
+Slon.SlonDataSource.CreateBatch() -> Slon.SlonBatch!
+Slon.SlonDataSource.CreateCommand(string? commandText = null) -> Slon.SlonCommand!
+Slon.SlonDataSource.CreateConnection() -> Slon.SlonConnection!
+Slon.SlonDataSource.Name.get -> string!
+Slon.SlonDataSource.OpenConnection() -> Slon.SlonConnection!
+Slon.SlonDataSource.OpenConnection(Slon.SlonConnectionOptions options) -> Slon.SlonConnection!
+Slon.SlonDataSource.OpenConnectionAsync(Slon.SlonConnectionOptions options, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.ValueTask<Slon.SlonConnection!>
+Slon.SlonDataSource.OpenConnectionAsync(System.Threading.CancellationToken cancellationToken) -> System.Threading.Tasks.ValueTask<Slon.SlonConnection!>
+Slon.SlonDataSource.ReloadTypes() -> void
+Slon.SlonDataSource.ReloadTypesAsync(System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.ValueTask
+Slon.SlonDataSource.SlonDataSource(Slon.SlonDataSourceOptions! options) -> void
+Slon.SlonDataSourceOptions
+Slon.SlonDataSourceOptions.AsyncConnectionInitializer.get -> System.Func<Slon.SlonConnection!, System.Threading.CancellationToken, System.Threading.Tasks.ValueTask>?
+Slon.SlonDataSourceOptions.AsyncConnectionInitializer.init -> void
+Slon.SlonDataSourceOptions.Authentication.get -> Slon.PostgreSqlAuthenticationOptions!
+Slon.SlonDataSourceOptions.Authentication.init -> void
+Slon.SlonDataSourceOptions.AutoPreparationMinimumUses.get -> int
+Slon.SlonDataSourceOptions.AutoPreparationMinimumUses.init -> void
+Slon.SlonDataSourceOptions.CancellationRetryInterval.get -> System.TimeSpan
+Slon.SlonDataSourceOptions.CancellationRetryInterval.init -> void
+Slon.SlonDataSourceOptions.CancellationTimeout.get -> System.TimeSpan
+Slon.SlonDataSourceOptions.CancellationTimeout.init -> void
+Slon.SlonDataSourceOptions.CommandTimeout.get -> System.TimeSpan
+Slon.SlonDataSourceOptions.CommandTimeout.init -> void
+Slon.SlonDataSourceOptions.CompatibilityProfile.get -> Slon.PostgreSqlCompatibilityProfile?
+Slon.SlonDataSourceOptions.CompatibilityProfile.init -> void
+Slon.SlonDataSourceOptions.ConnectionIdleLifetime.get -> System.TimeSpan
+Slon.SlonDataSourceOptions.ConnectionIdleLifetime.init -> void
+Slon.SlonDataSourceOptions.ConnectionInitializer.get -> System.Action<Slon.SlonConnection!, System.TimeSpan>?
+Slon.SlonDataSourceOptions.ConnectionInitializer.init -> void
+Slon.SlonDataSourceOptions.ConnectionPruningInterval.get -> System.TimeSpan
+Slon.SlonDataSourceOptions.ConnectionPruningInterval.init -> void
+Slon.SlonDataSourceOptions.ConnectionTimeout.get -> System.TimeSpan
+Slon.SlonDataSourceOptions.ConnectionTimeout.init -> void
+Slon.SlonDataSourceOptions.Database.get -> string?
+Slon.SlonDataSourceOptions.Database.init -> void
+Slon.SlonDataSourceOptions.DataRowStreamingThreshold.get -> int
+Slon.SlonDataSourceOptions.DataRowStreamingThreshold.init -> void
+Slon.SlonDataSourceOptions.EndPoint.get -> System.Net.EndPoint!
+Slon.SlonDataSourceOptions.EndPoint.init -> void
+Slon.SlonDataSourceOptions.IntegratedSecurity.get -> Slon.PostgreSqlIntegratedSecurityOptions?
+Slon.SlonDataSourceOptions.IntegratedSecurity.init -> void
+Slon.SlonDataSourceOptions.LoadTableComposites.get -> bool
+Slon.SlonDataSourceOptions.LoadTableComposites.init -> void
+Slon.SlonDataSourceOptions.LoggerFactory.get -> Microsoft.Extensions.Logging.ILoggerFactory!
+Slon.SlonDataSourceOptions.LoggerFactory.init -> void
+Slon.SlonDataSourceOptions.MaxActiveAutoPreparations.get -> int
+Slon.SlonDataSourceOptions.MaxActiveAutoPreparations.init -> void
+Slon.SlonDataSourceOptions.MaxInFlightOperationsPerWire.get -> int
+Slon.SlonDataSourceOptions.MaxInFlightOperationsPerWire.init -> void
+Slon.SlonDataSourceOptions.MaxPoolSize.get -> int
+Slon.SlonDataSourceOptions.MaxPoolSize.init -> void
+Slon.SlonDataSourceOptions.MinPoolSize.get -> int
+Slon.SlonDataSourceOptions.MinPoolSize.init -> void
+Slon.SlonDataSourceOptions.Name.get -> string?
+Slon.SlonDataSourceOptions.Name.init -> void
+Slon.SlonDataSourceOptions.OAuth.get -> Slon.PostgreSqlOAuthOptions?
+Slon.SlonDataSourceOptions.OAuth.init -> void
+Slon.SlonDataSourceOptions.Password.get -> string?
+Slon.SlonDataSourceOptions.Password.init -> void
+Slon.SlonDataSourceOptions.PoolSize.init -> void
+Slon.SlonDataSourceOptions.Ssl.get -> Slon.PostgreSqlSslOptions!
+Slon.SlonDataSourceOptions.Ssl.init -> void
+Slon.SlonDataSourceOptions.TypeLoadingSchemas.get -> System.Collections.Generic.IReadOnlyList<string!>!
+Slon.SlonDataSourceOptions.TypeLoadingSchemas.init -> void
+Slon.SlonDataSourceOptions.Username.get -> string!
+Slon.SlonDataSourceOptions.Username.init -> void
+Slon.SlonDbColumn
+Slon.SlonDbColumn.SlonDbType.get -> Slon.SlonDbType
+Slon.SlonDbType
+Slon.SlonDbType.MakeArrayType() -> Slon.SlonDbType
+Slon.SlonDbType.MakeMultirangeType() -> Slon.SlonDbType
+Slon.SlonDbType.SlonDbType() -> void
+Slon.SlonDbType.ToDbType() -> System.Data.DbType?
+Slon.SlonDbTypes
+Slon.SlonException
+Slon.SlonException.IsCollateral.get -> bool
+Slon.SlonException.PostgreSqlError.get -> Slon.PostgreSqlException?
+Slon.SlonParameter
+Slon.SlonParameter.Clone() -> Slon.SlonParameter!
+Slon.SlonParameter.SlonDbType.get -> Slon.SlonDbType
+Slon.SlonParameter.SlonDbType.set -> void
+Slon.SlonParameter.SlonParameter() -> void
+Slon.SlonParameter.SlonParameter(object? value) -> void
+Slon.SlonParameter.SlonParameter(string! parameterName, object? value) -> void
+Slon.SlonParameter<T>
+Slon.SlonParameter<T>.Clone() -> Slon.SlonParameter<T>!
+Slon.SlonParameter<T>.SlonParameter() -> void
+Slon.SlonParameter<T>.SlonParameter(string! parameterName, T? value) -> void
+Slon.SlonParameter<T>.SlonParameter(T? value) -> void
+Slon.SlonParameter<T>.Value.get -> T?
+Slon.SlonParameter<T>.Value.set -> void
+Slon.SlonParameters
+Slon.SlonParameters.Add(Slon.SlonParameter! parameter) -> void
+Slon.SlonParameters.Add(string! parameterName, object? value) -> void
+Slon.SlonParameters.Add(string! parameterName, System.Data.DbType dbType, object? value) -> void
+Slon.SlonParameters.Add<T>(Slon.SlonDbType dbType, T? value) -> void
+Slon.SlonParameters.Add<T>(string! parameterName, Slon.SlonDbType dbType, T? value) -> void
+Slon.SlonParameters.Add<T>(string! parameterName, System.Data.DbType dbType, T? value) -> void
+Slon.SlonParameters.Add<T>(string! parameterName, T? value) -> void
+Slon.SlonParameters.Add<T>(System.Data.DbType dbType, T? value) -> void
+Slon.SlonParameters.Add<T>(T? value) -> void
+Slon.SlonParameters.AddRange(params System.Collections.Generic.IEnumerable<System.Collections.Generic.KeyValuePair<string!, object?>>! parameters) -> void
+Slon.SlonParameters.AddRange(params System.ReadOnlySpan<object?> parameters) -> void
+Slon.SlonParameters.AddRange(params System.ReadOnlySpan<System.Collections.Generic.KeyValuePair<string!, object?>> parameters) -> void
+Slon.SlonParameters.Contains(Slon.SlonParameter! value) -> bool
+Slon.SlonParameters.CopyTo(Slon.SlonParameter![]! array, int arrayIndex) -> void
+Slon.SlonParameters.EnsureCapacity(int capacity) -> int
+Slon.SlonParameters.IndexOf(Slon.SlonParameter! value) -> int
+Slon.SlonParameters.Insert(int index, Slon.SlonParameter! value) -> void
+Slon.SlonParameters.Remove(Slon.SlonParameter! value) -> bool
+Slon.SlonParameters.Remove(string! parameterName) -> void
+Slon.SlonParameters.SlonParameters() -> void
+Slon.SlonParameters.SlonParameters(int initialCapacity = 5) -> void
+Slon.SlonParameters.SlonParameters(System.Collections.Generic.IEnumerable<System.Collections.Generic.KeyValuePair<string!, object?>>! parameters) -> void
+Slon.SlonParameters.this[int index].get -> Slon.SlonParameter!
+Slon.SlonParameters.this[int index].set -> void
+Slon.SlonParameters.this[string! parameterName].get -> Slon.SlonParameter!
+Slon.SlonParameters.this[string! parameterName].set -> void
+Slon.SlonParameters.TryGetValue(string! parameterName, out object? value) -> bool
+Slon.SlonParameters.TryGetValue(string! parameterName, out Slon.SlonParameter? parameter) -> bool
+Slon.SlonTransaction
+Slon.SlonTransaction.Connection.get -> Slon.SlonConnection?
+static Slon.SlonCommand.Prepare(Slon.SlonConnection! connection, string! commandText) -> Slon.SlonCommand!
+static Slon.SlonCommand.PrepareAsync(Slon.SlonConnection! connection, string! commandText, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.ValueTask<Slon.SlonCommand!>
+static Slon.SlonDataSourceOptions.ParseIpOrDnsEndPoint(string! host) -> System.Net.EndPoint!
+static Slon.SlonDbType.Create(string! dataTypeName) -> Slon.SlonDbType
+static Slon.SlonDbType.explicit operator Slon.SlonDbType(System.Data.DbType dbType) -> Slon.SlonDbType
+static Slon.SlonDbType.explicit operator Slon.SlonDbType(System.Data.DbType? dbType) -> Slon.SlonDbType
+static Slon.SlonDbType.Infer.get -> Slon.SlonDbType
+static Slon.SlonDbTypes.Bit.get -> Slon.SlonDbType
+static Slon.SlonDbTypes.Bool.get -> Slon.SlonDbType
+static Slon.SlonDbTypes.Box.get -> Slon.SlonDbType
+static Slon.SlonDbTypes.Bpchar.get -> Slon.SlonDbType
+static Slon.SlonDbTypes.Bytea.get -> Slon.SlonDbType
+static Slon.SlonDbTypes.Cid.get -> Slon.SlonDbType
+static Slon.SlonDbTypes.Cidr.get -> Slon.SlonDbType
+static Slon.SlonDbTypes.Circle.get -> Slon.SlonDbType
+static Slon.SlonDbTypes.Date.get -> Slon.SlonDbType
+static Slon.SlonDbTypes.Float4.get -> Slon.SlonDbType
+static Slon.SlonDbTypes.Float8.get -> Slon.SlonDbType
+static Slon.SlonDbTypes.Inet.get -> Slon.SlonDbType
+static Slon.SlonDbTypes.Int2.get -> Slon.SlonDbType
+static Slon.SlonDbTypes.Int2Vector.get -> Slon.SlonDbType
+static Slon.SlonDbTypes.Int4.get -> Slon.SlonDbType
+static Slon.SlonDbTypes.Int8.get -> Slon.SlonDbType
+static Slon.SlonDbTypes.Interval.get -> Slon.SlonDbType
+static Slon.SlonDbTypes.Json.get -> Slon.SlonDbType
+static Slon.SlonDbTypes.Jsonb.get -> Slon.SlonDbType
+static Slon.SlonDbTypes.Jsonpath.get -> Slon.SlonDbType
+static Slon.SlonDbTypes.Line.get -> Slon.SlonDbType
+static Slon.SlonDbTypes.Lseg.get -> Slon.SlonDbType
+static Slon.SlonDbTypes.MacAddr.get -> Slon.SlonDbType
+static Slon.SlonDbTypes.MacAddr8.get -> Slon.SlonDbType
+static Slon.SlonDbTypes.Money.get -> Slon.SlonDbType
+static Slon.SlonDbTypes.Name.get -> Slon.SlonDbType
+static Slon.SlonDbTypes.Numeric.get -> Slon.SlonDbType
+static Slon.SlonDbTypes.Oid.get -> Slon.SlonDbType
+static Slon.SlonDbTypes.OidVector.get -> Slon.SlonDbType
+static Slon.SlonDbTypes.Path.get -> Slon.SlonDbType
+static Slon.SlonDbTypes.PgLsn.get -> Slon.SlonDbType
+static Slon.SlonDbTypes.Point.get -> Slon.SlonDbType
+static Slon.SlonDbTypes.Polygon.get -> Slon.SlonDbType
+static Slon.SlonDbTypes.RefCursor.get -> Slon.SlonDbType
+static Slon.SlonDbTypes.RegConfig.get -> Slon.SlonDbType
+static Slon.SlonDbTypes.RegType.get -> Slon.SlonDbType
+static Slon.SlonDbTypes.Text.get -> Slon.SlonDbType
+static Slon.SlonDbTypes.Tid.get -> Slon.SlonDbType
+static Slon.SlonDbTypes.Time.get -> Slon.SlonDbType
+static Slon.SlonDbTypes.Timestamp.get -> Slon.SlonDbType
+static Slon.SlonDbTypes.TimestampTz.get -> Slon.SlonDbType
+static Slon.SlonDbTypes.TimeTz.get -> Slon.SlonDbType
+static Slon.SlonDbTypes.TsQuery.get -> Slon.SlonDbType
+static Slon.SlonDbTypes.TsVector.get -> Slon.SlonDbType
+static Slon.SlonDbTypes.Unknown.get -> Slon.SlonDbType
+static Slon.SlonDbTypes.Uuid.get -> Slon.SlonDbType
+static Slon.SlonDbTypes.Varbit.get -> Slon.SlonDbType
+static Slon.SlonDbTypes.Varchar.get -> Slon.SlonDbType
+static Slon.SlonDbTypes.Xid.get -> Slon.SlonDbType
+static Slon.SlonDbTypes.Xid8.get -> Slon.SlonDbType
+static Slon.SlonDbTypes.Xml.get -> Slon.SlonDbType
+static Slon.SlonParameters.Create() -> Slon.SlonParameters!
+static Slon.SlonParameters.Create(object? value) -> Slon.SlonParameters!
+static Slon.SlonParameters.Create(string! parameterName, object? value) -> Slon.SlonParameters!
+static Slon.SlonParameters.Create(System.Collections.Generic.KeyValuePair<string!, object?> parameter) -> Slon.SlonParameters!
+static Slon.SlonParameters.CreateRange(params System.Collections.Generic.IEnumerable<System.Collections.Generic.KeyValuePair<string!, object?>>! parameters) -> Slon.SlonParameters!
+static Slon.SlonParameters.CreateRange(params System.ReadOnlySpan<System.Collections.Generic.KeyValuePair<string!, object?>> parameters) -> Slon.SlonParameters!

@@ -19,6 +19,7 @@
 
     <ItemGroup>
         <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.0"/>
+        <PackageReference Include="Microsoft.CodeAnalysis.PublicApiAnalyzers" Version="3.3.4" PrivateAssets="all" />
         <ProjectReference Include="../../Draghi/Draghi.Pipelining/Draghi.Pipelining.csproj"/>
     </ItemGroup>
 
