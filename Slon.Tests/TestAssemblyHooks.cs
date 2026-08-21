@@ -1,7 +1,3 @@
-using Slon.Tests.Pg;
-
-// Method-level parallelism by default. Classes that can't tolerate it
-// (fast-heartbeat-tick contention, TP-count assertions) opt out with [DoNotParallelize].
 [assembly: Parallelize(Workers = 0, Scope = ExecutionScope.MethodLevel)]
 
 namespace Slon.Tests;

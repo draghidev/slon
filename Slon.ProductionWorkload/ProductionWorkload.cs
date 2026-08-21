@@ -2,7 +2,6 @@ using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Globalization;
 using System.Text;
-using Slon;
 
 namespace Slon.ProductionWorkload;
 

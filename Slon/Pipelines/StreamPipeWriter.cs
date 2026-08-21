@@ -22,7 +22,13 @@ abstract class StreamPipeWriter : PipeWriter, IOutputWriter
     protected Stream Stream { get; }
     protected int? WriteTimeout { get; }
 
-    public StreamPipeWriter(Stream writingStream, StreamPipeWriterOptions options, bool supportCancelPending = true)
+    /// <summary>
+    /// Creates a new StreamPipeWriter.
+    /// </summary>
+    /// <param name="writingStream">The stream to write to.</param>
+    /// <param name="options">The options to use.</param>
+    /// <param name="supportCancelPending">Whether cancellation handling for CancelPendingFlush() gets registered on flushes.</param>
+    protected StreamPipeWriter(Stream writingStream, StreamPipeWriterOptions options, bool supportCancelPending = true)
     {
         ArgumentNullException.ThrowIfNull(writingStream);
         ArgumentNullException.ThrowIfNull(options);

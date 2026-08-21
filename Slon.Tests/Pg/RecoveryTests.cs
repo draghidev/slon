@@ -1,6 +1,4 @@
 using System.Buffers.Binary;
-using System.Collections.Immutable;
-using System.Text;
 using System.Threading.Tasks.Sources;
 using Slon.Pg;
 using Slon.Pg.Protocol;

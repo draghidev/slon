@@ -30,6 +30,7 @@ abstract class StreamPipeReader : PipeReader
     /// </summary>
     /// <param name="readingStream">The stream to read from.</param>
     /// <param name="options">The options to use.</param>
+    /// <param name="supportCancelPending">Whether cancellation handling for CancelPendingRead() gets registered on reads.</param>
     protected StreamPipeReader(Stream readingStream, StreamPipeReaderOptions options, bool supportCancelPending = true)
     {
         ArgumentNullException.ThrowIfNull(readingStream);

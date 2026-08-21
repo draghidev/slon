@@ -1,7 +1,4 @@
-using System.Threading.Tasks;
 using BenchmarkDotNet.Attributes;
-using Draghi.Pipelining;
-using Slon.Pg.Protocol;
 
 namespace Slon.Benchmark;
 

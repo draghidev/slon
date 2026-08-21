@@ -1,6 +1,5 @@
 using System.Buffers.Binary;
 using System.Text;
-using Slon.Buffers;
 using Slon.Pg;
 using Slon.Pg.Protocol;
 using Slon.Pg.Protocol.Flows;

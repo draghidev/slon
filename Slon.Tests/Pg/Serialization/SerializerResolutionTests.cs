@@ -1,5 +1,4 @@
 using System.Data;
-using Slon.Pg;
 using Slon.Pg.Serialization;
 using Slon.Pg.Types;
 

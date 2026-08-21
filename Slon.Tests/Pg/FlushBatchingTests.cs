@@ -1,6 +1,5 @@
 using System.Buffers.Binary;
 using System.IO.Pipelines;
-using Draghi.Pipelining;
 using Microsoft.Extensions.Time.Testing;
 using Slon.Pg;
 using Slon.Pg.Protocol;

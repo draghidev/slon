@@ -5,8 +5,7 @@
         <ImplicitUsings>enable</ImplicitUsings>
         <LangVersion>preview</LangVersion>
         <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
-        <ResolveAssemblyReferencesDependsOn>$(ResolveAssemblyReferencesDependsOn);TransformPackPrivates</ResolveAssemblyReferencesDependsOn>
-        <TargetsForTfmSpecificBuildOutput>TransformPackPrivates;$(TargetsForTfmSpecificBuildOutput);IncludeProjectReferenceDlls</TargetsForTfmSpecificBuildOutput>
+        <TargetsForTfmSpecificBuildOutput>$(TargetsForTfmSpecificBuildOutput);IncludeProjectReferenceDlls</TargetsForTfmSpecificBuildOutput>
         <TargetsForTfmSpecificContentInPackage>$(TargetsForTfmSpecificContentInPackage);IncludeReferenceAssemblies</TargetsForTfmSpecificContentInPackage>
         <NoWarn>$(NoWarn);NU5131;DRAGHI001</NoWarn>
     </PropertyGroup>

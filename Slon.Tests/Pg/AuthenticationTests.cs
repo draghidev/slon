@@ -5,7 +5,6 @@ using System.Security.Authentication;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
-using Slon.Pg.Protocol.Flows;
 using Slon.Pg;
 using Slon.Pg.Protocol;
 using Slon.Pipelines;
