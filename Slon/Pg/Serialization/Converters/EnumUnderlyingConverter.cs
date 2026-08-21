@@ -4,7 +4,7 @@ using System.Runtime.CompilerServices;
 namespace Slon.Pg.Serialization.Converters;
 
 /// <summary>
-/// Non-generic marker for <see cref="EnumUnderlyingConverter{T}"/>. Used by <see cref="PgConcreteTypeInfo"/> at
+/// Non-generic marker for <see cref="EnumUnderlyingConverter{T}"/>. Used by <see cref="PgTypeInfo"/> at
 /// construction time to enforce that only this converter may participate in enum reported-type widening.
 /// </summary>
 interface IEnumUnderlyingConverter

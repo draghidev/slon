@@ -19,7 +19,7 @@ static class SequenceReaderExtensions
     /// <remarks>
     /// IMPORTANT: The peek is a straight copy of bits. If a struct depends on specific state of it's members to
     /// behave correctly this can lead to exceptions, etc. If reading endian specific integers, use the explicit
-    /// overloads such as <see cref="TryPeekLittleEndian(ref SequenceReader{T}, out short)"/>
+    /// overloads such as <see cref="TryPeekLittleEndian(ref SequenceReader{byte}, out short)"/>
     /// </remarks>
     /// <returns>
     /// True if successful. <paramref name="value"/> will be default if failed (due to lack of space).

@@ -974,6 +974,9 @@ public sealed partial class SlonDataReader : DbDataReader, IDbColumnSchemaGenera
     protected override DbDataReader GetDbDataReader(int ordinal)
         => GetData(ordinal);
 
+    /// <summary>Reads the complete field at the specified ordinal as a byte array.</summary>
+    /// <param name="ordinal">The zero-based column ordinal.</param>
+    /// <returns>The field contents.</returns>
     public byte[] GetBytes(int ordinal)
         => GetFieldValueCore<byte[]>(ordinal);
 

@@ -26,7 +26,11 @@ public sealed class SlonBatch : DbBatch
         }
     }
 
+    /// Initializes an unbound batch.
     public SlonBatch() : this(null, null) {}
+
+    /// <summary>Initializes a batch bound to the specified connection.</summary>
+    /// <param name="conn">The connection on which the batch executes.</param>
     public SlonBatch(SlonConnection conn) : this(conn, null) {}
     internal SlonBatch(SlonDataSource dataSource) : this(null, dataSource) {}
 

@@ -43,12 +43,26 @@ public sealed class SlonCommand: DbCommand
         static ref AdoBatchCore<AdoCommand> GetBatchCore(SlonCommand instance) => ref instance._batchCore;
     }
 
+    /// Initializes an unbound command.
     public SlonCommand() : this(null, null, null) {}
+
+    /// <summary>Initializes a command bound to the specified connection.</summary>
+    /// <param name="connection">The connection on which the command executes.</param>
     public SlonCommand(SlonConnection connection) : this(connection, null, null) {}
+
+    /// <summary>Initializes an unbound command with the specified command text.</summary>
+    /// <param name="commandText">The SQL statement to execute.</param>
     public SlonCommand(string commandText) : this(null, null, commandText) {}
+
+    /// <summary>Initializes a command bound to the specified connection.</summary>
+    /// <param name="connection">The connection on which the command executes.</param>
+    /// <param name="commandText">The SQL statement to execute.</param>
     public SlonCommand(SlonConnection connection, string commandText) : this(connection, null, commandText) {}
     // A data-source-bound command runs on the MULTIPLEXED path (no connection lease, no exclusive scope) -
     // the stateless fast path. Use this for one-off commands that don't need session state / transactions.
+    /// <summary>Initializes a multiplexed command bound to the specified datasource.</summary>
+    /// <param name="dataSource">The datasource through which the command executes.</param>
+    /// <param name="commandText">The SQL statement to execute.</param>
     public SlonCommand(SlonDataSource dataSource, string commandText) : this(null, dataSource, commandText) {}
 
     void ThrowIfDisposed() => _batchCore.ThrowIfDisposed();
@@ -104,6 +118,10 @@ public sealed class SlonCommand: DbCommand
         return _batchCore.PrepareAsync(parameters: null, cancellationToken);
     }
 
+    /// <summary>Creates and synchronously prepares a command on the specified connection.</summary>
+    /// <param name="connection">The connection on which to prepare the command.</param>
+    /// <param name="commandText">The SQL statement to prepare.</param>
+    /// <returns>The prepared command.</returns>
     public static SlonCommand Prepare(SlonConnection connection, string commandText)
     {
         var cmd = new SlonCommand(connection, commandText);
@@ -111,6 +129,11 @@ public sealed class SlonCommand: DbCommand
         return cmd;
     }
 
+    /// <summary>Creates and asynchronously prepares a command on the specified connection.</summary>
+    /// <param name="connection">The connection on which to prepare the command.</param>
+    /// <param name="commandText">The SQL statement to prepare.</param>
+    /// <param name="cancellationToken">A token for cancelling the preparation.</param>
+    /// <returns>The prepared command.</returns>
     public static async ValueTask<SlonCommand> PrepareAsync(SlonConnection connection, string commandText,
         CancellationToken cancellationToken = default)
     {

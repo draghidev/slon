@@ -17,7 +17,7 @@ struct ManualResetValueTaskSourceCore<TResult>
 {
     /// <summary>
     /// The callback to invoke when the operation completes if <see cref="OnCompleted"/> was called before the operation completed,
-    /// or <see cref="ContinuationDispatchCore.CompletionSentinelAction"/> if the operation completed before a callback was supplied,
+    /// or <see cref="ContinuationDispatcher.CompletionSentinelAction"/> if the operation completed before a callback was supplied,
     /// or null if a callback hasn't yet been provided and the operation hasn't yet completed.
     /// </summary>
     Action<object?>? _continuation;
@@ -244,7 +244,7 @@ struct ManualResetValueTaskSourceCore<TResult>
         return result;
     }
 
-    /// <summary>Throws an exception in response to a failed <see cref="GetResult"/>.</summary>
+    /// <summary>Throws an exception in response to a failed <see cref="GetResult(short)"/>.</summary>
     [StackTraceHidden]
     void ThrowForFailedGetResult()
     {

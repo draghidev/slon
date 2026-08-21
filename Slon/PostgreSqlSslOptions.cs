@@ -4,6 +4,7 @@ using System.Net.Sockets;
 
 namespace Slon;
 
+/// Specifies whether and how a PostgreSQL connection uses TLS.
 public enum PostgreSqlSslMode
 {
     /// <summary>Connect without TLS.</summary>
@@ -20,6 +21,7 @@ public enum PostgreSqlSslMode
     VerifyFull
 }
 
+/// Specifies how TLS negotiation starts on a PostgreSQL connection.
 public enum PostgreSqlSslNegotiation
 {
     /// <summary>Use direct TLS for an asserted PostgreSQL 17 or newer endpoint; otherwise use an SSLRequest.</summary>
@@ -30,6 +32,7 @@ public enum PostgreSqlSslNegotiation
     Direct
 }
 
+/// Specifies the SCRAM channel-binding policy.
 public enum PostgreSqlChannelBinding
 {
     /// <summary>Do not use SCRAM channel binding.</summary>
@@ -40,6 +43,7 @@ public enum PostgreSqlChannelBinding
     Require
 }
 
+/// Configures PostgreSQL TLS negotiation and server authentication.
 public sealed class PostgreSqlSslOptions
 {
     static readonly SslApplicationProtocol PostgreSqlAlpn = new("postgresql");
@@ -47,9 +51,12 @@ public sealed class PostgreSqlSslOptions
     static readonly RemoteCertificateValidationCallback VerifyCertificateAuthority = static (_, _, _, errors)
         => (errors & ~SslPolicyErrors.RemoteCertificateNameMismatch) is SslPolicyErrors.None;
 
+    /// Gets or sets whether and how TLS is used and certificates are validated.
     public PostgreSqlSslMode Mode { get; set; } = PostgreSqlSslMode.Prefer;
 
+    /// Gets or sets the SCRAM channel-binding policy.
     public PostgreSqlChannelBinding ChannelBinding { get; set; } = PostgreSqlChannelBinding.Prefer;
+    /// Gets or sets how TLS negotiation starts.
     public PostgreSqlSslNegotiation Negotiation { get; set; }
     /// <summary>
     /// Declares the PostgreSQL version implemented by the endpoint itself. An asserted version of

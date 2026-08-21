@@ -222,10 +222,16 @@ public partial class SlonParameter
 /// <inheritdoc cref="System.Data.Common.DbParameter" />
 public partial class SlonParameter : DbParameter
 {
+    /// Initializes an unnamed parameter with no value.
     public SlonParameter() { }
 
+    /// <summary>Initializes an unnamed parameter with the specified value.</summary>
+    /// <param name="value">The parameter value.</param>
     public SlonParameter(object? value) : this(string.Empty, value) { }
 
+    /// <summary>Initializes a parameter with the specified name and value.</summary>
+    /// <param name="parameterName">The parameter name, or an empty string for a positional parameter.</param>
+    /// <param name="value">The parameter value.</param>
     public SlonParameter(string parameterName, object? value)
     {
         InitializeName(parameterName);
@@ -236,12 +242,14 @@ public partial class SlonParameter : DbParameter
     /// <returns>The new instance.</returns>
     public SlonParameter Clone() => CloneCore();
 
+    /// Gets or sets the PostgreSQL type requested for this parameter.
     public SlonDbType SlonDbType
     {
         get => SlonDbTypeCore;
         set => SlonDbTypeCore = value;
     }
 
+    /// <inheritdoc />
     [AllowNull]
     public sealed override string ParameterName
     {
@@ -266,11 +274,13 @@ public partial class SlonParameter : DbParameter
             _nameOrProps = value;
         }
     }
+    /// <inheritdoc />
     public sealed override object? Value
     {
         get => ValueCore;
         set => ValueCore = value;
     }
+    /// <inheritdoc />
     public sealed override DbType DbType
     {
         get => DbTypeCore ?? DbType.String;
@@ -281,6 +291,7 @@ public partial class SlonParameter : DbParameter
             DbTypeCore = value;
         }
     }
+    /// <inheritdoc />
     public sealed override ParameterDirection Direction
     {
         get => DirectionCore;
@@ -294,32 +305,38 @@ public partial class SlonParameter : DbParameter
         }
     }
 
+    /// <inheritdoc />
     public sealed override bool IsNullable
     {
         get => IsNullableCore;
         set => IsNullableCore = value;
     }
 
+    /// <inheritdoc />
     public sealed override byte Precision
     {
         get => PrecisionCore.GetValueOrDefault();
         set => PrecisionCore = value;
     }
 
+    /// <inheritdoc />
     public sealed override byte Scale
     {
         get => ScaleCore.GetValueOrDefault();
         set => ScaleCore = value;
     }
 
+    /// <inheritdoc />
     public sealed override int Size
     {
         get => SizeCore.GetValueOrDefault();
         set => SizeCore = value;
     }
 
+    /// <inheritdoc />
     public sealed override void ResetDbType() => DbTypeCore = null;
 
+    /// <inheritdoc />
     [AllowNull]
     public sealed override string SourceColumn
     {
@@ -339,6 +356,7 @@ public partial class SlonParameter : DbParameter
             GetOrCreateProps().SourceColumn = value;
         }
     }
+    /// <inheritdoc />
     public sealed override bool SourceColumnNullMapping
     {
         get
@@ -356,6 +374,7 @@ public partial class SlonParameter : DbParameter
             GetOrCreateProps().SourceColumnNullMapping = value;
         }
     }
+    /// <inheritdoc />
     public sealed override DataRowVersion SourceVersion
     {
         get
@@ -380,10 +399,16 @@ public sealed class SlonParameter<T> : SlonParameter, IDbDataParameter<T>
 {
     T? _value;
 
+    /// Initializes an unnamed typed parameter with no value.
     public SlonParameter() => InvalidateBoxedValue();
 
+    /// <summary>Initializes an unnamed typed parameter with the specified value.</summary>
+    /// <param name="value">The parameter value.</param>
     public SlonParameter(T? value) : this(string.Empty, value) { }
 
+    /// <summary>Initializes a typed parameter with the specified name and value.</summary>
+    /// <param name="parameterName">The parameter name, or an empty string for a positional parameter.</param>
+    /// <param name="value">The parameter value.</param>
     public SlonParameter(string parameterName, T? value)
     {
         InitializeName(parameterName);
@@ -394,6 +419,7 @@ public sealed class SlonParameter<T> : SlonParameter, IDbDataParameter<T>
     /// <returns>The new instance.</returns>
     public new SlonParameter<T> Clone() => (SlonParameter<T>)CloneCore();
 
+    /// Gets or sets the strongly typed parameter value.
     public new T? Value
     {
         get => _value;

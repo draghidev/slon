@@ -21,6 +21,7 @@ public enum SlonConnectionOptions
 }
 
 // Implementation
+/// <inheritdoc cref="DbConnection" />
 public sealed partial class SlonConnection : IAdoConnection
 {
     static StateChangeEventArgs StateChangeOpen { get; } = new(originalState: ConnectionState.Closed, ConnectionState.Open);
@@ -690,6 +691,7 @@ public sealed partial class SlonConnection : DbConnection
     /// <returns>A <see cref="Slon.SlonCommand" /> object.</returns>
     public new SlonCommand CreateCommand() => new(this);
 
+    /// <inheritdoc />
     public override bool CanCreateBatch => true;
 
     /// <summary>Returns a new instance of the provider's class that implements the <see cref="T:System.Data.Common.DbBatch" /> class.</summary>

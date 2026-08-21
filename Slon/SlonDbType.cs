@@ -4,58 +4,110 @@ using Slon.Pg.Types;
 namespace Slon;
 
 // TODO add friendly aliases (short etc)
+/// Provides identifiers for built-in PostgreSQL data types.
 public static class SlonDbTypes
 {
+    /// The PostgreSQL <c>int2</c> type.
     public static SlonDbType Int2 => new(DataTypeNames.Int2);
+    /// The PostgreSQL <c>int4</c> type.
     public static SlonDbType Int4 => new(DataTypeNames.Int4);
+    /// The PostgreSQL <c>int8</c> type.
     public static SlonDbType Int8 => new(DataTypeNames.Int8);
+    /// The PostgreSQL <c>float4</c> type.
     public static SlonDbType Float4 => new(DataTypeNames.Float4);
+    /// The PostgreSQL <c>float8</c> type.
     public static SlonDbType Float8 => new(DataTypeNames.Float8);
+    /// The PostgreSQL <c>numeric</c> type.
     public static SlonDbType Numeric => new(DataTypeNames.Numeric);
+    /// The PostgreSQL <c>money</c> type.
     public static SlonDbType Money => new(DataTypeNames.Money);
+    /// The PostgreSQL <c>bool</c> type.
     public static SlonDbType Bool => new(DataTypeNames.Bool);
+    /// The PostgreSQL <c>box</c> type.
     public static SlonDbType Box => new(DataTypeNames.Box);
+    /// The PostgreSQL <c>circle</c> type.
     public static SlonDbType Circle => new(DataTypeNames.Circle);
+    /// The PostgreSQL <c>line</c> type.
     public static SlonDbType Line => new(DataTypeNames.Line);
+    /// The PostgreSQL <c>lseg</c> type.
     public static SlonDbType Lseg => new(DataTypeNames.LSeg);
+    /// The PostgreSQL <c>path</c> type.
     public static SlonDbType Path => new(DataTypeNames.Path);
+    /// The PostgreSQL <c>point</c> type.
     public static SlonDbType Point => new(DataTypeNames.Point);
+    /// The PostgreSQL <c>polygon</c> type.
     public static SlonDbType Polygon => new(DataTypeNames.Polygon);
+    /// The PostgreSQL <c>bpchar</c> type.
     public static SlonDbType Bpchar => new(DataTypeNames.Bpchar);
+    /// The PostgreSQL <c>text</c> type.
     public static SlonDbType Text => new(DataTypeNames.Text);
+    /// The PostgreSQL <c>varchar</c> type.
     public static SlonDbType Varchar => new(DataTypeNames.Varchar);
+    /// The PostgreSQL <c>name</c> type.
     public static SlonDbType Name => new(DataTypeNames.Name);
+    /// The PostgreSQL <c>bytea</c> type.
     public static SlonDbType Bytea => new(DataTypeNames.Bytea);
+    /// The PostgreSQL <c>date</c> type.
     public static SlonDbType Date => new(DataTypeNames.Date);
+    /// The PostgreSQL <c>time</c> type without time zone.
     public static SlonDbType Time => new(DataTypeNames.Time);
+    /// The PostgreSQL <c>timestamp</c> type without time zone.
     public static SlonDbType Timestamp => new(DataTypeNames.Timestamp);
+    /// The PostgreSQL <c>timestamp with time zone</c> type.
     public static SlonDbType TimestampTz => new(DataTypeNames.TimestampTz);
+    /// The PostgreSQL <c>interval</c> type.
     public static SlonDbType Interval => new(DataTypeNames.Interval);
+    /// The PostgreSQL <c>time with time zone</c> type.
     public static SlonDbType TimeTz => new(DataTypeNames.TimeTz);
+    /// The PostgreSQL <c>inet</c> type.
     public static SlonDbType Inet => new(DataTypeNames.Inet);
+    /// The PostgreSQL <c>cidr</c> type.
     public static SlonDbType Cidr => new(DataTypeNames.Cidr);
+    /// The PostgreSQL <c>macaddr</c> type.
     public static SlonDbType MacAddr => new(DataTypeNames.MacAddr);
+    /// The PostgreSQL <c>macaddr8</c> type.
     public static SlonDbType MacAddr8 => new(DataTypeNames.MacAddr8);
+    /// The PostgreSQL <c>bit</c> type.
     public static SlonDbType Bit => new(DataTypeNames.Bit);
+    /// The PostgreSQL <c>varbit</c> type.
     public static SlonDbType Varbit => new(DataTypeNames.Varbit);
+    /// The PostgreSQL <c>tsvector</c> type.
     public static SlonDbType TsVector => new(DataTypeNames.TsVector);
+    /// The PostgreSQL <c>tsquery</c> type.
     public static SlonDbType TsQuery => new(DataTypeNames.TsQuery);
+    /// The PostgreSQL <c>regconfig</c> type.
     public static SlonDbType RegConfig => new(DataTypeNames.RegConfig);
+    /// The PostgreSQL <c>uuid</c> type.
     public static SlonDbType Uuid => new(DataTypeNames.Uuid);
+    /// The PostgreSQL <c>xml</c> type.
     public static SlonDbType Xml => new(DataTypeNames.Xml);
+    /// The PostgreSQL <c>json</c> type.
     public static SlonDbType Json => new(DataTypeNames.Json);
+    /// The PostgreSQL <c>jsonb</c> type.
     public static SlonDbType Jsonb => new(DataTypeNames.Jsonb);
+    /// The PostgreSQL <c>jsonpath</c> type.
     public static SlonDbType Jsonpath => new(DataTypeNames.Jsonpath);
+    /// The PostgreSQL <c>refcursor</c> type.
     public static SlonDbType RefCursor => new(DataTypeNames.RefCursor);
+    /// The PostgreSQL <c>oidvector</c> type.
     public static SlonDbType OidVector => new(DataTypeNames.OidVector);
+    /// The PostgreSQL <c>int2vector</c> type.
     public static SlonDbType Int2Vector => new(DataTypeNames.Int2Vector);
+    /// The PostgreSQL <c>oid</c> type.
     public static SlonDbType Oid => new(DataTypeNames.Oid);
+    /// The PostgreSQL <c>xid</c> type.
     public static SlonDbType Xid => new(DataTypeNames.Xid);
+    /// The PostgreSQL <c>xid8</c> type.
     public static SlonDbType Xid8 => new(DataTypeNames.Xid8);
+    /// The PostgreSQL <c>cid</c> type.
     public static SlonDbType Cid => new(DataTypeNames.Cid);
+    /// The PostgreSQL <c>regtype</c> type.
     public static SlonDbType RegType => new(DataTypeNames.RegType);
+    /// The PostgreSQL <c>tid</c> type.
     public static SlonDbType Tid => new(DataTypeNames.Tid);
+    /// The PostgreSQL <c>pg_lsn</c> type.
     public static SlonDbType PgLsn => new(DataTypeNames.PgLsn);
+    /// The PostgreSQL <c>unknown</c> pseudo-type.
     public static SlonDbType Unknown => new(DataTypeNames.Unknown);
 
     internal static DbType? ToDbType(SlonDbType slonDbType)
@@ -120,6 +172,7 @@ public static class SlonDbTypes
 
 // A potentially invalid or unknown type identifier, used in frontend operations like configuring DbParameter types.
 // The DbDataSource this is passed to decides on the validity of the contents.
+/// Identifies a requested PostgreSQL data type for an ADO parameter or command.
 public readonly record struct SlonDbType
 {
     readonly string? _dataTypeName;
@@ -179,6 +232,11 @@ public readonly record struct SlonDbType
     /// <returns>The DbType, null when this is a <see cref="Slon.SlonDbType.Infer"/> value.</returns>
     public DbType? ToDbType() => SlonDbTypes.ToDbType(this);
 
+    /// <summary>Converts an ADO database type to its PostgreSQL type request.</summary>
+    /// <param name="dbType">The ADO database type.</param>
     public static explicit operator SlonDbType(DbType dbType) => SlonDbTypes.ToSlonDbType(dbType);
+
+    /// <summary>Converts an optional ADO database type to its PostgreSQL type request.</summary>
+    /// <param name="dbType">The ADO database type, or null to infer the type.</param>
     public static explicit operator SlonDbType(DbType? dbType) => dbType is null ? Infer : SlonDbTypes.ToSlonDbType(dbType.GetValueOrDefault());
 }

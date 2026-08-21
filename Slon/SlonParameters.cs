@@ -11,7 +11,11 @@ namespace Slon;
 /// </summary>
 public sealed partial class SlonParameters : IList<SlonParameter>
 {
+    /// Initializes an empty parameter collection.
     public SlonParameters() : this(initialCapacity: 5) {}
+
+    /// <summary>Initializes a parameter collection from parameter names and values.</summary>
+    /// <param name="parameters">The parameters to add.</param>
     public SlonParameters(IEnumerable<KeyValuePair<string, object?>> parameters) : this(initialCapacity: 5)
     {
         foreach (var (key, value) in parameters)
@@ -50,12 +54,28 @@ public sealed partial class SlonParameters : IList<SlonParameter>
         object IEnumerator.Current => Current;
     }
 
+    /// Creates an empty parameter collection.
     public static SlonParameters Create() => new();
+
+    /// <summary>Creates a collection containing one positional parameter.</summary>
+    /// <param name="value">The parameter value.</param>
     public static SlonParameters Create(object? value) => Create(new(PositionalName, value));
+
+    /// <summary>Creates a collection containing one named parameter.</summary>
+    /// <param name="parameterName">The parameter name.</param>
+    /// <param name="value">The parameter value.</param>
     public static SlonParameters Create(string parameterName, object? value) => Create(new(parameterName, value));
+
+    /// <summary>Creates a collection containing one parameter.</summary>
+    /// <param name="parameter">The parameter name and value.</param>
     public static SlonParameters Create(KeyValuePair<string, object?> parameter) => new() { { parameter.Key, parameter.Value } };
 
+    /// <summary>Creates a collection containing the supplied parameters.</summary>
+    /// <param name="parameters">The parameters to add.</param>
     public static SlonParameters CreateRange(params IEnumerable<KeyValuePair<string, object?>> parameters) => new(parameters);
+
+    /// <summary>Creates a collection containing the supplied parameters.</summary>
+    /// <param name="parameters">The parameters to add.</param>
     public static SlonParameters CreateRange(params ReadOnlySpan<KeyValuePair<string, object?>> parameters)
     {
         var collection = new SlonParameters(parameters.Length);

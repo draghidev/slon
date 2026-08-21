@@ -9,3 +9,10 @@ dotnet_style_require_accessibility_modifiers = omit_if_default:suggestion
 
 # Consider calling ConfigureAwait on the awaited task
 dotnet_diagnostic.CA2007.severity = error;
+
+# Public ADO and configuration APIs must be documented.
+dotnet_diagnostic.CS1591.severity = error
+
+# The lower-level protocol and serializer surface remains experimental.
+[Pg/**/*.cs]
+dotnet_diagnostic.CS1591.severity = none

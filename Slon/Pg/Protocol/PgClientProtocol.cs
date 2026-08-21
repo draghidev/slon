@@ -790,7 +790,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
     }
 
     /// Synchronous tear-down for callers that can't go async (the canonical case is
-    /// <see cref="System.Data.Common.DbDataSource.Dispose"/>'s sync contract bubbling down to
+    /// <see cref="IDisposable.Dispose"/>'s sync contract bubbling down to
     /// connection/protocol cleanup). Same fire-and-forget semantics as <see cref="DisposeAsync"/>:
     /// AbortToken fires immediately, pipeline drain happens in the background. Idempotent.
     public void Dispose()

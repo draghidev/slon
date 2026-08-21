@@ -15,24 +15,32 @@ using Slon.Threading;
 
 namespace Slon;
 
+/// Configures a <see cref="SlonDataSource" />.
 public sealed record SlonDataSourceOptions
 {
     internal static TimeSpan DefaultCommandTimeout = TimeSpan.FromSeconds(30);
 
+    /// Gets the PostgreSQL network endpoint.
     public required EndPoint EndPoint { get; init; }
+    /// Gets the PostgreSQL username.
     public required string Username { get; init; }
     /// <summary>Identifies this datasource in metrics. Defaults to endpoint/database.</summary>
     public string? Name { get; init; }
+    /// Gets the password used for password-based authentication.
     public string? Password { get; init; }
+    /// Gets the database name. When omitted, the username is used.
     public string? Database { get; init; }
     /// <summary>Configures PostgreSQL TLS negotiation and server authentication.</summary>
     public PostgreSqlSslOptions Ssl { get; init; } = new();
     /// <summary>Configures authentication policy. The data source snapshots these values when built.</summary>
     public PostgreSqlAuthenticationOptions Authentication { get; init; } = new();
+    /// Gets OAuth bearer-token authentication configuration.
     public PostgreSqlOAuthOptions? OAuth { get; init; }
+    /// Gets integrated-security authentication configuration.
     public PostgreSqlIntegratedSecurityOptions? IntegratedSecurity { get; init; }
     /// <summary>Describes differences from PostgreSQL for a compatible wire-protocol backend.</summary>
     public PostgreSqlCompatibilityProfile? CompatibilityProfile { get; init; }
+    /// Gets the maximum time allowed for establishing and initializing a connection.
     public TimeSpan ConnectionTimeout { get; init; } = TimeSpan.FromSeconds(10);
     /// <summary>
     /// Bounds cancellation convergence after a command has acquired a PostgreSQL wire. The bound
@@ -42,7 +50,9 @@ public sealed record SlonDataSourceOptions
     public TimeSpan CancellationTimeout { get; init; } = TimeSpan.FromSeconds(10);
     /// <summary>Delay before the one ambiguous backend-cancellation retry.</summary>
     public TimeSpan CancellationRetryInterval { get; init; } = TimeSpan.FromSeconds(1);
+    /// Gets the minimum number of physical connections retained by the pool.
     public int MinPoolSize { get; init; } = 1;
+    /// Gets the maximum number of physical connections created by the pool.
     public int MaxPoolSize { get; init; } = 10;
     /// <summary>
     /// Limits datasource operations assigned to one physical PostgreSQL wire. Zero leaves assignment
@@ -69,7 +79,9 @@ public sealed record SlonDataSourceOptions
         }
     }
 
+    /// Gets the synchronous initializer invoked for each newly opened physical connection.
     public Action<SlonConnection, TimeSpan>? ConnectionInitializer { get; init; }
+    /// Gets the asynchronous initializer invoked for each newly opened physical connection.
     public Func<SlonConnection, CancellationToken, ValueTask>? AsyncConnectionInitializer { get; init; }
 
     /// <summary>
@@ -78,7 +90,9 @@ public sealed record SlonDataSourceOptions
     /// each command.
     /// </summary>
     public TimeSpan CommandTimeout { get; init; } = DefaultCommandTimeout;
+    /// Gets the number of matching executions required before automatic preparation.
     public int AutoPreparationMinimumUses { get; init; } = 5;
+    /// Gets the maximum number of automatically prepared statements tracked by the datasource.
     public int MaxActiveAutoPreparations { get; init; }
     /// <summary>
     /// DataRows larger than this may cross the decoder boundary before their complete body has arrived.
@@ -179,8 +193,12 @@ public sealed record SlonDataSourceOptions
             ?? throw new ArgumentNullException(nameof(TypeLoadingSchemas)))]
     };
 
+    /// <summary>Parses a host and optional port into an IP or DNS endpoint.</summary>
+    /// <param name="host">The host, optionally followed by a port.</param>
+    /// <returns>The parsed endpoint.</returns>
     public static EndPoint ParseIpOrDnsEndPoint(string host) => PgClientOptions.ParseIpOrDnsEndPoint(host);
 
+    /// Returns a redacted description of these options.
     public override string ToString()
         => $"{nameof(SlonDataSourceOptions)} {{ EndPoint = {EndPoint}, Username = {Username}, " +
            $"Database = {Database}, Password = <redacted> }}";
@@ -210,6 +228,8 @@ public sealed class SlonDataSource : DbDataSource
     volatile bool _isInitialized;
     int _disposed;
 
+    /// <summary>Initializes a datasource from a snapshot of the specified options.</summary>
+    /// <param name="options">The datasource configuration.</param>
     public SlonDataSource(SlonDataSourceOptions options)
     {
         _options = options.Snapshot();
@@ -255,6 +275,7 @@ public sealed class SlonDataSource : DbDataSource
         => SlonLogMessages.TransactionDisposeRollbackFailed(_adoLogger, exception);
     internal string Database => _options.Database ?? _options.Username;
     internal EndPoint EndPoint => _options.EndPoint;
+    /// Gets the name used to identify this datasource in diagnostics and metrics.
     public string Name { get; }
     internal string DisplayEndpoint { get; }
 
@@ -534,9 +555,12 @@ public sealed class SlonDataSource : DbDataSource
             : initialization;
     }
 
+    /// Reloads PostgreSQL type metadata and publishes a new serializer snapshot.
     public void ReloadTypes()
         => ReloadTypesCore(async: false, CancellationToken.None).AsTask().GetAwaiter().GetResult();
 
+    /// <summary>Reloads PostgreSQL type metadata and publishes a new serializer snapshot.</summary>
+    /// <param name="cancellationToken">A token for cancelling the reload.</param>
     public ValueTask ReloadTypesAsync(CancellationToken cancellationToken = default)
         => ReloadTypesCore(async: true, cancellationToken);
 
@@ -784,6 +808,7 @@ public sealed class SlonDataSource : DbDataSource
         return context.Connection.Protocol.TryQueue(flow, enqueueOptions, context.CancellationToken);
     }
 
+    /// <inheritdoc />
     public override string ConnectionString => _connectionString;
     internal CommandTracker GetCommandTracker(bool initializedOnly = false)
     {
@@ -819,10 +844,14 @@ public sealed class SlonDataSource : DbDataSource
         }
     }
 
+    /// <inheritdoc />
     protected override DbConnection CreateDbConnection() => CreateConnection();
+    /// Creates a closed connection owned by this datasource.
     public new SlonConnection CreateConnection() => new(this);
 
+    /// <inheritdoc />
     protected override DbConnection OpenDbConnection() => OpenConnection();
+    /// Creates and opens a connection owned by this datasource.
     public new SlonConnection OpenConnection()
     {
         var connection = CreateConnection();
@@ -839,12 +868,15 @@ public sealed class SlonDataSource : DbDataSource
     }
 
 
+    /// <inheritdoc />
     protected override async ValueTask<DbConnection> OpenDbConnectionAsync(CancellationToken cancellationToken = default)
     {
         var connection = CreateConnection();
         await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
         return connection;
     }
+    /// <summary>Creates and asynchronously opens a connection owned by this datasource.</summary>
+    /// <param name="cancellationToken">A token for cancelling the open operation.</param>
     public new async ValueTask<SlonConnection> OpenConnectionAsync(CancellationToken cancellationToken)
     {
         var connection = CreateConnection();
@@ -863,12 +895,18 @@ public sealed class SlonDataSource : DbDataSource
         return connection;
     }
 
+    /// Creates a batch which executes directly through this datasource.
     public new SlonBatch CreateBatch() => new(this);
+    /// <inheritdoc />
     protected override DbBatch CreateDbBatch() => CreateBatch();
 
+    /// <inheritdoc />
     protected override DbCommand CreateDbCommand(string? commandText = null) => CreateCommand(commandText);
+    /// <summary>Creates a command which executes directly through this datasource.</summary>
+    /// <param name="commandText">The SQL statement to execute.</param>
     public new SlonCommand CreateCommand(string? commandText = null) => new(null, this, commandText);
 
+    /// <inheritdoc />
     protected override void Dispose(bool disposing)
     {
         // The data source owns its connection pool (created in EnsureInitialized); disposing it closes
@@ -892,6 +930,7 @@ public sealed class SlonDataSource : DbDataSource
         }
     }
 
+    /// <inheritdoc />
     protected override async ValueTask DisposeAsyncCore()
     {
         if (Interlocked.Exchange(ref _disposed, 1) is not 0)

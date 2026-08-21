@@ -26,6 +26,7 @@ public class SlonException : DbException
     /// </summary>
     public bool IsCollateral => ProjectedException is PgCollateralException;
 
+    /// <inheritdoc />
     public override bool IsTransient => IsTransientFailure(ProjectedException);
 
     static bool IsTransientFailure(Exception exception) => exception switch
@@ -62,18 +63,31 @@ public sealed class PostgreSqlException : SlonException
 
     readonly bool _isTransient;
 
+    /// The localized or nonlocalized severity reported by PostgreSQL.
     public string Severity { get; }
+    /// <inheritdoc />
     public override string SqlState { get; }
+    /// The primary human-readable PostgreSQL error message.
     public string MessageText { get; }
+    /// Optional detail about the error.
     public string? Detail { get; }
+    /// Optional advice for resolving the error.
     public string? Hint { get; }
+    /// The one-based character position of the error, or zero when PostgreSQL did not report one.
     public int Position { get; }
+    /// Context describing where the error occurred.
     public string? Where { get; }
+    /// The related schema name, when reported.
     public string? SchemaName { get; }
+    /// The related table name, when reported.
     public string? TableName { get; }
+    /// The related column name, when reported.
     public string? ColumnName { get; }
+    /// The related constraint name, when reported.
     public string? ConstraintName { get; }
+    /// Whether this cancellation error affected the operation collaterally.
     public bool IsCollateralCancellation { get; }
+    /// <inheritdoc />
     public override bool IsTransient => _isTransient;
 }
 

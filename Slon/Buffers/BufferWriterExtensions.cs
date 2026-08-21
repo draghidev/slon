@@ -6,7 +6,7 @@ namespace Slon.Buffers;
 static class BufferWriterExtensions
 {
     /// <summary>
-    /// Copies the caller's buffer into this writer and calls <see cref="Advance(int)"/> with the length of the source buffer.
+    /// Copies the caller's buffer into this writer and calls <see cref="IBufferWriter{T}.Advance(int)"/> with the length of the source buffer.
     /// </summary>
     /// <param name="writer"></param>
     /// <param name="source">The buffer to copy in.</param>

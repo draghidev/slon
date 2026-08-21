@@ -4,18 +4,29 @@ using Microsoft.Extensions.Logging.Abstractions;
 
 namespace Slon;
 
+/// <summary>Represents an OAuth bearer token and its optional expiry.</summary>
+/// <param name="AccessToken">The bearer token.</param>
+/// <param name="ExpiresAt">The instant at which the token expires, when known.</param>
 public readonly record struct PostgreSqlOAuthToken(string AccessToken, DateTimeOffset? ExpiresAt = null)
 {
+    /// Returns a description with the bearer token redacted.
     public override string ToString()
         => $"{nameof(PostgreSqlOAuthToken)} {{ AccessToken = <redacted:{AccessToken?.Length ?? 0} chars>, " +
            $"ExpiresAt = {ExpiresAt} }}";
 }
 
+/// <summary>Describes the connection for which an OAuth token is requested.</summary>
+/// <param name="EndPoint">The PostgreSQL endpoint.</param>
+/// <param name="Username">The PostgreSQL username.</param>
+/// <param name="Database">The PostgreSQL database, when explicitly configured.</param>
 public readonly record struct PostgreSqlOAuthContext(EndPoint EndPoint, string Username, string? Database);
 
+/// Configures OAuth bearer-token authentication.
 public sealed class PostgreSqlOAuthOptions
 {
+    /// Gets the callback used to acquire bearer tokens.
     public Func<PostgreSqlOAuthContext, CancellationToken, ValueTask<PostgreSqlOAuthToken>>? TokenProvider { get; init; }
+    /// Gets how long before expiry a token should be refreshed.
     public TimeSpan RefreshBeforeExpiration { get; init; } = TimeSpan.FromMinutes(1);
 
     internal void Validate()

@@ -33,6 +33,8 @@ public sealed class SlonBatchCommand : DbBatchCommand, IAdoCommand
         }
     } = CommandType.Text;
 
+    /// Gets or sets whether this command ends its PostgreSQL error barrier, allowing later batch
+    /// commands to continue after it fails.
     public bool AppendErrorBarrier
     {
         get;

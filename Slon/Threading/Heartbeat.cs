@@ -29,7 +29,7 @@ sealed class Heartbeat : IDisposable
     /// Invoked when a tick arrives later than <see cref="DriftThresholdMultiplier"/> times the
     /// requested interval. Callback receives (requestedInterval, actualElapsed). Wire to a
     /// logger, metrics sink, or operator alert as the embedder prefers; null = no observation.
-    /// Read via <see cref="Volatile.Read{T}(ref T)"/> per tick so a late-attached handler picks
+    /// Read through <see cref="Volatile"/> per tick so a late-attached handler picks
     /// up on the next drifted tick without restarting the heartbeat.
     public Action<TimeSpan, TimeSpan>? OnDrift
     {

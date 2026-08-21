@@ -11,7 +11,7 @@ namespace Slon.Buffers;
 /// </summary>
 /// <typeparam name="TWriter">The type of buffer writer to use.</typeparam>
 /// <typeparam name="T">The type of item being written.</typeparam>
-public ref struct SpanWriter<TWriter, T> : IBufferWriter<T> where TWriter : IBufferWriter<T>
+internal ref struct SpanWriter<TWriter, T> : IBufferWriter<T> where TWriter : IBufferWriter<T>
 {
     TWriter _writer; // don't make readonly, we want to support mutable structs.
     Span<T> _span;
@@ -100,7 +100,7 @@ public ref struct SpanWriter<TWriter, T> : IBufferWriter<T> where TWriter : IBuf
 
 // Convenience type that delegates to TWriter = IBufferWriter<T>.
 // The TWriter variant allows for specialization over structs and supports mutable structs.
-public ref struct SpanWriter<T> : IBufferWriter<T>
+internal ref struct SpanWriter<T> : IBufferWriter<T>
 {
     SpanWriter<IBufferWriter<T>, T> _spanWriter;
 
@@ -124,4 +124,3 @@ public ref struct SpanWriter<T> : IBufferWriter<T>
     public static implicit operator SpanWriter<IBufferWriter<T>, T>(SpanWriter<T> writer) => writer._spanWriter;
     public static explicit operator SpanWriter<T>(SpanWriter<IBufferWriter<T>, T> writer) => new(writer);
 }
-
