@@ -4,7 +4,6 @@ using System.Text;
 using Microsoft.Extensions.Time.Testing;
 using Slon.Buffers;
 using Slon.Pg;
-using Slon.Tests;
 using Slon.Pg.Protocol;
 using Slon.Pg.Protocol.Flows;
 using Slon.Pipelines;
@@ -197,7 +196,7 @@ public class ExclusiveAccessFlowTests : ConnectionCreatingTest
     public async Task Scope_Release_CanPreserveTemporaryObjects()
     {
         var protocol = await PgTestPool.NewIsolatedAsync(
-            options => options.ScopeReset.DropTemporaryObjects = false);
+            options => options.SessionReset.DropTemporaryObjects = false);
         var table = "slon_preserved_" + Guid.NewGuid().ToString("N");
         try
         {
@@ -246,7 +245,7 @@ public class ExclusiveAccessFlowTests : ConnectionCreatingTest
     {
         var protocol = await PgTestPool.NewIsolatedAsync(options =>
         {
-            var reset = options.ScopeReset;
+            var reset = options.SessionReset;
             reset.CloseCursors = false;
             reset.ResetSessionAuthorization = false;
             reset.ResetParameters = false;
@@ -451,7 +450,7 @@ public class ExclusiveAccessFlowTests : ConnectionCreatingTest
             Password = "postgres123",
             Database = "postgres",
             Ssl = new() { Mode = PostgreSqlSslMode.Disable },
-            ScopeReset = new ScopeResetOptions { ClearListeners = true },
+            SessionReset = new PgSessionResetOptions { ClearListeners = true },
         };
 
         var time = new FakeTimeProvider();

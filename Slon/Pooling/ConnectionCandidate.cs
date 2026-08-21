@@ -1,4 +1,4 @@
-namespace Slon.Pools;
+namespace Slon.Pooling;
 
 readonly struct ConnectionCandidate<T>(T connection, CancellationToken cancellationToken, bool isIdleCandidate = true)
 {

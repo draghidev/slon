@@ -1,7 +1,8 @@
 using Slon.Runtime;
 
-namespace Slon.Pools;
+namespace Slon.Pooling;
 
+/// Composes a connection factory with initialization before pool admission, closing connections whose initialization fails.
 sealed class InitializingConnectionFactory<T>(
     IPoolConnectionFactory<T> factory,
     Action<T, TimeSpan>? initializer = null,

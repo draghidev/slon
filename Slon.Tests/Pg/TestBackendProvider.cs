@@ -5,7 +5,7 @@ namespace Slon.Tests.Pg;
 
 // Canned startup transcripts intentionally contain only the messages needed by the behavior under
 // test. Keep the production PostgreSQL provider strict and make their synthetic backend explicit.
-sealed class TestBackendProvider : PgBackendProvider
+sealed class TestBackendProvider : PostgreSqlBackendProvider
 {
     public static TestBackendProvider Instance { get; } = new();
 

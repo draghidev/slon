@@ -209,8 +209,8 @@ abstract class PgBackendInfoProvider
     public virtual void ValidateConnectionCompatibility(PgBackendInfo expected, PgBackendInfo actual)
         => PgBackendCompatibility.ValidateConnectionCompatibility(expected, actual);
 
-    public virtual string? ResolveScopeResetCommand(
-        ScopeResetOptions options, PgBackendInfo backendInfo)
+    public virtual string? ResolveSessionResetCommand(
+        PgSessionResetOptions options, PgBackendInfo backendInfo)
         => options.ResolveCommand(backendInfo.Capabilities);
 }
 

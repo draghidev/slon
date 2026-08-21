@@ -4,7 +4,7 @@ using Microsoft.Extensions.Time.Testing;
 using Slon.Pg;
 using Slon.Pg.Protocol;
 using Slon.Pg.Protocol.Flows;
-using Slon.Pools;
+using Slon.Pooling;
 using Slon.Tests.Pg;
 using Slon.Transport;
 
@@ -18,18 +18,47 @@ namespace Slon.Tests;
 public class ConnectionPoolTests
 {
     [TestMethod]
-    public async Task DisposeAsync_JoinsDetachedWork()
+    public async Task DisposeAsync_JoinsBackgroundOperation()
     {
-        var detached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var operation = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var pool = new ConnectionPool<AdmissionConnection>(
             new AdmissionConnectionFactory(), new() { MaxConnections = 1 });
-        pool.TrackDetached(detached.Task);
+        pool.TrackBackgroundOperation(() => operation.Task);
 
         var disposal = pool.DisposeAsync().AsTask();
         Assert.IsFalse(disposal.IsCompleted);
 
-        detached.SetResult();
+        operation.SetResult();
         await disposal;
+    }
+
+    [TestMethod]
+    public async Task DisposeAsync_PropagatesBackgroundOperationFailure()
+    {
+        var pool = new ConnectionPool<AdmissionConnection>(
+            new AdmissionConnectionFactory(), new() { MaxConnections = 1 });
+        pool.TrackBackgroundOperation(
+            () => Task.FromException(new InvalidOperationException("failed")));
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => pool.DisposeAsync().AsTask());
+        Assert.AreEqual("failed", exception.Message);
+    }
+
+    [TestMethod]
+    public void RejectedBackgroundOperation_IsNotStarted()
+    {
+        var pool = new ConnectionPool<AdmissionConnection>(
+            new AdmissionConnectionFactory(), new() { MaxConnections = 1 });
+        ((IDisposable)pool).Dispose();
+        var started = false;
+
+        Assert.Throws<ObjectDisposedException>(() => pool.TrackBackgroundOperation(() =>
+        {
+            started = true;
+            return Task.CompletedTask;
+        }));
+        Assert.IsFalse(started);
     }
 
     [TestMethod]
@@ -1635,41 +1664,6 @@ public class ConnectionPoolTests
 
         Assert.IsTrue(connection.Completion.IsCompleted,
             "disposal must complete the connection yielded by the settling opener");
-    }
-
-    // Once an open returns its timeout source to the thread-static cache, a later placement or
-    // admission failure must not return that source again. A double return disposes the cached
-    // instance in place, making the next rent throw from CancelAfter.
-    [TestMethod]
-    public async Task OpenFailureAfterTimeoutSourceReturn_DoesNotPoisonRentCache()
-    {
-        // The pre-fix poison threw deterministically on the second same-thread rent of every
-        // iteration; five iterations keep repeated reuse coverage without the timer bill of fifty.
-        for (var i = 0; i < 5; i++)
-        {
-            var time = new FakeTimeProvider();
-            var factory = new AdmissionConnectionFactory();
-            await using var pool = new ConnectionPool<AdmissionConnection>(
-                factory,
-                new() { MaxConnections = 1, TimeProvider = time });
-
-            await Assert.ThrowsExactlyAsync<InvalidOperationException>(async () =>
-                await pool.GetAsync<int>(
-                    static (_, _) => throw new InvalidOperationException("placement failed"),
-                    state: 0,
-                    timeout: default));
-
-            // Placement failure republishes the admitted connection. Consume that token, then
-            // rent again immediately on this thread: the second rent parks and exercises the
-            // returned timeout source. On the pre-fix poisoned cache this throws
-            // ObjectDisposedException instead of timing out.
-            Assert.AreSame(factory.LastCreated, (await pool.GetUnqualifiedAsync(default)).Transfer());
-            var waiting = pool.GetAsync(static (_, _) => true, (object?)null, TimeSpan.FromSeconds(1)).AsTask();
-            await WaitUntilAsync(() => pool.WaiterCount == 1,
-                "the rent-cache probe must arm its returned timeout source");
-            time.Advance(TimeSpan.FromSeconds(1));
-            await Assert.ThrowsExactlyAsync<TimeoutException>(() => waiting);
-        }
     }
 
     [TestMethod]

@@ -1,6 +1,6 @@
 using System.Runtime.CompilerServices;
-using Slon.Pools;
-using static Slon.Pools.ConnectionPool;
+using Slon.Pooling;
+using static Slon.Pooling.ConnectionPool;
 
 namespace Slon.Tests;
 

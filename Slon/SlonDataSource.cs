@@ -8,7 +8,7 @@ using Slon.Pg.Protocol;
 using Slon.Pg.Protocol.Flows;
 using Slon.Pg.Types;
 using Slon.Pg.Serialization;
-using Slon.Pools;
+using Slon.Pooling;
 using Slon.Transport;
 using Draghi.Pipelining;
 using Slon.Threading;
@@ -85,7 +85,7 @@ public sealed record SlonDataSourceOptions
     /// </summary>
     public int DataRowStreamingThreshold { get; init; } = BackendMessageBatch.Segmenter.DefaultDataRowStreamingThreshold;
     /// <summary>Configures which connection state is reset when an exclusive scope is released.</summary>
-    public ScopeResetOptions ScopeReset { get; init; } = new();
+    internal PgSessionResetOptions SessionReset { get; init; } = new();
     /// <summary>
     /// Optionally restricts ordinary type loading to <c>pg_catalog</c> and the listed schemas.
     /// Category-U extension types and their canonical array counterparts remain discoverable
@@ -98,7 +98,7 @@ public sealed record SlonDataSourceOptions
     // Keep the provider override internal while its type-loading contracts settle. Public callers
     // select a supported profile through CompatibilityProfile; automatic backend detection is not
     // reliable for servers that deliberately advertise PostgreSQL identity.
-    internal PgBackendProvider? BackendProvider { get; init; }
+    internal PostgreSqlBackendProvider? BackendProvider { get; init; }
     internal IReadOnlyList<PgTypeCatalogPlugin> TypeCatalogPlugins { get; init; } = [];
 
     // Internal, tests need to override these to drive maintenance flows on a tight loop. Public
@@ -125,7 +125,7 @@ public sealed record SlonDataSourceOptions
         TimeProvider = TimeProvider,
         CancellationTimeout = CancellationTimeout,
         CancellationRetryInterval = CancellationRetryInterval,
-        ScopeReset = ScopeReset.Snapshot(),
+        SessionReset = SessionReset.Snapshot(),
         DataRowStreamingThreshold = DataRowStreamingThreshold,
         MaxInFlightFlowsPerWire = MaxInFlightOperationsPerWire,
         ExecutionScheduler = ExecutionScheduler,
@@ -174,7 +174,7 @@ public sealed record SlonDataSourceOptions
         Ssl = Ssl.Snapshot(),
         Authentication = Authentication.Snapshot(),
         IntegratedSecurity = IntegratedSecurity?.Snapshot(),
-        ScopeReset = ScopeReset.Snapshot(),
+        SessionReset = SessionReset.Snapshot(),
         TypeLoadingSchemas = [.. (TypeLoadingSchemas
             ?? throw new ArgumentNullException(nameof(TypeLoadingSchemas)))]
     };
@@ -190,7 +190,7 @@ public sealed record SlonDataSourceOptions
 public sealed class SlonDataSource : DbDataSource
 {
     readonly SlonDataSourceOptions _options;
-    readonly PgBackendProvider _backendProvider;
+    readonly PostgreSqlBackendProvider _backendProvider;
     readonly PgTypeCatalogPlugin[] _userTypeCatalogPlugins;
     readonly SemaphoreSlim _lifecycleLock;
     readonly CancellationTokenSource _shutdown = new();

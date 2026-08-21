@@ -66,7 +66,7 @@ static class PgTestPool
         var transport = await SocketStreamConnection.ConnectAsync(options.EndPoint);
         var protocolOptions = new PgClientProtocolOptions(options)
         {
-            BackendProvider = PostgreSqlBackendProvider.Instance,
+            BackendProvider = DefaultPostgreSqlBackendProvider.Instance,
             // Tests commonly hold sender settlement and PostgreSQL locks deliberately. Individual
             // convergence tests override this; the shared helper must not turn harness gates into
             // ten-second protocol failures under parallel suite pressure.

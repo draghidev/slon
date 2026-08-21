@@ -1,5 +1,5 @@
 using BenchmarkDotNet.Attributes;
-using Slon.Pools;
+using Slon.Pooling;
 
 namespace Slon.Benchmark;
 

@@ -304,7 +304,7 @@ public class DataSourceTypeLoadingTests : ConnectionCreatingTest
         await Assert.ThrowsAsync<OperationCanceledException>(async () => await reload);
     }
 
-    sealed class RecordingProvider(List<string> events) : PgBackendProvider
+    sealed class RecordingProvider(List<string> events) : PostgreSqlBackendProvider
     {
         public int BackendInfoBuilds { get; private set; }
         public int CatalogFactoryBuilds { get; private set; }
@@ -334,7 +334,7 @@ public class DataSourceTypeLoadingTests : ConnectionCreatingTest
             => events.Add($"apply:{name}");
     }
 
-    sealed class ReloadableProvider(PgTypeCatalogFactory factory) : PgBackendProvider
+    sealed class ReloadableProvider(PgTypeCatalogFactory factory) : PostgreSqlBackendProvider
     {
         public override PgBackendInfo CreateBackendInfo(IReadOnlyDictionary<string, string> serverParameters)
             => new PgBackendInfoBuilder(serverParameters).Build();

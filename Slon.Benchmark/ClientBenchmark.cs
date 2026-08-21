@@ -5,8 +5,7 @@ using BenchmarkDotNet.Configs;
 using BenchmarkDotNet.Diagnosers;
 using Npgsql;
 using Slon.Pg;
-using Slon.Pg.Protocol;
-using Slon.Pools;
+using Slon.Pooling;
 using Slon.Transport;
 
 namespace Slon.Benchmark;

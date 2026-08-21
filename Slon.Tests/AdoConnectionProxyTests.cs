@@ -1,7 +1,6 @@
-using System.Diagnostics;
 using Slon.Pg;
 using Slon.Pg.Protocol.Flows;
-using Slon.Pools;
+using Slon.Pooling;
 using Slon.Tests.Pg;
 using Slon.Transport;
 

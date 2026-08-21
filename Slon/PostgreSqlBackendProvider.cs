@@ -5,7 +5,7 @@ namespace Slon;
 
 // Datasource composition seam. The protocol consumes the inherited low-level backend-info
 // contract; catalog construction belongs to this higher layer that composes protocol and types.
-abstract class PgBackendProvider : PgBackendInfoProvider
+abstract class PostgreSqlBackendProvider : PgBackendInfoProvider
 {
     // Every backend makes the dynamic-vs-prebuilt catalog choice explicitly. Falling back here
     // would let a provider that only customizes identity silently disable type discovery/reload.
@@ -15,11 +15,11 @@ abstract class PgBackendProvider : PgBackendInfoProvider
         => [];
 }
 
-sealed class PostgreSqlBackendProvider : PgBackendProvider
+sealed class DefaultPostgreSqlBackendProvider : PostgreSqlBackendProvider
 {
-    public static PostgreSqlBackendProvider Instance { get; } = new();
+    public static DefaultPostgreSqlBackendProvider Instance { get; } = new();
 
-    PostgreSqlBackendProvider() { }
+    DefaultPostgreSqlBackendProvider() { }
 
     public override PgBackendInfo CreateBackendInfo(IReadOnlyDictionary<string, string> serverParameters)
         => new PgBackendInfoBuilder(serverParameters).Build();
@@ -28,7 +28,7 @@ sealed class PostgreSqlBackendProvider : PgBackendProvider
         => PostgreSqlTypeCatalogFactory.Instance;
 }
 
-sealed class ConfiguredBackendProvider(PostgreSqlCompatibilityProfile profile) : PgBackendProvider
+sealed class ConfiguredBackendProvider(PostgreSqlCompatibilityProfile profile) : PostgreSqlBackendProvider
 {
     public override PgBackendInfo CreateBackendInfo(IReadOnlyDictionary<string, string> serverParameters)
     {
@@ -43,14 +43,14 @@ sealed class ConfiguredBackendProvider(PostgreSqlCompatibilityProfile profile) :
             ? PostgreSqlTypeCatalogFactory.Instance
             : PgTypeCatalogFactory.FromBaseline(PgTypeCatalog.Default);
 
-    public override string? ResolveScopeResetCommand(
-        ScopeResetOptions options, PgBackendInfo backendInfo)
+    public override string? ResolveSessionResetCommand(
+        PgSessionResetOptions options, PgBackendInfo backendInfo)
     {
-        if (options.HasAllActionsEnabled && profile.CompleteScopeResetCommand is not null)
-            return profile.CompleteScopeResetCommand;
+        if (options.HasAllActionsEnabled && profile.CompleteSessionResetCommand is not null)
+            return profile.CompleteSessionResetCommand;
 
-        var command = base.ResolveScopeResetCommand(options, backendInfo);
-        if (command is null && options.HasEnabledActions && profile.CompleteScopeResetCommand is not null)
+        var command = base.ResolveSessionResetCommand(options, backendInfo);
+        if (command is null && options.HasEnabledActions && profile.CompleteSessionResetCommand is not null)
             throw new NotSupportedException(
                 "The compatibility profile provides complete scope reset but not the configured partial reset.");
         return command;
@@ -59,6 +59,6 @@ sealed class ConfiguredBackendProvider(PostgreSqlCompatibilityProfile profile) :
 
 static class PgBackendProviders
 {
-    public static PgBackendProvider Create(PostgreSqlCompatibilityProfile? profile)
-        => profile is null ? PostgreSqlBackendProvider.Instance : new ConfiguredBackendProvider(profile);
+    public static PostgreSqlBackendProvider Create(PostgreSqlCompatibilityProfile? profile)
+        => profile is null ? DefaultPostgreSqlBackendProvider.Instance : new ConfiguredBackendProvider(profile);
 }

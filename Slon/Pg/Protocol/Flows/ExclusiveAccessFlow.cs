@@ -166,7 +166,7 @@ sealed class ExclusiveAccessFlow : PgClientFlow
         await completion.ConfigureAwait(false);
     }
 
-    internal static bool WriteScopeReset(PgEncoder encoder, string? command)
+    internal static bool WriteSessionReset(PgEncoder encoder, string? command)
     {
         if (command is null)
             return false;
@@ -222,7 +222,7 @@ sealed class ExclusiveAccessFlow : PgClientFlow
             throw new InvalidOperationException(
                 $"The exclusive scope completed leaving the connection in transaction status '{_protocol.TransactionStatus}'. " +
                 "The transaction must be committed or rolled back before completing the scope.");
-        if (_protocol.ScopeResetCommand is { } resetCommand)
+        if (_protocol.SessionResetCommand is { } resetCommand)
         {
             // An inner flow's CancelRequest is connection-wide. Do not extend its exposed prefix
             // with the outer scope reset while delivery is unresolved.
@@ -246,7 +246,7 @@ sealed class ExclusiveAccessFlow : PgClientFlow
     {
         while (true)
         {
-            if (!WriteScopeReset(encoder, command))
+            if (!WriteSessionReset(encoder, command))
                 return;
             await encoder.FlushAsync().ConfigureAwait(false);
 

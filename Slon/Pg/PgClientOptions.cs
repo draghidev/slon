@@ -36,7 +36,7 @@ sealed class PgClientOptions
 
     public TimeSpan ConnectionTimeout { get; init; } = Timeout.InfiniteTimeSpan;
 
-    internal ScopeResetOptions ScopeReset { get; init; } = new();
+    internal PgSessionResetOptions SessionReset { get; init; } = new();
     internal int DataRowStreamingThreshold { get; init; } = BackendMessageBatch.Segmenter.DefaultDataRowStreamingThreshold;
     internal int MaxInFlightFlowsPerWire { get; init; }
     internal PipelineScheduler? ExecutionScheduler { get; init; }

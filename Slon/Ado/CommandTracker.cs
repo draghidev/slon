@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
+
 using Slon.Pg;
 using Slon.Text;
 

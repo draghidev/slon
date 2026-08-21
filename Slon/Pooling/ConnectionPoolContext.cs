@@ -1,4 +1,4 @@
-namespace Slon.Pools;
+namespace Slon.Pooling;
 
 sealed class ConnectionPoolContext<T>(ConnectionPool<T>? pool,
     Func<T, Func<T, TimeSpan, ValueTask>, IDisposable> onHeartbeat)
@@ -15,7 +15,7 @@ sealed class ConnectionPoolContext<T>(ConnectionPool<T>? pool,
         => (pool ?? throw new InvalidOperationException("This pool context cannot schedule connections."))
             .GetAsync(schedule, state, timeout, cancellationToken);
 
-    internal void TrackDetached(Task task)
-        => (pool ?? throw new InvalidOperationException("This pool context cannot track detached work."))
-            .TrackDetached(task);
+    internal void TrackBackgroundOperation(Func<Task> start)
+        => (pool ?? throw new InvalidOperationException("This pool context cannot track background operations."))
+            .TrackBackgroundOperation(start);
 }

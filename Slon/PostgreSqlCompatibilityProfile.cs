@@ -17,14 +17,14 @@ public sealed record PostgreSqlCompatibilityProfile
     public bool LoadTypesFromCatalog { get; init; } = true;
 
     /// <summary>
-    /// Replaces the normal reset sequence when every scope-reset action is enabled.
+    /// Replaces the normal reset sequence when every session-reset action is enabled.
     /// </summary>
-    public string? CompleteScopeResetCommand { get; init; }
+    public string? CompleteSessionResetCommand { get; init; }
 
     internal void Validate()
     {
-        if (CompleteScopeResetCommand is not null)
-            ArgumentException.ThrowIfNullOrWhiteSpace(CompleteScopeResetCommand);
+        if (CompleteSessionResetCommand is not null)
+            ArgumentException.ThrowIfNullOrWhiteSpace(CompleteSessionResetCommand);
     }
 }
 

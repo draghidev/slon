@@ -1,10 +1,10 @@
 using Microsoft.Extensions.Logging;
 using Slon.Pg;
 using Slon.Pg.Protocol;
-using Slon.Threading;
-using Slon.Pools;
-using Slon.Transport;
+using Slon.Pooling;
 using Slon.Text;
+using Slon.Threading;
+using Slon.Transport;
 
 namespace Slon;
 
@@ -319,7 +319,7 @@ sealed class PgConnection : IPoolConnection<PgConnection>
     {
         if (_poolContext is not { } poolContext)
             return false;
-        poolContext.TrackDetached(MigrateFlowAsync(poolContext, migration));
+        poolContext.TrackBackgroundOperation(() => MigrateFlowAsync(poolContext, migration));
         return true;
     }
 

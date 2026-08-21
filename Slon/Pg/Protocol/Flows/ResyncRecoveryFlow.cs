@@ -35,7 +35,7 @@ sealed class ResyncRecoveryFlow : PgClientFlow
     bool _canWrite;
     // Captured with the recovery tenure so the written query and its RFQ accounting cannot observe
     // different reset-plan revisions.
-    string? _scopeResetCommand;
+    string? _sessionResetCommand;
     PgClientProtocol.Control? _control;
 
     /// The flow this recovery supplanted, carried so the policy can complete it when the
@@ -81,12 +81,12 @@ sealed class ResyncRecoveryFlow : PgClientFlow
         recovery._outstandingIsRead = outstandingIsRead;
         recovery._canWriteSync = canWriteSync;
         recovery._canWrite = canWrite;
-        recovery._scopeResetCommand = failedFlow is ExclusiveAccessFlow ? control.ScopeResetCommand : null;
+        recovery._sessionResetCommand = failedFlow is ExclusiveAccessFlow ? control.SessionResetCommand : null;
         // drainCount = inheritedRfqCount + the resync move's RFQs (WriteResyncAsync): the realigning Sync
         // when canWriteSync, the always-written ROLLBACK when canWrite, and the reset query when the
         // failed item was an exclusive scope.
         recovery._drainCount = inheritedRfqCount + (canWriteSync ? 1 : 0) + (canWrite ? 1 : 0)
-            + (canWrite && recovery._scopeResetCommand is not null ? 1 : 0);
+            + (canWrite && recovery._sessionResetCommand is not null ? 1 : 0);
         return recovery;
     }
 
@@ -100,7 +100,7 @@ sealed class ResyncRecoveryFlow : PgClientFlow
         _outstandingIsRead = false;
         _canWriteSync = false;
         _canWrite = false;
-        _scopeResetCommand = null;
+        _sessionResetCommand = null;
         _control = null;
         FailedFlow = null;
         FailureException = null;
@@ -174,7 +174,7 @@ sealed class ResyncRecoveryFlow : PgClientFlow
                 _drainCount = FailedFlow!.GetExecutionControl(_control!).RfqCount
                     + (_canWriteSync ? 1 : 0)
                     + (_canWrite ? 1 : 0)
-                    + (_canWrite && _scopeResetCommand is not null ? 1 : 0);
+                    + (_canWrite && _sessionResetCommand is not null ? 1 : 0);
             }
             var decoder = await context.GetDecoderAsync().ConfigureAwait(false);
             int remaining = _drainCount;
@@ -252,7 +252,7 @@ sealed class ResyncRecoveryFlow : PgClientFlow
         }
         // Closes the now-explicit (or already-explicit) transaction; a no-op-with-notice when Idle.
         encoder.WriteQuery("ROLLBACK -- Slon connection recovery");
-        ExclusiveAccessFlow.WriteScopeReset(encoder, _scopeResetCommand);
+        ExclusiveAccessFlow.WriteSessionReset(encoder, _sessionResetCommand);
         await encoder.FlushResumable().ConfigureAwait(false);
     }
 }

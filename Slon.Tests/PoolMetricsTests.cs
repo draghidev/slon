@@ -1,7 +1,7 @@
 using System.Collections.Concurrent;
 using System.Diagnostics.Metrics;
 using Microsoft.Extensions.Time.Testing;
-using Slon.Pools;
+using Slon.Pooling;
 
 namespace Slon.Tests;
 

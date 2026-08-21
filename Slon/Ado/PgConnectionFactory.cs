@@ -1,29 +1,24 @@
 using Slon.Pg;
 using Slon.Pg.Protocol;
-using Slon.Pools;
+using Slon.Pooling;
 using Slon.Transport;
 
 namespace Slon;
 
-// Adds PgConnection's ADO/pool-owned lifetime to the lower raw protocol factory.
-sealed class PgConnectionFactory : IPoolConnectionFactory<PgConnection>
+// Adds the ADO/pool-owned PgConnection lifetime to the lower raw protocol factory.
+sealed class PgConnectionFactory(
+    PgClientOptions clientOptions,
+    TransportConnection.Factory transportConnectionFactory,
+    CommandTracker? tracker = null,
+    Action<PgClientProtocolOptions>? configureOptions = null)
+    : IPoolConnectionFactory<PgConnection>
 {
-    readonly PgClientProtocolFactory _protocolFactory;
-    readonly CommandTracker? _tracker;
-
-    public PgConnectionFactory(PgClientOptions clientOptions,
-        TransportConnection.Factory transportConnectionFactory,
-        CommandTracker? tracker = null,
-        Action<PgClientProtocolOptions>? configureOptions = null)
-    {
-        _protocolFactory = new(clientOptions, transportConnectionFactory, configureOptions);
-        _tracker = tracker;
-    }
+    readonly PgClientProtocolFactory _protocolFactory = new(clientOptions, transportConnectionFactory, configureOptions);
 
     PgConnection Create(ConnectionPoolContext<PgConnection>? poolContext, TimeSpan timeout = default)
         => _protocolFactory.Create(
             (protocolOptions, clientOptions, transport, remaining, upgrade, started) =>
-                PgConnection.Create(protocolOptions, clientOptions, transport, _tracker, poolContext,
+                PgConnection.Create(protocolOptions, clientOptions, transport, tracker, poolContext,
                     remaining, upgrade, started),
             timeout);
 
@@ -31,7 +26,7 @@ sealed class PgConnectionFactory : IPoolConnectionFactory<PgConnection>
         CancellationToken cancellationToken = default)
         => _protocolFactory.CreateAsync(
             (protocolOptions, clientOptions, transport, token, upgrade, started) =>
-                PgConnection.CreateAsync(protocolOptions, clientOptions, transport, _tracker,
+                PgConnection.CreateAsync(protocolOptions, clientOptions, transport, tracker,
                     poolContext, token, upgrade, started),
             cancellationToken);
 

@@ -2,13 +2,10 @@ using System.Data;
 using System.Data.Common;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
-using System.Runtime.CompilerServices;
 using Slon.Pg;
 using Slon.Pg.Protocol;
 using Slon.Pg.Protocol.Flows;
 using Slon.Text;
-using IsolationLevel = System.Data.IsolationLevel;
-#pragma warning disable CS0197 // Using a field of a marshal-by-reference class as a ref or out value or taking its address may cause a runtime exception
 
 namespace Slon;
 
@@ -186,8 +183,14 @@ public sealed partial class SlonConnection : IAdoConnection
             return;
         }
 
-        try { transaction.Rollback(); }
-        finally { DetachTransaction(); }
+        try
+        {
+            transaction.Rollback();
+        }
+        finally
+        {
+            DetachTransaction();
+        }
     }
 
     async ValueTask RollbackTransactionOnCloseAsync()
@@ -202,8 +205,14 @@ public sealed partial class SlonConnection : IAdoConnection
             return;
         }
 
-        try { await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false); }
-        finally { DetachTransaction(); }
+        try
+        {
+            await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+        }
+        finally
+        {
+            DetachTransaction();
+        }
     }
 
     void DisposeCore()
@@ -219,7 +228,7 @@ public sealed partial class SlonConnection : IAdoConnection
         {
             _disposed = true;
             _proxy?.Dispose();
-            base.Dispose();
+            base.Dispose(disposing: true);
         }
     }
 
@@ -237,7 +246,7 @@ public sealed partial class SlonConnection : IAdoConnection
             _disposed = true;
             if (_proxy is not null)
                 await _proxy.DisposeAsync().ConfigureAwait(false);
-            base.Dispose();
+            base.Dispose(disposing: true);
         }
     }
 
@@ -462,7 +471,7 @@ public sealed partial class SlonConnection : IAdoConnection
             pgConnection.RemoveTracked(command);
         }
 
-        var flow = new OwnedStatementCloseFlow(names, async: awaitable);
+        var flow = new MaintenanceFlow(names, async: awaitable);
         if (!awaitable)
         {
             _proxy.Enqueue(flow);
@@ -576,15 +585,27 @@ public sealed partial class SlonConnection : DbConnection
     /// <inheritdoc />
     public override void Open()
     {
-        try { OpenCore(); }
-        catch (Exception ex) { AdoException.Throw(ex); }
+        try
+        {
+            OpenCore();
+        }
+        catch (Exception ex)
+        {
+            AdoException.Throw(ex);
+        }
     }
 
     /// <summary>Opens the connection using the requested connection policy.</summary>
     public void Open(SlonConnectionOptions options)
     {
-        try { OpenCore(options); }
-        catch (Exception ex) { AdoException.Throw(ex); }
+        try
+        {
+            OpenCore(options);
+        }
+        catch (Exception ex)
+        {
+            AdoException.Throw(ex);
+        }
     }
 
     /// <inheritdoc />
@@ -683,8 +704,14 @@ public sealed partial class SlonConnection : DbConnection
     /// </summary>
     public void UnprepareAll()
     {
-        try { UnprepareAllCore(); }
-        catch (Exception ex) { AdoException.Throw(ex); }
+        try
+        {
+            UnprepareAllCore();
+        }
+        catch (Exception ex)
+        {
+            AdoException.Throw(ex);
+        }
     }
 
     /// <summary>
@@ -701,8 +728,14 @@ public sealed partial class SlonConnection : DbConnection
     /// <inheritdoc />
     public override void Close()
     {
-        try { CloseCore(); }
-        catch (Exception ex) { AdoException.Throw(ex); }
+        try
+        {
+            CloseCore();
+        }
+        catch (Exception ex)
+        {
+            AdoException.Throw(ex);
+        }
     }
 
     /// <inheritdoc />
@@ -714,32 +747,62 @@ public sealed partial class SlonConnection : DbConnection
     /// <inheritdoc />
     protected override void Dispose(bool disposing)
     {
-        try { DisposeCore(); }
-        catch (Exception ex) { AdoException.Throw(ex); }
+        try
+        {
+            DisposeCore();
+        }
+        catch (Exception ex)
+        {
+            AdoException.Throw(ex);
+        }
     }
 
     async Task OpenAsyncProjected(SlonConnectionOptions options, CancellationToken cancellationToken)
     {
-        try { await OpenAsyncCore(options, cancellationToken).ConfigureAwait(false); }
-        catch (Exception ex) { AdoException.Throw(ex); }
+        try
+        {
+            await OpenAsyncCore(options, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            AdoException.Throw(ex);
+        }
     }
 
     async ValueTask UnprepareAllAsyncProjected()
     {
-        try { await UnprepareAllAsyncCore().ConfigureAwait(false); }
-        catch (Exception ex) { AdoException.Throw(ex); }
+        try
+        {
+            await UnprepareAllAsyncCore().ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            AdoException.Throw(ex);
+        }
     }
 
     async ValueTask CloseAsyncProjected()
     {
-        try { await CloseAsyncCore().ConfigureAwait(false); }
-        catch (Exception ex) { AdoException.Throw(ex); }
+        try
+        {
+            await CloseAsyncCore().ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            AdoException.Throw(ex);
+        }
     }
 
     async ValueTask DisposeAsyncProjected()
     {
-        try { await DisposeAsyncCore().ConfigureAwait(false); }
-        catch (Exception ex) { AdoException.Throw(ex); }
+        try
+        {
+            await DisposeAsyncCore().ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            AdoException.Throw(ex);
+        }
     }
 
     /// <inheritdoc />

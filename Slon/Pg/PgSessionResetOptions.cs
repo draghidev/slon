@@ -1,12 +1,11 @@
 using System.Text;
-using Slon.Pg;
 
-namespace Slon;
+namespace Slon.Pg;
 
 /// <summary>
 /// Configures which connection state is reset when an exclusive scope is released.
 /// </summary>
-public sealed class ScopeResetOptions
+internal sealed class PgSessionResetOptions
 {
     /// <summary>Closes cursors left open by the scope.</summary>
     public bool CloseCursors { get; set; } = true;
@@ -26,7 +25,7 @@ public sealed class ScopeResetOptions
     /// <summary>Drops temporary objects owned by the session.</summary>
     public bool DropTemporaryObjects { get; set; } = true;
 
-    internal ScopeResetOptions Snapshot() => new()
+    internal PgSessionResetOptions Snapshot() => new()
     {
         CloseCursors = CloseCursors,
         ResetSessionAuthorization = ResetSessionAuthorization,

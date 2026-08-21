@@ -1,7 +1,6 @@
 using System.Collections.Immutable;
 using Slon.Pg;
 using Slon.Pg.Protocol;
-using Slon.Pg.Types;
 
 namespace Slon.Tests.Pg;
 
@@ -97,9 +96,9 @@ public class ServerParameterTests
     }
 
     [TestMethod]
-    public void ScopeReset_UsesTheBackendCapabilitySnapshot()
+    public void SessionReset_UsesTheBackendCapabilitySnapshot()
     {
-        var options = new ScopeResetOptions();
+        var options = new PgSessionResetOptions();
         var capabilities = new PgBackendCapabilities
         {
             SupportsCloseAll = true,

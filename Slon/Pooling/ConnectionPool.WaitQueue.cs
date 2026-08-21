@@ -1,7 +1,7 @@
 using System.Diagnostics;
 using System.Threading.Tasks.Sources;
 
-namespace Slon.Pools;
+namespace Slon.Pooling;
 
 static partial class ConnectionPool
 {

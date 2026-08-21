@@ -1,4 +1,3 @@
-using Slon.Tests.Pg;
 using System.Net;
 
 namespace Slon.Tests;
@@ -49,12 +48,12 @@ public class SlonDataSourceOptionsTests
             Ssl = new() { Mode = PostgreSqlSslMode.Require },
             Authentication = new() { AllowInsecureTransport = true },
             IntegratedSecurity = new() { Credential = credential },
-            ScopeReset = new() { ResetParameters = true }
+            SessionReset = new() { ResetParameters = true }
         };
 
         var snapshot = options.Snapshot();
         options.Ssl.Mode = PostgreSqlSslMode.Disable;
-        options.ScopeReset.ResetParameters = false;
+        options.SessionReset.ResetParameters = false;
         endpoint.Port = 6432;
         credential.UserName = "after-user";
         credential.Password = "after-password";
@@ -62,7 +61,7 @@ public class SlonDataSourceOptionsTests
         Assert.AreEqual(PostgreSqlSslMode.Require, snapshot.Ssl.Mode);
         Assert.AreEqual(5432, ((IPEndPoint)snapshot.EndPoint).Port);
         Assert.IsTrue(snapshot.Authentication.AllowInsecureTransport);
-        Assert.IsTrue(snapshot.ScopeReset.ResetParameters);
+        Assert.IsTrue(snapshot.SessionReset.ResetParameters);
         Assert.AreEqual("before-user", snapshot.IntegratedSecurity!.Credential.UserName);
         Assert.AreEqual("before-password", snapshot.IntegratedSecurity.Credential.Password);
     }

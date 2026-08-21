@@ -1,5 +1,4 @@
 using Slon.Pg;
-using Slon.Pg.Protocol.Flows;
 using Slon.Pg.Types;
 
 namespace Slon.Tests.Pg;
@@ -10,7 +9,7 @@ public class PgBackendInfoTests
     [TestMethod]
     public void ConfiguredProfileControlsBackendBehavior()
     {
-        Assert.AreSame(PostgreSqlBackendProvider.Instance, PgBackendProviders.Create(null));
+        Assert.AreSame(DefaultPostgreSqlBackendProvider.Instance, PgBackendProviders.Create(null));
         Assert.IsInstanceOfType<ConfiguredBackendProvider>(PgBackendProviders.Create(CreateQuestDbProfile()));
     }
 
@@ -38,9 +37,9 @@ public class PgBackendInfoTests
             ["server_version"] = "11.3"
         });
 
-        Assert.AreEqual("DISCARD ALL", provider.ResolveScopeResetCommand(new ScopeResetOptions(), info));
+        Assert.AreEqual("DISCARD ALL", provider.ResolveSessionResetCommand(new PgSessionResetOptions(), info));
 
-        var disabled = new ScopeResetOptions
+        var disabled = new PgSessionResetOptions
         {
             CloseCursors = false,
             ResetSessionAuthorization = false,
@@ -49,10 +48,10 @@ public class PgBackendInfoTests
             ReleaseAdvisoryLocks = false,
             DropTemporaryObjects = false
         };
-        Assert.IsNull(provider.ResolveScopeResetCommand(disabled, info));
+        Assert.IsNull(provider.ResolveSessionResetCommand(disabled, info));
 
         disabled.CloseCursors = true;
-        Assert.ThrowsExactly<NotSupportedException>(() => provider.ResolveScopeResetCommand(disabled, info));
+        Assert.ThrowsExactly<NotSupportedException>(() => provider.ResolveSessionResetCommand(disabled, info));
     }
 
     static PostgreSqlCompatibilityProfile CreateQuestDbProfile()
@@ -60,7 +59,7 @@ public class PgBackendInfoTests
         {
             Features = PostgreSqlCompatibilityFeatures.IntegerDateTimes,
             LoadTypesFromCatalog = false,
-            CompleteScopeResetCommand = "DISCARD ALL"
+            CompleteSessionResetCommand = "DISCARD ALL"
         };
 
     [TestMethod]
@@ -174,7 +173,7 @@ public class PgBackendInfoTests
     [TestMethod]
     public void Provider_RejectsConnectionWithDifferentCapabilityShape()
     {
-        var provider = PostgreSqlBackendProvider.Instance;
+        var provider = DefaultPostgreSqlBackendProvider.Instance;
         var expected = CreateInfo("14.1", "UTF8", "on");
         var actual = CreateInfo("13.9", "UTF8", "on");
 
@@ -186,7 +185,7 @@ public class PgBackendInfoTests
     [TestMethod]
     public void Provider_AllowsDifferentVersionsAndServerEncodingsWithTheSameCapabilityShape()
     {
-        var provider = PostgreSqlBackendProvider.Instance;
+        var provider = DefaultPostgreSqlBackendProvider.Instance;
         var expected = CreateInfo("17.1", "UTF8", "on");
         var actual = CreateInfo("17.2 (rolling upgrade)", "LATIN1", "on");
 
@@ -196,7 +195,7 @@ public class PgBackendInfoTests
     [TestMethod]
     public void Provider_AllowsConnectionLocalCapabilityDifferences()
     {
-        var provider = PostgreSqlBackendProvider.Instance;
+        var provider = DefaultPostgreSqlBackendProvider.Instance;
         var expected = CreateInfo("17.1", "UTF8", "on");
         var builder = new PgBackendInfoBuilder(expected.StartupParameters);
         builder.Capabilities = builder.Capabilities with

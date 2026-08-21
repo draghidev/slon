@@ -5,11 +5,11 @@ using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
 using System.Runtime.ExceptionServices;
 using System.Collections.Concurrent;
-using static Slon.Pools.ConnectionPool;
+using static Slon.Pooling.ConnectionPool;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
-namespace Slon.Pools;
+namespace Slon.Pooling;
 
 sealed class ConnectionPoolOptions
 {
@@ -81,7 +81,7 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
 
     readonly ConcurrentQueue<IdleToken> _idle = new();
     readonly WaitQueue<Placement> _waiters = new();
-    ConcurrentDictionary<Task, byte>? _detachedTasks;
+    ConcurrentDictionary<Task, byte>? _backgroundOperations;
     internal int WaiterCount => _waiters.Count;
 
     PoolMetricsSnapshot IPoolMetricsSource.GetMetricsSnapshot()
@@ -736,7 +736,7 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
 
         T? conn = null;
         var admitted = false;
-        PooledLinkedSource? timeoutSource = null;
+        TimeoutCancellation? timeoutSource = null;
         bool scheduled;
         try
         {
@@ -999,7 +999,7 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
         {
             if (tasks is not null)
                 Task.WhenAll(tasks).GetAwaiter().GetResult();
-            WaitForDetachedTasksAsync().GetAwaiter().GetResult();
+            WaitForBackgroundOperationsAsync().GetAwaiter().GetResult();
         }
         finally
         {
@@ -1017,7 +1017,7 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
         {
             if (tasks is not null)
                 await Task.WhenAll(tasks).ConfigureAwait(false);
-            await WaitForDetachedTasksAsync().ConfigureAwait(false);
+            await WaitForBackgroundOperationsAsync().ConfigureAwait(false);
         }
         finally
         {
@@ -1025,28 +1025,52 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
         }
     }
 
-    internal void TrackDetached(Task task)
+    internal void TrackBackgroundOperation(Func<Task> start)
     {
-        var tasks = Volatile.Read(ref _detachedTasks);
-        if (tasks is null)
+        ArgumentNullException.ThrowIfNull(start);
+        var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        ConcurrentDictionary<Task, byte> tasks;
+        lock (SyncObj)
         {
-            var created = new ConcurrentDictionary<Task, byte>();
-            tasks = Interlocked.CompareExchange(ref _detachedTasks, created, null) ?? created;
+            ThrowIfDisposed();
+            tasks = _backgroundOperations ??= new();
+            if (!tasks.TryAdd(completion.Task, 0))
+                ThrowHelper.ThrowUnexpected("Background operation registration was duplicated.");
         }
-        tasks.TryAdd(task, 0);
-        _ = RemoveWhenCompletedAsync(tasks, task);
+        _ = RunAsync(start, completion);
+        _ = RemoveWhenCompletedSuccessfullyAsync(tasks, completion.Task);
 
-        static async Task RemoveWhenCompletedAsync(ConcurrentDictionary<Task, byte> tasks, Task tracked)
+        static async Task RunAsync(Func<Task> start, TaskCompletionSource completion)
         {
-            try { await tracked.ConfigureAwait(false); }
-            catch { }
-            finally { tasks.TryRemove(tracked, out _); }
+            try
+            {
+                await start().ConfigureAwait(false);
+                completion.SetResult();
+            }
+            catch (Exception ex)
+            {
+                completion.SetException(ex);
+            }
+        }
+
+        static async Task RemoveWhenCompletedSuccessfullyAsync(
+            ConcurrentDictionary<Task, byte> tasks, Task tracked)
+        {
+            try
+            {
+                await tracked.ConfigureAwait(false);
+                tasks.TryRemove(tracked, out _);
+            }
+            catch
+            {
+                // Preserve unexpected failures so pool disposal observes them.
+            }
         }
     }
 
-    async Task WaitForDetachedTasksAsync()
+    async Task WaitForBackgroundOperationsAsync()
     {
-        var tasks = Volatile.Read(ref _detachedTasks);
+        var tasks = _backgroundOperations;
         while (tasks is not null && !tasks.IsEmpty)
             await Task.WhenAll(tasks.Keys).ConfigureAwait(false);
     }
@@ -1325,20 +1349,127 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
         internal int SlotIndex => Volatile.Read(ref _slotIndex);
     }
 
+    struct IdleTokenTenure
+    {
+        const long StateMask = 3;
+        const long None = 0;
+        const long Queued = 1;
+        const long Claimed = 2;
+        const long ClaimedWithPendingPublication = 3;
+
+        long _word;
+
+        /// Assigns the coordinator generation before the connection-side idle
+        /// level can become visible. This does not create or defer a token.
+        internal void PreparePublication(long generation)
+        {
+            while (true)
+            {
+                var word = Volatile.Read(ref _word);
+                if (Interlocked.CompareExchange(ref _word,
+                        generation | (word & StateMask), word) == word)
+                    return;
+            }
+        }
+
+        /// Records an idle edge at the generation assigned by the pool coordinator.
+        /// Returns true only when the caller must enqueue the identity token.
+        internal bool CommitPublication(long generation)
+        {
+            while (true)
+            {
+                var word = Volatile.Read(ref _word);
+                if ((word & ~StateMask) != generation)
+                    ThrowInvalidTransition(nameof(CommitPublication), word);
+                var state = word & StateMask;
+                long next;
+                switch (state)
+                {
+                    case None:
+                        next = generation | Queued;
+                        break;
+                    case Queued:
+                        next = generation | Queued;
+                        break;
+                    case ClaimedWithPendingPublication:
+                        next = generation | ClaimedWithPendingPublication;
+                        break;
+                    case Claimed:
+                        next = generation | ClaimedWithPendingPublication;
+                        break;
+                    default:
+                        System.Diagnostics.Debug.Fail("Invalid idle-token state.");
+                        return false;
+                }
+
+                if (Interlocked.CompareExchange(ref _word, next, word) == word)
+                    return state is None;
+            }
+        }
+
+        internal long Generation => Volatile.Read(ref _word) & ~StateMask;
+
+        /// Claims the queued token and returns its latest publication generation.
+        internal long Claim()
+        {
+            while (true)
+            {
+                var word = Volatile.Read(ref _word);
+                if ((word & StateMask) is not Queued)
+                    ThrowInvalidTransition(nameof(Claim), word);
+                if (Interlocked.CompareExchange(ref _word,
+                        (word & ~StateMask) | Claimed, word) == word)
+                    return word & ~StateMask;
+            }
+        }
+
+        /// Returns the token. True means a publication raced the claim and the
+        /// caller must make token visibility precede another coordinator bell.
+        internal bool Return()
+        {
+            while (true)
+            {
+                var word = Volatile.Read(ref _word);
+                var state = word & StateMask;
+                if (state is not (Claimed or ClaimedWithPendingPublication))
+                    ThrowInvalidTransition(nameof(Return), word);
+                if (Interlocked.CompareExchange(ref _word,
+                        (word & ~StateMask) | Queued, word) == word)
+                    return state is ClaimedWithPendingPublication;
+            }
+        }
+
+        internal bool Consume()
+        {
+            while (true)
+            {
+                var word = Volatile.Read(ref _word);
+                var state = word & StateMask;
+                if (state is not (Claimed or ClaimedWithPendingPublication))
+                    ThrowInvalidTransition(nameof(Consume), word);
+                if (Interlocked.CompareExchange(ref _word,
+                        word & ~StateMask, word) == word)
+                    return state is ClaimedWithPendingPublication;
+            }
+        }
+
+        [DoesNotReturn]
+        static void ThrowInvalidTransition(string operation, long word)
+            => throw new InvalidOperationException(
+                $"Idle-token operation {operation} is invalid in state {word & StateMask}.");
+    }
+
 }
 
 static partial class ConnectionPool
 {
-    [ThreadStatic]
-    static PooledLinkedSource? TimeoutSource;
-
     internal static bool IsCancellationTokenException(Exception ex, CancellationToken cancellationToken)
         => ex is OperationCanceledException { CancellationToken: var token } && cancellationToken.IsCancellationRequested && token == cancellationToken;
 
     internal static void ThrowSourceExhausted(Exception? inner = null)
         => throw new TimeoutException($"{nameof(ConnectionPool)} is exhausted, there are no empty spots or connections idle enough to take new work in time.", inner);
 
-    internal static PooledLinkedSource? RentTimeoutSource(TimeSpan timeout, TimeProvider timeProvider,
+    internal static TimeoutCancellation? RentTimeoutSource(TimeSpan timeout, TimeProvider timeProvider,
         CancellationToken cancellationToken = default)
     {
         if (timeout == default || timeout == Timeout.InfiniteTimeSpan)
@@ -1346,34 +1477,41 @@ static partial class ConnectionPool
 
         return Core(timeout, timeProvider, cancellationToken);
 
-        static PooledLinkedSource Core(TimeSpan timeout, TimeProvider timeProvider,
+        static TimeoutCancellation Core(TimeSpan timeout, TimeProvider timeProvider,
             CancellationToken cancellationToken)
         {
             if (timeout < TimeSpan.Zero)
                 throw new TimeoutException("The operation has timed out.");
 
-            PooledLinkedSource timeoutSource;
-            if (ReferenceEquals(timeProvider, TimeProvider.System))
-            {
-                timeoutSource = TimeoutSource ?? new PooledLinkedSource(ReturnTimeoutSource);
-                TimeoutSource = null;
-                timeoutSource.CancelAfter(timeout);
-            }
-            else
-                timeoutSource = new PooledLinkedSource(timeout, timeProvider);
-            timeoutSource.Initialize(cancellationToken.UnsafeRegister(static state => ((CancellationTokenSource)state!).Cancel(), timeoutSource));
-            return timeoutSource;
+            return new(timeout, timeProvider, cancellationToken);
         }
     }
 
-    static void ReturnTimeoutSource(PooledLinkedSource timeoutSource)
+    internal sealed class TimeoutCancellation : IDisposable, IAsyncDisposable
     {
-        if (timeoutSource.TryReset() && TimeoutSource is null)
+        readonly CancellationTokenSource _source;
+        readonly CancellationTokenRegistration _registration;
+
+        internal TimeoutCancellation(
+            TimeSpan timeout, TimeProvider timeProvider, CancellationToken cancellationToken)
         {
-            TimeoutSource = timeoutSource;
-            return;
+            _source = new(timeout, timeProvider);
+            _registration = cancellationToken.UnsafeRegister(
+                static state => ((CancellationTokenSource)state!).Cancel(), _source);
         }
 
-        ((CancellationTokenSource)timeoutSource).Dispose();
+        internal CancellationToken Token => _source.Token;
+
+        public void Dispose()
+        {
+            _registration.Dispose();
+            _source.Dispose();
+        }
+
+        public async ValueTask DisposeAsync()
+        {
+            await _registration.DisposeAsync().ConfigureAwait(false);
+            _source.Dispose();
+        }
     }
 }

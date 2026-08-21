@@ -56,7 +56,7 @@ sealed class PgClientProtocolOptions
         CancellationTimeout = options.CancellationTimeout;
         CancellationRetryInterval = options.CancellationRetryInterval;
         FlowActivationTimeout = options.ConnectionTimeout;
-        ScopeReset = options.ScopeReset.Snapshot();
+        SessionReset = options.SessionReset.Snapshot();
         DataRowStreamingThreshold = options.DataRowStreamingThreshold;
         MaxInFlightFlowsPerWire = options.MaxInFlightFlowsPerWire;
         ExecutionScheduler = options.ExecutionScheduler;
@@ -81,7 +81,7 @@ sealed class PgClientProtocolOptions
     public TimeSpan CancelRequestDelay { get; set; }
     public TimeSpan CancellationTimeout { get; set; } = TimeSpan.FromSeconds(10);
     public TimeSpan CancellationRetryInterval { get; set; } = TimeSpan.FromSeconds(1);
-    public ScopeResetOptions ScopeReset { get; set; } = new();
+    internal PgSessionResetOptions SessionReset { get; set; } = new();
     public int DataRowStreamingThreshold { get; set; } = BackendMessageBatch.Segmenter.DefaultDataRowStreamingThreshold;
     internal int MaxInFlightFlowsPerWire { get; set; }
     public ILoggerFactory LoggerFactory { get; set; } = NullLoggerFactory.Instance;
@@ -102,7 +102,7 @@ sealed class PgClientProtocolOptions
 sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
 {
     readonly PgClientProtocolOptions _options;
-    readonly ScopeResetOptions _scopeReset;
+    readonly PgSessionResetOptions _sessionReset;
     readonly ILogger _logger;
     TransportConnection _connection = null!;
     IOutputWriter _pipeWriter = null!;
@@ -131,7 +131,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
     readonly PgServerParameterState _serverParameterState = new();
     PgBackendInfo? _backendInfo;
     PgBackendCapabilities _backendCapabilities;
-    string? _scopeResetCommand;
+    string? _sessionResetCommand;
     // Last transaction status observed at RFQ, shared by outer and nested flows on this wire.
     TransactionStatus _transactionStatus;
 
@@ -156,7 +156,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
     {
         ArgumentNullException.ThrowIfNull(options.LoggerFactory);
         _options = options;
-        _scopeReset = options.ScopeReset.Snapshot();
+        _sessionReset = options.SessionReset.Snapshot();
         _logger = options.LoggerFactory.CreateLogger("Slon.Pg.Protocol");
         _backendCapabilities = options.BackendCapabilities;
         _close = CloseSignal.CreateRoot();
@@ -220,7 +220,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
     internal TransactionStatus TransactionStatus => _transactionStatus;
     // Raw shutdown cause, or null after clean completion.
     internal Exception? CompletionException => _close.Reason?.InnerException;
-    internal string? ScopeResetCommand => _scopeResetCommand;
+    internal string? SessionResetCommand => _sessionResetCommand;
     internal int CompareTo(PgClientProtocol? other)
     {
         // Empty slots are preferred.
@@ -458,11 +458,11 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
                 if (_options.ExpectedBackendInfo is { } expectedBackendInfo)
                     backendProvider.ValidateConnectionCompatibility(expectedBackendInfo, _backendInfo);
                 _backendCapabilities = _backendInfo.Capabilities;
-                _scopeResetCommand = backendProvider.ResolveScopeResetCommand(_scopeReset, _backendInfo);
+                _sessionResetCommand = backendProvider.ResolveSessionResetCommand(_sessionReset, _backendInfo);
             }
             else
             {
-                _scopeResetCommand = _scopeReset.ResolveCommand(_backendCapabilities);
+                _sessionResetCommand = _sessionReset.ResolveCommand(_backendCapabilities);
             }
             Volatile.Write(ref _queryProtocolEstablished, 1);
             SignalReady();
@@ -1542,7 +1542,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
             SubstituteCancellationActivation(from, to);
             protocol.OnFlowSubstituted(from, to);
         }
-        internal string? ScopeResetCommand => protocol.ScopeResetCommand;
+        internal string? SessionResetCommand => protocol.SessionResetCommand;
 
         // The scope's linked close signal, set once for an exclusive-scope inner Control; null for the
         // pool-facing FlowControl (which reads the protocol's _close directly). Inner flows read the
