@@ -5,13 +5,12 @@ using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
-using Slon.Pg;
 using Slon.Pg.Serialization;
 using Slon.Pg.Types;
 
 namespace Slon;
 
-// Originally DbDataParameterCollection but now just a partial of SlonParameters, implements all the uninteresting base members and the name lookup handling.
+// Implementation
 public partial class SlonParameters
 {
     // Internal for tests
@@ -423,13 +422,50 @@ public partial class SlonParameters
         return true;
     }
 
+    struct NameValueEnumerator : IEnumerator<KeyValuePair<string, object?>>
+    {
+        readonly List<ParameterItem> _parameters;
+        int _index;
+        KeyValuePair<string, object?> _current;
+
+        internal NameValueEnumerator(SlonParameters parameters) => _parameters = parameters._parameters;
+
+        public bool MoveNext()
+        {
+            var parameters = _parameters;
+
+            if ((uint)_index < (uint)parameters.Count)
+            {
+                _current = parameters[_index].AsKeyValuePair();
+                _index++;
+                return true;
+            }
+
+            _current = default;
+            _index = parameters.Count + 1;
+            return false;
+        }
+
+        public KeyValuePair<string, object?> Current => _current;
+
+        public void Reset()
+        {
+            _index = 0;
+            _current = default;
+        }
+
+        object IEnumerator.Current => Current;
+
+        public void Dispose() { }
+    }
+
     // Beautiful ADO.NET 1.0 design to fill the public GetEnumerator method slot with a non generic IEnumerable method...
     NameValueEnumerator GetNameValueEnumerator() => new(this);
 }
 
 // Public surface & ADO.NET
 /// <inheritdoc cref="System.Data.Common.DbParameterCollection"/>
-public partial class SlonParameters: DbParameterCollection, ICollection<KeyValuePair<string, object?>>, IDataParameterCollection
+public partial class SlonParameters : DbParameterCollection, ICollection<KeyValuePair<string, object?>>, IDataParameterCollection
 {
     /// <summary>Adds a parameter value with the given name.</summary>
     /// <param name="parameterName">The name of the parameter.</param>
@@ -492,48 +528,6 @@ public partial class SlonParameters: DbParameterCollection, ICollection<KeyValue
     }
 
     /// <inheritdoc />
-    struct NameValueEnumerator : IEnumerator<KeyValuePair<string, object?>>
-    {
-        readonly List<ParameterItem> _parameters;
-        int _index;
-        KeyValuePair<string, object?> _current;
-
-        internal NameValueEnumerator(SlonParameters parameters) => _parameters = parameters._parameters;
-
-        /// <inheritdoc />
-        public bool MoveNext()
-        {
-            var parameters = _parameters;
-
-            if ((uint)_index < (uint)parameters.Count)
-            {
-                _current = parameters[_index].AsKeyValuePair();
-                _index++;
-                return true;
-            }
-
-            _current = default;
-            _index = parameters.Count + 1;
-            return false;
-        }
-
-        /// <inheritdoc />
-        public KeyValuePair<string, object?> Current => _current;
-
-        /// <inheritdoc />
-        public void Reset()
-        {
-            _index = 0;
-            _current = default;
-        }
-
-        /// <inheritdoc />
-        object IEnumerator.Current => Current;
-        /// <inheritdoc />
-        public void Dispose() { }
-    }
-
-    /// <inheritdoc />
     IEnumerator<KeyValuePair<string, object?>> IEnumerable<KeyValuePair<string, object?>>.GetEnumerator() => GetNameValueEnumerator();
 
     /// <inheritdoc />
@@ -581,7 +575,7 @@ public partial class SlonParameters: DbParameterCollection, ICollection<KeyValue
         if ((uint)arrayIndex > array.Length)
             throw new ArgumentOutOfRangeException(nameof(arrayIndex), "Index cannot be negative or larger than the length of the array.");
 
-        if (arrayIndex >= 0 && arrayIndex + _parameters.Count <= array.Length)
+        if (arrayIndex + _parameters.Count > array.Length)
             throw new ArgumentOutOfRangeException(nameof(array), "Array too small.");
 
         for (var i = 0; i < _parameters.Count; i++)
@@ -607,6 +601,7 @@ public partial class SlonParameters: DbParameterCollection, ICollection<KeyValue
             if ((uint)index >= _parameters.Count)
                 throw new ArgumentOutOfRangeException(nameof(index), "Index cannot be negative or larger than or equal to Count.");
 
+            ArgumentNullException.ThrowIfNull(value);
             ReplaceCore(index, null, value);
         }
     }
@@ -629,6 +624,7 @@ public partial class SlonParameters: DbParameterCollection, ICollection<KeyValue
         {
             if (parameterName is null)
                 throw new ArgumentNullException(nameof(parameterName));
+            ArgumentNullException.ThrowIfNull(value);
 
             var index = IndexOfCore(parameterName);
             if (index == -1)
@@ -683,16 +679,16 @@ public partial class SlonParameters: DbParameterCollection, ICollection<KeyValue
     public override void Remove(object? value) => RemoveAtCore(IndexOfCore(value ?? throw new ArgumentNullException(nameof(value))));
 
     /// <inheritdoc cref="DbParameterCollection.IndexOf(string)" />
-    public override int IndexOf(string parameterName) => IndexOfCore(parameterName ?? throw new ArgumentNullException(nameof(parameterName)));
+    public override int IndexOf(string? parameterName) => parameterName is null ? -1 : IndexOfCore(parameterName);
 
     /// <inheritdoc cref="DbParameterCollection.IndexOf(object)" />
-    public override int IndexOf(object? value) => IndexOfCore(value ?? throw new ArgumentNullException(nameof(value)));
+    public override int IndexOf(object? value) => value is null ? -1 : IndexOfCore(value);
 
     /// <inheritdoc cref="DbParameterCollection.Contains(string)" />
-    public override bool Contains(string parameterName) => IndexOfCore(parameterName ?? throw new ArgumentNullException(nameof(parameterName))) != -1;
+    public override bool Contains(string? parameterName) => parameterName is not null && IndexOfCore(parameterName) != -1;
 
     /// <inheritdoc cref="DbParameterCollection.Contains(object)" />
-    public override bool Contains(object? value) => IndexOfCore(value ?? throw new ArgumentNullException(nameof(value))) != -1;
+    public override bool Contains(object? value) => value is not null && IndexOfCore(value) != -1;
 
     /// <inheritdoc cref="DbParameterCollection.CopyTo" />
     public override void CopyTo(Array array, int arrayIndex)
@@ -702,7 +698,7 @@ public partial class SlonParameters: DbParameterCollection, ICollection<KeyValue
         if ((uint)arrayIndex > array.Length)
             throw new ArgumentOutOfRangeException(nameof(arrayIndex), "Index cannot be negative or larger than the length of the array.");
 
-        if (arrayIndex >= 0 && arrayIndex + _parameters.Count <= array.Length)
+        if (arrayIndex + _parameters.Count > array.Length)
             throw new ArgumentOutOfRangeException(nameof(array), "Array too small.");
 
         var list = array as IList;

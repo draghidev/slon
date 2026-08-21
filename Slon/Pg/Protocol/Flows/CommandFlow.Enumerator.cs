@@ -214,26 +214,25 @@ sealed partial class CommandFlow
         // DisposeAsync always calls MoveNextAsync to confirm the enumerator is done without tracking additional state.
         // So this method should be resilient to multiple fetches of the final result.
         /// <inheritdoc />
-        public ValueTask<bool> MoveNextAsync() => MoveNextAsync(null);
+        public ValueTask<bool> MoveNextAsync() => MoveNextAsync(default);
 
         /// <summary>Advances the enumerator asynchronously to the next element of the collection.</summary>
         /// <param name="cancellationToken">A <see cref="T:System.Threading.CancellationToken" /> that may be used to cancel the asynchronous operation.</param>
         /// <returns>A <see cref="T:System.Threading.Tasks.ValueTask`1" /> that will complete with a result of <see langword="true" /> if the enumerator was successfully advanced to the next element, or <see langword="false" /> if the enumerator has passed the end of the collection.</returns>
-        public ValueTask<bool> MoveNextAsync(CancellationToken cancellationToken) => MoveNextAsync(new CancellationToken?(cancellationToken));
-        ValueTask<bool> MoveNextAsync(CancellationToken? cancellationToken)
+        public ValueTask<bool> MoveNextAsync(CancellationToken cancellationToken)
         {
             if (flow is null)
                 return new(false);
 
-            if (cancellationToken is { IsCancellationRequested: true } preCanceledToken)
+            if (cancellationToken.IsCancellationRequested)
             {
-                flow._callerCancellationToken = preCanceledToken;
-                if (flow.RequestCancel(preCanceledToken, CancellationScope.CurrentWindow))
+                flow._callerCancellationToken = cancellationToken;
+                if (flow.RequestCancel(cancellationToken, CancellationScope.CurrentWindow))
                 {
                     flow._callerInteractionCore.ResumeBody(runContinuationsAsynchronously: false);
                     flow._callerInteractionCore.WakeBody();
                 }
-                return ValueTask.FromException<bool>(new OperationCanceledException(preCanceledToken));
+                return ValueTask.FromException<bool>(new OperationCanceledException(cancellationToken));
             }
 
             // The guard-decide-rearm is serialized against the body's terminal (see _rearmLock): the using
@@ -245,9 +244,9 @@ sealed partial class CommandFlow
                 // Publish the per-read token before the terminal repair below: a flow may already have
                 // completed before its first consumer call, and EnsureEnumerationCompleted needs this token to
                 // distinguish a pre-fired cancellation from a clean end.
-                if (cancellationToken is { } terminalToken && terminalToken.CanBeCanceled)
+                if (cancellationToken.CanBeCanceled)
                 {
-                    flow._callerCancellationToken = terminalToken;
+                    flow._callerCancellationToken = cancellationToken;
                     flow._enumeratorMoveNextTaskSource.CanCompleteConcurrently = true;
                 }
 

@@ -6,6 +6,76 @@ using System.Data;
 public class LifecycleTests
 {
     [TestMethod]
+    public async Task EmptyCommandText_IsRejectedBeforeExecution()
+    {
+        await using var dataSource = AdoTestPool.NewIsolatedDataSource();
+        await using var connection = await dataSource.OpenConnectionAsync(CancellationToken.None);
+        await using var command = connection.CreateCommand();
+
+        Assert.ThrowsExactly<InvalidOperationException>(() => command.Prepare());
+        Assert.ThrowsExactly<InvalidOperationException>(() => command.ExecuteReader());
+        Assert.ThrowsExactly<InvalidOperationException>(() => command.ExecuteScalar());
+        Assert.ThrowsExactly<InvalidOperationException>(() => command.ExecuteNonQuery());
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            async () => await command.ExecuteReaderAsync(CancellationToken.None));
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            async () => await command.ExecuteScalarAsync(CancellationToken.None));
+    }
+
+    [TestMethod]
+    public async Task ConnectionDispose_RaisesDisposedExactlyOnce()
+    {
+        await using var dataSource = AdoTestPool.NewIsolatedDataSource();
+
+        var connection = dataSource.OpenConnection();
+        var disposed = 0;
+        connection.Disposed += (_, _) => disposed++;
+        connection.Dispose();
+        connection.Dispose();
+        Assert.AreEqual(1, disposed);
+
+        connection = await dataSource.OpenConnectionAsync(CancellationToken.None);
+        disposed = 0;
+        connection.Disposed += (_, _) => disposed++;
+        await connection.DisposeAsync();
+        await connection.DisposeAsync();
+        Assert.AreEqual(1, disposed);
+    }
+
+    [TestMethod]
+    public void FinalRead_ReleasesFlowAfterCommandIsDisposed()
+    {
+        using var dataSource = AdoTestPool.NewIsolatedDataSource();
+        using var connection = dataSource.OpenConnection();
+        SlonDataReader reader;
+        using (var command = connection.CreateCommand("select 'test'"))
+            reader = command.ExecuteReader();
+
+        Assert.IsTrue(reader.Read());
+        Assert.AreEqual("test", reader.GetString(0));
+        Assert.IsFalse(reader.Read());
+
+        using var successor = connection.CreateCommand("select 42");
+        Assert.AreEqual(42, successor.ExecuteScalar());
+    }
+
+    [TestMethod]
+    public void CommandConnection_CanBeUnsetButExecutionStateCannotBeMutated()
+    {
+        using var dataSource = AdoTestPool.NewIsolatedDataSource();
+        using var connection = dataSource.OpenConnection();
+        using var command = connection.CreateCommand("select 1");
+
+        command.Connection = null;
+        Assert.IsNull(command.Connection);
+        command.Connection = connection;
+
+        using var reader = command.ExecuteReader();
+        Assert.ThrowsExactly<InvalidOperationException>(() => command.CommandText = "select 2");
+        Assert.ThrowsExactly<InvalidOperationException>(() => command.Connection = null);
+    }
+
+    [TestMethod]
     public void CommandsAndBatches_RejectUseAfterDispose()
     {
         using var dataSource = AdoTestPool.NewIsolatedDataSource();
@@ -47,8 +117,14 @@ public class LifecycleTests
         var disposed = connection.BeginTransaction();
         await disposed.DisposeAsync();
         Assert.IsNull(disposed.Connection);
-        Assert.ThrowsExactly<InvalidOperationException>(() => disposed.Rollback());
-        await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => disposed.CommitAsync());
+        Assert.ThrowsExactly<ObjectDisposedException>(() => disposed.Rollback());
+        await Assert.ThrowsExactlyAsync<ObjectDisposedException>(() => disposed.CommitAsync());
+
+        var synchronouslyDisposed = connection.BeginTransaction();
+        synchronouslyDisposed.Dispose();
+        Assert.IsNull(synchronouslyDisposed.Connection);
+        Assert.ThrowsExactly<ObjectDisposedException>(() => synchronouslyDisposed.Commit());
+        await Assert.ThrowsExactlyAsync<ObjectDisposedException>(() => synchronouslyDisposed.RollbackAsync());
     }
 
     [TestMethod]

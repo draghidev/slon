@@ -17,7 +17,7 @@ public class AdoErrorSurfacingTests
 
     static SlonCommand Failed() => AdoTestPool.CreateCommand(Failing);
 
-    static void AssertUsable() => Assert.AreEqual(0, AdoTestPool.ExecuteNonQuery("SELECT 1"));
+    static void AssertUsable() => Assert.AreEqual(-1, AdoTestPool.ExecuteNonQuery("SELECT 1"));
 
     [TestMethod]
     public void ClientProjection_DoesNotDuplicateInnerMessage()
@@ -59,7 +59,7 @@ public class AdoErrorSurfacingTests
     }
 
     [TestMethod]
-    public void BackendTerminationProjection_IsPostgreSqlErrorAndNonTransient()
+    public void BackendTerminationProjection_PreservesPostgreSqlTransience()
     {
         PgError error = ErrorOrNoticeMessage.FromFieldBlock(ErrorBlock(
             ('S', "FATAL"),
@@ -73,10 +73,26 @@ public class AdoErrorSurfacingTests
         var projected = Assert.IsInstanceOfType<SlonException>(AdoException.Project(lowLevel));
 
         Assert.IsTrue(projected.IsCollateral);
-        Assert.IsFalse(projected.IsTransient);
+        Assert.IsTrue(projected.IsTransient);
         var backend = Assert.IsInstanceOfType<PostgreSqlException>(projected.InnerException);
         Assert.AreSame(backend, projected.PostgreSqlError);
         Assert.AreEqual(PgErrorCodes.AdminShutdown, backend.SqlState);
+    }
+
+    [TestMethod]
+    public void TransportProjection_IsTransientWithoutClassifyingProtocolViolationsAsTransient()
+    {
+        var transport = Assert.IsInstanceOfType<SlonException>(
+            AdoException.Project(new PgClientException(new IOException("connection reset"))));
+        Assert.IsTrue(transport.IsTransient);
+
+        var timeout = Assert.IsInstanceOfType<SlonException>(
+            AdoException.Project(new PgClientException(new TimeoutException("read timed out"))));
+        Assert.IsTrue(timeout.IsTransient);
+
+        var protocol = Assert.IsInstanceOfType<SlonException>(
+            AdoException.Project(new PgClientException(new PgProtocolException("invalid frame"))));
+        Assert.IsFalse(protocol.IsTransient);
     }
 
     [TestMethod]
@@ -127,7 +143,7 @@ public class AdoErrorSurfacingTests
 
         await Assert.ThrowsExactlyAsync<PostgreSqlException>(async () => await batch.ExecuteNonQueryAsync(CancellationToken.None));
         await using var command = new SlonCommand(connection, "SELECT 1");
-        Assert.AreEqual(0, await command.ExecuteNonQueryAsync());
+        Assert.AreEqual(-1, await command.ExecuteNonQueryAsync());
     }
 
     [TestMethod]
@@ -332,7 +348,7 @@ public class AdoErrorSurfacingTests
                     {
                         PendingTimeout = Timeout.InfiniteTimeSpan
                     };
-                    Assert.AreEqual(0, command.ExecuteNonQuery(), $"iter {i}: datasource successor failed");
+                    Assert.AreEqual(-1, command.ExecuteNonQuery(), $"iter {i}: datasource successor failed");
                 }
             }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
         }

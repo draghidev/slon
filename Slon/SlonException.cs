@@ -1,5 +1,6 @@
 using System.Data.Common;
 using System.Diagnostics.CodeAnalysis;
+using System.Net.Sockets;
 using System.Runtime.ExceptionServices;
 using Slon.Pg.Protocol;
 
@@ -25,8 +26,17 @@ public class SlonException : DbException
     /// </summary>
     public bool IsCollateral => ProjectedException is PgCollateralException;
 
-    public override bool IsTransient
-        => ProjectedException is PgCollateralException { CollateralSource: PgCollateralSource.Cancellation };
+    public override bool IsTransient => IsTransientFailure(ProjectedException);
+
+    static bool IsTransientFailure(Exception exception) => exception switch
+    {
+        PgCollateralException { CollateralSource: PgCollateralSource.Cancellation } => true,
+        PgErrorException error => error.IsTransient,
+        PgProtocolException or PgClientClosedException => false,
+        PgClientException { InnerException: { } cause } => IsTransientFailure(cause),
+        IOException or SocketException or TimeoutException => true,
+        _ => false
+    };
 }
 
 /// <summary>Represents an error reported by PostgreSQL.</summary>

@@ -1,6 +1,5 @@
 using System.Data;
 using System.Data.Common;
-using Slon.Pg;
 using Slon.Runtime.CompilerServices;
 using Slon.Pg.Protocol.Flows;
 
@@ -31,50 +30,6 @@ public sealed class SlonBatch : DbBatch
     public SlonBatch(SlonConnection conn) : this(conn, null) {}
     internal SlonBatch(SlonDataSource dataSource) : this(null, dataSource) {}
 
-    internal static unsafe SlonBatch CreateFromDbCommand<TCommand>(AdoBatchCore<TCommand> dbCommandCore, int copies, bool withParameters) where TCommand : IAdoCommand
-    {
-        var dbCommands = dbCommandCore.Commands;
-        var commands = new AdoCommandList<SlonBatchCommand>(dbCommands.Count);
-        for (var i = 0; i < copies; i++)
-        {
-            foreach (var dbCommand in dbCommands)
-            {
-                var batchCommand = new SlonBatchCommand
-                {
-                    CommandText = dbCommand.CommandText,
-                    CommandType = dbCommand.CommandType,
-                    AppendErrorBarrier = dbCommand.AppendErrorBarrier,
-                    DisableAutoPreparation = dbCommand.DisableAutoPreparation
-                };
-                ((IAdoCommand)batchCommand).Tracked = dbCommand.Tracked;
-                if (withParameters && batchCommand.Parameters is { Count: > 0 } parameters)
-                    batchCommand.Parameters.AddRange(parameters);
-                commands.Add(batchCommand);
-            }
-        }
-        var batchCore = new AdoBatchCore<SlonBatchCommand>();
-        var batch = new SlonBatch { _batchCore = batchCore };
-        batch._batchCore.InitializeFrom(FieldRef<AdoBatchCore<SlonBatchCommand>>.Create(&GetBatchCore, batch), dbCommandCore, commands);
-        return batch;
-    }
-
-    void SetupCommands()
-    {
-    }
-
-    ValueTask<T> SetupCommandsWrappedExceptions<T>()
-    {
-        return new();
-        // try
-        // {
-        //     SetupCommands();
-        //     return new();
-        // }
-        // catch (Exception ex)
-        // {
-        //     return ValueTask.FromException<T>(ex);
-        // }
-    }
 
     /// <summary>
     /// Return whether the instance is ready for mutations. It can become read-only, for example, if it has been prepared.
@@ -99,97 +54,57 @@ public sealed class SlonBatch : DbBatch
     /// <summary>Executes the command against its connection object, returning the number of rows affected.</summary>
     /// <returns>The number of records affected.</returns>
     public override int ExecuteNonQuery()
-    {
-        SetupCommands();
-        return _batchCore.ExecuteNonQuery(parameters: null);
-    }
+        => _batchCore.ExecuteNonQuery(parameters: null);
 
     /// <summary>Executes the command against its connection object, returning the number of rows affected.</summary>
     /// <param name="cancellationToken">A token to cancel the asynchronous operation.</param>
     /// <returns>A task returning the number of records affected.</returns>
     public override Task<int> ExecuteNonQueryAsync(CancellationToken cancellationToken = default)
-    {
-        if (SetupCommandsWrappedExceptions<int>() is { IsCompleted: true, IsCompletedSuccessfully: false } task)
-            return task.AsTask();
-
-        return _batchCore.ExecuteNonQueryAsync(parameters: null, cancellationToken).AsTask();
-    }
+        => _batchCore.ExecuteNonQueryAsync(parameters: null, cancellationToken).AsTask();
 
     /// <summary>Executes the command and returns the first column of the first row in the first returned result set. All other columns, rows and result sets are ignored.</summary>
     /// <returns>The first column of the first row in the first result set.</returns>
     public override object? ExecuteScalar()
-    {
-        SetupCommands();
-        return _batchCore.ExecuteScalar(parameters: null);
-    }
+        => _batchCore.ExecuteScalar(parameters: null);
 
     /// <summary>Executes the command and returns the first column of the first row in the first returned result set. All other columns, rows and result sets are ignored.</summary>
     /// <returns>The first column of the first row in the first result set.</returns>
     public object? ExecuteScalar(DbParameterCollection parameters)
-    {
-        SetupCommands();
-        return _batchCore.ExecuteScalar(parameters);
-    }
+        => _batchCore.ExecuteScalar(parameters);
 
     /// <summary>Executes the command and returns the first column of the first row in the first returned result set. All other columns, rows and result sets are ignored.</summary>
     /// <param name="cancellationToken">A token to cancel the asynchronous operation.</param>
     /// <returns>A task returning the first column of the first row in the first result set.</returns>
     public override Task<object?> ExecuteScalarAsync(CancellationToken cancellationToken = default)
-    {
-        if (SetupCommandsWrappedExceptions<object?>() is { IsCompleted: true, IsCompletedSuccessfully: false } task)
-            return task.AsTask();
-
-        return _batchCore.ExecuteScalarAsync(parameters: null, cancellationToken).AsTask();
-    }
+        => _batchCore.ExecuteScalarAsync(parameters: null, cancellationToken).AsTask();
 
     /// <summary>Executes the command against its connection, returning a <see cref="T:Slon.SlonDataReader" /> which can be used to access the results.</summary>
     /// <param name="behavior">An instance of <see cref="T:System.Data.CommandBehavior" />, specifying options for command execution and data retrieval.</param>
     /// <returns>An <see cref="T:Slon.SlonDataReader" /> object.</returns>
     public new SlonDataReader ExecuteReader(CommandBehavior behavior = CommandBehavior.Default)
-    {
-        SetupCommands();
-        return _batchCore.ExecuteReader(parameters: null, behavior);
-    }
+        => _batchCore.ExecuteReader(parameters: null, behavior);
 
     /// <summary>Executes the command against its connection, returning a <see cref="T:Slon.SlonDataReader" /> which can be used to access the results.</summary>
     /// <param name="parameters">The parameter collection used for this invocation.</param>
     /// <returns>An <see cref="T:Slon.SlonDataReader" /> object.</returns>
     public SlonDataReader ExecuteReader(DbParameterCollection parameters)
-    {
-        SetupCommands();
-        return _batchCore.ExecuteReader(parameters, CommandBehavior.Default);
-    }
+        => _batchCore.ExecuteReader(parameters, CommandBehavior.Default);
 
     /// <inheritdoc/>
     protected override DbDataReader ExecuteDbDataReader(CommandBehavior behavior)
-    {
-        SetupCommands();
-        return _batchCore.ExecuteReader(parameters: null, behavior);
-    }
+        => _batchCore.ExecuteReader(parameters: null, behavior);
 
     /// <inheritdoc cref="System.Data.Common.DbBatch.ExecuteReaderAsync(CancellationToken)"/>
     public new ValueTask<SlonDataReader> ExecuteReaderAsync(CancellationToken cancellationToken = default)
-    {
-        if (SetupCommandsWrappedExceptions<SlonDataReader>() is { IsCompleted: true, IsCompletedSuccessfully: false } task)
-            return task;
-        return _batchCore.ExecuteReaderAsync(parameters: null, CommandBehavior.Default, cancellationToken);
-    }
+        => _batchCore.ExecuteReaderAsync(parameters: null, CommandBehavior.Default, cancellationToken);
 
     /// <inheritdoc cref="System.Data.Common.DbBatch.ExecuteReaderAsync(CommandBehavior, CancellationToken)"/>
     public new ValueTask<SlonDataReader> ExecuteReaderAsync(CommandBehavior behavior, CancellationToken cancellationToken = default)
-    {
-        if (SetupCommandsWrappedExceptions<SlonDataReader>() is { IsCompleted: true, IsCompletedSuccessfully: false } task)
-            return task;
-        return _batchCore.ExecuteReaderAsync(parameters: null, behavior, cancellationToken);
-    }
+        => _batchCore.ExecuteReaderAsync(parameters: null, behavior, cancellationToken);
 
     /// <inheritdoc/>
     protected override Task<DbDataReader> ExecuteDbDataReaderAsync(CommandBehavior behavior, CancellationToken cancellationToken)
-    {
-        if (SetupCommandsWrappedExceptions<DbDataReader>() is { IsCompleted: true, IsCompletedSuccessfully: false } task)
-            return task.AsTask();
-        return _batchCore.ExecuteDbReaderAsync(parameters: null, behavior, cancellationToken).AsTask();
-    }
+        => _batchCore.ExecuteDbReaderAsync(parameters: null, behavior, cancellationToken).AsTask();
 
     /// <inheritdoc/>
     public override void Cancel() => _batchCore.Cancel();

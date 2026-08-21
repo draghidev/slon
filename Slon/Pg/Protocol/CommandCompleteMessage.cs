@@ -40,6 +40,7 @@ readonly struct CommandCompleteMessage
         or StatementType.Copy or StatementType.Move or StatementType.Fetch or StatementType.CreateTableAs
             ? (long)Rows
             : 0;
+    public long BatchRecordsAffected => StatementType is StatementType.Select ? -1 : RecordsAffected;
 
     CommandCompleteMessage(StatementType statementType, uint oid, ulong rows)
     {
@@ -120,4 +121,3 @@ readonly struct CommandCompleteMessage
         return scratch[..len];
     }
 }
-

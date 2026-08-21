@@ -1,5 +1,4 @@
 using System.Collections.Concurrent;
-using Slon.Pg.Serialization;
 using Slon.Pg.Types;
 
 namespace Slon.Pg.Serialization;

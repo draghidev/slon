@@ -31,7 +31,7 @@ public class DataReaderCancellationTests : ConnectionCreatingTest
             await using var command = new SlonCommand(dataSource, "select 1");
             try
             {
-                Assert.AreEqual(0, await command.ExecuteNonQueryAsync());
+                Assert.AreEqual(-1, await command.ExecuteNonQueryAsync());
                 return;
             }
             catch (SlonException ex) when (attempt < 2 && ex.IsTransient)
@@ -82,7 +82,7 @@ public class DataReaderCancellationTests : ConnectionCreatingTest
                 using var command = new SlonCommand(dataSource, "select 1");
                 try
                 {
-                    Assert.AreEqual(0, command.ExecuteNonQuery());
+                    Assert.AreEqual(-1, command.ExecuteNonQuery());
                     return;
                 }
                 catch (SlonException ex)

@@ -54,23 +54,24 @@ sealed class PreparedSlonCommandFlowObserver : CommandFlowObserver
 static class AdoPreparedCommandObserver
 {
     internal static void AttachTerminal(CommandResult result, PgConnection connection)
-        => result.OnCompleted(static (completed, state) =>
-        {
-            var connection = (PgConnection)state!;
-            try
-            {
-                if (completed.Error is not { } error)
-                    return;
+        => result.OnCompleted(static (completed, state) => ObserveTerminal(completed, (PgConnection)state!), connection);
 
-                var metadata = completed.GetMetadata();
-                if (metadata.IsPrepared)
-                    connection.ReconcilePreparedError(metadata.ToPreparedDescriptor(), error.SqlState);
-            }
-            catch (Exception ex)
-            {
-                connection.ReportUnobservedCallback(ex, "a command-result observer");
-            }
-        }, connection);
+    internal static void ObserveTerminal(CommandResult completed, PgConnection connection)
+    {
+        try
+        {
+            if (completed.Error is not { } error)
+                return;
+
+            var metadata = completed.GetMetadata();
+            if (metadata.IsPrepared)
+                connection.ReconcilePreparedError(metadata.ToPreparedDescriptor(), error.SqlState);
+        }
+        catch (Exception ex)
+        {
+            connection.ReportUnobservedCallback(ex, "a command-result observer");
+        }
+    }
 }
 
 sealed class SlonBatchFlowObserver : CommandFlowObserver
@@ -248,6 +249,8 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
     public void ThrowIfDisposedOrReadOnly()
     {
         ThrowIfDisposed();
+        if (Volatile.Read(ref _activeFlow) is not null)
+            ThrowHelper.ThrowInvalidOperation("The command cannot be changed while an execution is active.");
         ThrowIfReadOnly();
     }
 
@@ -267,7 +270,7 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
             ThrowHelper.ThrowInvalidOperation("Command is prepared and cannot be changed until it is unprepared.");
     }
 
-    public void SetConnection(SlonConnection connection)
+    public void SetConnection(SlonConnection? connection)
     {
         ThrowIfDisposedOrReadOnly();
         // TODO We probably can...
@@ -280,7 +283,7 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
             ReleaseOwned(oldConnection);
         ClearTrackedRefs();
 
-        _dataSourceOrConnection = connection;
+        _dataSourceOrConnection = connection!;
     }
 
     void ReleaseOwned(SlonConnection connection)
@@ -354,6 +357,10 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
             for (var i = 0; i < commands.Length; i++)
             {
                 ref var adoCommand = ref commands[i];
+                var batchCommand = !preparing && !_explicitlyPrepared
+                    ? adoCommand as SlonBatchCommand
+                    : null;
+                batchCommand?.ResetRecordsAffected();
                 TrackerContext trackerContext = default;
                 if (connection is not null)
                 {
@@ -401,9 +408,23 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
                                     tracked.CommandName, descriptor.ParameterTypes, rowDescription: null)
                             }, result.TrackerResult);
                         }
-                        thisResultAction = static (result, state) =>
-                            AdoPreparedCommandObserver.AttachTerminal(result, (PgConnection)state!);
-                        thisResultActionState = pgConnection;
+                        if (batchCommand is null)
+                        {
+                            thisResultAction = static (result, state) =>
+                                AdoPreparedCommandObserver.AttachTerminal(result, (PgConnection)state!);
+                            thisResultActionState = pgConnection;
+                        }
+                        else
+                        {
+                            thisResultAction = static (result, state) =>
+                                result.OnCompleted(static (completed, completionState) =>
+                                {
+                                    var (connection, command) = ((PgConnection, SlonBatchCommand))completionState!;
+                                    AdoPreparedCommandObserver.ObserveTerminal(completed, connection);
+                                    command.ObserveCompletedResult(completed);
+                                }, state);
+                            thisResultActionState = (pgConnection, batchCommand);
+                        }
                     }
                     else if (status is TrackedStatus.Preparing)
                     {
@@ -426,7 +447,8 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
                             result = (result.Command with { Descriptor = CommandDescriptor.Create(commandText, paramTypes, tracked.CommandName) }, result.TrackerResult);
                             thisResultAction = static (cmdResult, state) =>
                             {
-                                var (p, t) = ((PgConnection, TrackedCommand))state!;
+                                var (p, t, batchCommand) =
+                                    ((PgConnection, TrackedCommand, SlonBatchCommand?))state!;
                                 var metadata = cmdResult.GetMetadata();
                                 // Here we would make RowDescription portable (once we need it).
                                 if (metadata.IsPrepared)
@@ -443,9 +465,24 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
                                 }
 
                                 if (metadata.IsPrepared)
-                                    AdoPreparedCommandObserver.AttachTerminal(cmdResult, p);
+                                {
+                                    if (batchCommand is null)
+                                        AdoPreparedCommandObserver.AttachTerminal(cmdResult, p);
+                                    else
+                                        cmdResult.OnCompleted(static (completed, completionState) =>
+                                        {
+                                            var (connection, _, command) =
+                                                ((PgConnection, TrackedCommand, SlonBatchCommand))completionState!;
+                                            AdoPreparedCommandObserver.ObserveTerminal(completed, connection);
+                                            command.ObserveCompletedResult(completed);
+                                        }, state);
+                                }
+                                else if (batchCommand is not null)
+                                    cmdResult.OnCompleted(static (completed, completionState) =>
+                                        ((SlonBatchCommand)completionState!).ObserveCompletedResult(completed),
+                                        batchCommand);
                             };
-                            thisResultActionState = (pgConnection, tracked);
+                            thisResultActionState = (pgConnection, tracked, batchCommand);
                             (preparationClaims ??= new(pgConnection)).Add(tracked);
                         }
                         else
@@ -466,6 +503,14 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
                     // baked path as the connection-bound case here.)
                     thisResultAction = null;
                     thisResultActionState = null;
+                }
+
+                if (batchCommand is not null && thisResultAction is null)
+                {
+                    thisResultAction = static (result, state) =>
+                        result.OnCompleted(static (completed, completionState) =>
+                            ((SlonBatchCommand)completionState!).ObserveCompletedResult(completed), state);
+                    thisResultActionState = batchCommand;
                 }
 
                 if (commandArray is null)
@@ -763,7 +808,10 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
     {
         ThrowIfDisposed();
         using var activity = StartActivity();
-        try { return ExecuteNonQueryCore(parameters); }
+        try
+        {
+            return ExecuteNonQueryCore(parameters);
+        }
         catch (Exception ex)
         {
             SlonTracing.RecordException(activity, ex);
@@ -774,7 +822,7 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
 
     int ExecuteNonQueryCore(DbParameterCollection? parameters)
     {
-        var recordsAffected = 0L;
+        var recordsAffected = -1L;
         var dependencies = GetDependencies();
         foreach (var result in Enqueue(parameters, CommandBehavior.Default, dependencies))
         {
@@ -783,7 +831,11 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
             // RecordsAffected throws a PgErrorException on a failed command, so the error surfaces here
             // instead of silently reporting 0 affected.
             foreach (var _ in result) { }
-            recordsAffected = checked(recordsAffected + result.RecordsAffected);
+            var resultRecordsAffected = result.GetCommandComplete().BatchRecordsAffected;
+            if (resultRecordsAffected >= 0)
+                recordsAffected = recordsAffected < 0
+                    ? resultRecordsAffected
+                    : checked(recordsAffected + resultRecordsAffected);
         }
         return checked((int)recordsAffected);
     }
@@ -820,7 +872,10 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
     {
         ThrowIfDisposed();
         using var activity = StartActivity();
-        try { return ExecuteScalarCore(parameters); }
+        try
+        {
+            return ExecuteScalarCore(parameters);
+        }
         catch (Exception ex)
         {
             SlonTracing.RecordException(activity, ex);
@@ -920,7 +975,10 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
     {
         ThrowIfDisposed();
         using var activity = StartActivity();
-        try { return ExecuteReaderCore(parameters, behavior); }
+        try
+        {
+            return ExecuteReaderCore(parameters, behavior);
+        }
         catch (Exception ex)
         {
             SlonTracing.RecordException(activity, ex);
@@ -965,29 +1023,78 @@ struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
             _fieldRef, parameters, behavior, cancellationToken);
     }
 
-    static async ValueTask<TReader> ExecuteReaderAsyncCore<TReader>(
+    static ValueTask<TReader> ExecuteReaderAsyncCore<TReader>(
         FieldRef<AdoBatchCore<TCommand>> fieldRef, DbParameterCollection? parameters,
         CommandBehavior behavior, CancellationToken cancellationToken)
         where TReader : DbDataReader
     {
         ref var core = ref fieldRef.Invoke();
-        using var activity = core.StartActivity();
+        var activity = core.StartActivity();
         try
         {
             var connectionToClose = core.GetConnectionToClose(behavior);
-            var dependencies = await core.GetDependenciesAsync(cancellationToken)
-                .ConfigureAwait(false);
-            return await SlonDataReader.CreateAsync<TReader>(behavior,
+            var dependenciesTask = core.GetDependenciesAsync(cancellationToken);
+            return dependenciesTask.IsCompletedSuccessfully
+                ? BeginReaderCreation<TReader>(fieldRef, parameters, behavior, cancellationToken,
+                    connectionToClose, dependenciesTask.Result, activity)
+                : AwaitDependenciesAndCreateReaderAsync<TReader>(fieldRef, parameters, behavior,
+                    cancellationToken, connectionToClose, dependenciesTask, activity);
+        }
+        catch (Exception ex)
+        {
+            return FailReaderCreation<TReader>(activity, ex);
+        }
+    }
+
+    static ValueTask<TReader> BeginReaderCreation<TReader>(
+        FieldRef<AdoBatchCore<TCommand>> fieldRef, DbParameterCollection? parameters,
+        CommandBehavior behavior, CancellationToken cancellationToken,
+        SlonConnection? connectionToClose, SlonDataSource.PgDbDependencies dependencies,
+        Activity? activity)
+        where TReader : DbDataReader
+    {
+        try
+        {
+            return SlonDataReader.CreateAsync<TReader>(behavior,
                 fieldRef.Invoke().EnqueueAsync(parameters, behavior, dependencies, cancellationToken),
-                dependencies.SerializerOptions, cancellationToken, connectionToClose)
-                .ConfigureAwait(false);
+                dependencies.SerializerOptions, cancellationToken, connectionToClose, activity);
+        }
+        catch (Exception ex)
+        {
+            return FailReaderCreation<TReader>(activity, ex);
+        }
+    }
+
+    static async ValueTask<TReader> AwaitDependenciesAndCreateReaderAsync<TReader>(
+        FieldRef<AdoBatchCore<TCommand>> fieldRef, DbParameterCollection? parameters,
+        CommandBehavior behavior, CancellationToken cancellationToken,
+        SlonConnection? connectionToClose,
+        ValueTask<SlonDataSource.PgDbDependencies> dependenciesTask, Activity? activity)
+        where TReader : DbDataReader
+    {
+        SlonDataSource.PgDbDependencies dependencies;
+        try
+        {
+            dependencies = await dependenciesTask.ConfigureAwait(false);
         }
         catch (Exception ex)
         {
             SlonTracing.RecordException(activity, ex);
+            activity?.Dispose();
             AdoException.Throw(ex);
             return default!;
         }
+
+        return await BeginReaderCreation<TReader>(fieldRef, parameters, behavior, cancellationToken,
+            connectionToClose, dependencies, activity).ConfigureAwait(false);
+    }
+
+    static ValueTask<TReader> FailReaderCreation<TReader>(Activity? activity, Exception exception)
+        where TReader : DbDataReader
+    {
+        SlonTracing.RecordException(activity, exception);
+        activity?.Dispose();
+        return ValueTask.FromException<TReader>(AdoException.Project(exception));
     }
 
     Activity? StartActivity()

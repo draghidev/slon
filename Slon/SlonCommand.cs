@@ -2,7 +2,6 @@ using System.Data;
 using System.Data.Common;
 using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
-using Slon.Pg;
 using Slon.Runtime.CompilerServices;
 using Slon.Pg.Protocol.Flows;
 
@@ -77,6 +76,9 @@ public sealed class SlonCommand: DbCommand
         [MethodImpl(MethodImplOptions.NoInlining)]
         void Core()
         {
+            if (string.IsNullOrWhiteSpace(_overallCommandText))
+                throw new InvalidOperationException("CommandText must be set before executing or preparing the command.");
+
             _batchCore.Clear();
             // TODO this is where we would parse the SQL and possible create a batch of commands.
             _batchCore.Add(new AdoCommand
@@ -90,25 +92,6 @@ public sealed class SlonCommand: DbCommand
         }
     }
 
-    ValueTask<T> SetupCommandsWrappedExceptions<T>()
-    {
-        return !_isOverallStateDirty ? new() : Core();
-
-        [MethodImpl(MethodImplOptions.NoInlining)]
-        ValueTask<T> Core()
-        {
-            try
-            {
-                SetupCommands();
-                return new();
-            }
-            catch (Exception ex)
-            {
-                return ValueTask.FromException<T>(ex);
-            }
-        }
-    }
-
     void PrepareCore()
     {
         SetupCommands();
@@ -117,8 +100,7 @@ public sealed class SlonCommand: DbCommand
 
     ValueTask PrepareCoreAsync(CancellationToken cancellationToken)
     {
-        if (SetupCommandsWrappedExceptions<object>() is { IsCompleted: true, IsCompletedSuccessfully: false } task)
-            return new(task.AsTask());
+        SetupCommands();
         return _batchCore.PrepareAsync(parameters: null, cancellationToken);
     }
 
@@ -135,14 +117,6 @@ public sealed class SlonCommand: DbCommand
         var cmd = new SlonCommand(connection, commandText);
         await cmd.PrepareCoreAsync(cancellationToken).ConfigureAwait(false);
         return cmd;
-    }
-
-    public SlonBatch ToBatch(bool withParameters = true) => ToBatch(1, withParameters);
-    public SlonBatch ToBatch(int copies, bool withParameters = false)
-    {
-        ThrowIfDisposed();
-        SetupCommands();
-        return SlonBatch.CreateFromDbCommand(_batchCore, copies, withParameters);
     }
 
     /// <summary>
@@ -280,9 +254,7 @@ public sealed class SlonCommand: DbCommand
     /// <returns>A task returning the number of records affected.</returns>
     public override Task<int> ExecuteNonQueryAsync(CancellationToken cancellationToken)
     {
-        if (SetupCommandsWrappedExceptions<int>() is { IsCompleted: true, IsCompletedSuccessfully: false } task)
-            return task.AsTask();
-
+        SetupCommands();
         return _batchCore.ExecuteNonQueryAsync(parameters: null, cancellationToken).AsTask();
     }
 
@@ -292,10 +264,7 @@ public sealed class SlonCommand: DbCommand
     /// <returns>A task returning the number of records affected.</returns>
     public ValueTask<int> ExecuteNonQueryAsync(DbParameterCollection parameters, CancellationToken cancellationToken = default)
     {
-        if (SetupCommandsWrappedExceptions<int>() is
-            { IsCompleted: true, IsCompletedSuccessfully: false } task)
-            return task;
-
+        SetupCommands();
         return _batchCore.ExecuteNonQueryAsync(parameters, cancellationToken);
     }
 
@@ -320,9 +289,7 @@ public sealed class SlonCommand: DbCommand
     /// <returns>A task returning the first column of the first row in the first result set.</returns>
     public override Task<object?> ExecuteScalarAsync(CancellationToken cancellationToken)
     {
-        if (SetupCommandsWrappedExceptions<object?>() is { IsCompleted: true, IsCompletedSuccessfully: false } task)
-            return task.AsTask();
-
+        SetupCommands();
         return _batchCore.ExecuteScalarAsync(parameters: null, cancellationToken).AsTask();
     }
 
@@ -332,10 +299,7 @@ public sealed class SlonCommand: DbCommand
     /// <returns>A task returning the first column of the first row in the first result set.</returns>
     public ValueTask<object?> ExecuteScalarAsync(DbParameterCollection parameters, CancellationToken cancellationToken = default)
     {
-        if (SetupCommandsWrappedExceptions<object?>() is
-            { IsCompleted: true, IsCompletedSuccessfully: false } task)
-            return task;
-
+        SetupCommands();
         return _batchCore.ExecuteScalarAsync(parameters, cancellationToken);
     }
 
@@ -385,16 +349,14 @@ public sealed class SlonCommand: DbCommand
     /// <inheritdoc cref="System.Data.Common.DbCommand.ExecuteReaderAsync(CancellationToken)"/>
     public new ValueTask<SlonDataReader> ExecuteReaderAsync(CancellationToken cancellationToken = default)
     {
-        if (SetupCommandsWrappedExceptions<SlonDataReader>() is { IsCompletedSuccessfully: false, IsCompleted: true } task)
-            return task;
+        SetupCommands();
         return _batchCore.ExecuteReaderAsync(parameters: null, CommandBehavior.Default, cancellationToken);
     }
 
     /// <inheritdoc cref="System.Data.Common.DbCommand.ExecuteReaderAsync(CommandBehavior, CancellationToken)"/>
     public new ValueTask<SlonDataReader> ExecuteReaderAsync(CommandBehavior behavior, CancellationToken cancellationToken = default)
     {
-        if (SetupCommandsWrappedExceptions<SlonDataReader>() is { IsCompletedSuccessfully: false, IsCompleted: true } task)
-            return task;
+        SetupCommands();
         return _batchCore.ExecuteReaderAsync(parameters: null, behavior, cancellationToken);
     }
 
@@ -406,9 +368,7 @@ public sealed class SlonCommand: DbCommand
     /// <returns>A task representing the asynchronous operation.</returns>
     public ValueTask<SlonDataReader> ExecuteReaderAsync(DbParameterCollection parameters, CancellationToken cancellationToken = default)
     {
-        if (SetupCommandsWrappedExceptions<SlonDataReader>() is
-            { IsCompleted: true, IsCompletedSuccessfully: false } task)
-            return task;
+        SetupCommands();
         return _batchCore.ExecuteReaderAsync(parameters, CommandBehavior.Default, cancellationToken);
     }
 
@@ -421,17 +381,14 @@ public sealed class SlonCommand: DbCommand
     /// <returns>A task representing the asynchronous operation.</returns>
     public ValueTask<SlonDataReader> ExecuteReaderAsync(DbParameterCollection parameters, CommandBehavior behavior, CancellationToken cancellationToken = default)
     {
-        if (SetupCommandsWrappedExceptions<SlonDataReader>() is
-            { IsCompleted: true, IsCompletedSuccessfully: false } task)
-            return task;
+        SetupCommands();
         return _batchCore.ExecuteReaderAsync(parameters, behavior, cancellationToken);
     }
 
     /// <inheritdoc/>
     protected override Task<DbDataReader> ExecuteDbDataReaderAsync(CommandBehavior behavior, CancellationToken cancellationToken)
     {
-        if (SetupCommandsWrappedExceptions<DbDataReader>() is { IsCompleted: true, IsCompletedSuccessfully: false } task)
-            return task.AsTask();
+        SetupCommands();
         return _batchCore.ExecuteDbReaderAsync(parameters: null, behavior, cancellationToken).AsTask();
     }
 
@@ -448,12 +405,12 @@ public sealed class SlonCommand: DbCommand
         set
         {
             ThrowIfDisposedOrReadOnly();
-            if (value is not SlonConnection conn)
+            if (value is not null and not SlonConnection)
             {
                 ThrowHelper.ThrowArgumentException(nameof(value), $"Value is not an instance of {nameof(SlonConnection)}.");
                 return;
             }
-            _batchCore.SetConnection(conn);
+            _batchCore.SetConnection((SlonConnection?)value);
         }
     }
 

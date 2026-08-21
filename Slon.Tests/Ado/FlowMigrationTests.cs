@@ -44,7 +44,7 @@ public class FlowMigrationTests : ConnectionCreatingTest
             scheduler.Resume();
             await shutdown;
 
-            Assert.AreEqual(0, await result);
+            Assert.AreEqual(-1, await result);
         }
         finally
         {

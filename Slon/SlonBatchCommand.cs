@@ -1,5 +1,6 @@
 using System.Data;
 using System.Data.Common;
+using Slon.Pg;
 
 namespace Slon;
 
@@ -8,6 +9,7 @@ public sealed class SlonBatchCommand : DbBatchCommand, IAdoCommand
 {
     SlonParameters? _parameters;
     bool _isReadOnly;
+    long _recordsAffected;
 
     /// <inheritdoc cref="System.Data.Common.DbBatchCommand.CommandText" />
     public override string CommandText
@@ -56,9 +58,13 @@ public sealed class SlonBatchCommand : DbBatchCommand, IAdoCommand
         }
     }
 
-    // TODO decide what to do with this, we have a few options to pass data back.
     /// <inheritdoc cref="System.Data.Common.DbBatchCommand.RecordsAffected" />
-    public override int RecordsAffected { get; }
+    /// <remarks>When the value exceeds <see cref="int.MaxValue" />, <see cref="int.MinValue" /> is returned.</remarks>
+    public override int RecordsAffected
+        => _recordsAffected > int.MaxValue ? int.MinValue : (int)_recordsAffected;
+
+    /// <summary>Gets the number of rows affected without narrowing the PostgreSQL row count.</summary>
+    public long LongRecordsAffected => _recordsAffected;
 
     /// <summary>Gets the collection of <see cref="T:Slon.SlonParameter" /> objects. For more information on parameters, see Configuring Parameters and Parameter Data Types.</summary>
     /// <returns>The parameters of the SQL statement or stored procedure.</returns>
@@ -96,7 +102,20 @@ public sealed class SlonBatchCommand : DbBatchCommand, IAdoCommand
             adoCommand.Tracked = null;
     }
 
-    void IAdoCommand.MakeReadOnly() => _isReadOnly = true;
+    internal void ResetRecordsAffected() => _recordsAffected = 0;
+
+    internal void ObserveCompletedResult(CommandResult result)
+    {
+        _recordsAffected = result.Error is not null
+            ? 0
+            : result.GetCommandComplete().BatchRecordsAffected;
+    }
+
+    void IAdoCommand.MakeReadOnly()
+    {
+        _recordsAffected = 0;
+        _isReadOnly = true;
+    }
     TrackedCommand? IAdoCommand.Tracked { get; set; }
     SlonParameters? IAdoCommand.Parameters => _parameters;
 }

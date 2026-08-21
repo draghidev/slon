@@ -220,6 +220,7 @@ sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
     internal async ValueTask<long> ConsumeNonQueryAsync(CancellationToken cancellationToken = default)
     {
         _consumeNonQuery = true;
+        _nonQueryRecordsAffected = -1;
         var enumerator = GetAsyncEnumerator(cancellationToken);
         try
         {
@@ -679,7 +680,13 @@ sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
                     var completion = _options.Commands.ItemRef(_commandIndex).CompleteAsync(_decoder);
                     completeError = await completion.ConfigureAwait(false);
                     if (_pgError is null && completeError is null)
-                        _nonQueryRecordsAffected = checked(_nonQueryRecordsAffected + result.RecordsAffected);
+                    {
+                        var recordsAffected = result.GetCommandComplete().BatchRecordsAffected;
+                        if (recordsAffected >= 0)
+                            _nonQueryRecordsAffected = _nonQueryRecordsAffected < 0
+                                ? recordsAffected
+                                : checked(_nonQueryRecordsAffected + recordsAffected);
+                    }
                 }
                 else if (IsAsync)
                 {

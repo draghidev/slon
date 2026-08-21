@@ -3,11 +3,11 @@ using System.Diagnostics.CodeAnalysis;
 
 namespace Slon;
 
-static class ThrowHelper
+internal static class ThrowHelper
 {
     [DoesNotReturn]
     [StackTraceHidden]
-    public static InvalidOperationException ThrowArgumentException(string parameter, string? message = null)
+    public static ArgumentException ThrowArgumentException(string parameter, string? message = null)
         => throw new ArgumentException(message, parameter);
 
     [DoesNotReturn]
@@ -29,9 +29,4 @@ static class ThrowHelper
     [StackTraceHidden]
     public static UnreachableException ThrowUnexpected(string message)
         => throw new UnreachableException(message);
-
-    [DoesNotReturn]
-    [StackTraceHidden]
-    public static NotSupportedException ThrowNotSupported(string message)
-        => throw new NotSupportedException(message);
 }

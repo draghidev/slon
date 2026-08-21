@@ -62,7 +62,7 @@ static class AdoTestPool
     internal static SlonBatch CreateBatch() => _shared.CreateBatch();
 
     internal static async Task WarmAsync()
-        => Assert.AreEqual(0, await ExecuteNonQueryAsync("SELECT 1"));
+        => Assert.AreEqual(-1, await ExecuteNonQueryAsync("SELECT 1"));
 
     // Construct a fresh, non-pooled SlonDataSource the caller owns end to end. Use in tests
     // that need non-default configuration (auto-prepare thresholds, tight heartbeat ticks,
