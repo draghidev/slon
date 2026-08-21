@@ -3,7 +3,7 @@ using System.Threading.Tasks.Sources;
 
 namespace Slon.Pg.Protocol.Flows;
 
-sealed partial class CommandFlow
+partial class CommandFlow
 {
     Slon.Threading.Tasks.Sources.ManualResetValueTaskSourceCore<bool> _enumeratorMoveNextTaskSource;
     // Serializes move-next rearming against body termination. Otherwise Reset can replace the generation

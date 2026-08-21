@@ -130,4 +130,20 @@ public class SlonParameterTests
         Assert.AreSame(parameters[1], destination[2]);
         Assert.ThrowsExactly<ArgumentOutOfRangeException>(() => parameters.CopyTo(new object?[1], 0));
     }
+
+    [TestMethod]
+    public void EnumerableAddRange_AddsNamesAndValues()
+    {
+        IEnumerable<KeyValuePair<string, object?>> source =
+        [
+            new("first", 1),
+            new("second", 2)
+        ];
+        var parameters = new SlonParameters();
+
+        parameters.AddRange(source);
+
+        Assert.AreEqual(1, parameters["first"].Value);
+        Assert.AreEqual(2, parameters["second"].Value);
+    }
 }

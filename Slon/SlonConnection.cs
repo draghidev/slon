@@ -385,30 +385,16 @@ public sealed partial class SlonConnection : IAdoConnection
 
     SlonConnection CloneCore() => _dataSource.CreateConnection();
 
-    // Sync delegate-based enqueue, mirror of the async variant.
-    internal TFlow Enqueue<TArg, TFlow>(
-        Func<PgConnection, TArg, TFlow> flowFactory,
-        TArg arg)
+    internal TFlow Enqueue<TFlow>(TFlow flow)
         where TFlow : PgClientFlow
-        where TArg : allows ref struct
     {
-        var proxy = EnsureConnected();
-        return proxy.Enqueue(flowFactory, arg);
+        EnsureConnected().Enqueue(flow);
+        return flow;
     }
 
-    // Delegate-based enqueue: the flowFactory callback runs inside the proxy's atomic PgConnection scope,
-    // so flow construction (presence consultation, descriptor baking) sees the connection the flow
-    // will run on. State flows through `arg` to avoid closure allocation.
-    internal ValueTask<TFlow> EnqueueAsync<TArg, TFlow>(
-        Func<PgConnection, TArg, TFlow> flowFactory,
-        TArg arg,
-        CancellationToken cancellationToken)
+    internal ValueTask<TFlow> EnqueueAsync<TFlow>(TFlow flow, CancellationToken cancellationToken)
         where TFlow : PgClientFlow
-        where TArg : allows ref struct
-    {
-        var proxy = EnsureConnected();
-        return proxy.EnqueueAsync(flowFactory, arg, cancellationToken);
-    }
+        => EnsureConnected().EnqueueAsync(flow, cancellationToken);
 
     // We should only get here when we are enqueuing and have confirmed we are connected.
     // Dispatch: explicit-prepare (owningInstance non-null) → connection-local OwnedTracker.

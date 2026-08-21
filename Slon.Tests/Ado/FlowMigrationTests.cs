@@ -97,8 +97,7 @@ public class FlowMigrationTests : ConnectionCreatingTest
             return MoveTo(final, migration);
         });
 
-        var strategy = new BindingProbeStrategy();
-        var flow = new CommandFlow(async: true, new CommandFlowBinding { Strategy = strategy });
+        var flow = new BindingProbeFlow();
         Assert.IsTrue(first.TryQueue(flow,
             FlowEnqueueOptions.AllowMigration | FlowEnqueueOptions.RequireExistingPipeline));
         var drain = DrainAsync(flow);
@@ -111,8 +110,8 @@ public class FlowMigrationTests : ConnectionCreatingTest
         await secondShutdown;
         await drain;
 
-        Assert.AreEqual(1, strategy.BindCount);
-        Assert.AreEqual("final", strategy.ContextName);
+        Assert.AreEqual(1, flow.BindCount);
+        Assert.AreEqual("final", flow.ContextName);
 
         static bool MoveTo(PgClientProtocol protocol, FlowMigration migration)
         {

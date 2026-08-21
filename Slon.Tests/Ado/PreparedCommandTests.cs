@@ -164,6 +164,9 @@ public class PreparedCommandTests
 
         await command.PrepareAsync();
         Assert.AreEqual(1, await CountPreparedStatements(dataSource, "_dp"));
+        var executionsBefore = await CountPreparedExecutions(dataSource, "_dp");
+        Assert.AreEqual(42, await command.ExecuteScalarAsync());
+        Assert.AreEqual(executionsBefore + 1, await CountPreparedExecutions(dataSource, "_dp"));
         await command.DisposeAsync();
     }
 
@@ -240,6 +243,14 @@ public class PreparedCommandTests
         {
             DisableAutoPreparation = true
         };
+        return (int)(await command.ExecuteScalarAsync())!;
+    }
+
+    static async Task<int> CountPreparedExecutions(SlonDataSource dataSource, string prefix)
+    {
+        await using var command = dataSource.CreateCommand(
+            $"select coalesce(sum(generic_plans + custom_plans), 0)::int from pg_prepared_statements where left(name, 3) = '{prefix}'");
+        command.DisableAutoPreparation = true;
         return (int)(await command.ExecuteScalarAsync())!;
     }
 }

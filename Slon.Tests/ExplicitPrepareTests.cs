@@ -47,6 +47,20 @@ public class ExplicitPrepareTests
         Assert.AreEqual(0, await CountExplicitStatements(connection));
     }
 
+    [TestMethod]
+    public void FailedBatchPrepareSynchronouslyClosesStatementsPreparedBeforeTheError()
+    {
+        using var dataSource = AdoTestPool.NewIsolatedDataSource();
+        using var connection = dataSource.CreateConnection();
+        connection.Open();
+        using var batch = new SlonBatch(connection) { EnableErrorBarriers = true };
+        batch.BatchCommands.Add(batch.CreateBatchCommand("SELECT 1"));
+        batch.BatchCommands.Add(batch.CreateBatchCommand("THIS IS NOT SQL"));
+
+        Assert.ThrowsExactly<AggregateException>(() => batch.Prepare());
+        Assert.AreEqual(0, CountExplicitStatementsSync(connection));
+    }
+
     static async Task<int> CountExplicitStatements(SlonConnection connection)
     {
         await using var command = new SlonCommand(connection,

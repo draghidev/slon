@@ -23,12 +23,10 @@ public class ExclusiveAccessFlowTests : ConnectionCreatingTest
     {
         await using var protocol = await PgTestPool.NewIsolatedAsync();
         protocol.SetFlowBindingContext(new BindingProbeContext("wire"));
-        var strategy = new BindingProbeStrategy(fail: true);
-        var flow = protocol.Queue(new CommandFlow(
-            async: true, new CommandFlowBinding { Strategy = strategy }));
+        var flow = protocol.Queue(new BindingProbeFlow(fail: true));
 
         await Assert.ThrowsExactlyAsync<InvalidOperationException>(async () => await DrainAsync(flow));
-        Assert.AreEqual(1, strategy.BindCount);
+        Assert.AreEqual(1, flow.BindCount);
 
         await DrainAsync(protocol.Queue(new CommandFlow(async: true, Command.Create("select 1"))));
     }
@@ -77,10 +75,9 @@ public class ExclusiveAccessFlowTests : ConnectionCreatingTest
         Assert.IsFalse(protocol.TryQueue(rejected),
             "ordinary outer work must not queue behind a long-running scope");
         rejected.DiscardUnqueued();
-        var bindStrategy = new BindingProbeStrategy();
-        var bindProbe = new CommandFlow(async: true, new CommandFlowBinding { Strategy = bindStrategy });
+        var bindProbe = new BindingProbeFlow();
         Assert.IsFalse(protocol.TryQueue(bindProbe));
-        Assert.AreEqual(0, bindStrategy.BindCount,
+        Assert.AreEqual(0, bindProbe.BindCount,
             "connection-local command state must not bind after the barrier wins admission");
 
         await scope.HandoffReady;
@@ -90,7 +87,7 @@ public class ExclusiveAccessFlowTests : ConnectionCreatingTest
         Assert.IsTrue(protocol.IsSchedulable);
         Assert.IsTrue(protocol.TryQueue(bindProbe));
         await DrainAsync(bindProbe);
-        Assert.AreEqual(1, bindStrategy.BindCount,
+        Assert.AreEqual(1, bindProbe.BindCount,
             "the portable flow must bind exactly once when its later placement reaches dispatch");
     }
 

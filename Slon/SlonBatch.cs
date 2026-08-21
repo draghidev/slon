@@ -34,6 +34,17 @@ public sealed class SlonBatch : DbBatch
     public SlonBatch(SlonConnection conn) : this(conn, null) {}
     internal SlonBatch(SlonDataSource dataSource) : this(null, dataSource) {}
 
+    unsafe SlonBatchCommands CreateBatchCommandCollection()
+        => new(FieldRef<AdoBatchCore<SlonBatchCommand>>.Create(&GetBatchCore, this));
+
+    internal void OnFlowStarted(CommandFlow flow)
+        => _batchCore.OnFlowStarted(flow);
+
+    internal void OnFlowCompleting(CommandFlow flow, Exception? exception)
+        => _batchCore.OnFlowCompleting(flow, exception);
+
+    static ref AdoBatchCore<SlonBatchCommand> GetBatchCore(SlonBatch instance) => ref instance._batchCore;
+
 
     /// <summary>
     /// Return whether the instance is ready for mutations. It can become read-only, for example, if it has been prepared.
@@ -117,12 +128,6 @@ public sealed class SlonBatch : DbBatch
     public Task CancelAsync(CancellationToken cancellationToken = default)
         => _batchCore.CancelAsync(cancellationToken);
 
-    internal void OnFlowStarted(CommandFlow flow)
-        => _batchCore.OnFlowStarted(flow);
-
-    internal void OnFlowCompleting(CommandFlow flow, Exception? exception)
-        => _batchCore.OnFlowCompleting(flow, exception);
-
     /// <summary>
     /// Setting this property is ignored by Slon. PostgreSQL only supports a single transaction at a given time on
     /// a given connection, and all commands implicitly run inside the current transaction started via
@@ -134,9 +139,6 @@ public sealed class SlonBatch : DbBatch
     /// <summary>Gets the collection of <see cref="T:Slon.SlonBatchCommand" /> objects.</summary>
     /// <returns>The commands contained within the batch.</returns>
     public new SlonBatchCommands BatchCommands => _batchCommands ??= CreateBatchCommandCollection();
-
-    unsafe SlonBatchCommands CreateBatchCommandCollection()
-        => new(FieldRef<AdoBatchCore<SlonBatchCommand>>.Create(&GetBatchCore, this));
 
     /// <summary>Creates a new instance of a <see cref="T:Slon.SlonBatchCommand" /> object.</summary>
     /// <param name="commandText">The command text to be used.</param>
@@ -211,6 +213,4 @@ public sealed class SlonBatch : DbBatch
         await _batchCore.DisposeAsync().ConfigureAwait(false);
         base.Dispose();
     }
-
-    static ref AdoBatchCore<SlonBatchCommand> GetBatchCore(SlonBatch instance) => ref instance._batchCore;
 }

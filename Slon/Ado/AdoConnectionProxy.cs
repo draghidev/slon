@@ -87,23 +87,6 @@ sealed class AdoConnectionProxy : IDisposable, IAsyncDisposable
         }
     }
 
-    // Sync delegate-based enqueue, sibling to the async variant: snapshots the current PgConnection
-    // so the flowFactory callback's decisions (presence consultation, descriptor baking) and the queue
-    // operation share a single atomic reference.
-    public TFlow Enqueue<TArg, TFlow>(Func<PgConnection, TArg, TFlow> flowFactory, TArg arg)
-        where TFlow : PgClientFlow
-        where TArg : allows ref struct
-    {
-        var connection = _pgConnection;
-        var flow = flowFactory(connection, arg);
-        if (!TryQueueOn(connection, flow))
-        {
-            flow.DiscardUnqueued();
-            ThrowHelper.ThrowInvalidOperation("Could not enqueue flow.");
-        }
-        return flow;
-    }
-
     // Returns the given flow to allow an async caller to directly return this task.
     public ValueTask<TFlow> EnqueueAsync<TFlow>(TFlow flow, CancellationToken cancellationToken) where TFlow : PgClientFlow
     {
@@ -113,27 +96,6 @@ sealed class AdoConnectionProxy : IDisposable, IAsyncDisposable
             ThrowHelper.ThrowInvalidOperation("Could not enqueue flow.");
         }
 
-        return new(flow);
-    }
-
-    // Delegate-based enqueue: snapshots the current PgConnection into a local for the duration of
-    // the flowFactory callback so the flow's wire-shape decisions (presence consultation, TryBeginPreparing,
-    // descriptor baking) happen atomically against the connection the flow will run on. Caller passes
-    // state through `arg` to avoid closure allocation.
-    public ValueTask<TFlow> EnqueueAsync<TArg, TFlow>(
-        Func<PgConnection, TArg, TFlow> flowFactory,
-        TArg arg,
-        CancellationToken cancellationToken)
-        where TFlow : PgClientFlow
-        where TArg : allows ref struct
-    {
-        var connection = _pgConnection;
-        var flow = flowFactory(connection, arg);
-        if (!TryQueueOn(connection, flow))
-        {
-            flow.DiscardUnqueued();
-            ThrowHelper.ThrowInvalidOperation("Could not enqueue flow.");
-        }
         return new(flow);
     }
 

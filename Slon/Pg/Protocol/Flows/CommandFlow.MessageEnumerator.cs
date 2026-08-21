@@ -6,7 +6,7 @@ using Slon.Runtime.CompilerServices;
 
 namespace Slon.Pg.Protocol.Flows;
 
-sealed partial class CommandFlow
+partial class CommandFlow
 {
     internal struct ReadState
     {

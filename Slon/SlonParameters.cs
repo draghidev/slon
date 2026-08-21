@@ -94,8 +94,8 @@ public sealed partial class SlonParameters : IList<SlonParameter>
     /// <param name="parameters">The parameters to add to the collection.</param>
     public void AddRange(params IEnumerable<KeyValuePair<string, object?>> parameters)
     {
-        foreach (var value in parameters)
-            Add(value);
+        foreach (var (key, value) in parameters)
+            Add(key, value);
     }
 
     /// <summary>Adds the parameter values of the specified enumerable to the collection.</summary>

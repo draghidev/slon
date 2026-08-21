@@ -2,7 +2,7 @@ using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Threading.Tasks.Sources;
 using Slon.Runtime.CompilerServices;
-// A unique result type distinguishes the caller gate from this flow's other IValueTaskSource faces.
+// A unique result type distinguishes the caller gate from this flow's other IValueTaskSource instantiations.
 using FlowCallerInteractionCoreResult = System.ValueTuple;
 
 namespace Slon.Pg.Protocol.Flows;
@@ -11,7 +11,7 @@ abstract class CommandFlowObserver : PgClientFlowObserver
 {
     internal virtual void OnStarted(CommandFlow flow, object? state) { }
     internal virtual void OnCommandResult(CommandFlow flow, CommandResult result, object? state) { }
-    internal virtual void OnSemanticDrainStarted(CommandFlow flow, object? state) { }
+    internal virtual void OnDrainStarted(CommandFlow flow, object? state) { }
 }
 
 readonly struct CommandFlowOptions
@@ -23,25 +23,7 @@ readonly struct CommandFlowOptions
     public TimeSpan? PendingTimeout { get; init; }
 }
 
-abstract class CommandFlowBindingStrategy
-{
-    internal abstract CommandFlowOptions Bind(
-        PgClientFlowBindingContext context, in CommandFlowBinding binding, TimeSpan? pendingTimeout);
-}
-
-readonly struct CommandFlowBinding
-{
-    internal CommandFlowBindingStrategy? Strategy { get; init; }
-    internal object? Owner { get; init; }
-    internal object? Parameters { get; init; }
-    internal object? Dependencies { get; init; }
-    internal nint Getter { get; init; }
-    internal int Behavior { get; init; }
-    internal int CommandCount { get; init; }
-    internal bool IsPreparing { get; init; }
-}
-
-sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSource<FlowCallerInteractionCoreResult>, IValueTaskSource
+partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSource<FlowCallerInteractionCoreResult>, IValueTaskSource
 {
     static readonly TimeSpan ConsumerDrainCancellationGracePeriod = TimeSpan.FromSeconds(1);
 
@@ -56,7 +38,6 @@ sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
 
     // Flow state
     CommandFlowOptions _options;
-    readonly CommandFlowBinding _binding;
     FlowCallerInteractionCore<FlowCallerInteractionCoreResult> _callerInteractionCore;
     // Per-read caller token: overlaid by MoveNextAsync(ct) for a single read.
     CancellationToken _callerCancellationToken;
@@ -176,21 +157,11 @@ sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
     public CommandFlow(bool async, in CommandFlowOptions options) : this()
         => Initialize(async, options);
 
-    internal CommandFlow(bool async, in CommandFlowBinding binding, TimeSpan? pendingTimeout = null) : this()
+    private protected CommandFlow(bool async, TimeSpan? pendingTimeout) : this()
     {
         IsAsync = async;
-        _binding = binding;
         _options = new() { PendingTimeout = pendingTimeout };
         _enumeratorMoveNextTaskSource.CanCompleteConcurrently = true;
-    }
-
-    internal override void Bind(PgClientFlowBindingContext? context)
-    {
-        if (_binding.Strategy is not { } strategy)
-            return;
-        if (context is null)
-            throw new InvalidOperationException("The command flow requires a wire binding context.");
-        Initialize(IsAsync, strategy.Bind(context, _binding, _options.PendingTimeout));
     }
 
     public CommandFlow Initialize(bool async, params ReadOnlySpan<Command> commands)
@@ -248,8 +219,7 @@ sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
             : _flowCancellationToken;
 
     public int CommandCount => _options.Commands.Count;
-    internal int VisibleCommandCount
-        => _binding.CommandCount is > 0 ? _binding.CommandCount : _options.Commands.VisibleCount;
+    internal virtual int VisibleCommandCount => _options.Commands.VisibleCount;
     public bool IsResultReady => _isResultReady;
 
     public Enumerator GetEnumerator()
@@ -797,7 +767,7 @@ sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
             if (_flowCancellationToken.CanBeCanceled)
                 await _flowCancellationTokenRegistration.DisposeAsync().ConfigureAwait(false);
             ((CommandFlowObserver?)GetObserver(out var observerState))
-                ?.OnSemanticDrainStarted(this, observerState);
+                ?.OnDrainStarted(this, observerState);
             try
             {
                 while (context.OutstandingRfqCount != 0)

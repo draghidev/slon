@@ -39,11 +39,11 @@ public class CommandUserCancellationTests : ConnectionCreatingTest
         }
     }
 
-    sealed class SemanticDrainProbe : CommandFlowObserver
+    sealed class DrainProbe : CommandFlowObserver
     {
         public TaskCompletionSource Started { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
-        internal override void OnSemanticDrainStarted(CommandFlow flow, object? state)
+        internal override void OnDrainStarted(CommandFlow flow, object? state)
             => Started.TrySetResult();
     }
 
@@ -562,7 +562,7 @@ public class CommandUserCancellationTests : ConnectionCreatingTest
         var secondAttempted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var firstReadArmed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var drainReadArmed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var drainProbe = new SemanticDrainProbe();
+        var drainProbe = new DrainProbe();
         var attempts = 0;
         var observeReadArms = false;
         await using var protocol = await PgTestPool.NewIsolatedAsync(o =>
