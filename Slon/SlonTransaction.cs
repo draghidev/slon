@@ -3,20 +3,34 @@ using System.Data.Common;
 
 namespace Slon;
 
+/// Specifies PostgreSQL-specific transaction options.
+[Flags]
+public enum SlonTransactionOptions
+{
+    /// Uses PostgreSQL's default transaction options.
+    None = 0,
+    /// Starts a read-only transaction.
+    ReadOnly = 1,
+    /// Defers a serializable, read-only transaction until PostgreSQL can acquire a safe snapshot.
+    Deferrable = 2
+}
+
 /// <inheritdoc/>
 public sealed class SlonTransaction : DbTransaction
 {
     readonly SlonConnection _connection;
     readonly IsolationLevel _isolationLevel;
+    readonly SlonTransactionOptions _options;
     // Set once the transaction is committed, rolled back, or disposed-without-completing. Guards against a
     // second completion and makes Dispose's safety-net rollback a no-op after an explicit Commit/Rollback.
     bool _completed;
     bool _disposed;
 
-    internal SlonTransaction(SlonConnection connection, IsolationLevel isolationLevel)
+    internal SlonTransaction(SlonConnection connection, IsolationLevel isolationLevel, SlonTransactionOptions options)
     {
         _connection = connection;
         _isolationLevel = isolationLevel;
+        _options = options;
     }
 
     /// <inheritdoc/>
@@ -60,6 +74,12 @@ public sealed class SlonTransaction : DbTransaction
 
     /// <inheritdoc/>
     public override IsolationLevel IsolationLevel => _isolationLevel;
+
+    /// Whether the transaction is read-only.
+    public bool IsReadOnly => _options.HasFlag(SlonTransactionOptions.ReadOnly);
+
+    /// Whether the transaction is deferrable.
+    public bool IsDeferrable => _options.HasFlag(SlonTransactionOptions.Deferrable);
 
     internal void Detach() => _completed = true;
 

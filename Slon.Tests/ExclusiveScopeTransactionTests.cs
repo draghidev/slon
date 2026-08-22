@@ -120,4 +120,24 @@ public class ExclusiveScopeTransactionTests : ConnectionCreatingTest
         await Exec(conn, "SELECT 1");
         await tx.CommitAsync();
     }
+
+    [TestMethod]
+    public async Task Async_PostgreSqlOptions_AreAppliedAndExposed()
+    {
+        await using var ds = AdoTestPool.NewIsolatedDataSource();
+        await using var conn = await ds.OpenConnectionAsync(CancellationToken.None);
+        await using var tx = await conn.BeginTransactionAsync(
+            IsolationLevel.Serializable,
+            SlonTransactionOptions.ReadOnly | SlonTransactionOptions.Deferrable);
+
+        Assert.IsTrue(tx.IsReadOnly);
+        Assert.IsTrue(tx.IsDeferrable);
+
+        await using var cmd = conn.CreateCommand(
+            "SELECT current_setting('transaction_read_only') = 'on' " +
+            "AND current_setting('transaction_deferrable') = 'on'");
+        Assert.AreEqual(true, await cmd.ExecuteScalarAsync(CancellationToken.None));
+
+        await tx.CommitAsync(CancellationToken.None);
+    }
 }

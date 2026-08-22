@@ -335,7 +335,11 @@ Slon.SlonCommand.Transaction.get -> Slon.SlonTransaction?
 Slon.SlonConnection
 Slon.SlonConnection.BeginTransaction() -> Slon.SlonTransaction!
 Slon.SlonConnection.BeginTransaction(System.Data.IsolationLevel level) -> Slon.SlonTransaction!
+Slon.SlonConnection.BeginTransaction(System.Data.IsolationLevel level, Slon.SlonTransactionOptions options) -> Slon.SlonTransaction!
+Slon.SlonConnection.BeginTransaction(Slon.SlonTransactionOptions options) -> Slon.SlonTransaction!
 Slon.SlonConnection.BeginTransactionAsync(System.Data.IsolationLevel level, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.ValueTask<Slon.SlonTransaction!>
+Slon.SlonConnection.BeginTransactionAsync(System.Data.IsolationLevel level, Slon.SlonTransactionOptions options, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.ValueTask<Slon.SlonTransaction!>
+Slon.SlonConnection.BeginTransactionAsync(Slon.SlonTransactionOptions options, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.ValueTask<Slon.SlonTransaction!>
 Slon.SlonConnection.BeginTransactionAsync(System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.ValueTask<Slon.SlonTransaction!>
 Slon.SlonConnection.Clone() -> Slon.SlonConnection!
 Slon.SlonConnection.CreateBatch() -> Slon.SlonBatch!
@@ -477,6 +481,12 @@ Slon.SlonParameters.TryGetValue(string! parameterName, out object? value) -> boo
 Slon.SlonParameters.TryGetValue(string! parameterName, out Slon.SlonParameter? parameter) -> bool
 Slon.SlonTransaction
 Slon.SlonTransaction.Connection.get -> Slon.SlonConnection?
+Slon.SlonTransaction.IsDeferrable.get -> bool
+Slon.SlonTransaction.IsReadOnly.get -> bool
+Slon.SlonTransactionOptions
+Slon.SlonTransactionOptions.Deferrable = 2 -> Slon.SlonTransactionOptions
+Slon.SlonTransactionOptions.None = 0 -> Slon.SlonTransactionOptions
+Slon.SlonTransactionOptions.ReadOnly = 1 -> Slon.SlonTransactionOptions
 static Slon.SlonCommand.Prepare(Slon.SlonConnection! connection, string! commandText) -> Slon.SlonCommand!
 static Slon.SlonCommand.PrepareAsync(Slon.SlonConnection! connection, string! commandText, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.ValueTask<Slon.SlonCommand!>
 static Slon.SlonDataSourceOptions.ParseIpOrDnsEndPoint(string! host) -> System.Net.EndPoint!
