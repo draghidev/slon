@@ -26,7 +26,7 @@ sealed class BackendMessageBodyReader : IInputReader
     {
         _context = context;
         _token = token;
-        _segmentOffset = context.GetCurrentMessageOffset(token);
+        _segmentOffset = isComplete ? 0 : context.GetCurrentMessageOffset(token);
         _buffer = buffer;
         _consumed = buffer.Start;
         IsComplete = isComplete;

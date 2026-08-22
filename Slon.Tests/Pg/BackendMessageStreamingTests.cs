@@ -900,13 +900,16 @@ public class BackendMessageStreamingTests
     }
 
     [TestMethod]
-    public void BackendSegmenter_RejectsUnknownMessageTypeAtFramingBoundary()
+    public void BackendSegmenter_FramesUnknownMessageType()
     {
         var wire = BackendHeaderBytes((BackendType)(byte)'o', 4);
         var segmenter = new BackendMessageBatch.Segmenter();
 
-        Assert.ThrowsExactly<PgFramingException>(() =>
-            segmenter.CreateSegment(new ReadOnlySequence<byte>(wire), out _, out _));
+        Assert.AreEqual(OperationStatus.Done,
+            segmenter.CreateSegment(new ReadOnlySequence<byte>(wire), out var length, out var batch));
+        Assert.AreEqual(wire.Length, length);
+        Assert.IsTrue(batch.TryReadNextInPlace(out var header, out _, out _));
+        Assert.AreEqual((BackendType)(byte)'o', header.Type);
     }
 
     [TestMethod]

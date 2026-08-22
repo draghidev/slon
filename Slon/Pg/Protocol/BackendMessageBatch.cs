@@ -17,6 +17,31 @@ struct BackendMessageBatch(ReadOnlySequence<byte> buffer)
 
     public readonly long ConsumedLength => _consumedLength;
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public bool TryPeekType(out BackendType type)
+    {
+        var span = _buffer.FirstSpan;
+        if (!span.IsEmpty)
+        {
+            type = (BackendType)span[0];
+            return true;
+        }
+        return TryPeekTypeMultiSegment(_buffer.Sequence, out type);
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    static bool TryPeekTypeMultiSegment(ReadOnlySequence<byte> buffer, out BackendType type)
+    {
+        var reader = new SequenceReader<byte>(buffer);
+        if (reader.TryPeek(out var tag))
+        {
+            type = (BackendType)tag;
+            return true;
+        }
+        type = default;
+        return false;
+    }
+
     public bool TryReadNextInPlace(out BackendHeader header, out ReadOnlySequence<byte> buffer, out uint bufferLength)
     {
         if (!Header.TryParse(_buffer.FirstSpan, out var protoHeader) && !Header.TryParseMultiSegment(_buffer.Sequence, out protoHeader))
@@ -76,8 +101,6 @@ struct BackendMessageBatch(ReadOnlySequence<byte> buffer)
             while (Header.TryParse(reader.UnreadSpan, out var header) || Header.TryParseMultiSegment(reader.UnreadSequence, out header))
             {
                 var backendType = (BackendType)header.Tag;
-                if (!backendType.IsDefined())
-                    throw new PgFramingException($"Unknown PostgreSQL backend message type: {header.Tag}.");
                 if (header.MessageLength > MaxMessageLength)
                     throw new PgFramingException($"PostgreSQL backend message length {header.MessageLength} exceeds the maximum supported length.");
 

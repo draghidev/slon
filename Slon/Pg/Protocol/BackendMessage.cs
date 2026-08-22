@@ -106,6 +106,12 @@ readonly struct BackendMessage
     public bool TryGetFirstSpan(int offset, out ReadOnlySpan<byte> span)
     {
         EnsureBodyWindowAvailable();
+        return TryGetFirstSpanUnchecked(offset, out span);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal bool TryGetFirstSpanUnchecked(int offset, out ReadOnlySpan<byte> span)
+    {
         offset += BackendHeader.ByteCount;
         ref var buffer = ref Unsafe.AsRef(in _buffer);
         var startObject = StartObject(ref buffer);
@@ -131,9 +137,9 @@ readonly struct BackendMessage
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public bool TryGetFirstMemory(int offset, out ReadOnlyMemory<byte> memory)
+    internal bool TryGetBufferedFirstMemory(int offset, out ReadOnlyMemory<byte> memory)
     {
-        EnsureBodyWindowAvailable();
+        Debug.Assert(_buffered);
         offset += BackendHeader.ByteCount;
         ref var buffer = ref Unsafe.AsRef(in _buffer);
         var startObject = StartObject(ref buffer);
@@ -364,6 +370,7 @@ readonly struct BackendMessage
 
     // We have no buffer for header only messages.
     public bool Buffered => _buffered;
+    internal long BufferedLength => _buffer.Length;
 }
 
 readonly struct BackendHeader
@@ -380,7 +387,6 @@ readonly struct BackendHeader
 
     BackendHeader(Header header)
     {
-        Debug.Assert(((BackendType)header.Tag).IsDefined());
         Type = (BackendType)header.Tag;
         Length = header.Length;
     }

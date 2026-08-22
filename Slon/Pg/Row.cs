@@ -506,7 +506,6 @@ sealed class Row : PgFieldReader
     public Reader GetReader()
     {
         RevokeColumnLease();
-        EnsureBuffered();
         return new(this);
     }
 
@@ -520,7 +519,11 @@ sealed class Row : PgFieldReader
         {
             _row = row;
             _ordinal = 0;
-            if (!row.Message.TryGetFirstSpan(sizeof(short), out _remaining))
+            var message = row.Message;
+            var found = row._column == 0
+                ? message.TryGetFirstSpanUnchecked(sizeof(short), out _remaining)
+                : message.TryGetFirstSpan(sizeof(short), out _remaining);
+            if (!found)
                 _remaining = default;
         }
 
@@ -564,7 +567,7 @@ sealed class Row : PgFieldReader
         _columnOffset = sizeof(short);
         _lastBufferedOrdinal = -1;
         BackendMessage.Accessor.WriteGranularly(ref _messageAccessor, row.GetAccessor());
-        CaptureBufferedBody();
+        CaptureBufferedBody(row);
     }
 
     void EnsureBuffered()
@@ -578,7 +581,13 @@ sealed class Row : PgFieldReader
 
     void CaptureBufferedBody()
     {
-        if (_bodyReader is null && Message.TryGetFirstMemory(0, out var body))
+        var message = Message;
+        CaptureBufferedBody(message);
+    }
+
+    void CaptureBufferedBody(in BackendMessage message)
+    {
+        if (_bodyReader is null && message.TryGetBufferedFirstMemory(0, out var body))
             _bufferedBody = body;
         else
             _bufferedBody = default;

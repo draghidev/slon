@@ -386,7 +386,7 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
         while (true)
         {
             var pipe = _pipe;
-            while (pipe.TryMoveNext())
+            while (TryMoveNext(pipe))
             {
                 var handleTask = CurrentExecutionControl.HandleMessageAuto(pipe.Current);
                 if (!handleTask.IsCompletedSuccessfully)
@@ -550,7 +550,7 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
                         }
                     }
 
-                    while (_pipe.TryMoveNext())
+                    while (TryMoveNext(_pipe))
                     {
                         var handleTask = CurrentExecutionControl.HandleMessageAuto(_pipe.Current);
                         if (!handleTask.IsCompletedSuccessfully)
@@ -625,7 +625,7 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
     public BackendMessage Current
     {
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        get => EnrichError(_pipe.Current);
+        get => _pipe.Current;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -633,20 +633,19 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
     {
         if (!_pipe.TryGetCurrent(out message))
             return false;
-        message = EnrichError(message);
         return true;
     }
 
-    BackendMessage EnrichError(BackendMessage message)
+    void ObserveMessage(BackendMessage message)
     {
         if (message.Header.Type is not PgTypes.BackendType.ErrorResponse)
-            return message;
+            return;
 
         // Current may be inspected repeatedly while parsing and completing a command. Cancellation
         // acknowledgement is an arrival event: replaying it after the logical command window advances
         // would let one ErrorResponse satisfy a successor window which still needs its own request.
         if (!message.TryObserveError())
-            return message;
+            return;
 
         // ErrorResponse ends the current execution window. Any following read belongs to RFQ drain or
         // recovery, so it must use the protocol timeout rather than the command-specific timeout. A later
@@ -668,38 +667,53 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
                 message.MarkBackendTermination();
                 message.TryCreateError(out error);
                 _control.FailBackendTermination(error!);
-                return message;
+                return;
             }
             if (error.SqlState == PgErrorCodes.QueryCanceled)
                 _control.OnBackendCancellationObserved(flow, flow.CancellationWindow);
         }
-        return message;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    bool TryMoveNext(ProtocolReadPipe pipe)
+    {
+        if (!pipe.TryMoveNext())
+            return false;
+        if (pipe.CurrentIsError)
+            ObserveMessage(pipe.Current);
+        return true;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public bool TryGetNext(out BackendMessage message)
     {
-        // Peek - try - commit, mirroring MoveNext's auto-handled skip + RFQ accounting on the sync-fast
-        // path. Run the handler here: a body reading its terminating RFQ via TryGetNext would otherwise
-        // leave _rfqCount stale and route the wrong count to recovery. TryHandleMessage returns false
-        // only when the handler needs I/O, where we bail and the caller falls back to MoveNextAsync.
         while (true)
         {
-            while (_pipe.TryPeekNext(out var header))
+            while (_pipe.TryPeekNextType(out var type))
             {
-                var handled = false;
-                if (header.Type is PgTypes.BackendType.ReadyForQuery)
-                    RestoreDefaultReadTimeout();
-                if (header.Type
-                    is PgTypes.BackendType.ReadyForQuery
+                // Only auto-handled messages need the transactional peek slot: their handler may need
+                // I/O and decline the synchronous path. Ordinary messages can publish directly.
+                if (type is not (PgTypes.BackendType.ReadyForQuery
                     or PgTypes.BackendType.NoticeResponse
                     or PgTypes.BackendType.NotificationResponse
-                    or PgTypes.BackendType.ParameterStatus
-                    && !CurrentExecutionControl.TryHandleMessage(_pipe.Peeked, out handled))
+                    or PgTypes.BackendType.ParameterStatus))
+                {
+                    var moved = TryMoveNext(_pipe);
+                    Debug.Assert(moved);
+                    message = _pipe.Current;
+                    return true;
+                }
+
+                if (!_pipe.TryPeekNext(out _))
+                    break;
+                var handled = false;
+                if (type is PgTypes.BackendType.ReadyForQuery)
+                    RestoreDefaultReadTimeout();
+                if (!CurrentExecutionControl.TryHandleMessage(_pipe.Peeked, out handled))
                 {
                     goto unavailable;
                 }
-                _pipe.TryMoveNext();
+                TryMoveNext(_pipe);
                 if (handled)
                     continue;
                 message = Current;
@@ -756,7 +770,7 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
             while (true)
             {
                 var pipe = _pipe;
-                if (!pipe.TryMoveNext())
+                if (!TryMoveNext(pipe))
                 {
                     if (!timeoutSet)
                     {
@@ -790,7 +804,7 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
                     if (!success)
                         return ReadCompleted();
 
-                    if (!pipe.TryMoveNext())
+                    if (!TryMoveNext(pipe))
                         ThrowHelper.ThrowInvalidOperation("No message in a new batch");
                 }
 
