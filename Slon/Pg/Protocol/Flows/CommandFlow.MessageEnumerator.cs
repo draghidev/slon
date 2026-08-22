@@ -56,7 +56,7 @@ partial class CommandFlow
             ExceptionDispatchInfo? _exceptionDispatchInfo;
             (PgError, TransactionStatus)? _completeError;
 
-            Command Command => _flow._options.Commands[_flow._commandIndex];
+            Command Command => _flow._commands[_flow._commandIndex];
 
             // An Execute response consists of DataRow messages followed by one terminal message.
             [Conditional("DEBUG")]

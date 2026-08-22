@@ -37,7 +37,8 @@ partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSour
     }
 
     // Flow state
-    CommandFlowOptions _options;
+    CommandList _commands;
+    TimeSpan? _pendingTimeout;
     FlowCallerInteractionCore<FlowCallerInteractionCoreResult> _callerInteractionCore;
     // Per-read caller token: overlaid by MoveNextAsync(ct) for a single read.
     CancellationToken _callerCancellationToken;
@@ -148,7 +149,7 @@ partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSour
 
     // Interactive commands carry caller patience, so arm the activation timeout.
     protected override bool EnableActivationTimeout => true;
-    protected override TimeSpan? PendingTimeout => _options.PendingTimeout;
+    protected override TimeSpan? PendingTimeout => _pendingTimeout;
     internal override TimeSpan? BackendCancellationGracePeriod
         => Volatile.Read(ref _consumerDisposed) ? ConsumerDrainCancellationGracePeriod : null;
 
@@ -160,7 +161,7 @@ partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSour
     private protected CommandFlow(bool async, TimeSpan? pendingTimeout) : this()
     {
         IsAsync = async;
-        _options = new() { PendingTimeout = pendingTimeout };
+        _pendingTimeout = pendingTimeout;
         _enumeratorMoveNextTaskSource.CanCompleteConcurrently = true;
     }
 
@@ -172,11 +173,8 @@ partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSour
         IsAsync = async;
         if (options.Observer is { } observer)
             SetObserver(observer, options.ObserverState);
-        _options = new()
-        {
-            Commands = options.Commands,
-            PendingTimeout = options.PendingTimeout
-        };
+        _commands = options.Commands;
+        _pendingTimeout = options.PendingTimeout;
         options.Observer?.OnStarted(this, options.ObserverState);
         // Arm before publication: teardown may complete the source concurrently even before enumeration.
         _enumeratorMoveNextTaskSource.CanCompleteConcurrently = true;
@@ -218,8 +216,8 @@ partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSour
             : _callerCancellationToken.CanBeCanceled ? _callerCancellationToken
             : _flowCancellationToken;
 
-    public int CommandCount => _options.Commands.Count;
-    internal virtual int VisibleCommandCount => _options.Commands.VisibleCount;
+    public int CommandCount => _commands.Count;
+    internal virtual int VisibleCommandCount => _commands.VisibleCount;
     public bool IsResultReady => _isResultReady;
 
     public Enumerator GetEnumerator()
@@ -282,19 +280,19 @@ partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSour
             // Async writes use transport completion; sync writes use the resumable non-blocking path so
             // the caller thread retains execution ownership across readiness waits.
             var encoder = IsAsync ? default : context.GetEncoder();
-            var appendSync = !_options.Commands[CommandCount - 1].WithSync;
+            var appendSync = !_commands[CommandCount - 1].WithSync;
             _readFlowRfq = appendSync;
             if (IsAsync)
             {
                 // Caller cancellation never cancels wire I/O. A partially cancelled write requires
                 // protocol recovery and can strand already-pipelined successors; the body instead
                 // observes the latched intent and drains every written command to RFQ.
-                writeTask = _options.Commands.WriteCommandsAsync(context.GetEncoder(), appendSync, default);
+                writeTask = _commands.WriteCommandsAsync(context.GetEncoder(), appendSync, default);
             }
             else
             {
                 using (encoder.BeginResumableWriteScope())
-                    writeTask = _options.Commands.WriteCommandsResumable(encoder, appendSync);
+                    writeTask = _commands.WriteCommandsResumable(encoder, appendSync);
             }
 
             // Observe synchronous faults here; pending writes remain the framework-owned trailing task.
@@ -434,7 +432,7 @@ partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSour
                 bool suppressEnumeration;
                 bool describeForPreparation;
                 {
-                    ref readonly var command = ref _options.Commands.ItemRef(_commandIndex);
+                    ref readonly var command = ref _commands.ItemRef(_commandIndex);
                     _decoder.UseReadTimeout(command.Timeout);
                     suppressEnumeration = command.SuppressEnumeration;
                     describeForPreparation = command.DescribeForPreparation;
@@ -468,13 +466,13 @@ partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSour
                     if (IsAsync)
                     {
                         (_pgError, describedParameterTypes, _requestedRowDescription) =
-                            await _options.Commands.ItemRef(_commandIndex)
+                            await _commands.ItemRef(_commandIndex)
                                 .ReadPreparationDescriptionAsync(_decoder, rowDescription).ConfigureAwait(false);
                     }
                     else
                     {
                         (_pgError, describedParameterTypes, _requestedRowDescription) =
-                            _options.Commands.ItemRef(_commandIndex)
+                            _commands.ItemRef(_commandIndex)
                                 .ReadPreparationDescription(_decoder, rowDescription);
                     }
                 }
@@ -512,13 +510,13 @@ partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSour
                 else if (IsAsync)
                 {
                     var rowDescription = context.GetProtocolStatic<ReadState>().RowDescription;
-                    var read = _options.Commands.ItemRef(_commandIndex).ReadUntilExecuteAsync(_decoder, rowDescription);
+                    var read = _commands.ItemRef(_commandIndex).ReadUntilExecuteAsync(_decoder, rowDescription);
                     (_pgError, _requestedRowDescription) = await read.ConfigureAwait(false);
                 }
                 else
                 {
                     var rowDescription = context.GetProtocolStatic<ReadState>().RowDescription;
-                    (_pgError, _requestedRowDescription) = _options.Commands.ItemRef(_commandIndex)
+                    (_pgError, _requestedRowDescription) = _commands.ItemRef(_commandIndex)
                         .ReadUntilExecute(_decoder, rowDescription);
                 }
 
@@ -554,7 +552,7 @@ partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSour
                     readState.ResultMessageEnumerator.Initialize(this, _decoder);
                     result = _enumeratorCurrent ?? readState.CommandResult;
 
-                    ref readonly var resultCommand = ref _options.Commands.ItemRef(_commandIndex);
+                    ref readonly var resultCommand = ref _commands.ItemRef(_commandIndex);
                     var descriptor = resultCommand.Descriptor;
                     // We were preparing and we have no error from parse, make a prepared descriptor.
                     if (!descriptor.IsPrepared && !descriptor.CommandName.IsDefault
@@ -647,7 +645,7 @@ partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSour
                             await _decoder.GetNextAsync().ConfigureAwait(false);
                     }
                     result.CompleteNonQuery(_decoder.Current);
-                    var completion = _options.Commands.ItemRef(_commandIndex).CompleteAsync(_decoder);
+                    var completion = _commands.ItemRef(_commandIndex).CompleteAsync(_decoder);
                     completeError = await completion.ConfigureAwait(false);
                     if (_pgError is null && completeError is null)
                     {
@@ -697,7 +695,7 @@ partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSour
                 // those commands locally and consume the RFQ which is their only wire response.
                 if (completeError is { TransactionStatus: TransactionStatus.Unknown })
                 {
-                    while (++_commandIndex < CommandCount && !_options.Commands[_commandIndex].WithSync) { }
+                    while (++_commandIndex < CommandCount && !_commands[_commandIndex].WithSync) { }
 
                     if (IsAsync)
                         await ReadRfqAsync(_decoder).ConfigureAwait(false);
@@ -1058,14 +1056,14 @@ partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSour
     protected override void OnReleasing(Exception? exception)
     {
         Volatile.Read(ref _cancelDelivery)?.TrySetResult();
-        _options.Commands.Return();
+        _commands.Return();
     }
 
     protected override void OnDiscarded()
     {
         // Discarded flows never enter the base release path.
         GetObserver(out var observerState)?.OnCompleting(this, null, observerState);
-        _options.Commands.Return();
+        _commands.Return();
     }
 
     protected override void OnReset()
