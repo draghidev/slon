@@ -1001,7 +1001,7 @@ partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSour
     bool IsBodyTerminated => Volatile.Read(ref _bodyState) == BodyTerminated;
 
     // Source handoff finishes before body/consumer rendezvous begins, so both reuse the same wait event.
-    protected override ManualResetEventSlim? HandoffEvent => _callerInteractionCore.GetWaitEvent();
+    protected override FlowHandoffEvent? HandoffEvent => _callerInteractionCore.GetWaitEvent();
 
     // Return the rendezvous directly. An async wrapper could signal the disposer before registering the
     // body's continuation, causing a late ThreadPool dispatch instead of caller-thread drain execution.

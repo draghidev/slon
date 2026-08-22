@@ -8,21 +8,15 @@ namespace Slon.Pg.Protocol.Flows;
 // gate; sync consumers receive the body's continuation and run it on their own thread.
 struct FlowCallerInteractionCore<TResult>
 {
-    ManualResetEventSlim? _waitEvent;
-    Action? _handoffContinuation;
-    // The handoff remains as a marker after consumption; the pending slot is claim-and-clear and is
-    // the only continuation that may be scheduled or returned to a caller.
-    Action? _pendingContinuation;
+    FlowHandoffEvent? _waitEvent;
     int _progressSignaled;
     // One-shot flag set by WakeBody; consumed by the OnCompleted post-store re-check.
     bool _wakeRequested;
     // Cancellation may have to take ownership from a sync caller that will not return. Once set,
     // a claimed handoff runs on a dedicated driver instead of occupying a pool worker.
-    bool _dedicatedWakeRequested;
     // First close wins for the current tenure. The consumer replays this durable state onto whichever
     // task-source generation it arms, so teardown never needs to target a generation directly.
     Exception? _closeException;
-    int _isWaiting;
     public Exception? CloseException => Volatile.Read(ref _closeException);
     // Set the latch, monotone (first writer wins). Returns the latched exception (this call's or the
     // prior winner's), never null.
@@ -65,7 +59,7 @@ struct FlowCallerInteractionCore<TResult>
     }
 
     // The source handoff completes before body/consumer rendezvous begins, so both may reuse this event.
-    public ManualResetEventSlim GetWaitEvent()
+    public FlowHandoffEvent GetWaitEvent()
     {
         if (_waitEvent is not { } waitEvent)
         {
@@ -77,8 +71,9 @@ struct FlowCallerInteractionCore<TResult>
         return waitEvent;
     }
 
-    public bool IsWaiting => Volatile.Read(ref _isWaiting) != 0;
-    public bool HasHandoff => Volatile.Read(ref _handoffContinuation) is not null;
+    public bool IsWaiting => Volatile.Read(ref _waitEvent) is { } waitEvent
+        && Volatile.Read(ref waitEvent.IsWaiting) != 0;
+    public bool HasHandoff => Volatile.Read(ref _waitEvent)?.HandoffContinuation is not null;
 
     // Returns a continuation for the caller to run, or null when result/terminal progress produced the
     // wake. The durable handoff marker prevents a redundant first handoff.
@@ -86,7 +81,7 @@ struct FlowCallerInteractionCore<TResult>
     {
         var waitEvent = GetWaitEvent();
 
-        Volatile.Write(ref _isWaiting, 1);
+        Volatile.Write(ref waitEvent.IsWaiting, 1);
         try
         {
             // Check progress BEFORE blocking. A SignalProgress that ran before this GetWaitEvent (e.g. a body
@@ -101,11 +96,11 @@ struct FlowCallerInteractionCore<TResult>
             // Claim the continuation itself. _handoffContinuation is only a durable marker; returning
             // it after another driver claimed _pendingContinuation would execute the same pooled state
             // machine twice.
-            return Interlocked.Exchange(ref _pendingContinuation, null);
+            return Interlocked.Exchange(ref waitEvent.PendingContinuation, null);
         }
         finally
         {
-            Volatile.Write(ref _isWaiting, 0);
+            Volatile.Write(ref waitEvent.IsWaiting, 0);
         }
     }
 
@@ -113,27 +108,36 @@ struct FlowCallerInteractionCore<TResult>
     // window; ordinary MoveNext must leave that continuation deferred because the result owns its turn,
     // while a disposing consumer has no result turn left and may claim it immediately.
     public Action? TryTakePendingContinuation()
-        => Interlocked.Exchange(ref _pendingContinuation, null);
+        => Volatile.Read(ref _waitEvent) is { } waitEvent
+            ? Interlocked.Exchange(ref waitEvent.PendingContinuation, null)
+            : null;
 
     // A rendezvous can publish a result and register the body's following continuation before the
     // caller wakes. The result owns this turn; put the continuation back so the next MoveNext drives it.
     public void DeferContinuation(Action continuation)
     {
-        Interlocked.Exchange(ref _pendingContinuation, continuation);
-        GetWaitEvent().Set();
+        var waitEvent = GetWaitEvent();
+        Interlocked.Exchange(ref waitEvent.PendingContinuation, continuation);
+        waitEvent.Set();
     }
 
     // Wake a parked caller and claim any pending body continuation. Cancellation may use a dedicated
     // driver when the original synchronous caller will not return.
     public void WakeBody(bool useDedicatedDriver = false)
     {
+        var waitEvent = Volatile.Read(ref _waitEvent);
         if (useDedicatedDriver)
-            Volatile.Write(ref _dedicatedWakeRequested, true);
+        {
+            waitEvent ??= GetWaitEvent();
+            Volatile.Write(ref waitEvent.DedicatedWakeRequested, true);
+        }
         Volatile.Write(ref _wakeRequested, true);
         SignalProgress();
-        var stored = Interlocked.Exchange(ref _pendingContinuation, null);
+        var stored = waitEvent is null
+            ? null
+            : Interlocked.Exchange(ref waitEvent.PendingContinuation, null);
         if (stored is not null)
-            Dispatch(stored, Volatile.Read(ref _dedicatedWakeRequested));
+            Dispatch(stored, Volatile.Read(ref waitEvent!.DedicatedWakeRequested));
     }
 
     static void Dispatch(Action continuation, bool useDedicatedDriver)
@@ -178,14 +182,10 @@ struct FlowCallerInteractionCore<TResult>
 
     public void Reset()
     {
-        _waitEvent?.Reset();
-        _handoffContinuation = null;
-        _pendingContinuation = null;
+        _waitEvent?.ResetInteraction();
         _progressSignaled = 0;
         _wakeRequested = false;
-        _dedicatedWakeRequested = false;
         _closeException = null;
-        _isWaiting = 0;
         _gate.Reset();
     }
 
@@ -210,22 +210,23 @@ struct FlowCallerInteractionCore<TResult>
             public void OnCompleted(Action continuation)
             {
                 ref var field = ref fieldRef.Invoke();
-                if (!ReferenceEquals(field._handoffContinuation, continuation))
-                    Volatile.Write(ref field._handoffContinuation, continuation);
+                var waitEvent = field.GetWaitEvent();
+                if (!ReferenceEquals(waitEvent.HandoffContinuation, continuation))
+                    Volatile.Write(ref waitEvent.HandoffContinuation, continuation);
                 // _pendingContinuation is the wake-eligibility slot. Interlocked.Exchange acts
                 // as a full memory barrier so the prior store to _handoffContinuation is ordered
                 // before the _wakeRequested read below (StoreLoad).
-                Interlocked.Exchange(ref field._pendingContinuation, continuation);
-                field.GetWaitEvent().Set();
+                Interlocked.Exchange(ref waitEvent.PendingContinuation, continuation);
+                waitEvent.Set();
                 // Race-safe re-check: if WakeBody ran before our store, it saw
                 // _pendingContinuation = null and didn't queue. _wakeRequested stays set; self-
                 // wake here. Exchange-claim ensures exactly-once delivery if WakeBody races
                 // (one observes non-null, the other gets null).
                 if (Volatile.Read(ref field._wakeRequested))
                 {
-                    var stored = Interlocked.Exchange(ref field._pendingContinuation, null);
+                    var stored = Interlocked.Exchange(ref waitEvent.PendingContinuation, null);
                     if (stored is not null)
-                        Dispatch(stored, Volatile.Read(ref field._dedicatedWakeRequested));
+                        Dispatch(stored, Volatile.Read(ref waitEvent.DedicatedWakeRequested));
                 }
             }
 

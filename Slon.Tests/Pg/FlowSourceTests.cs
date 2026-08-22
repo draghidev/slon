@@ -10,11 +10,11 @@ public class FlowSourceTests
 {
     sealed class ReleasingSyncFlow : PgClientFlow
     {
-        public ManualResetEventSlim Handoff { get; } = new();
+        public FlowHandoffEvent Handoff { get; } = new();
 
         public ReleasingSyncFlow() => IsAsync = false;
 
-        protected override ManualResetEventSlim? HandoffEvent => Handoff;
+        protected override FlowHandoffEvent? HandoffEvent => Handoff;
         protected override ValueTask<FlowTasks> ExecuteAuto(Context context) => new(new FlowTasks());
         protected override void OnStopping(Exception exception) => Handoff.Set();
         // Reproduce a waiter consuming the early OnStopping edge before terminal publication.

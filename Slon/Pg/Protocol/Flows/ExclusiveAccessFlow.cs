@@ -42,7 +42,7 @@ sealed class ExclusiveAccessFlow : PgClientFlow
     bool _innerStopping;
     int _innerAborting;
     // Lazily allocated and reused rendezvous for caller-thread execution of synchronous scopes.
-    ManualResetEventSlim? _handoffEvent;
+    FlowHandoffEvent? _handoffEvent;
 
     internal ExclusiveAccessFlow(PgClientProtocol protocol, PgClientProtocol.Control innerControl, PgClientProtocol.ExclusiveScopeState state, Func<Exception?, ValueTask> completeInner)
     {
@@ -73,7 +73,7 @@ sealed class ExclusiveAccessFlow : PgClientFlow
     }
 
     // Non-null only for caller-thread execution of a synchronous scope.
-    protected override ManualResetEventSlim? HandoffEvent => _handoffEvent;
+    protected override FlowHandoffEvent? HandoffEvent => _handoffEvent;
 
     protected override void OnReset()
     {

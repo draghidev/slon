@@ -21,7 +21,7 @@ sealed partial class StartupFlow : PgClientFlow
     // open, not pooled), so the MRES is allocated eagerly when sync; an async startup never parks => null,
     // the waiter-presence gate fec0355 keys on. The scripted body runs straight through (no consumer gate /
     // WaitForContinuation), so the MRES is only the handoff park, never reused for body rendezvous.
-    protected override ManualResetEventSlim? HandoffEvent { get; }
+    protected override FlowHandoffEvent? HandoffEvent { get; }
 
     // Parsed from the BackendKeyData wire message. Pulled by PgClientProtocol after the flow
     // completes; the protocol stores them as its own fields and exposes them via Control.

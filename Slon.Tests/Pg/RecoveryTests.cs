@@ -159,7 +159,7 @@ public class RecoveryTests : ConnectionCreatingTest
         // The wait-list-free sync handoff parks the caller on the flow's OWN MRES (HandoffEvent). A
         // standalone one is enough for a test flow that is taken over (OnExecutorSuspended Sets it, the
         // caller Waits); it does not reuse a caller-core like CommandFlow.
-        protected override ManualResetEventSlim? HandoffEvent { get; } = new(false);
+        protected override FlowHandoffEvent? HandoffEvent { get; } = new(false);
 
         /// Runs after the write shape lands but before the fault fires. Lets a test kill the
         /// transport at the exact point where the flow's own writes succeeded but the

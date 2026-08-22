@@ -34,12 +34,14 @@ static class ProtocolDiag
         var gateType = gate.GetType();
         var version = gateType.GetProperty("Version", All)!.GetValue(gate)!;
         var status = gateType.GetMethod("GetStatus", All)!.Invoke(gate, [version]);
+        var waitEvent = C("_waitEvent");
+        var pendingContinuation = waitEvent?.GetType().GetField("PendingContinuation", All)?.GetValue(waitEvent);
         return $"{{{common},command={F("_commandIndex")},window={B("_cancellationWindow")},rfqs={B("_rfqCount")}," +
                $"scope={F("_cancellationScope")},timing={F("_backendCancellationTiming")}/" +
                $"{F("_subsequentBackendCancellationTiming")},context={F("_contextPublished")},body={F("_bodyState")}," +
                $"draining={F("_draining")},disposed={F("_consumerDisposed")}," +
                $"terminal={F("_enumeratorCompleted")},cancel={F("_cancelRequested")}," +
-               $"gate={status},wake={C("_wakeRequested")},pendingContinuation={C("_pendingContinuation") is not null}," +
+               $"gate={status},wake={C("_wakeRequested")},pendingContinuation={pendingContinuation is not null}," +
                $"progress={C("_progressSignaled")}}}";
     }
 

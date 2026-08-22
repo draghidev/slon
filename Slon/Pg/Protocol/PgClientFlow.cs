@@ -15,11 +15,66 @@ abstract class PgClientFlowObserver
 // them from the migratable source backlog, while standalone low-level flows remain initialized.
 abstract class PgClientFlowBindingContext;
 
+sealed class FlowHandoffEvent : ManualResetEventSlim
+{
+    PgClientFlowSource.State? _placementSource;
+    bool _wasDetached;
+
+    // The source handoff completes before body/consumer rendezvous begins, so synchronous command
+    // flows reuse this object for both state machines.
+    internal Action? HandoffContinuation;
+    internal Action? PendingContinuation;
+    internal int IsWaiting;
+    internal bool DedicatedWakeRequested;
+
+    internal FlowHandoffEvent(bool initialState = false) : base(initialState) { }
+
+    internal PgClientFlowSource.State? PlacementSource => Volatile.Read(ref _placementSource);
+
+    internal bool Attach(PgClientFlowSource.State source, bool allowsMigration)
+    {
+        if (!allowsMigration)
+        {
+            Debug.Assert(_placementSource is null);
+            _placementSource = source;
+            return false;
+        }
+
+        if (Interlocked.CompareExchange(ref _placementSource, source, null) is not null)
+            ThrowHelper.ThrowInvalidOperation("The flow is already assigned to a protocol source.");
+        var wasDetached = _wasDetached;
+        _wasDetached = false;
+        return wasDetached;
+    }
+
+    internal void Detach(PgClientFlowSource.State source)
+    {
+        _wasDetached = true;
+        if (!ReferenceEquals(Interlocked.CompareExchange(ref _placementSource, null, source), source))
+            ThrowHelper.ThrowInvalidOperation("The flow is not assigned to the expected protocol source.");
+    }
+
+    internal bool Complete() => Interlocked.Exchange(ref _placementSource, null) is not null;
+
+    internal void ResetPlacement()
+    {
+        _placementSource = null;
+        _wasDetached = false;
+    }
+
+    internal void ResetInteraction()
+    {
+        Reset();
+        HandoffContinuation = null;
+        PendingContinuation = null;
+        IsWaiting = 0;
+        DedicatedWakeRequested = false;
+    }
+}
+
 abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgClientFlow>, IThreadPoolWorkItem
 {
     PgClientProtocol.Control? _pendingActivationControl;
-    PgClientFlowSource.State? _placementSource;
-    int _placementWasDetached;
     FlowEnqueueOptions _enqueueOptions;
     bool _ownsWireCapacity;
 
@@ -35,34 +90,24 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
 
     void AttachPlacementSource(PgClientFlowSource.State source)
     {
-        if (!AllowsMigration)
-        {
-            Debug.Assert(_placementSource is null);
-            _placementSource = source;
-            return;
-        }
-
-        if (Interlocked.CompareExchange(ref _placementSource, source, null) is not null)
-            ThrowHelper.ThrowInvalidOperation("The flow is already assigned to a protocol source.");
+        var handoff = HandoffEvent
+            ?? throw new InvalidOperationException("A synchronous placement requires a handoff event.");
         // Initial placement leaves the edge clean. Replacement placement wakes a synchronous
         // consumer which may be waiting between the retired source and this one.
-        if (Interlocked.Exchange(ref _placementWasDetached, 0) != 0)
-            HandoffEvent?.Set();
+        if (handoff.Attach(source, AllowsMigration))
+            handoff.Set();
     }
 
     void DetachPlacementSource(PgClientFlowSource.State source)
-    {
-        Volatile.Write(ref _placementWasDetached, 1);
-        if (!ReferenceEquals(Interlocked.CompareExchange(ref _placementSource, null, source), source))
-            ThrowHelper.ThrowInvalidOperation("The flow is not assigned to the expected protocol source.");
-    }
+        => HandoffEvent!.Detach(source);
 
     void CompletePlacement()
     {
         // Placement terminality is published by Release before this edge. A sync consumer may have
         // consumed an earlier source-stopping wake, so terminal placement owns the final notification.
-        if (Interlocked.Exchange(ref _placementSource, null) is not null)
-            HandoffEvent?.Set();
+        var handoff = HandoffEvent;
+        if (handoff is not null && handoff.Complete())
+            handoff.Set();
     }
 
     internal void UpdatePendingTimeout(TimeSpan remaining)
@@ -190,11 +235,11 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
             ?? throw new InvalidOperationException("A synchronous caller handoff requires a wait event.");
         while (!IsCompleted)
         {
-            var source = Volatile.Read(ref _placementSource);
+            var source = waitEvent.PlacementSource;
             if (source is null)
             {
                 waitEvent.Reset();
-                if (Volatile.Read(ref _placementSource) is null && !IsCompleted)
+                if (waitEvent.PlacementSource is null && !IsCompleted)
                     waitEvent.Wait();
                 // Attachment is a level change, not the source handoff edge. Clear its wake before
                 // asking the newly observed source to publish/claim the actual handoff.
@@ -208,7 +253,7 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
             // Source completion is not a handoff. Its inert drain will either fault this placement
             // or detach it for migration; wait for that level change before consulting a source again.
             waitEvent.Reset();
-            if (ReferenceEquals(source, Volatile.Read(ref _placementSource)) && !IsCompleted)
+            if (ReferenceEquals(source, waitEvent.PlacementSource) && !IsCompleted)
                 waitEvent.Wait();
         }
     }
@@ -332,9 +377,8 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
         _rfqCount = 0;
         _cancellationWindow = 0;
         _lastMessageInducesRfq = false;
-        _placementSource = null;
+        HandoffEvent?.ResetPlacement();
         _pendingTimeoutStarted = false;
-        _placementWasDetached = 0;
         _enqueueOptions = FlowEnqueueOptions.None;
         _ownsWireCapacity = false;
         _observer = null;
@@ -374,7 +418,7 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
     // it is reachable only by the flow's own subclasses (which override it) and by ExecutionControl (the
     // nested write-side handle) - the source pulls it via ExecutionControl.HandoffEvent, never off a
     // bare flow ref. Keeps the handoff primitive off PgClientFlow's internal API, like _rfqCount.
-    protected virtual ManualResetEventSlim? HandoffEvent => null;
+    protected virtual FlowHandoffEvent? HandoffEvent => null;
 
     PgClientFlow IValueTaskSource<PgClientFlow>.GetResult(short token)
     {
@@ -614,7 +658,7 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
         // through this control-mediated handle rather than off a bare flow ref, so the primitive stays
         // encapsulated on the flow (HandoffEvent is protected). Used by the source's WaitForExecutor /
         // OnExecutorSuspended.
-        public ManualResetEventSlim? HandoffEvent => flow.HandoffEvent;
+        public FlowHandoffEvent? HandoffEvent => flow.HandoffEvent;
 
         // Initializes a recovery flow's RFQ obligation to what the failed flow's wire activity
         // left outstanding. Routed through the write-side handle (alongside OnMessageWrite) so
@@ -887,7 +931,7 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
                 Debug.Assert(control.AbortToken.IsCancellationRequested);
                 flow._activationTaskSource.Reset();
             }
-            if (flow._placementSource is not null)
+            if (flow.HandoffEvent?.PlacementSource is not null)
                 flow.DetachPlacementSource(source.SourceState);
             if (flow.OwnsAdmissionBarrier)
                 control.ReleaseAdmissionBarrier();
