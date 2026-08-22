@@ -3,7 +3,6 @@ using Slon.Pg.Types;
 
 namespace Slon;
 
-// TODO add friendly aliases (short etc)
 /// Provides identifiers for built-in PostgreSQL data types.
 public static class SlonDbTypes
 {
@@ -109,6 +108,35 @@ public static class SlonDbTypes
     public static SlonDbType PgLsn => new(DataTypeNames.PgLsn);
     /// The PostgreSQL <c>unknown</c> pseudo-type.
     public static SlonDbType Unknown => new(DataTypeNames.Unknown);
+
+    /// The SQL <c>bigint</c> alias for <see cref="Int8"/>.
+    public static SlonDbType Bigint => Int8;
+    /// The SQL <c>bit varying</c> alias for <see cref="Varbit"/>.
+    public static SlonDbType BitVarying => Varbit;
+    /// The SQL <c>boolean</c> alias for <see cref="Bool"/>.
+    public static SlonDbType Boolean => Bool;
+    /// The SQL <c>character</c> alias for <see cref="Bpchar"/>.
+    public static SlonDbType Character => Bpchar;
+    /// The SQL <c>character varying</c> alias for <see cref="Varchar"/>.
+    public static SlonDbType CharacterVarying => Varchar;
+    /// The SQL <c>decimal</c> alias for <see cref="Numeric"/>.
+    public static SlonDbType Decimal => Numeric;
+    /// The SQL <c>double precision</c> alias for <see cref="Float8"/>.
+    public static SlonDbType DoublePrecision => Float8;
+    /// The SQL <c>integer</c> alias for <see cref="Int4"/>.
+    public static SlonDbType Integer => Int4;
+    /// The SQL <c>real</c> alias for <see cref="Float4"/>.
+    public static SlonDbType Real => Float4;
+    /// The SQL <c>smallint</c> alias for <see cref="Int2"/>.
+    public static SlonDbType Smallint => Int2;
+    /// The SQL <c>time with time zone</c> alias for <see cref="TimeTz"/>.
+    public static SlonDbType TimeWithTimeZone => TimeTz;
+    /// The SQL <c>time without time zone</c> alias for <see cref="Time"/>.
+    public static SlonDbType TimeWithoutTimeZone => Time;
+    /// The SQL <c>timestamp with time zone</c> alias for <see cref="TimestampTz"/>.
+    public static SlonDbType TimestampWithTimeZone => TimestampTz;
+    /// The SQL <c>timestamp without time zone</c> alias for <see cref="Timestamp"/>.
+    public static SlonDbType TimestampWithoutTimeZone => Timestamp;
 
     internal static DbType? ToDbType(SlonDbType slonDbType)
         => slonDbType switch
