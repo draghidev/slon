@@ -1,3 +1,4 @@
+using System.Data.Common;
 using System.Runtime.CompilerServices;
 
 namespace Slon.Tests;
@@ -5,6 +6,22 @@ namespace Slon.Tests;
 [TestClass]
 public class PreparedCommandTests
 {
+    [TestMethod]
+    public async Task PreparedCommandRemainsUsableThroughDbCommand()
+    {
+        await using DbCommand command = AdoTestPool.CreateCommand("select $1::int");
+        var parameter = command.CreateParameter();
+        parameter.Value = 1;
+        command.Parameters.Add(parameter);
+
+        await command.PrepareAsync();
+
+        Assert.AreEqual(1, await command.ExecuteScalarAsync());
+        parameter.Value = 2;
+        Assert.AreEqual(2, await command.ExecuteScalarAsync());
+        Assert.IsTrue(((SlonCommand)command).IsReadOnly);
+    }
+
     [TestMethod]
     public async Task Prepare_MakesZeroParameterCommandImmutableAndConcurrentlyReusable()
     {

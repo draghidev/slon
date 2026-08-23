@@ -167,10 +167,18 @@ public sealed class SlonCommand: DbCommand
     }
 
     /// <inheritdoc/>
+    /// <remarks>
+    /// Successful preparation makes the command shape read-only. Values in <see cref="Parameters"/>
+    /// remain mutable and are used by the ordinary <see cref="DbCommand"/> execution methods.
+    /// </remarks>
     public override void Prepare()
         => PrepareCore();
 
     /// <inheritdoc/>
+    /// <remarks>
+    /// Successful preparation makes the command shape read-only. Values in <see cref="Parameters"/>
+    /// remain mutable and are used by the ordinary <see cref="DbCommand"/> execution methods.
+    /// </remarks>
     public override Task PrepareAsync(CancellationToken cancellationToken = default)
         => PrepareCoreAsync(cancellationToken).AsTask();
 
