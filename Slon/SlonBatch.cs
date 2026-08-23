@@ -5,19 +5,20 @@ using Slon.Pg.Protocol.Flows;
 
 namespace Slon;
 
+// Implementation
 /// <inheritdoc cref="System.Data.Common.DbBatch" />
-public sealed class SlonBatch : DbBatch
+public sealed partial class SlonBatch
 {
     AdoBatchCore<SlonBatchCommand> _batchCore;
     SlonBatchCommands? _batchCommands;
 
-    unsafe SlonBatch(SlonConnection? conn, SlonDataSource? dataSource)
+    unsafe SlonBatch(SlonConnection? connection, SlonDataSource? dataSource)
     {
         var fieldRef = FieldRef<AdoBatchCore<SlonBatchCommand>>.Create(&GetBatchCore, this);
-        if (conn is not null)
+        if (connection is not null)
         {
-            _batchCore = new(conn, fieldRef);
-            _batchCore.Timeout = conn.DefaultCommandTimeout;
+            _batchCore = new(connection, fieldRef);
+            _batchCore.Timeout = connection.DefaultCommandTimeout;
         }
         else if (dataSource is not null)
         {
@@ -27,15 +28,6 @@ public sealed class SlonBatch : DbBatch
         else
             _batchCore = new(fieldRef);
     }
-
-    /// Initializes an unbound batch.
-    public SlonBatch() : this(null, null) {}
-
-    /// <summary>Initializes a batch bound to the specified connection.</summary>
-    /// <param name="conn">The connection on which the batch executes.</param>
-    public SlonBatch(SlonConnection conn)
-        : this(conn ?? throw new ArgumentNullException(nameof(conn)), null) {}
-    internal SlonBatch(SlonDataSource dataSource) : this(null, dataSource) {}
 
     unsafe SlonBatchCommands CreateBatchCommandCollection()
         => new(FieldRef<AdoBatchCore<SlonBatchCommand>>.Create(&GetBatchCore, this));
@@ -47,18 +39,41 @@ public sealed class SlonBatch : DbBatch
         => _batchCore.OnFlowCompleting(flow, exception);
 
     static ref AdoBatchCore<SlonBatchCommand> GetBatchCore(SlonBatch instance) => ref instance._batchCore;
+}
 
+// Public surface & ADO.NET
+public sealed partial class SlonBatch : DbBatch
+{
+    /// Initializes an unbound batch.
+    public SlonBatch() : this(null, null) {}
 
-    /// <summary>
-    /// Return whether the instance is ready for mutations. It can become read-only, for example, if it has been prepared.
-    /// </summary>
+    /// <summary>Initializes a batch bound to the specified connection.</summary>
+    /// <param name="conn">The connection on which the batch executes.</param>
+    public SlonBatch(SlonConnection conn)
+        : this(conn ?? throw new ArgumentNullException(nameof(conn)), null) {}
+    internal SlonBatch(SlonDataSource dataSource) : this(null, dataSource) {}
+
+    /// <summary>Gets whether the batch shape is read-only.</summary>
+    /// <remarks>A successfully prepared batch is read-only.</remarks>
     public bool IsReadOnly => _batchCore.IsReadOnly;
 
-    /// <summary>Whether to place an error barrier between every command in this batch. The default value is <see langword="false" />.</summary>
+    /// <summary>Gets or sets whether to place an error barrier between every command in this batch.</summary>
     public bool EnableErrorBarriers
     {
         get => _batchCore.EnableErrorBarriers;
         set => _batchCore.EnableErrorBarriers = value;
+    }
+
+    /// <summary>Gets or sets whether commands in this batch are eligible for automatic preparation.</summary>
+    /// <remarks>
+    /// Individual commands can further restrict eligibility through
+    /// <see cref="SlonBatchCommand.AllowAutoPreparation"/>. Explicit preparation creates owned
+    /// prepared commands independently of both settings.
+    /// </remarks>
+    public bool AllowAutoPreparation
+    {
+        get => _batchCore.AllowAutoPreparation;
+        set => _batchCore.AllowAutoPreparation = value;
     }
 
     /// <inheritdoc/>
@@ -86,14 +101,6 @@ public sealed class SlonBatch : DbBatch
         => _batchCore.ExecuteScalar(parameters: null);
 
     /// <summary>Executes the command and returns the first column of the first row in the first returned result set. All other columns, rows and result sets are ignored.</summary>
-    /// <returns>The first column of the first row in the first result set.</returns>
-    public object? ExecuteScalar(DbParameterCollection parameters)
-    {
-        ArgumentNullException.ThrowIfNull(parameters);
-        return _batchCore.ExecuteScalar(parameters);
-    }
-
-    /// <summary>Executes the command and returns the first column of the first row in the first returned result set. All other columns, rows and result sets are ignored.</summary>
     /// <param name="cancellationToken">A token to cancel the asynchronous operation.</param>
     /// <returns>A task returning the first column of the first row in the first result set.</returns>
     public override Task<object?> ExecuteScalarAsync(CancellationToken cancellationToken = default)
@@ -104,15 +111,6 @@ public sealed class SlonBatch : DbBatch
     /// <returns>An <see cref="T:Slon.SlonDataReader" /> object.</returns>
     public new SlonDataReader ExecuteReader(CommandBehavior behavior = CommandBehavior.Default)
         => _batchCore.ExecuteReader(parameters: null, behavior);
-
-    /// <summary>Executes the command against its connection, returning a <see cref="T:Slon.SlonDataReader" /> which can be used to access the results.</summary>
-    /// <param name="parameters">The parameter collection used for this invocation.</param>
-    /// <returns>An <see cref="T:Slon.SlonDataReader" /> object.</returns>
-    public SlonDataReader ExecuteReader(DbParameterCollection parameters)
-    {
-        ArgumentNullException.ThrowIfNull(parameters);
-        return _batchCore.ExecuteReader(parameters, CommandBehavior.Default);
-    }
 
     /// <inheritdoc/>
     protected override DbDataReader ExecuteDbDataReader(CommandBehavior behavior)
@@ -137,11 +135,11 @@ public sealed class SlonBatch : DbBatch
     public Task CancelAsync(CancellationToken cancellationToken = default)
         => _batchCore.CancelAsync(cancellationToken);
 
-    /// <summary>
-    /// Setting this property is ignored by Slon. PostgreSQL only supports a single transaction at a given time on
-    /// a given connection, and all commands implicitly run inside the current transaction started via
-    /// <see cref="Slon.SlonConnection.BeginTransaction()"/>
-    /// </summary>
+    /// <summary>Gets the transaction active on this batch's connection, if any.</summary>
+    /// <remarks>
+    /// PostgreSQL has one current transaction per connection, so batches implicitly participate in
+    /// the transaction started through <see cref="SlonConnection.BeginTransaction()"/>.
+    /// </remarks>
     public new SlonTransaction? Transaction
         => !_batchCore.TryGetDataSource(out _, out var connection) ? connection?.CurrentTransaction : null;
 
@@ -191,11 +189,7 @@ public sealed class SlonBatch : DbBatch
     public new SlonConnection? Connection
     {
         get => !_batchCore.TryGetDataSource(out _, out var connection) ? connection : null;
-        set
-        {
-            _batchCore.ThrowIfDisposedOrReadOnly();
-            _batchCore.SetConnection(value);
-        }
+        set => _batchCore.SetConnection(value);
     }
 
     /// <inheritdoc/>

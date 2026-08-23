@@ -17,14 +17,15 @@ interface IAdoCommand
     public CommandType CommandType { get; }
     public SlonParameters? Parameters { get; }
     public bool AppendErrorBarrier { get; }
-    public bool DisableAutoPreparation { get; }
+    public bool AllowAutoPreparation { get; }
 }
 
 static class AdoCommandFactory
 {
     public static (Command, TrackerResult) CreateCommand<TCommand>(in TCommand command,
-        bool enableErrorBarriers, CommandBehavior behavior, in TrackerContext trackerContext,
-        DbParameterCollection? dbParameters, TimeSpan timeout, bool preparing,
+        bool allowAutoPreparation, bool enableErrorBarriers, CommandBehavior behavior,
+        in TrackerContext trackerContext, DbParameterCollection? dbParameters, TimeSpan timeout,
+        bool preparing,
         PgSerializerOptions? serializerOptions = null, ParameterWriter? parameterWriter = null)
         where TCommand : IAdoCommand
     {
@@ -97,9 +98,9 @@ static class AdoCommandFactory
         }
         else
         {
-            trackerResult = command.DisableAutoPreparation && !preparing
-                ? default
-                : trackerContext.TrackCommand(command.CommandText, parameterTypes);
+            trackerResult = preparing || allowAutoPreparation && command.AllowAutoPreparation
+                ? trackerContext.TrackCommand(command.CommandText, parameterTypes)
+                : default;
             descriptor = trackerResult.GetDescriptor(command.CommandText, parameterTypes);
         }
         return (new Command

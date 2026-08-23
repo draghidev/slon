@@ -164,7 +164,7 @@ public class PreparedCommandTests
     }
 
     [TestMethod]
-    public async Task DisableAutoPreparationDoesNotDisableExplicitPrepare()
+    public async Task AutoPreparationOptOutDoesNotAffectExplicitPrepare()
     {
         await using var dataSource = AdoTestPool.NewIsolatedDataSource(options => options with
         {
@@ -173,7 +173,7 @@ public class PreparedCommandTests
             AutoPreparationMinimumUses = 1
         });
         var command = dataSource.CreateCommand("select 42");
-        command.DisableAutoPreparation = true;
+        command.AllowAutoPreparation = false;
 
         _ = await command.ExecuteScalarAsync();
         _ = await command.ExecuteScalarAsync();
@@ -185,6 +185,49 @@ public class PreparedCommandTests
         Assert.AreEqual(42, await command.ExecuteScalarAsync());
         Assert.AreEqual(executionsBefore + 1, await CountPreparedExecutions(dataSource, "_dp"));
         await command.DisposeAsync();
+    }
+
+    [TestMethod]
+    public async Task BatchAutoPreparationOptOutDoesNotAffectExplicitPrepare()
+    {
+        await using var dataSource = AdoTestPool.NewIsolatedDataSource(options => options with
+        {
+            PoolSize = 1,
+            MaxActiveAutoPreparations = 2,
+            AutoPreparationMinimumUses = 1
+        });
+        await using var batch = dataSource.CreateBatch();
+        batch.AllowAutoPreparation = false;
+        batch.BatchCommands.Add(batch.CreateBatchCommand("select 41"));
+        batch.BatchCommands.Add(batch.CreateBatchCommand("select 42"));
+
+        _ = await batch.ExecuteScalarAsync();
+        _ = await batch.ExecuteScalarAsync();
+        Assert.AreEqual(0, await CountPreparedStatements(dataSource, "_ap"));
+
+        await batch.PrepareAsync();
+        Assert.AreEqual(2, await CountPreparedStatements(dataSource, "_dp"));
+    }
+
+    [TestMethod]
+    public async Task BatchCommandCanOptOutOfAutoPreparationIndividually()
+    {
+        await using var dataSource = AdoTestPool.NewIsolatedDataSource(options => options with
+        {
+            PoolSize = 1,
+            MaxActiveAutoPreparations = 2,
+            AutoPreparationMinimumUses = 1
+        });
+        await using var batch = dataSource.CreateBatch();
+        var excluded = batch.CreateBatchCommand("select 41");
+        excluded.AllowAutoPreparation = false;
+        batch.BatchCommands.Add(excluded);
+        batch.BatchCommands.Add(batch.CreateBatchCommand("select 42"));
+
+        _ = await batch.ExecuteScalarAsync();
+        _ = await batch.ExecuteScalarAsync();
+
+        Assert.AreEqual(1, await CountPreparedStatements(dataSource, "_ap"));
     }
 
     [TestMethod]
@@ -252,13 +295,32 @@ public class PreparedCommandTests
         Assert.ThrowsExactly<InvalidOperationException>(() => command.CommandText = "select 43");
     }
 
+    [TestMethod]
+    public async Task BatchCommandCloneDoesNotBorrowPreparedStatementOwnership()
+    {
+        await using var dataSource = AdoTestPool.NewIsolatedDataSource(options => options with { PoolSize = 1 });
+        SlonBatchCommand clone;
+        await using (var batch = dataSource.CreateBatch())
+        {
+            var command = batch.CreateBatchCommand("select 42");
+            batch.BatchCommands.Add(command);
+            await batch.PrepareAsync();
+            clone = command.Clone();
+        }
+
+        Assert.AreEqual(0, await CountPreparedStatements(dataSource, "_dp"));
+        await using var clonedBatch = dataSource.CreateBatch();
+        clonedBatch.BatchCommands.Add(clone);
+        Assert.AreEqual(42, await clonedBatch.ExecuteScalarAsync());
+    }
+
     static async Task<int> CountPreparedStatements(SlonDataSource dataSource, string prefix)
     {
         await using var connection = (SlonConnection)await dataSource.OpenConnectionAsync();
         await using var command = new SlonCommand(connection,
             $"select count(*)::int from pg_prepared_statements where left(name, 3) = '{prefix}'")
         {
-            DisableAutoPreparation = true
+            AllowAutoPreparation = false
         };
         return (int)(await command.ExecuteScalarAsync())!;
     }
@@ -267,7 +329,7 @@ public class PreparedCommandTests
     {
         await using var command = dataSource.CreateCommand(
             $"select coalesce(sum(generic_plans + custom_plans), 0)::int from pg_prepared_statements where left(name, 3) = '{prefix}'");
-        command.DisableAutoPreparation = true;
+        command.AllowAutoPreparation = false;
         return (int)(await command.ExecuteScalarAsync())!;
     }
 }

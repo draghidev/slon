@@ -282,13 +282,13 @@ Slon.SlonBatch.Connection.get -> Slon.SlonConnection?
 Slon.SlonBatch.Connection.set -> void
 Slon.SlonBatch.CreateBatchCommand() -> Slon.SlonBatchCommand!
 Slon.SlonBatch.CreateBatchCommand(string! commandText) -> Slon.SlonBatchCommand!
+Slon.SlonBatch.AllowAutoPreparation.get -> bool
+Slon.SlonBatch.AllowAutoPreparation.set -> void
 Slon.SlonBatch.EnableErrorBarriers.get -> bool
 Slon.SlonBatch.EnableErrorBarriers.set -> void
 Slon.SlonBatch.ExecuteReader(System.Data.CommandBehavior behavior = System.Data.CommandBehavior.Default) -> Slon.SlonDataReader!
-Slon.SlonBatch.ExecuteReader(System.Data.Common.DbParameterCollection! parameters) -> Slon.SlonDataReader!
 Slon.SlonBatch.ExecuteReaderAsync(System.Data.CommandBehavior behavior, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.ValueTask<Slon.SlonDataReader!>
 Slon.SlonBatch.ExecuteReaderAsync(System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.ValueTask<Slon.SlonDataReader!>
-Slon.SlonBatch.ExecuteScalar(System.Data.Common.DbParameterCollection! parameters) -> object?
 Slon.SlonBatch.IsReadOnly.get -> bool
 Slon.SlonBatch.PendingTimeout.get -> System.TimeSpan
 Slon.SlonBatch.PendingTimeout.set -> void
@@ -299,8 +299,8 @@ Slon.SlonBatchCommand
 Slon.SlonBatchCommand.AppendErrorBarrier.get -> bool
 Slon.SlonBatchCommand.AppendErrorBarrier.set -> void
 Slon.SlonBatchCommand.Clone() -> Slon.SlonBatchCommand!
-Slon.SlonBatchCommand.DisableAutoPreparation.get -> bool
-Slon.SlonBatchCommand.DisableAutoPreparation.set -> void
+Slon.SlonBatchCommand.AllowAutoPreparation.get -> bool
+Slon.SlonBatchCommand.AllowAutoPreparation.set -> void
 Slon.SlonBatchCommand.LongRecordsAffected.get -> long
 Slon.SlonBatchCommand.Parameters.get -> Slon.SlonParameters!
 Slon.SlonBatchCommand.SlonBatchCommand() -> void
@@ -316,8 +316,8 @@ Slon.SlonBatchCommands.this[int index].set -> void
 Slon.SlonCommand
 Slon.SlonCommand.CancelAsync(System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task!
 Slon.SlonCommand.CreateParameter() -> Slon.SlonParameter!
-Slon.SlonCommand.DisableAutoPreparation.get -> bool
-Slon.SlonCommand.DisableAutoPreparation.set -> void
+Slon.SlonCommand.AllowAutoPreparation.get -> bool
+Slon.SlonCommand.AllowAutoPreparation.set -> void
 Slon.SlonCommand.ExecuteNonQuery(System.Data.Common.DbParameterCollection! parameters) -> int
 Slon.SlonCommand.ExecuteNonQueryAsync(System.Data.Common.DbParameterCollection! parameters, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.ValueTask<int>
 Slon.SlonCommand.ExecuteReader() -> Slon.SlonDataReader!

@@ -55,7 +55,7 @@ public class AdoCommandFlowFactoryBenchmark : ClientBenchmark
         _untrackedCommand = new()
         {
             CommandText = "select 1",
-            DisableAutoPreparation = true
+            AllowAutoPreparation = false
         };
         _unpreparedBatch = new(_dataSource);
         _unpreparedBatch.BatchCommands.Add(_untrackedCommand);

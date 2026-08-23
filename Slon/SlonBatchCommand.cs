@@ -28,13 +28,15 @@ public sealed class SlonBatchCommand : DbBatchCommand, IAdoCommand
         get;
         set
         {
+            if (value is not CommandType.Text)
+                throw new NotSupportedException();
             EnsureMutable();
             field = value;
         }
     } = CommandType.Text;
 
-    /// Gets or sets whether this command ends its PostgreSQL error barrier, allowing later batch
-    /// commands to continue after it fails.
+    /// Gets or sets whether to append a PostgreSQL error barrier after this command, allowing later
+    /// batch commands to continue after it fails.
     public bool AppendErrorBarrier
     {
         get;
@@ -45,12 +47,11 @@ public sealed class SlonBatchCommand : DbBatchCommand, IAdoCommand
         }
     }
 
-    /// <summary>Whether executions of this command are excluded from automatic preparation.</summary>
+    /// <summary>Gets or sets whether executions of this command are eligible for automatic preparation.</summary>
     /// <remarks>
     /// Explicit preparation of the containing batch creates an owned prepared command regardless of this value.
-    /// Afterward this setting has no effect.
     /// </remarks>
-    public bool DisableAutoPreparation
+    public bool AllowAutoPreparation
     {
         get;
         set
@@ -58,7 +59,7 @@ public sealed class SlonBatchCommand : DbBatchCommand, IAdoCommand
             EnsureMutable();
             field = value;
         }
-    }
+    } = true;
 
     /// <inheritdoc cref="System.Data.Common.DbBatchCommand.RecordsAffected" />
     /// <remarks>When the value exceeds <see cref="int.MaxValue" />, <see cref="int.MinValue" /> is returned.</remarks>
@@ -88,9 +89,8 @@ public sealed class SlonBatchCommand : DbBatchCommand, IAdoCommand
             CommandType = CommandType,
             _parameters = _parameters is null ? null : CloneParameters(_parameters),
             AppendErrorBarrier = AppendErrorBarrier,
-            DisableAutoPreparation = DisableAutoPreparation
+            AllowAutoPreparation = AllowAutoPreparation
         };
-        ((IAdoCommand)clone).Tracked = ((IAdoCommand)this).Tracked;
         return clone;
 
         static SlonParameters CloneParameters(SlonParameters parameters)

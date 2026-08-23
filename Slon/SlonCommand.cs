@@ -7,8 +7,9 @@ using Slon.Pg.Protocol.Flows;
 
 namespace Slon;
 
+// Implementation
 /// <inheritdoc cref="System.Data.Common.DbCommand" />
-public sealed class SlonCommand: DbCommand
+public sealed partial class SlonCommand
 {
     AdoBatchCore<AdoCommand> _batchCore;
 
@@ -17,7 +18,6 @@ public sealed class SlonCommand: DbCommand
     CommandType _overallCommandType;
     SlonParameters? _overallParameterCollection;
     bool _isOverallStateDirty;
-    bool _disableAutoPreparation;
 
     internal unsafe SlonCommand(SlonConnection? connection, SlonDataSource? dataSource, string? commandText)
     {
@@ -43,6 +43,50 @@ public sealed class SlonCommand: DbCommand
         static ref AdoBatchCore<AdoCommand> GetBatchCore(SlonCommand instance) => ref instance._batchCore;
     }
 
+    void SetupCommands()
+    {
+        if (_isOverallStateDirty)
+            Rebuild();
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        void Rebuild()
+        {
+            if (string.IsNullOrWhiteSpace(_overallCommandText))
+                throw new InvalidOperationException("CommandText must be set before executing or preparing the command.");
+
+            _batchCore.Clear();
+            // TODO this is where we would parse the SQL and possibly create a batch of commands.
+            _batchCore.Add(new AdoCommand
+            {
+                CommandText = _overallCommandText,
+                CommandType = _overallCommandType,
+                Parameters = _overallParameterCollection
+            });
+            _isOverallStateDirty = false;
+        }
+    }
+
+    internal void OnFlowStarted(CommandFlow flow)
+        => _batchCore.OnFlowStarted(flow);
+
+    internal void OnFlowCompleting(CommandFlow flow, Exception? exception)
+        => _batchCore.OnFlowCompleting(flow, exception);
+
+    struct AdoCommand : IAdoCommand
+    {
+        public void MakeReadOnly() { }
+        public TrackedCommand? Tracked { get; set; }
+        public string CommandText { get; set; }
+        public CommandType CommandType { get; set; }
+        public SlonParameters? Parameters { get; set; }
+        public bool AppendErrorBarrier { get; set; }
+        public bool AllowAutoPreparation => true;
+    }
+}
+
+// Public surface & ADO.NET
+public sealed partial class SlonCommand : DbCommand
+{
     /// Initializes an unbound command.
     public SlonCommand() : this(null, null, null) {}
 
@@ -60,66 +104,15 @@ public sealed class SlonCommand: DbCommand
     /// <param name="commandText">The SQL statement to execute.</param>
     public SlonCommand(SlonConnection connection, string commandText)
         : this(connection ?? throw new ArgumentNullException(nameof(connection)), null, commandText) {}
-    // A data-source-bound command runs on the MULTIPLEXED path (no connection lease, no exclusive scope) -
-    // the stateless fast path. Use this for one-off commands that don't need session state / transactions.
     /// <summary>Initializes a multiplexed command bound to the specified datasource.</summary>
     /// <param name="dataSource">The datasource through which the command executes.</param>
     /// <param name="commandText">The SQL statement to execute.</param>
+    /// <remarks>
+    /// A datasource-bound command uses the stateless multiplexed path and does not hold a connection
+    /// lease or exclusive scope. Use a connection-bound command for session state and transactions.
+    /// </remarks>
     public SlonCommand(SlonDataSource dataSource, string commandText)
         : this(null, dataSource ?? throw new ArgumentNullException(nameof(dataSource)), commandText) {}
-
-    void ThrowIfDisposed() => _batchCore.ThrowIfDisposed();
-    void ThrowIfDisposedOrReadOnly() => _batchCore.ThrowIfDisposedOrReadOnly();
-
-    void SetCommandText(string? value)
-    {
-        _isOverallStateDirty = _isOverallStateDirty || _overallCommandText != value;
-        _overallCommandText = value ?? string.Empty;
-    }
-
-    void SetCommandType(CommandType value)
-    {
-        if (!Enum.IsDefined(value))
-            throw new ArgumentOutOfRangeException();
-        _isOverallStateDirty = _isOverallStateDirty || _overallCommandType != value;
-        _overallCommandType = value;
-    }
-
-    void SetupCommands()
-    {
-        if (_isOverallStateDirty)
-            Core();
-
-        [MethodImpl(MethodImplOptions.NoInlining)]
-        void Core()
-        {
-            if (string.IsNullOrWhiteSpace(_overallCommandText))
-                throw new InvalidOperationException("CommandText must be set before executing or preparing the command.");
-
-            _batchCore.Clear();
-            // TODO this is where we would parse the SQL and possible create a batch of commands.
-            _batchCore.Add(new AdoCommand
-            {
-                CommandText = _overallCommandText,
-                CommandType = _overallCommandType,
-                Parameters = _overallParameterCollection,
-                DisableAutoPreparation = _disableAutoPreparation
-            });
-            _isOverallStateDirty = false;
-        }
-    }
-
-    void PrepareCore()
-    {
-        SetupCommands();
-        _batchCore.Prepare(parameters: null);
-    }
-
-    ValueTask PrepareCoreAsync(CancellationToken cancellationToken)
-    {
-        SetupCommands();
-        return _batchCore.PrepareAsync(parameters: null, cancellationToken);
-    }
 
     /// <summary>Creates and synchronously prepares a command on the specified connection.</summary>
     /// <param name="connection">The connection on which to prepare the command.</param>
@@ -128,7 +121,7 @@ public sealed class SlonCommand: DbCommand
     public static SlonCommand Prepare(SlonConnection connection, string commandText)
     {
         var cmd = new SlonCommand(connection, commandText);
-        cmd.PrepareCore();
+        cmd.Prepare();
         return cmd;
     }
 
@@ -141,29 +134,22 @@ public sealed class SlonCommand: DbCommand
         CancellationToken cancellationToken = default)
     {
         var cmd = new SlonCommand(connection, commandText);
-        await cmd.PrepareCoreAsync(cancellationToken).ConfigureAwait(false);
+        await cmd.PrepareAsync(cancellationToken).ConfigureAwait(false);
         return cmd;
     }
 
-    /// <summary>
-    /// Return whether the instance is ready for mutations. It can become read-only, for example, if it has been prepared.
-    /// </summary>
+    /// <summary>Gets whether the command shape is read-only.</summary>
+    /// <remarks>A successfully prepared command is read-only.</remarks>
     public bool IsReadOnly => _batchCore.IsReadOnly;
 
-    /// <summary>Whether executions of this command are excluded from automatic preparation.</summary>
+    /// <summary>Gets or sets whether executions of this command are eligible for automatic preparation.</summary>
     /// <remarks>
     /// Explicit <see cref="Prepare()"/> creates an owned prepared command regardless of this value.
-    /// After preparation this setting has no effect.
     /// </remarks>
-    public bool DisableAutoPreparation
+    public bool AllowAutoPreparation
     {
-        get => _disableAutoPreparation;
-        set
-        {
-            ThrowIfDisposedOrReadOnly();
-            _isOverallStateDirty = _isOverallStateDirty || _disableAutoPreparation != value;
-            _disableAutoPreparation = value;
-        }
+        get => _batchCore.AllowAutoPreparation;
+        set => _batchCore.AllowAutoPreparation = value;
     }
 
     /// <inheritdoc/>
@@ -172,7 +158,10 @@ public sealed class SlonCommand: DbCommand
     /// remain mutable and are used by the ordinary <see cref="DbCommand"/> execution methods.
     /// </remarks>
     public override void Prepare()
-        => PrepareCore();
+    {
+        SetupCommands();
+        _batchCore.Prepare(parameters: null);
+    }
 
     /// <inheritdoc/>
     /// <remarks>
@@ -180,7 +169,10 @@ public sealed class SlonCommand: DbCommand
     /// remain mutable and are used by the ordinary <see cref="DbCommand"/> execution methods.
     /// </remarks>
     public override Task PrepareAsync(CancellationToken cancellationToken = default)
-        => PrepareCoreAsync(cancellationToken).AsTask();
+    {
+        SetupCommands();
+        return _batchCore.PrepareAsync(parameters: null, cancellationToken).AsTask();
+    }
 
     /// <inheritdoc/>
     [AllowNull]
@@ -189,8 +181,10 @@ public sealed class SlonCommand: DbCommand
         get => _overallCommandText;
         set
         {
-            ThrowIfDisposedOrReadOnly();
-            SetCommandText(value);
+            _batchCore.ThrowIfDisposedOrReadOnly();
+            value ??= string.Empty;
+            _isOverallStateDirty = _isOverallStateDirty || _overallCommandText != value;
+            _overallCommandText = value;
         }
     }
 
@@ -223,10 +217,11 @@ public sealed class SlonCommand: DbCommand
         get => _overallCommandType;
         set
         {
-            ThrowIfDisposedOrReadOnly();
+            _batchCore.ThrowIfDisposedOrReadOnly();
             if (value is not CommandType.Text)
                 throw new NotSupportedException();
-            SetCommandType(value);
+            _isOverallStateDirty = _isOverallStateDirty || _overallCommandType != value;
+            _overallCommandType = value;
         }
     }
 
@@ -263,12 +258,6 @@ public sealed class SlonCommand: DbCommand
     /// <summary>Requests cancellation and waits until delivery settles or execution ends.</summary>
     public Task CancelAsync(CancellationToken cancellationToken = default)
         => _batchCore.CancelAsync(cancellationToken);
-
-    internal void OnFlowStarted(CommandFlow flow)
-        => _batchCore.OnFlowStarted(flow);
-
-    internal void OnFlowCompleting(CommandFlow flow, Exception? exception)
-        => _batchCore.OnFlowCompleting(flow, exception);
 
     /// <summary>Executes the command against its connection object, returning the number of rows affected.</summary>
     /// <returns>The number of records affected.</returns>
@@ -450,7 +439,6 @@ public sealed class SlonCommand: DbCommand
         get => !_batchCore.TryGetDataSource(out _, out var connection) ? connection : null;
         set
         {
-            ThrowIfDisposedOrReadOnly();
             if (value is not null and not SlonConnection)
             {
                 ThrowHelper.ThrowArgumentException(nameof(value), $"Value is not an instance of {nameof(SlonConnection)}.");
@@ -500,14 +488,4 @@ public sealed class SlonCommand: DbCommand
         }
     }
 
-    struct AdoCommand : IAdoCommand
-    {
-        public void MakeReadOnly() { }
-        public TrackedCommand? Tracked { get; set; }
-        public string CommandText { get; set; }
-        public CommandType CommandType { get; set; }
-        public SlonParameters? Parameters { get; set; }
-        public bool AppendErrorBarrier { get; set; }
-        public bool DisableAutoPreparation { get; set; }
-    }
 }

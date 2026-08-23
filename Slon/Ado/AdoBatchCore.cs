@@ -16,6 +16,7 @@ partial struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
     object _dataSourceOrConnection;
     bool _disposed;
     bool _explicitlyPrepared;
+    bool _allowAutoPreparation = true;
     TimeSpan _timeout;
     TimeSpan? _pendingTimeout;
     bool _enableErrorBarriers;
@@ -75,6 +76,16 @@ partial struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
         {
             ThrowIfDisposed();
             _enableErrorBarriers = value;
+        }
+    }
+
+    public bool AllowAutoPreparation
+    {
+        get => _allowAutoPreparation;
+        set
+        {
+            ThrowIfDisposedOrReadOnly();
+            _allowAutoPreparation = value;
         }
     }
 
@@ -163,7 +174,8 @@ partial struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
         var factory = new AdoCommandFlowFactory<TCommand>(
             _fieldRef.Instance, _commands.AsSpan(), dependencies);
         return factory.Create(
-            parametersSpan, behavior, _explicitlyPrepared, _enableErrorBarriers, Timeout,
+            parametersSpan, behavior, _explicitlyPrepared, _allowAutoPreparation,
+            _enableErrorBarriers, Timeout,
             connection, pgConnection, pendingTimeout, preparing);
     }
 

@@ -19,7 +19,8 @@ readonly ref struct AdoCommandFlowFactory<TCommand>(
 
     public AdoCommandFlowOptions Create(
         ReadOnlySpan<DbParameterCollection?> parametersSpan, CommandBehavior behavior,
-        bool explicitlyPrepared, bool enableErrorBarriers, TimeSpan timeout,
+        bool explicitlyPrepared, bool allowAutoPreparation, bool enableErrorBarriers,
+        TimeSpan timeout,
         SlonConnection? connection = null, PgConnection? pgConnection = null,
         TimeSpan? pendingTimeout = null, bool preparing = false)
     {
@@ -71,8 +72,9 @@ readonly ref struct AdoCommandFlowFactory<TCommand>(
                 }
 
                 var parameters = indexParameters ? parametersSpan[i] : !parametersSpan.IsEmpty ? parametersSpan[0] : null;
-                result = AdoCommandFactory.CreateCommand(adoCommand, enableErrorBarriers, behavior, trackerContext, parameters,
-                    timeout, preparing, dependencies.SerializerOptions, dependencies.ParameterWriter);
+                result = AdoCommandFactory.CreateCommand(adoCommand, allowAutoPreparation,
+                    enableErrorBarriers, behavior, trackerContext, parameters, timeout, preparing,
+                    dependencies.SerializerOptions, dependencies.ParameterWriter);
                 // Refresh the cache when the tracker resolved to a different TC than the one we
                 // passed in (catches workload-tracker recreation via DbDepsRevision++ and similar).
                 if (result.TrackerResult.Tracked is not null && !ReferenceEquals(adoCommand.Tracked, result.TrackerResult.Tracked))
