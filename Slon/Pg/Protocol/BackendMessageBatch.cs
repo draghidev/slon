@@ -89,6 +89,7 @@ struct BackendMessageBatch(ReadOnlySequence<byte> buffer)
             _dataRowStreamingThreshold = dataRowStreamingThreshold;
         }
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public OperationStatus CreateSegment(in ReadOnlySequence<byte> buffer, out long segmentLength, out BackendMessageBatch segment)
         {
             _minimumSize = Header.ByteCount;
