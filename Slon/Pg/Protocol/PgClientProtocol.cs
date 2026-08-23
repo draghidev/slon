@@ -1351,13 +1351,11 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
                 item.PrepareActivationDispatch(_control);
                 // SubmitDetached must not throw (the PipeScheduler.Schedule-style dispatch contract); a
                 // caller handing us a fallible scheduler owns the resulting connection breakage. No guard.
-                ActivationScheduler.SubmitDetached(ActivationWorkItemAction, item, preferLocal: true);
+                ActivationScheduler.SubmitDetached((IThreadPoolWorkItem)item, preferLocal: true);
             }
             else
                 _control.Activate(item);
         }
-
-        static readonly Action<object?> ActivationWorkItemAction = static state => ((IThreadPoolWorkItem)state!).Execute();
 
         public bool TryRecoverItemFailure(in PipelineItemFailureContext context, PgClientFlow failedItem, CancellationToken cancellationToken, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out PgClientFlow? recoveryItem)
         {
