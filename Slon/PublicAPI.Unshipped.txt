@@ -483,7 +483,7 @@ Slon.SlonParameters.Insert(int index, Slon.SlonParameter! value) -> void
 Slon.SlonParameters.Remove(Slon.SlonParameter! value) -> bool
 Slon.SlonParameters.Remove(string! parameterName) -> void
 Slon.SlonParameters.SlonParameters() -> void
-Slon.SlonParameters.SlonParameters(int initialCapacity = 5) -> void
+Slon.SlonParameters.SlonParameters(int initialCapacity) -> void
 Slon.SlonParameters.SlonParameters(System.Collections.Generic.IEnumerable<System.Collections.Generic.KeyValuePair<string!, object?>>! parameters) -> void
 Slon.SlonParameters.this[int index].get -> Slon.SlonParameter!
 Slon.SlonParameters.this[int index].set -> void
