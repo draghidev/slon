@@ -45,7 +45,7 @@ public class DataReaderTests
         batch.BatchCommands.Add(batch.CreateBatchCommand("set application_name = 'slon-enumerate-command-results'"));
         batch.BatchCommands.Add(batch.CreateBatchCommand("select 42"));
 
-        await using var reader = await batch.ExecuteReaderAsync((CommandBehavior)64,
+        await using var reader = await batch.ExecuteReaderAsync((CommandBehavior)int.MinValue,
             CancellationToken.None);
         Assert.AreEqual(0, reader.FieldCount);
         Assert.IsFalse(await reader.ReadAsync(CancellationToken.None));
