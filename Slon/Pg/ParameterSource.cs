@@ -27,7 +27,7 @@ readonly struct ParameterSource
         _count = parameters.Length;
     }
 
-    public int Count => _writer is null ? _count : _writer.GetParameterCountCore(_state!);
+    public int Count => _writer?.GetParameterCountCore(_state!) ?? _count;
     public object? State => _state;
     public ParameterWriter? Writer => _writer;
 }

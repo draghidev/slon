@@ -15,9 +15,9 @@ sealed class InitializingConnectionFactory<T>(
         Action<T, TimeSpan>? initializer, Func<T, CancellationToken, ValueTask>? asyncInitializer)
     {
         ArgumentNullException.ThrowIfNull(factory);
-        if ((initializer is null) != (asyncInitializer is null))
-            throw new ArgumentException("Synchronous and asynchronous connection initializers must be configured together.");
-        return factory;
+        return initializer is null != asyncInitializer is null
+            ? throw new ArgumentException("Synchronous and asynchronous connection initializers must be configured together.")
+            : factory;
     }
 
     public T Create(ConnectionPoolContext<T> poolContext, TimeSpan timeout = default)

@@ -14,12 +14,12 @@ sealed class ResumeSignal : IValueTaskSource
     bool _pending;
     Deadline? _pendingDeadline;
 
-    internal bool IsPending => Volatile.Read(ref _pending);
-    internal static Deadline? CreateDeadline(TimeSpan timeout)
+    public bool IsPending => Volatile.Read(ref _pending);
+    public static Deadline? CreateDeadline(TimeSpan timeout)
         => timeout == default || timeout == Timeout.InfiniteTimeSpan
             ? null
             : new Deadline(timeout);
-    internal TimeSpan GetRemainingTimeout()
+    public TimeSpan GetRemainingTimeout()
         => _pendingDeadline?.GetRemaining() ?? Timeout.InfiniteTimeSpan;
 
     public ValueTask Pending(Deadline? deadline = null)

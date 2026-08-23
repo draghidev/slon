@@ -116,11 +116,6 @@ sealed class AdoConnectionProxy : IDisposable, IAsyncDisposable
         return true;
     }
 
-    public void PerformUserCancellation(TimeSpan? timeout = null)
-    {
-        // TODO spin up a connection and write out cancel
-    }
-
     public bool InExclusiveScope => _exclusiveScope is not null;
 
     internal bool TryStartExclusiveScope(PgConnection connection, bool async, FlowEnqueueOptions options)
