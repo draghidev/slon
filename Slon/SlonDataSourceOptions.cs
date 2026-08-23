@@ -10,6 +10,18 @@ using Slon.Threading;
 
 namespace Slon;
 
+/// Provides the connection being initialized.
+// TODO expose a session-state bag shared with later operations so initialization effects can
+// participate in session reset policy.
+public readonly struct SlonConnectionInitializerContext
+{
+    internal SlonConnectionInitializerContext(SlonConnection connection)
+        => Connection = connection;
+
+    /// Gets the newly opened physical connection being initialized.
+    public SlonConnection Connection { get; }
+}
+
 /// Configures a <see cref="SlonDataSource" />.
 public sealed record SlonDataSourceOptions
 {
@@ -83,9 +95,9 @@ public sealed record SlonDataSourceOptions
     }
 
     /// Gets the synchronous initializer invoked for each newly opened physical connection.
-    public Action<SlonConnection, TimeSpan>? ConnectionInitializer { get; init; }
+    public Action<SlonConnectionInitializerContext, TimeSpan>? ConnectionInitializer { get; init; }
     /// Gets the asynchronous initializer invoked for each newly opened physical connection.
-    public Func<SlonConnection, CancellationToken, ValueTask>? AsyncConnectionInitializer { get; init; }
+    public Func<SlonConnectionInitializerContext, CancellationToken, ValueTask>? AsyncConnectionInitializer { get; init; }
 
     /// <summary>
     /// A command's PendingTimeout initially follows CommandTimeout and bounds datasource admission and

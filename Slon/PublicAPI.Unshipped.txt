@@ -360,6 +360,9 @@ Slon.SlonConnection.UnprepareAllAsync() -> System.Threading.Tasks.ValueTask
 Slon.SlonConnectionOptions
 Slon.SlonConnectionOptions.LongRunning = 1 -> Slon.SlonConnectionOptions
 Slon.SlonConnectionOptions.None = 0 -> Slon.SlonConnectionOptions
+Slon.SlonConnectionInitializerContext
+Slon.SlonConnectionInitializerContext.SlonConnectionInitializerContext() -> void
+Slon.SlonConnectionInitializerContext.Connection.get -> Slon.SlonConnection!
 Slon.SlonDataReader
 Slon.SlonDataReader.GetBytes(int ordinal) -> byte[]!
 Slon.SlonDataReader.GetColumnSchema() -> System.Collections.ObjectModel.ReadOnlyCollection<Slon.SlonDbColumn!>!
@@ -373,13 +376,13 @@ Slon.SlonDataSource.Name.get -> string!
 Slon.SlonDataSource.OpenConnection() -> Slon.SlonConnection!
 Slon.SlonDataSource.OpenConnection(Slon.SlonConnectionOptions options) -> Slon.SlonConnection!
 Slon.SlonDataSource.OpenConnectionAsync(Slon.SlonConnectionOptions options, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.ValueTask<Slon.SlonConnection!>
-Slon.SlonDataSource.OpenConnectionAsync(System.Threading.CancellationToken cancellationToken) -> System.Threading.Tasks.ValueTask<Slon.SlonConnection!>
+Slon.SlonDataSource.OpenConnectionAsync(System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.ValueTask<Slon.SlonConnection!>
 Slon.SlonDataSource.ProviderFactory.get -> System.Data.Common.DbProviderFactory!
 Slon.SlonDataSource.ReloadTypes() -> void
 Slon.SlonDataSource.ReloadTypesAsync(System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.ValueTask
 Slon.SlonDataSource.SlonDataSource(Slon.SlonDataSourceOptions! options) -> void
 Slon.SlonDataSourceOptions
-Slon.SlonDataSourceOptions.AsyncConnectionInitializer.get -> System.Func<Slon.SlonConnection!, System.Threading.CancellationToken, System.Threading.Tasks.ValueTask>?
+Slon.SlonDataSourceOptions.AsyncConnectionInitializer.get -> System.Func<Slon.SlonConnectionInitializerContext, System.Threading.CancellationToken, System.Threading.Tasks.ValueTask>?
 Slon.SlonDataSourceOptions.AsyncConnectionInitializer.init -> void
 Slon.SlonDataSourceOptions.Authentication.get -> Slon.PostgreSqlAuthenticationOptions!
 Slon.SlonDataSourceOptions.Authentication.init -> void
@@ -395,7 +398,7 @@ Slon.SlonDataSourceOptions.CompatibilityProfile.get -> Slon.PostgreSqlCompatibil
 Slon.SlonDataSourceOptions.CompatibilityProfile.init -> void
 Slon.SlonDataSourceOptions.ConnectionIdleLifetime.get -> System.TimeSpan
 Slon.SlonDataSourceOptions.ConnectionIdleLifetime.init -> void
-Slon.SlonDataSourceOptions.ConnectionInitializer.get -> System.Action<Slon.SlonConnection!, System.TimeSpan>?
+Slon.SlonDataSourceOptions.ConnectionInitializer.get -> System.Action<Slon.SlonConnectionInitializerContext, System.TimeSpan>?
 Slon.SlonDataSourceOptions.ConnectionInitializer.init -> void
 Slon.SlonDataSourceOptions.ConnectionPruningInterval.get -> System.TimeSpan
 Slon.SlonDataSourceOptions.ConnectionPruningInterval.init -> void
