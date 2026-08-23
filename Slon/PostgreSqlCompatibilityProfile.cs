@@ -19,12 +19,12 @@ public sealed record PostgreSqlCompatibilityProfile
     /// <summary>
     /// Replaces the normal reset sequence when every session-reset action is enabled.
     /// </summary>
-    public string? CompleteSessionResetCommand { get; init; }
+    public string? SessionResetCommand { get; init; }
 
     internal void Validate()
     {
-        if (CompleteSessionResetCommand is not null)
-            ArgumentException.ThrowIfNullOrWhiteSpace(CompleteSessionResetCommand);
+        if (SessionResetCommand is not null)
+            ArgumentException.ThrowIfNullOrWhiteSpace(SessionResetCommand);
     }
 }
 

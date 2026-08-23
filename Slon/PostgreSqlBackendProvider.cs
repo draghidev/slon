@@ -46,11 +46,11 @@ sealed class ConfiguredBackendProvider(PostgreSqlCompatibilityProfile profile) :
     public override string? ResolveSessionResetCommand(
         PgSessionResetOptions options, PgBackendInfo backendInfo)
     {
-        if (options.HasAllActionsEnabled && profile.CompleteSessionResetCommand is not null)
-            return profile.CompleteSessionResetCommand;
+        if (options.HasAllActionsEnabled && profile.SessionResetCommand is not null)
+            return profile.SessionResetCommand;
 
         var command = base.ResolveSessionResetCommand(options, backendInfo);
-        if (command is null && options.HasEnabledActions && profile.CompleteSessionResetCommand is not null)
+        if (command is null && options.HasEnabledActions && profile.SessionResetCommand is not null)
             throw new NotSupportedException(
                 "The compatibility profile provides complete scope reset but not the configured partial reset.");
         return command;

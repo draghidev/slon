@@ -192,8 +192,8 @@ Slon.PostgreSqlCompatibilityFeatures.SessionAuthorization = 1024 -> Slon.Postgre
 Slon.PostgreSqlCompatibilityFeatures.TypeCategory = 16 -> Slon.PostgreSqlCompatibilityFeatures
 Slon.PostgreSqlCompatibilityFeatures.Unlisten = 128 -> Slon.PostgreSqlCompatibilityFeatures
 Slon.PostgreSqlCompatibilityProfile
-Slon.PostgreSqlCompatibilityProfile.CompleteSessionResetCommand.get -> string?
-Slon.PostgreSqlCompatibilityProfile.CompleteSessionResetCommand.init -> void
+Slon.PostgreSqlCompatibilityProfile.SessionResetCommand.get -> string?
+Slon.PostgreSqlCompatibilityProfile.SessionResetCommand.init -> void
 Slon.PostgreSqlCompatibilityProfile.Features.get -> Slon.PostgreSqlCompatibilityFeatures?
 Slon.PostgreSqlCompatibilityProfile.Features.init -> void
 Slon.PostgreSqlCompatibilityProfile.LoadTypesFromCatalog.get -> bool

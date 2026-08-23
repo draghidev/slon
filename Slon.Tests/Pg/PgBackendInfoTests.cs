@@ -59,7 +59,7 @@ public class PgBackendInfoTests
         {
             Features = PostgreSqlCompatibilityFeatures.IntegerDateTimes,
             LoadTypesFromCatalog = false,
-            CompleteSessionResetCommand = "DISCARD ALL"
+            SessionResetCommand = "DISCARD ALL"
         };
 
     [TestMethod]
