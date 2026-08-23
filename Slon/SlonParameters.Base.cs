@@ -190,7 +190,7 @@ public partial class SlonParameters
 
     bool NameIsPositional(string name) => CanParameterBePositional && name is PositionalName;
 
-    void LookupClear() => _caseInsensitiveLookup?.Clear();
+    void LookupClear() => _caseInsensitiveLookup = null;
 
     void LookupAdd(string name, int index)
     {
@@ -205,39 +205,43 @@ public partial class SlonParameters
         if (_caseInsensitiveLookup is null)
             return;
 
-        if (NameIsPositional(name) || !_caseInsensitiveLookup.TryGetValue(name, out var indexCi) || index < indexCi)
+        foreach (var key in _caseInsensitiveLookup.Keys)
         {
-            for (var i = index + 1; i < _parameters.Count; i++)
-            {
-                var parameterName = GetName(i);
-                if (_caseInsensitiveLookup.TryGetValue(parameterName, out var currentI) && currentI + 1 == i)
-                    _caseInsensitiveLookup[parameterName] = i;
-            }
+            ref var mappedIndex = ref CollectionsMarshal.GetValueRefOrNullRef(_caseInsensitiveLookup, key);
+            if (mappedIndex >= index)
+                mappedIndex++;
+        }
 
-            if (!NameIsPositional(name))
-                _caseInsensitiveLookup[name] = index;
+        if (!NameIsPositional(name)
+            && (!_caseInsensitiveLookup.TryGetValue(name, out var existingIndex) || index < existingIndex))
+        {
+            _caseInsensitiveLookup[name] = index;
         }
     }
 
     void LookupRemove(string name, int index)
     {
-        if (NameIsPositional(name) || _caseInsensitiveLookup is null)
+        if (_caseInsensitiveLookup is null)
             return;
 
-        if (_caseInsensitiveLookup.Remove(name))
+        var removedFirst = !NameIsPositional(name)
+            && _caseInsensitiveLookup.TryGetValue(name, out var mappedIndex)
+            && mappedIndex == index;
+        if (removedFirst)
+            _caseInsensitiveLookup.Remove(name);
+
+        foreach (var key in _caseInsensitiveLookup.Keys)
+        {
+            ref var shiftedIndex = ref CollectionsMarshal.GetValueRefOrNullRef(_caseInsensitiveLookup, key);
+            if (shiftedIndex > index)
+                shiftedIndex--;
+        }
+
+        if (removedFirst)
         {
             for (var i = index; i < _parameters.Count; i++)
             {
-                var parameterName = GetName(i);
-                if (_caseInsensitiveLookup.TryGetValue(parameterName, out var currentI) && currentI - 1 == i)
-                    _caseInsensitiveLookup[parameterName] = i;
-            }
-
-            // Fix-up the case-insensitive lookup to point to the next match, if any.
-            for (var i = 0; i < _parameters.Count; i++)
-            {
-                var parameterName = GetName(i);
-                if (parameterName.Equals(name, StringComparison.OrdinalIgnoreCase))
+                if (GetName(i).Equals(name, StringComparison.OrdinalIgnoreCase))
                 {
                     _caseInsensitiveLookup[name] = i;
                     break;
@@ -248,13 +252,30 @@ public partial class SlonParameters
 
     void LookupChangeName(ParameterItem item, string oldName, int index)
     {
-        if (oldName.Equals(item.Name, StringComparison.OrdinalIgnoreCase))
+        if (_caseInsensitiveLookup is null
+            || oldName.Equals(item.Name, StringComparison.OrdinalIgnoreCase))
             return;
 
-        if (oldName.Length != 0)
-            LookupRemove(oldName, index);
-        if (NameIsPositional(item.Name))
-            LookupAdd(item.Name, index);
+        if (!NameIsPositional(oldName)
+            && _caseInsensitiveLookup.TryGetValue(oldName, out var oldIndex)
+            && oldIndex == index)
+        {
+            _caseInsensitiveLookup.Remove(oldName);
+            for (var i = index + 1; i < _parameters.Count; i++)
+            {
+                if (GetName(i).Equals(oldName, StringComparison.OrdinalIgnoreCase))
+                {
+                    _caseInsensitiveLookup[oldName] = i;
+                    break;
+                }
+            }
+        }
+
+        if (!NameIsPositional(item.Name)
+            && (!_caseInsensitiveLookup.TryGetValue(item.Name, out var newIndex) || index < newIndex))
+        {
+            _caseInsensitiveLookup[item.Name] = index;
+        }
     }
 
     object? GetValue(int index) => _parameters[index].Value;
@@ -283,11 +304,19 @@ public partial class SlonParameters
         var item = ParameterItem.Create(null, parameter);
         _parameters.Add(item);
         LookupAdd(item.Name, _parameters.Count - 1);
-        return _parameters.Count;
+        return _parameters.Count - 1;
     }
 
     /// parameterName can only be null if object is an instance of SlonParameter.
     int AddCore(string? parameterName, object? value)
+    {
+        var item = CreateItem(parameterName, value);
+        _parameters.Add(item);
+        LookupAdd(item.Name, _parameters.Count - 1);
+        return _parameters.Count - 1;
+    }
+
+    ParameterItem CreateItem(string? parameterName, object? value)
     {
         if (parameterName is null && value is not SlonParameter)
         {
@@ -303,23 +332,21 @@ public partial class SlonParameters
             value = CreateParameter(parameterName, value);
         }
 
-        var item = ParameterItem.Create(parameterName, value);
-        _parameters.Add(item);
-        LookupAdd(item.Name, _parameters.Count - 1);
-        return _parameters.Count;
+        return ParameterItem.Create(parameterName, value);
     }
 
     void ReplaceCore(int index, string? parameterName, object? value)
     {
         ref var current = ref GetItemRef(index);
-        var item = ParameterItem.Create(parameterName, value).PreserveTypeResolutionFrom(current);
-        LookupChangeName(item, current.Name, index);
+        var item = CreateItem(parameterName, value).PreserveTypeResolutionFrom(current);
+        var oldName = current.Name;
         current = item;
+        LookupChangeName(item, oldName, index);
     }
 
     void InsertCore(int index, string? parameterName, object? value)
     {
-        var item = ParameterItem.Create(parameterName, value);
+        var item = CreateItem(parameterName, value);
         _parameters.Insert(index, item);
         // Also called if the item is positional, the lookup needs to be shifted to account for the insert.
         LookupInsert(item.Name, index);
@@ -344,14 +371,14 @@ public partial class SlonParameters
             return -1;
 
         var p = _parameters[index];
-        if (item.Value == p.Value)
+        if (Equals(item.Value, p.Value))
             return index;
 
         var name = ParameterItem.CreateNameSpan(item.Key);
         for (var i = index; i < _parameters.Count; i++)
         {
             p = _parameters[i];
-            if (name.Equals(p.Name.AsSpan(), StringComparison.OrdinalIgnoreCase) && p.Value == item.Value)
+            if (name.Equals(p.Name.AsSpan(), StringComparison.OrdinalIgnoreCase) && Equals(item.Value, p.Value))
                 return i;
         }
 
@@ -363,7 +390,7 @@ public partial class SlonParameters
         for (var i = 0; i < _parameters.Count; i++)
         {
             var p = _parameters[i];
-            if (value == p.Value)
+            if (Equals(value, p.Value))
                 return i;
         }
 
@@ -650,6 +677,8 @@ public partial class SlonParameters : DbParameterCollection, ICollection<KeyValu
     /// <inheritdoc cref="DbParameterCollection.AddRange" />
     public override void AddRange(Array values)
     {
+        ArgumentNullException.ThrowIfNull(values);
+
         foreach (var parameter in values)
             AddCore(null, parameter);
     }

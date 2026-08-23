@@ -88,7 +88,7 @@ public sealed partial class SlonDataReader
             : commandCount;
 
     static bool ShouldEnumerateCommandResults(CommandBehavior behavior)
-        => (behavior & EnumerateCommandResultsBehavior) is not 0;
+        => behavior.HasFlag(EnumerateCommandResultsBehavior);
 
     static SlonDataReader CreateReader(CommandFlow.Enumerator enumerator, CommandBehavior behavior,
         int remainingResults, PgSerializerOptions serializerOptions,
@@ -769,6 +769,64 @@ public sealed partial class SlonDataReader
                 .ConfigureAwait(false);
     }
 
+
+    async Task CloseAsyncProjected()
+    {
+        try
+        {
+            await CloseAsyncCore().ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            AdoException.Throw(ex);
+        }
+    }
+
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
+    async ValueTask DisposeAsyncProjected()
+    {
+        var ownsCleanup = false;
+        try
+        {
+            if (Interlocked.CompareExchange(ref _closing, true, false))
+                ThrowHelper.ThrowInvalidOperation("Invalid concurrent call.");
+            ownsCleanup = true;
+
+            var rowEnumerator = _rowEnumerator;
+            var enumerator = _enumerator;
+            _enumerator = default;
+            _rowEnumerator = default;
+
+            try
+            {
+                try
+                {
+                    await rowEnumerator.RevokeColumnLeaseAsync().ConfigureAwait(false);
+                }
+                finally
+                {
+                    await enumerator.DisposeAsync().ConfigureAwait(false);
+                }
+            }
+            finally
+            {
+                Volatile.Write(ref _closing, false);
+            }
+
+            if (TakeConnectionToClose() is { } connection)
+                await new ValueTask(connection.CloseAsync()).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            AdoException.Throw(ex);
+        }
+        finally
+        {
+            if (ownsCleanup)
+                Reset();
+        }
+    }
+
     enum ReaderState
     {
         Uninitialized = 0,
@@ -1154,62 +1212,5 @@ public sealed partial class SlonDataReader : DbDataReader, IDbColumnSchemaGenera
 
         State = ReaderState.Disposed;
         return DisposeAsyncProjected();
-    }
-
-    async Task CloseAsyncProjected()
-    {
-        try
-        {
-            await CloseAsyncCore().ConfigureAwait(false);
-        }
-        catch (Exception ex)
-        {
-            AdoException.Throw(ex);
-        }
-    }
-
-    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
-    async ValueTask DisposeAsyncProjected()
-    {
-        var ownsCleanup = false;
-        try
-        {
-            if (Interlocked.CompareExchange(ref _closing, true, false))
-                ThrowHelper.ThrowInvalidOperation("Invalid concurrent call.");
-            ownsCleanup = true;
-
-            var rowEnumerator = _rowEnumerator;
-            var enumerator = _enumerator;
-            _enumerator = default;
-            _rowEnumerator = default;
-
-            try
-            {
-                try
-                {
-                    await rowEnumerator.RevokeColumnLeaseAsync().ConfigureAwait(false);
-                }
-                finally
-                {
-                    await enumerator.DisposeAsync().ConfigureAwait(false);
-                }
-            }
-            finally
-            {
-                Volatile.Write(ref _closing, false);
-            }
-
-            if (TakeConnectionToClose() is { } connection)
-                await new ValueTask(connection.CloseAsync()).ConfigureAwait(false);
-        }
-        catch (Exception ex)
-        {
-            AdoException.Throw(ex);
-        }
-        finally
-        {
-            if (ownsCleanup)
-                Reset();
-        }
     }
 }

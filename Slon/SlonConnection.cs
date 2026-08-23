@@ -574,7 +574,7 @@ public sealed partial class SlonConnection : DbConnection
     public override string DataSource => DbDataSource.DisplayEndpoint;
 
     /// <inheritdoc />
-    public override int ConnectionTimeout => (int)DbDataSource.ConnectionTimeout.TotalSeconds;
+    public override int ConnectionTimeout => SlonDataSourceOptions.ToAdoTimeoutSeconds(DbDataSource.ConnectionTimeout);
 
     /// <inheritdoc />
     public override string ServerVersion => DbDataSource.ServerVersion;

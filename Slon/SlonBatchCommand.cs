@@ -86,18 +86,26 @@ public sealed class SlonBatchCommand : DbBatchCommand, IAdoCommand
         {
             CommandText = CommandText,
             CommandType = CommandType,
-            _parameters = _parameters is null ? null : new(_parameters),
+            _parameters = _parameters is null ? null : CloneParameters(_parameters),
             AppendErrorBarrier = AppendErrorBarrier,
             DisableAutoPreparation = DisableAutoPreparation
         };
         ((IAdoCommand)clone).Tracked = ((IAdoCommand)this).Tracked;
         return clone;
+
+        static SlonParameters CloneParameters(SlonParameters parameters)
+        {
+            var clone = new SlonParameters(parameters.Count);
+            foreach (var (name, value) in (IEnumerable<KeyValuePair<string, object?>>)parameters)
+                clone.Add(name, value is SlonParameter parameter ? parameter.Clone() : value);
+            return clone;
+        }
     }
 
     void EnsureMutable()
     {
         if (_isReadOnly)
-            ThrowHelper.ThrowInvalidOperation("The batch command collection is read-only.");
+            ThrowHelper.ThrowInvalidOperation("The batch command is read-only.");
 
         var adoCommand = (IAdoCommand)this;
         if (adoCommand.Tracked is not null)

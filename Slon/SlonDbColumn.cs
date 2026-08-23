@@ -18,5 +18,5 @@ public sealed class SlonDbColumn : DbColumn
     /// <summary>
     /// The <see cref="Slon.SlonDbType" /> of the column.
     /// </summary>
-    public SlonDbType SlonDbType { get; private set; }
+    public SlonDbType SlonDbType { get; }
 }

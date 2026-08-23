@@ -121,6 +121,5 @@ public sealed class SlonTransaction : DbTransaction
             }
         }
         _disposed = true;
-        GC.SuppressFinalize(this);
     }
 }

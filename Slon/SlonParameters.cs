@@ -18,6 +18,8 @@ public sealed partial class SlonParameters : IList<SlonParameter>
     /// <param name="parameters">The parameters to add.</param>
     public SlonParameters(IEnumerable<KeyValuePair<string, object?>> parameters) : this(initialCapacity: 5)
     {
+        ArgumentNullException.ThrowIfNull(parameters);
+
         foreach (var (key, value) in parameters)
             Add(key, value);
     }
@@ -94,6 +96,8 @@ public sealed partial class SlonParameters : IList<SlonParameter>
     /// <param name="parameters">The parameters to add to the collection.</param>
     public void AddRange(params IEnumerable<KeyValuePair<string, object?>> parameters)
     {
+        ArgumentNullException.ThrowIfNull(parameters);
+
         foreach (var (key, value) in parameters)
             Add(key, value);
     }
@@ -134,7 +138,7 @@ public sealed partial class SlonParameters : IList<SlonParameter>
     {
         ArgumentNullException.ThrowIfNull(parameterName);
 
-        var parameter = new SlonParameter<T>(value)
+        var parameter = new SlonParameter<T>(parameterName, value)
         {
             DbType = dbType
         };

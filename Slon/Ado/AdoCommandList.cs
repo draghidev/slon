@@ -28,7 +28,7 @@ struct AdoCommandList<TCommand> where TCommand : IAdoCommand
         get
         {
             ArgumentOutOfRangeException.ThrowIfNegative(index);
-            ArgumentOutOfRangeException.ThrowIfGreaterThan(index, Count);
+            ArgumentOutOfRangeException.ThrowIfGreaterThanOrEqual(index, Count);
             return _commandHasValue ? _command : _commands![index];
         }
     }
@@ -63,10 +63,31 @@ struct AdoCommandList<TCommand> where TCommand : IAdoCommand
         _commands.Add(command);
     }
 
-    public void RemoveAt(int index)
+    public void Insert(int index, TCommand command)
     {
         ArgumentOutOfRangeException.ThrowIfNegative(index);
         ArgumentOutOfRangeException.ThrowIfGreaterThan(index, Count);
+        if (index == Count)
+        {
+            Add(command);
+            return;
+        }
+        if (_commands is not null)
+        {
+            _commands.Insert(index, command);
+            return;
+        }
+
+        Debug.Assert(_commandHasValue && index == 0);
+        _commands = [command, _command];
+        _command = default!;
+        _commandHasValue = false;
+    }
+
+    public void RemoveAt(int index)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(index);
+        ArgumentOutOfRangeException.ThrowIfGreaterThanOrEqual(index, Count);
         if (_commandHasValue)
         {
             Debug.Assert(index == 0);

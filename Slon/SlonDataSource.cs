@@ -20,6 +20,14 @@ public sealed record SlonDataSourceOptions
 {
     internal static TimeSpan DefaultCommandTimeout = TimeSpan.FromSeconds(30);
 
+    internal static int ToAdoTimeoutSeconds(TimeSpan timeout)
+    {
+        if (timeout == Timeout.InfiniteTimeSpan)
+            return 0;
+
+        return timeout.TotalSeconds >= int.MaxValue ? int.MaxValue : (int)timeout.TotalSeconds;
+    }
+
     /// Gets the PostgreSQL network endpoint.
     public required EndPoint EndPoint { get; init; }
     /// Gets the PostgreSQL username.
@@ -145,18 +153,46 @@ public sealed record SlonDataSourceOptions
         ExecutionScheduler = ExecutionScheduler,
     };
 
-    internal bool Validate()
+    internal void Validate()
     {
+        ArgumentNullException.ThrowIfNull(EndPoint);
+        ArgumentException.ThrowIfNullOrWhiteSpace(Username);
         ArgumentNullException.ThrowIfNull(Ssl);
         ArgumentNullException.ThrowIfNull(Authentication);
         ArgumentNullException.ThrowIfNull(LoggerFactory);
+        ArgumentNullException.ThrowIfNull(TypeLoadingSchemas);
         CompatibilityProfile?.Validate();
         if (Name is not null && string.IsNullOrWhiteSpace(Name))
             throw new ArgumentException("Cannot be empty or whitespace.", nameof(Name));
         if ((ConnectionInitializer is null) != (AsyncConnectionInitializer is null))
             throw new ArgumentException(
                 "Synchronous and asynchronous connection initializers must be configured together.");
+        if (MaxPoolSize <= 0)
+            throw new ArgumentOutOfRangeException(nameof(MaxPoolSize), "MaxPoolSize must be positive.");
+        if (MinPoolSize < 0 || MinPoolSize > MaxPoolSize)
+            throw new ArgumentOutOfRangeException(nameof(MinPoolSize),
+                "MinPoolSize must be between zero and MaxPoolSize.");
         ArgumentOutOfRangeException.ThrowIfNegative(MaxInFlightOperationsPerWire);
+        ValidateTimeout(ConnectionTimeout, nameof(ConnectionTimeout));
+        ValidateTimeout(CommandTimeout, nameof(CommandTimeout));
+        ArgumentOutOfRangeException.ThrowIfNegative(DataRowStreamingThreshold);
+        ArgumentOutOfRangeException.ThrowIfNegative(MaxActiveAutoPreparations);
+        if (AutoPreparationMinimumUses <= 0)
+            throw new ArgumentOutOfRangeException(nameof(AutoPreparationMinimumUses),
+                "AutoPreparationMinimumUses must be positive.");
+        if (ConnectionIdleLifetime < TimeSpan.Zero && ConnectionIdleLifetime != Timeout.InfiniteTimeSpan)
+            throw new ArgumentOutOfRangeException(nameof(ConnectionIdleLifetime),
+                "ConnectionIdleLifetime must be non-negative or Timeout.InfiniteTimeSpan.");
+        var pruningEnabled = ConnectionIdleLifetime != Timeout.InfiniteTimeSpan && MinPoolSize < MaxPoolSize;
+        if (pruningEnabled && ConnectionPruningInterval <= TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(nameof(ConnectionPruningInterval),
+                "ConnectionPruningInterval must be positive when pruning is enabled.");
+        if (pruningEnabled && ConnectionPruningInterval < HeartbeatInterval)
+            throw new ArgumentOutOfRangeException(nameof(ConnectionPruningInterval),
+                "ConnectionPruningInterval must be at least HeartbeatInterval when pruning is enabled.");
+        if (pruningEnabled && ConnectionIdleLifetime < ConnectionPruningInterval)
+            throw new ArgumentOutOfRangeException(nameof(ConnectionIdleLifetime),
+                "ConnectionIdleLifetime must be at least ConnectionPruningInterval.");
         if (CancellationTimeout <= TimeSpan.Zero || CancellationTimeout == Timeout.InfiniteTimeSpan)
             throw new ArgumentOutOfRangeException(nameof(CancellationTimeout),
                 "CancellationTimeout must be finite and positive.");
@@ -170,8 +206,13 @@ public sealed record SlonDataSourceOptions
         Ssl.Validate();
         OAuth?.Validate();
         IntegratedSecurity?.Validate();
-        // etc
-        return true;
+
+        static void ValidateTimeout(TimeSpan timeout, string parameterName)
+        {
+            if (timeout < TimeSpan.Zero && timeout != Timeout.InfiniteTimeSpan)
+                throw new ArgumentOutOfRangeException(parameterName,
+                    "The timeout must be non-negative or Timeout.InfiniteTimeSpan.");
+        }
     }
 
     internal SlonDataSourceOptions Snapshot() => this with
@@ -232,8 +273,9 @@ public sealed class SlonDataSource : DbDataSource
     /// <param name="options">The datasource configuration.</param>
     public SlonDataSource(SlonDataSourceOptions options)
     {
+        ArgumentNullException.ThrowIfNull(options);
+        options.Validate();
         _options = options.Snapshot();
-        _options.Validate();
         _loggerFactory = new SlonLoggerFactory(_options.LoggerFactory);
         _adoLogger = _loggerFactory.CreateLogger("Slon");
         DisplayEndpoint = _options.EndPoint.AddressFamily is AddressFamily.InterNetwork or AddressFamily.InterNetworkV6 ? $"tcp://{_options.EndPoint}" : _options.EndPoint.ToString()!;
@@ -847,7 +889,11 @@ public sealed class SlonDataSource : DbDataSource
     /// <inheritdoc />
     protected override DbConnection CreateDbConnection() => CreateConnection();
     /// Creates a closed connection owned by this datasource.
-    public new SlonConnection CreateConnection() => new(this);
+    public new SlonConnection CreateConnection()
+    {
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) is not 0, this);
+        return new(this);
+    }
 
     /// <inheritdoc />
     protected override DbConnection OpenDbConnection() => OpenConnection();
@@ -896,7 +942,11 @@ public sealed class SlonDataSource : DbDataSource
     }
 
     /// Creates a batch which executes directly through this datasource.
-    public new SlonBatch CreateBatch() => new(this);
+    public new SlonBatch CreateBatch()
+    {
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) is not 0, this);
+        return new(this);
+    }
     /// <inheritdoc />
     protected override DbBatch CreateDbBatch() => CreateBatch();
 
@@ -904,7 +954,11 @@ public sealed class SlonDataSource : DbDataSource
     protected override DbCommand CreateDbCommand(string? commandText = null) => CreateCommand(commandText);
     /// <summary>Creates a command which executes directly through this datasource.</summary>
     /// <param name="commandText">The SQL statement to execute.</param>
-    public new SlonCommand CreateCommand(string? commandText = null) => new(null, this, commandText);
+    public new SlonCommand CreateCommand(string? commandText = null)
+    {
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) is not 0, this);
+        return new(null, this, commandText);
+    }
 
     /// <inheritdoc />
     protected override void Dispose(bool disposing)

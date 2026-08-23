@@ -48,7 +48,8 @@ public sealed class SlonCommand: DbCommand
 
     /// <summary>Initializes a command bound to the specified connection.</summary>
     /// <param name="connection">The connection on which the command executes.</param>
-    public SlonCommand(SlonConnection connection) : this(connection, null, null) {}
+    public SlonCommand(SlonConnection connection)
+        : this(connection ?? throw new ArgumentNullException(nameof(connection)), null, null) {}
 
     /// <summary>Initializes an unbound command with the specified command text.</summary>
     /// <param name="commandText">The SQL statement to execute.</param>
@@ -57,13 +58,15 @@ public sealed class SlonCommand: DbCommand
     /// <summary>Initializes a command bound to the specified connection.</summary>
     /// <param name="connection">The connection on which the command executes.</param>
     /// <param name="commandText">The SQL statement to execute.</param>
-    public SlonCommand(SlonConnection connection, string commandText) : this(connection, null, commandText) {}
+    public SlonCommand(SlonConnection connection, string commandText)
+        : this(connection ?? throw new ArgumentNullException(nameof(connection)), null, commandText) {}
     // A data-source-bound command runs on the MULTIPLEXED path (no connection lease, no exclusive scope) -
     // the stateless fast path. Use this for one-off commands that don't need session state / transactions.
     /// <summary>Initializes a multiplexed command bound to the specified datasource.</summary>
     /// <param name="dataSource">The datasource through which the command executes.</param>
     /// <param name="commandText">The SQL statement to execute.</param>
-    public SlonCommand(SlonDataSource dataSource, string commandText) : this(null, dataSource, commandText) {}
+    public SlonCommand(SlonDataSource dataSource, string commandText)
+        : this(null, dataSource ?? throw new ArgumentNullException(nameof(dataSource)), commandText) {}
 
     void ThrowIfDisposed() => _batchCore.ThrowIfDisposed();
     void ThrowIfDisposedOrReadOnly() => _batchCore.ThrowIfDisposedOrReadOnly();
@@ -186,8 +189,12 @@ public sealed class SlonCommand: DbCommand
     /// <inheritdoc/>
     public override int CommandTimeout
     {
-        get => (int)_batchCore.Timeout.TotalSeconds;
-        set => _batchCore.Timeout = TimeSpan.FromSeconds(value);
+        get => SlonDataSourceOptions.ToAdoTimeoutSeconds(_batchCore.Timeout);
+        set
+        {
+            ArgumentOutOfRangeException.ThrowIfNegative(value);
+            _batchCore.Timeout = TimeSpan.FromSeconds(value);
+        }
     }
 
     /// <summary>
@@ -268,6 +275,7 @@ public sealed class SlonCommand: DbCommand
     /// <returns>The number of records affected.</returns>
     public int ExecuteNonQuery(DbParameterCollection parameters)
     {
+        ArgumentNullException.ThrowIfNull(parameters);
         SetupCommands();
         return _batchCore.ExecuteNonQuery(parameters);
     }
@@ -287,6 +295,7 @@ public sealed class SlonCommand: DbCommand
     /// <returns>A task returning the number of records affected.</returns>
     public ValueTask<int> ExecuteNonQueryAsync(DbParameterCollection parameters, CancellationToken cancellationToken = default)
     {
+        ArgumentNullException.ThrowIfNull(parameters);
         SetupCommands();
         return _batchCore.ExecuteNonQueryAsync(parameters, cancellationToken);
     }
@@ -303,6 +312,7 @@ public sealed class SlonCommand: DbCommand
     /// <returns>The first column of the first row in the first result set.</returns>
     public object? ExecuteScalar(DbParameterCollection parameters)
     {
+        ArgumentNullException.ThrowIfNull(parameters);
         SetupCommands();
         return _batchCore.ExecuteScalar(parameters);
     }
@@ -322,6 +332,7 @@ public sealed class SlonCommand: DbCommand
     /// <returns>A task returning the first column of the first row in the first result set.</returns>
     public ValueTask<object?> ExecuteScalarAsync(DbParameterCollection parameters, CancellationToken cancellationToken = default)
     {
+        ArgumentNullException.ThrowIfNull(parameters);
         SetupCommands();
         return _batchCore.ExecuteScalarAsync(parameters, cancellationToken);
     }
@@ -348,6 +359,7 @@ public sealed class SlonCommand: DbCommand
     /// <returns>An <see cref="T:Slon.SlonDataReader" /> object.</returns>
     public SlonDataReader ExecuteReader(DbParameterCollection parameters)
     {
+        ArgumentNullException.ThrowIfNull(parameters);
         SetupCommands();
         return _batchCore.ExecuteReader(parameters, CommandBehavior.Default);
     }
@@ -358,6 +370,7 @@ public sealed class SlonCommand: DbCommand
     /// <returns>An <see cref="T:Slon.SlonDataReader" /> object.</returns>
     public SlonDataReader ExecuteReader(DbParameterCollection parameters, CommandBehavior behavior)
     {
+        ArgumentNullException.ThrowIfNull(parameters);
         SetupCommands();
         return _batchCore.ExecuteReader(parameters, behavior);
     }
@@ -391,6 +404,7 @@ public sealed class SlonCommand: DbCommand
     /// <returns>A task representing the asynchronous operation.</returns>
     public ValueTask<SlonDataReader> ExecuteReaderAsync(DbParameterCollection parameters, CancellationToken cancellationToken = default)
     {
+        ArgumentNullException.ThrowIfNull(parameters);
         SetupCommands();
         return _batchCore.ExecuteReaderAsync(parameters, CommandBehavior.Default, cancellationToken);
     }
@@ -404,6 +418,7 @@ public sealed class SlonCommand: DbCommand
     /// <returns>A task representing the asynchronous operation.</returns>
     public ValueTask<SlonDataReader> ExecuteReaderAsync(DbParameterCollection parameters, CommandBehavior behavior, CancellationToken cancellationToken = default)
     {
+        ArgumentNullException.ThrowIfNull(parameters);
         SetupCommands();
         return _batchCore.ExecuteReaderAsync(parameters, behavior, cancellationToken);
     }
@@ -445,15 +460,36 @@ public sealed class SlonCommand: DbCommand
     /// <inheritdoc/>
     protected override void Dispose(bool disposing)
     {
-        _batchCore.Dispose();
-        base.Dispose(true);
+        try
+        {
+            if (disposing)
+                _batchCore.Dispose();
+        }
+        catch (Exception ex)
+        {
+            AdoException.Throw(ex);
+        }
+        finally
+        {
+            base.Dispose(disposing);
+        }
     }
 
     /// <inheritdoc/>
     public override async ValueTask DisposeAsync()
     {
-        await _batchCore.DisposeAsync().ConfigureAwait(false);
-        base.Dispose(true);
+        try
+        {
+            await _batchCore.DisposeAsync().ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            AdoException.Throw(ex);
+        }
+        finally
+        {
+            base.Dispose(true);
+        }
     }
 
     struct AdoCommand : IAdoCommand

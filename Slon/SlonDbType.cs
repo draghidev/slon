@@ -252,7 +252,11 @@ public readonly record struct SlonDbType
     /// </summary>
     /// <param name="dataTypeName">A fully qualified or unqualified data type name for the type.</param>
     /// <returns>The SlonDbType value.</returns>
-    public static SlonDbType Create(string dataTypeName) => new(dataTypeName.Trim());
+    public static SlonDbType Create(string dataTypeName)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(dataTypeName);
+        return new(dataTypeName.Trim());
+    }
 
     /// <summary>
     /// Resolve the <see cref="SlonDbType"/> to a <see cref="DbType"/> value.

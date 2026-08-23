@@ -5,7 +5,6 @@ using Slon.Pg.Protocol.Flows;
 
 namespace Slon;
 
-// TODO introduce execute overloads that take an array of parameter collections, requiring one for each batch command.
 /// <inheritdoc cref="System.Data.Common.DbBatch" />
 public sealed class SlonBatch : DbBatch
 {
@@ -14,16 +13,19 @@ public sealed class SlonBatch : DbBatch
 
     unsafe SlonBatch(SlonConnection? conn, SlonDataSource? dataSource)
     {
+        var fieldRef = FieldRef<AdoBatchCore<SlonBatchCommand>>.Create(&GetBatchCore, this);
         if (conn is not null)
         {
-            _batchCore = new(conn, FieldRef<AdoBatchCore<SlonBatchCommand>>.Create(&GetBatchCore, this));
+            _batchCore = new(conn, fieldRef);
             _batchCore.Timeout = conn.DefaultCommandTimeout;
         }
         else if (dataSource is not null)
         {
-            _batchCore = new(dataSource, FieldRef<AdoBatchCore<SlonBatchCommand>>.Create(&GetBatchCore, this));
+            _batchCore = new(dataSource, fieldRef);
             _batchCore.Timeout = dataSource.DefaultCommandTimeout;
         }
+        else
+            _batchCore = new(fieldRef);
     }
 
     /// Initializes an unbound batch.
@@ -31,7 +33,8 @@ public sealed class SlonBatch : DbBatch
 
     /// <summary>Initializes a batch bound to the specified connection.</summary>
     /// <param name="conn">The connection on which the batch executes.</param>
-    public SlonBatch(SlonConnection conn) : this(conn, null) {}
+    public SlonBatch(SlonConnection conn)
+        : this(conn ?? throw new ArgumentNullException(nameof(conn)), null) {}
     internal SlonBatch(SlonDataSource dataSource) : this(null, dataSource) {}
 
     unsafe SlonBatchCommands CreateBatchCommandCollection()
@@ -85,7 +88,10 @@ public sealed class SlonBatch : DbBatch
     /// <summary>Executes the command and returns the first column of the first row in the first returned result set. All other columns, rows and result sets are ignored.</summary>
     /// <returns>The first column of the first row in the first result set.</returns>
     public object? ExecuteScalar(DbParameterCollection parameters)
-        => _batchCore.ExecuteScalar(parameters);
+    {
+        ArgumentNullException.ThrowIfNull(parameters);
+        return _batchCore.ExecuteScalar(parameters);
+    }
 
     /// <summary>Executes the command and returns the first column of the first row in the first returned result set. All other columns, rows and result sets are ignored.</summary>
     /// <param name="cancellationToken">A token to cancel the asynchronous operation.</param>
@@ -103,7 +109,10 @@ public sealed class SlonBatch : DbBatch
     /// <param name="parameters">The parameter collection used for this invocation.</param>
     /// <returns>An <see cref="T:Slon.SlonDataReader" /> object.</returns>
     public SlonDataReader ExecuteReader(DbParameterCollection parameters)
-        => _batchCore.ExecuteReader(parameters, CommandBehavior.Default);
+    {
+        ArgumentNullException.ThrowIfNull(parameters);
+        return _batchCore.ExecuteReader(parameters, CommandBehavior.Default);
+    }
 
     /// <inheritdoc/>
     protected override DbDataReader ExecuteDbDataReader(CommandBehavior behavior)
@@ -157,8 +166,12 @@ public sealed class SlonBatch : DbBatch
     /// <inheritdoc/>
     public override int Timeout
     {
-        get => (int)_batchCore.Timeout.TotalSeconds;
-        set => _batchCore.Timeout = TimeSpan.FromSeconds(value);
+        get => SlonDataSourceOptions.ToAdoTimeoutSeconds(_batchCore.Timeout);
+        set
+        {
+            ArgumentOutOfRangeException.ThrowIfNegative(value);
+            _batchCore.Timeout = TimeSpan.FromSeconds(value);
+        }
     }
 
     /// <summary>
@@ -181,12 +194,7 @@ public sealed class SlonBatch : DbBatch
         set
         {
             _batchCore.ThrowIfDisposedOrReadOnly();
-            if (value is not { } conn)
-            {
-                ThrowHelper.ThrowArgumentException(nameof(value), $"Value is not an instance of {nameof(SlonConnection)}.");
-                return;
-            }
-            _batchCore.SetConnection(conn);
+            _batchCore.SetConnection(value);
         }
     }
 
@@ -194,7 +202,12 @@ public sealed class SlonBatch : DbBatch
     protected override DbConnection? DbConnection
     {
         get => Connection;
-        set => Connection = (SlonConnection?)value;
+        set
+        {
+            if (value is not null and not SlonConnection)
+                throw new ArgumentException($"Value is not an instance of {nameof(SlonConnection)}.", nameof(value));
+            Connection = (SlonConnection?)value;
+        }
     }
 
     /// <inheritdoc/>
@@ -203,14 +216,34 @@ public sealed class SlonBatch : DbBatch
     /// <inheritdoc/>
     public override void Dispose()
     {
-        _batchCore.Dispose();
-        base.Dispose();
+        try
+        {
+            _batchCore.Dispose();
+        }
+        catch (Exception ex)
+        {
+            AdoException.Throw(ex);
+        }
+        finally
+        {
+            base.Dispose();
+        }
     }
 
     /// <inheritdoc/>
     public override async ValueTask DisposeAsync()
     {
-        await _batchCore.DisposeAsync().ConfigureAwait(false);
-        base.Dispose();
+        try
+        {
+            await _batchCore.DisposeAsync().ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            AdoException.Throw(ex);
+        }
+        finally
+        {
+            base.Dispose();
+        }
     }
 }
