@@ -40,7 +40,7 @@ sealed class TrackedCommand
     public string CommandText { get; }
     public TrackedCommandKind Kind { get; }
 
-    public EncodedString CommandName
+    public EncodedCString CommandName
     {
         get
         {
@@ -51,7 +51,7 @@ sealed class TrackedCommand
 
     // Cleanup still needs the server-side name after logical invalidation has made CommandName
     // unavailable to new executions.
-    internal EncodedString StoredCommandName => Volatile.Read(ref _state).Descriptor.CommandName;
+    internal EncodedCString StoredCommandName => Volatile.Read(ref _state).Descriptor.CommandName;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal bool TryGetPreparedDescriptor(out CommandDescriptor descriptor)

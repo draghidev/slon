@@ -30,7 +30,7 @@ readonly struct TrackerContext
         _owningInstance = owningInstance;
     }
 
-    public EncodedString CommandName => _tracked?.CommandName ?? default;
+    public EncodedCString CommandName => _tracked?.CommandName ?? default;
 
     public static TrackerContext Create(CommandTracker tracker, TrackedCommand? tracked)
         => new(tracker, tracked);

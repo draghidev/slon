@@ -1,39 +1,38 @@
 using System.Diagnostics;
-using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
 using System.Text;
 
 namespace Slon.Text;
 
-// Defined as a struct wrapping a class so we can always pull some usable span out, without needing explicit null checks in consuming code.
+// PostgreSQL protocol C-string whose encoded form is reused across Parse/Bind/Close operations.
+// Defined as a struct wrapping a class so default cheaply represents the unnamed statement/portal.
 [DebuggerDisplay("{_core,nq}")]
-readonly struct EncodedString(string value) : IEquatable<EncodedString>
+readonly struct EncodedCString
 {
-    readonly Core _core = new(value);
+    readonly Core? _core;
 
-    [MemberNotNullWhen(false, nameof(Value))]
+    public EncodedCString(string value)
+    {
+        ArgumentNullException.ThrowIfNull(value);
+        if (value.Contains('\0'))
+            throw new ArgumentException("PostgreSQL protocol strings cannot contain NUL characters.", nameof(value));
+
+        _core = new(value);
+    }
+
     public bool IsDefault => _core is null;
 
     public ReadOnlySpan<byte> AsSpan(Encoding encoding) => _core is null ? [] : _core.AsSpan(encoding);
     public ReadOnlySpan<byte> AsNullTerminatedSpan(Encoding encoding) => _core is null ? [0] : _core.AsNullTerminatedSpan(encoding);
 
-    public string? Value => _core?.Value;
+    public bool ValueEquals(EncodedCString other)
+        => ReferenceEquals(_core, other._core)
+            || (_core is not null && other._core is not null
+                && string.Equals(_core.Value, other._core.Value, StringComparison.Ordinal));
 
     public override string ToString() => _core?.Value ?? "";
-    public bool Equals(EncodedString other)
-    {
-        if (_core is null && other._core is null)
-            return true;
 
-        return _core?.Value.Equals(other._core.Value) == true;
-    }
-
-    public override bool Equals(object? obj) => obj is EncodedString other && Equals(other);
-    public override int GetHashCode() => _core?.Value.GetHashCode() ?? 0;
-
-    public static implicit operator EncodedString(string value) => new(value);
-    public static bool operator ==(EncodedString left, EncodedString right) => left.Equals(right);
-    public static bool operator !=(EncodedString left, EncodedString right) => !left.Equals(right);
+    public static implicit operator EncodedCString(string value) => new(value);
 
     // Used for long lived strings that may have to be re-encoded (but usually wont), thread-safe.
     [DebuggerDisplay("{_value,nq}")]

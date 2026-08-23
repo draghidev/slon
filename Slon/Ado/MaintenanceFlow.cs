@@ -20,7 +20,7 @@ namespace Slon;
 sealed class MaintenanceFlow : PgClientFlow
 {
     PgConnection? _connection;
-    readonly EncodedString[]? _oneShotNames;
+    readonly EncodedCString[]? _oneShotNames;
     readonly ValueTaskSourcePromise<bool>? _readPromise;
 
     internal MaintenanceFlow() : base(supportsDeferredFlush: true)
@@ -29,7 +29,7 @@ sealed class MaintenanceFlow : PgClientFlow
         IsAsync = true;
     }
 
-    internal MaintenanceFlow(EncodedString[] names, bool async) : base(supportsDeferredFlush: true)
+    internal MaintenanceFlow(EncodedCString[] names, bool async) : base(supportsDeferredFlush: true)
     {
         _oneShotNames = names;
         IsAsync = async;
@@ -134,7 +134,7 @@ sealed class MaintenanceFlow : PgClientFlow
         }
     }
 
-    static async ValueTask<FlowTasks> ExecuteOneShot(Context context, EncodedString[] names)
+    static async ValueTask<FlowTasks> ExecuteOneShot(Context context, EncodedCString[] names)
     {
         var encoder = context.GetEncoder();
         foreach (var name in names)

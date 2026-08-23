@@ -328,7 +328,7 @@ public class AutoPrepareWireTests : ConnectionCreatingTest
         await using var ds = CreateDataSource(maxAutoPreparations: 1, autoMinimumUses: 2, maxPoolSize: 1);
         await using var conn = await ds.OpenConnectionAsync(CancellationToken.None);
         var pg = conn.UnderlyingPgConnection!;
-        var evictedNames = new List<EncodedString>(evictions);
+        var evictedNames = new List<EncodedCString>(evictions);
 
         // The held scope keeps maintenance behind this lease, accumulating every Close into one
         // extended-protocol window. Each new admission evicts the preceding prepared statement.
@@ -505,7 +505,7 @@ public class AutoPrepareWireTests : ConnectionCreatingTest
             CommandDescriptor.CreatePrepared(name, tracked.ParameterTypes, tracked.RowDescription));
 
         Assert.IsFalse(pg.TrackedEntries.Any(e => ReferenceEquals(e.Command, tracked)));
-        Assert.IsTrue(pg.PeekMaintenance().OfType<CloseStatement>().Any(e => e.Name == name));
+        Assert.IsTrue(pg.PeekMaintenance().OfType<CloseStatement>().Any(e => e.Name.ValueEquals(name)));
     }
 
     static async Task Execute(SlonConnection conn, string sql)

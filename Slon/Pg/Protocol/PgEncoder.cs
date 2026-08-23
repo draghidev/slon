@@ -123,7 +123,7 @@ readonly struct PgEncoder
         _writer.WriteStringWithNullTerminator(commandText, encoding, commandTextLength);
     }
 
-    public ValueTask WriteParseAuto(string commandText, EncodedString commandName = default, ParameterTypeList parameterTypes = default, CancellationToken cancellationToken = default)
+    public ValueTask WriteParseAuto(string commandText, EncodedCString commandName = default, ParameterTypeList parameterTypes = default, CancellationToken cancellationToken = default)
     {
         if (_executionControl.IsAsync)
             return WriteParseAsync(commandText, commandName, parameterTypes, cancellationToken);
@@ -131,7 +131,7 @@ readonly struct PgEncoder
         return new();
     }
 
-    public async ValueTask WriteParseAsync(string commandText, EncodedString commandName = default, ParameterTypeList parameterTypes = default, CancellationToken cancellationToken = default)
+    public async ValueTask WriteParseAsync(string commandText, EncodedCString commandName = default, ParameterTypeList parameterTypes = default, CancellationToken cancellationToken = default)
     {
         var encoding = ClientEncoding;
         var commandTextLength = GetStringWithNullTerminatorByteCount(commandText, encoding);
@@ -155,10 +155,10 @@ readonly struct PgEncoder
     }
 
     // See WriteQueryResumable for the contract.
-    public ValueTask WriteParseResumable(string commandText, EncodedString commandName = default, ParameterTypeList parameterTypes = default)
+    public ValueTask WriteParseResumable(string commandText, EncodedCString commandName = default, ParameterTypeList parameterTypes = default)
         => WriteParseAsync(commandText, commandName, parameterTypes);
 
-    public void WriteParse(string commandText, EncodedString commandName = default, ParameterTypeList parameterTypes = default)
+    public void WriteParse(string commandText, EncodedCString commandName = default, ParameterTypeList parameterTypes = default)
     {
         var encoding = ClientEncoding;
         var commandTextLength = GetStringWithNullTerminatorByteCount(commandText, encoding);
@@ -180,7 +180,7 @@ readonly struct PgEncoder
             _writer.WriteUInt(enumerator.Current.Oid.Value);
     }
 
-    public async ValueTask WriteBindAsync(EncodedString commandName = default, EncodedString portalName = default,
+    public async ValueTask WriteBindAsync(EncodedCString commandName = default, EncodedCString portalName = default,
         ParameterSource parameters = default, ImmutableArray<PgFormat> resultFormats = default,
         CancellationToken cancellationToken = default)
     {
@@ -216,11 +216,11 @@ readonly struct PgEncoder
     }
 
     // See WriteQueryResumable for the contract.
-    public ValueTask WriteBindResumable(EncodedString commandName = default, EncodedString portalName = default,
+    public ValueTask WriteBindResumable(EncodedCString commandName = default, EncodedCString portalName = default,
         ParameterSource parameters = default, ImmutableArray<PgFormat> resultFormats = default)
         => WriteBindAsync(commandName, portalName, parameters, resultFormats);
 
-    public void WriteBind(EncodedString commandName)
+    public void WriteBind(EncodedCString commandName)
     {
         var commandNameBytes = commandName.AsNullTerminatedSpan(ClientEncoding);
         StartMessage(FrontendType.Bind, bodyLength: commandNameBytes.Length + 1 + 4 * sizeof(ushort));
@@ -232,7 +232,7 @@ readonly struct PgEncoder
         _writer.WriteUShort(1); // all binary
     }
 
-    public void WriteBind(EncodedString commandName = default, EncodedString portalName = default,
+    public void WriteBind(EncodedCString commandName = default, EncodedCString portalName = default,
         ParameterSource parameters = default, ImmutableArray<PgFormat> resultFormats = default)
     {
         var parameterCount = parameters.Count;
@@ -282,7 +282,7 @@ readonly struct PgEncoder
         return writerState;
     }
 
-    void WriteBindPreamble(EncodedString commandName, EncodedString portalName,
+    void WriteBindPreamble(EncodedCString commandName, EncodedCString portalName,
         int parameterCountValue, int parameterBytes, ImmutableArray<PgFormat> resultFormats)
     {
         var encoding = ClientEncoding;
@@ -396,7 +396,7 @@ readonly struct PgEncoder
                     nameof(resultFormats), format, "Unknown PostgreSQL result format code.");
     }
 
-    public void WriteDescribe(EncodedString name = default, bool portalName = true)
+    public void WriteDescribe(EncodedCString name = default, bool portalName = true)
     {
         const byte portal = (byte)'P';
         const byte statement = (byte)'S';
@@ -417,7 +417,7 @@ readonly struct PgEncoder
         _writer.WriteUInt(0); // all rows
     }
 
-    public void WriteExecute(EncodedString portalName)
+    public void WriteExecute(EncodedCString portalName)
     {
         var portalNameBytes = portalName.AsNullTerminatedSpan(ClientEncoding);
         StartMessage(FrontendType.Execute, bodyLength:
@@ -442,7 +442,7 @@ readonly struct PgEncoder
     internal int PadCurrentMessage(int maxBytes = int.MaxValue)
         => _writer.CompleteCurrentMessageWithPadding(maxBytes);
 
-    public void WriteClose(EncodedString name = default, bool portalName = false)
+    public void WriteClose(EncodedCString name = default, bool portalName = false)
     {
         const byte portal = (byte)'P';
         const byte statement = (byte)'S';

@@ -20,7 +20,7 @@ readonly struct TrackerResult(TrackedCommand? tracked)
 sealed class CommandTracker : IDisposable, IAsyncDisposable
 {
     readonly TrackedCommands? _tracked;
-    List<EncodedString>? _leakedCommandNames;
+    List<EncodedCString>? _leakedCommandNames;
     ConditionalWeakTable<object, OwnedCommands>? _owned;
     // Registered PgConnections whose presence map may hold entries from _tracked. Used to fan out
     // eviction-driven DEALLOCATE pushes. Walked under _registryLock so concurrent register/deregister
@@ -169,7 +169,7 @@ sealed class CommandTracker : IDisposable, IAsyncDisposable
     // PgConnection. Leaked names come from OwnedCommands finalizers that fired while this tracker
     // was alive. By the time we drain, the owning user object is gone and we just need the wire
     // DEALLOCATE.
-    public List<EncodedString>? DrainLeakedNames()
+    public List<EncodedCString>? DrainLeakedNames()
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         return Interlocked.Exchange(ref _leakedCommandNames, null);
@@ -281,7 +281,7 @@ sealed class CommandTracker : IDisposable, IAsyncDisposable
     // We don't want to pass our AdoConnectionProxy as these instances would then have a path back to the CWT.
     // If proxy doesn't get disposed we don't clear the table which keeps table cycles alive until all keys are collected.
     // That would mean we leak memory until we reach that moment, see: https://github.com/dotnet/runtime/issues/12255
-    sealed class OwnedCommands(List<EncodedString> leakedCommandNames) : IDisposable
+    sealed class OwnedCommands(List<EncodedCString> leakedCommandNames) : IDisposable
     {
         readonly TrackedCommands _tracked = new(0, 0);
         bool _disposed;

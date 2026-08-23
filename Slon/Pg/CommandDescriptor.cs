@@ -8,10 +8,10 @@ namespace Slon.Pg;
 readonly struct CommandDescriptor
 {
     readonly object? _rowDescriptionOrCommandText;
-    readonly EncodedString _commandName;
+    readonly EncodedCString _commandName;
     readonly ParameterTypeList _parameterTypes;
 
-    CommandDescriptor(EncodedString commandName, ParameterTypeList parameterTypes, RowDescription? rowDescription)
+    CommandDescriptor(EncodedCString commandName, ParameterTypeList parameterTypes, RowDescription? rowDescription)
     {
         Debug.Assert(Unsafe.SizeOf<CommandDescriptor>() <= 40);
         if (commandName.IsDefault)
@@ -21,7 +21,7 @@ readonly struct CommandDescriptor
         _rowDescriptionOrCommandText = rowDescription;
     }
 
-    CommandDescriptor(string commandText, ParameterTypeList parameterTypes, EncodedString commandName)
+    CommandDescriptor(string commandText, ParameterTypeList parameterTypes, EncodedCString commandName)
     {
         ArgumentNullException.ThrowIfNull(commandText);
         _rowDescriptionOrCommandText = commandText;
@@ -32,7 +32,7 @@ readonly struct CommandDescriptor
     [MemberNotNullWhen(false, nameof(UnpreparedCommandText))]
     public bool IsPrepared => _rowDescriptionOrCommandText is not string;
 
-    public EncodedString CommandName
+    public EncodedCString CommandName
     {
         get => _commandName;
         init => _commandName = value;
@@ -70,9 +70,9 @@ readonly struct CommandDescriptor
         }
     }
 
-    public static CommandDescriptor CreatePrepared(EncodedString commandName, ParameterTypeList parameterTypes, RowDescription? rowDescription)
+    public static CommandDescriptor CreatePrepared(EncodedCString commandName, ParameterTypeList parameterTypes, RowDescription? rowDescription)
         => new(commandName, parameterTypes, rowDescription);
 
-    public static CommandDescriptor Create(string commandText, ParameterTypeList parameterTypes = default, EncodedString commandName = default)
+    public static CommandDescriptor Create(string commandText, ParameterTypeList parameterTypes = default, EncodedCString commandName = default)
         => new(commandText, parameterTypes, commandName);
 }

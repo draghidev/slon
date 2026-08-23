@@ -513,7 +513,7 @@ public sealed partial class SlonConnection : IAdoConnection
             return default;
 
         var pgConnection = _proxy.PgConnection;
-        var names = new EncodedString[tracked.Length];
+        var names = new EncodedCString[tracked.Length];
         for (var i = 0; i < tracked.Length; i++)
         {
             var command = tracked[i];

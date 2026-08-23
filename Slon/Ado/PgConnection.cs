@@ -28,13 +28,13 @@ abstract class MaintenanceWork
 sealed class EvictDeallocate(TrackedCommand tracked) : MaintenanceWork
 {
     public TrackedCommand Tracked { get; } = tracked;
-    public EncodedString Name { get; } = tracked.StoredCommandName;
+    public EncodedCString Name { get; } = tracked.StoredCommandName;
 }
 
 // Name-only DEALLOCATE, typically for leaked ownership whose presence is already absent.
-sealed class CloseStatement(EncodedString name) : MaintenanceWork
+sealed class CloseStatement(EncodedCString name) : MaintenanceWork
 {
-    public EncodedString Name { get; } = name;
+    public EncodedCString Name { get; } = name;
 }
 
 // ADO-owned session state around the protocol. Prepared presence and maintenance survive pool leases.
@@ -396,7 +396,7 @@ sealed class PgConnection : IPoolConnection<PgConnection>
 
         foreach (var tracked in _tracked.Keys)
         {
-            if (tracked.CommandName != descriptor.CommandName)
+            if (!tracked.CommandName.ValueEquals(descriptor.CommandName))
                 continue;
 
             if (tracked.Kind is TrackedCommandKind.Auto)

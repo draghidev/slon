@@ -14,7 +14,7 @@ public class PgClientRequestBenchmark : ClientBenchmark
 {
     const int ObjectPoolSize = Commands;
     const string CommandText = "SELECT 'fortune data here as a string' FROM generate_series(1,10)";
-    static readonly EncodedString StatementName = "p";
+    static readonly EncodedCString StatementName = "p";
     static readonly CommandFlowOptions Command = new() { Commands = new(new Command { Descriptor = CommandDescriptor.Create(CommandText, default, StatementName) }) };
     static readonly CommandFlowOptions PreparedCommand = new() { Commands = new(new Command { Descriptor = CommandDescriptor.CreatePrepared(StatementName, default, null!) }) };
 

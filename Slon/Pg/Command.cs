@@ -23,7 +23,7 @@ readonly struct Command()
     // otherwise the count must match the returned RowDescription.
     public ImmutableArray<PgFormat> ResultFormats { get; init; } = [];
 
-    public static Command Create(string commandText, ParameterTypeList parameterTypes = default, EncodedString commandName = default)
+    public static Command Create(string commandText, ParameterTypeList parameterTypes = default, EncodedCString commandName = default)
         => new() { Descriptor = CommandDescriptor.Create(commandText, parameterTypes, commandName) };
 
     public static Command Create(CommandDescriptor descriptor)
@@ -123,7 +123,7 @@ readonly struct CommandMetadata
 {
     // Which original command this result belongs to, important for prepared commands and multi result simple protocol commands.
     public int CommandIndex { get; init; }
-    public EncodedString CommandName { get; init; }
+    public EncodedCString CommandName { get; init; }
     public ParameterTypeList ParameterTypes { get; init; }
     public RowDescription? RowDescription { get; init; }
     public bool IsPrepared { get; init; }
