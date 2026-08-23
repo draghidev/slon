@@ -626,9 +626,15 @@ public sealed partial class SlonConnection : DbConnection
     public override string ConnectionString
     {
         get => _dataSource.ConnectionString;
-        set => throw new NotSupportedException(
-            $"{nameof(SlonConnection)} configuration is owned by its {nameof(SlonDataSource)}. " +
-            "Create a data source with the desired options instead.");
+        set
+        {
+            if (value == _dataSource.ConnectionString)
+                return;
+
+            throw new NotSupportedException(
+                $"{nameof(SlonConnection)} configuration is owned by its {nameof(SlonDataSource)}. " +
+                "Create a data source with the desired options instead.");
+        }
     }
 
     /// <inheritdoc />
@@ -929,7 +935,7 @@ public sealed partial class SlonConnection : DbConnection
         => throw new NotImplementedException();
 
     /// <inheritdoc />
-    protected override DbProviderFactory? DbProviderFactory => null;
+    protected override DbProviderFactory DbProviderFactory => _dataSource.ProviderFactory;
 
     /// <inheritdoc />
     public override event StateChangeEventHandler? StateChange

@@ -374,6 +374,7 @@ Slon.SlonDataSource.OpenConnection() -> Slon.SlonConnection!
 Slon.SlonDataSource.OpenConnection(Slon.SlonConnectionOptions options) -> Slon.SlonConnection!
 Slon.SlonDataSource.OpenConnectionAsync(Slon.SlonConnectionOptions options, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.ValueTask<Slon.SlonConnection!>
 Slon.SlonDataSource.OpenConnectionAsync(System.Threading.CancellationToken cancellationToken) -> System.Threading.Tasks.ValueTask<Slon.SlonConnection!>
+Slon.SlonDataSource.ProviderFactory.get -> System.Data.Common.DbProviderFactory!
 Slon.SlonDataSource.ReloadTypes() -> void
 Slon.SlonDataSource.ReloadTypesAsync(System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.ValueTask
 Slon.SlonDataSource.SlonDataSource(Slon.SlonDataSourceOptions! options) -> void

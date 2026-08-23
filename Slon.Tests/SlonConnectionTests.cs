@@ -1,3 +1,5 @@
+using System.Data.Common;
+
 namespace Slon.Tests;
 
 [TestClass]
@@ -11,6 +13,7 @@ public class SlonConnectionTests
 
         Assert.AreEqual(dataSource.ConnectionString, connection.ConnectionString);
         Assert.IsFalse(connection.ConnectionString.Contains("Password", StringComparison.OrdinalIgnoreCase));
+        connection.ConnectionString = dataSource.ConnectionString;
         Assert.ThrowsExactly<NotSupportedException>(() => connection.ConnectionString = "Database=other");
         Assert.ThrowsExactly<NotSupportedException>(() => connection.ChangeDatabase("other"));
     }
@@ -36,5 +39,24 @@ public class SlonConnectionTests
         var exception = Assert.ThrowsExactly<NotSupportedException>(
             () => connection.EnlistTransaction(transaction));
         StringAssert.Contains(exception.Message, nameof(SlonTransaction));
+    }
+
+    [TestMethod]
+    public void ProviderFactoryCreatesObjectsBoundToDataSource()
+    {
+        using var dataSource = AdoTestPool.NewIsolatedDataSource();
+        var factory = dataSource.ProviderFactory;
+
+        using var connection = factory.CreateConnection()!;
+        connection.ConnectionString = dataSource.ConnectionString;
+
+        Assert.AreSame(factory, DbProviderFactories.GetFactory(connection));
+        Assert.IsTrue(factory.CanCreateBatch);
+        using var command = factory.CreateCommand()!;
+        command.Connection = connection;
+        using var batch = factory.CreateBatch()!;
+        batch.Connection = connection;
+        Assert.IsInstanceOfType<SlonParameter>(factory.CreateParameter());
+        Assert.IsInstanceOfType<SlonBatchCommand>(factory.CreateBatchCommand());
     }
 }
