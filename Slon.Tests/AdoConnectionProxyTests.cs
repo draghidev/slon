@@ -6,10 +6,7 @@ using Slon.Transport;
 
 namespace Slon.Tests;
 
-// Wraps a pooled PgConnection in the proxy, which adds: per-proxy CommandTracker,
-// pipeline-depth counter, exclusive-scope flag, completion-action wiring. If cross-conn
-// blocking appears at this layer, the proxy itself (or its tracker integration) is the
-// coupling.
+// Exercises ADO flow routing and tracker integration over a pooled physical connection.
 [TestClass]
 public class AdoConnectionProxyTests : ConnectionCreatingTest
 {
@@ -29,13 +26,8 @@ public class AdoConnectionProxyTests : ConnectionCreatingTest
         return new ConnectionPool<PgConnection>(factory, new() { MaxConnections = maxConnections });
     }
 
-    sealed class StubAdoConnection : IAdoConnection
-    {
-        public void Break(Exception exception) { }
-    }
-
     static AdoConnectionProxy WrapInProxy(PgConnection pg, CommandTracker? sharedTracker = null) =>
-        new(pg, new StubAdoConnection(), autoPrepare: false, tracker: sharedTracker);
+        new(pg, autoPrepare: false, tracker: sharedTracker);
 
     static async Task RunSyncOn(AdoConnectionProxy proxy, string sql)
     {

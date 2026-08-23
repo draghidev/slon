@@ -1,25 +1,15 @@
-using System.Runtime.CompilerServices;
+using System.Data;
 using Slon.Pg;
 using Slon.Pg.Protocol;
 using Slon.Pg.Protocol.Flows;
 
 namespace Slon;
 
-interface IAdoConnection
+// Routes ADO work through either a connection's exclusive scope or a directly selected physical connection.
+sealed class AdoConnectionProxy
 {
-    void Break(Exception exception);
-}
-
-// Proxy allows us to decouple the actual connection used for database work from the ado connection itself.
-// For example allows us to enable seamless reconnects or offer apis for executing a set of commands across a guaranteed set of distinct connections.
-sealed class AdoConnectionProxy : IDisposable, IAsyncDisposable
-{
-    readonly SlonDataSource? _dataSource;
     readonly CommandTracker _tracker;
     PgConnection _pgConnection = null!;
-    readonly IAdoConnection _connection;
-
-    CommandFlow? _cachedFlow;
     // A SlonConnection holds an exclusive scope for its whole lease (acquired at Open), so its commands run
     // serially on one wire instead of multiplexed - the safe default, since Slon can't parse SQL to know
     // which commands carry session state (SET / LISTEN / temp tables / BEGIN...). Null on the data-source
@@ -27,10 +17,8 @@ sealed class AdoConnectionProxy : IDisposable, IAsyncDisposable
     // being non-null, so the connection/data-source split needs no separate flag.
     ExclusiveScopeLease? _exclusiveScope;
 
-    internal AdoConnectionProxy(SlonDataSource dataSource, IAdoConnection connection)
+    internal AdoConnectionProxy(SlonDataSource dataSource)
     {
-        _dataSource = dataSource;
-        _connection = connection;
         // Auto-prepare uses the workload-scope tracker directly. Explicit-prepare bookkeeping
         // lives on SlonConnection (per Policy A, survives Close-Open). PgConnection ↔ tracker
         // registration happens at PgConnection construction (in the factory), not here. Proxy
@@ -38,45 +26,39 @@ sealed class AdoConnectionProxy : IDisposable, IAsyncDisposable
         _tracker = dataSource.GetCommandTracker(initializedOnly: true);
     }
 
-    internal AdoConnectionProxy(SlonDataSource dataSource, PgConnection pgConnection, IAdoConnection connection)
-        : this(dataSource, connection)
+    internal AdoConnectionProxy(SlonDataSource dataSource, PgConnection pgConnection)
+        : this(dataSource)
         => _pgConnection = pgConnection;
 
-    internal AdoConnectionProxy(PgConnection pgConnection, IAdoConnection connection, bool autoPrepare, CommandTracker? tracker = null)
+    internal AdoConnectionProxy(PgConnection pgConnection, bool autoPrepare, CommandTracker? tracker = null)
     {
         const int MaxAuto = 100;
         const int AutoMinimumUses = 5;
 
-        _connection = connection;
         _tracker = new(autoPrepare ? MaxAuto : 0, AutoMinimumUses, parent: tracker);
         _pgConnection = pgConnection;
     }
 
-    internal PgClientFlow? CurrentReadingFlow { get; set; }
-    internal PgClientFlow? CurrentWritingFlow { get; set; }
+    internal ConnectionState State
+    {
+        get
+        {
+            var scope = _exclusiveScope;
+            if (scope is null)
+                return ConnectionState.Open;
+
+            var activatedFlow = scope.ActivatedFlow;
+            if (activatedFlow is CommandFlow { IsResultReady: true })
+                return ConnectionState.Fetching;
+
+            return activatedFlow is not null || scope.ExecutingFlow is not null
+                ? ConnectionState.Executing
+                : ConnectionState.Open;
+        }
+    }
 
     internal CommandTracker Tracker => _tracker;
     internal PgConnection PgConnection => _pgConnection;
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public TrackerResult TrackCommand(in CommandDescriptor descriptor, TrackedCommand? tracked = null, object? owningInstance = null)
-        => _tracker.Track(descriptor, tracked, owningInstance);
-
-    public CommandFlow RentCommandFlow(bool async, in CommandFlowOptions options)
-    {
-        return new CommandFlow(async, options);
-        // Re-enabling this (and ReturnCommandFlow) pools CommandFlow, which arms the activation timeout.
-        // PgClientFlow.Reset throws on that combination until generation-checked completion lands (the
-        // stale heartbeat callback hazard).
-        // return Interlocked.Exchange(ref _cachedFlow, null) ?? new();
-    }
-
-    public void ReturnCommandFlow(CommandFlow flow)
-    {
-        flow.Reset();
-        // We don't care about the race here.
-        _ = Interlocked.CompareExchange(ref _cachedFlow, flow, null);
-    }
 
     public void Enqueue(PgClientFlow flow)
     {
@@ -99,9 +81,7 @@ sealed class AdoConnectionProxy : IDisposable, IAsyncDisposable
         return new(flow);
     }
 
-    bool TryQueue(PgClientFlow flow) => TryQueueOn(_pgConnection, flow);
-
-    bool TryQueueOn(PgConnection connection, PgClientFlow flow)
+    bool TryQueue(PgClientFlow flow)
     {
         // A SlonConnection holds an exclusive scope for its lease: route the command as a subflow into the
         // held scope's inner pipeline (serial on this one wire) instead of onto the multiplexed protocol
@@ -111,12 +91,8 @@ sealed class AdoConnectionProxy : IDisposable, IAsyncDisposable
             scope.Queue(flow);
             return true;
         }
-        if (!connection.TryQueue(flow))
-            return false;
-        return true;
+        return _pgConnection.TryQueue(flow);
     }
-
-    public bool InExclusiveScope => _exclusiveScope is not null;
 
     internal bool TryStartExclusiveScope(PgConnection connection, bool async, FlowEnqueueOptions options)
     {
@@ -154,14 +130,4 @@ sealed class AdoConnectionProxy : IDisposable, IAsyncDisposable
         }
     }
 
-    public void Dispose()
-    {
-        // PgConnection survives the lease, it's the pool unit. Tracker deregister happens on
-        // PgConnection.CompleteAsync (true session end).
-    }
-
-    public ValueTask DisposeAsync()
-    {
-        return new();
-    }
 }

@@ -17,6 +17,9 @@ sealed class ExclusiveScopeLease
 
     public Task HandoffReady { get; }
 
+    internal PgClientFlow? ExecutingFlow => _flow.ExecutingFlow;
+    internal PgClientFlow? ActivatedFlow => _flow.ActivatedFlow;
+
     internal void WaitForHandoffSynchronously()
     {
         EnsureActive();

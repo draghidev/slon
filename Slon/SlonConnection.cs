@@ -2,10 +2,8 @@ using System.Data;
 using System.Data.Common;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
-using System.Runtime.ExceptionServices;
 using Slon.Pg;
 using Slon.Pg.Protocol;
-using Slon.Pg.Protocol.Flows;
 using Slon.Text;
 
 namespace Slon;
@@ -23,7 +21,7 @@ public enum SlonConnectionOptions
 
 // Implementation
 /// <inheritdoc cref="DbConnection" />
-public sealed partial class SlonConnection : IAdoConnection
+public sealed partial class SlonConnection
 {
     static StateChangeEventArgs StateChangeOpen { get; } = new(originalState: ConnectionState.Closed, ConnectionState.Open);
     static StateChangeEventArgs StateChangeClosed { get; } = new(originalState: ConnectionState.Open, ConnectionState.Closed);
@@ -34,6 +32,7 @@ public sealed partial class SlonConnection : IAdoConnection
     bool _disposed;
     AdoConnectionProxy? _proxy;
     bool _stateChangeEventHandlerAdded;
+    CommandTracker? _ownedTracker;
 
     // Test access to auto-prepare and connection state without a server query.
     internal AdoConnectionProxy? UnderlyingProxy => _proxy;
@@ -58,11 +57,9 @@ public sealed partial class SlonConnection : IAdoConnection
     }
 
     [MemberNotNullWhen(true, nameof(_proxy))]
-    bool HasProxy => _state is ConnectionState.Open or ConnectionState.Broken;
+    bool HasLease => _state is ConnectionState.Open or ConnectionState.Broken;
 
     internal SlonDataSource DbDataSource => _dataSource;
-
-    void ThrowIfDisposed() => ObjectDisposedException.ThrowIf(_disposed, this);
 
     AdoConnectionProxy EnsureConnected()
     {
@@ -75,7 +72,7 @@ public sealed partial class SlonConnection : IAdoConnection
         [DoesNotReturn]
         void Throw()
         {
-            ThrowIfDisposed();
+            ObjectDisposedException.ThrowIf(_disposed, this);
 
             if (_state is ConnectionState.Broken)
                 throw new InvalidOperationException("Connection is in a broken state.", _breakException);
@@ -86,9 +83,10 @@ public sealed partial class SlonConnection : IAdoConnection
 
     void CloseCore()
     {
-        // The only time SyncObj is null, before the first successful open.
-        if (!HasProxy)
+        // Only Open and Broken retain an active lease.
+        if (!HasLease)
             return;
+        var proxy = _proxy;
 
         Exception? rollbackFailure = null;
         try
@@ -99,42 +97,28 @@ public sealed partial class SlonConnection : IAdoConnection
         {
             rollbackFailure = ex;
         }
-        ConnectionState state;
+        ConnectionState previousState;
         try
         {
-            if (_proxy.InExclusiveScope)
-                _proxy.ReleaseExclusiveScope();
-
-            state = _state;
-            _state = ConnectionState.Closed;
-            _breakException = null;
+            proxy.ReleaseExclusiveScope();
+            previousState = TransitionToClosed(proxy);
         }
         catch (Exception ex)
         {
-            lock (BreakSyncObj)
-            {
-                if (_state is not ConnectionState.Broken)
-                {
-                    _state = ConnectionState.Broken;
-                    _breakException = ex;
-                }
-            }
-            throw;
+            RecordCloseFailure(proxy, ex);
+            AdoException.Throw(ex);
+            return;
         }
 
-        if (_stateChangeEventHandlerAdded)
-            OnStateChange(state is ConnectionState.Open
-                ? StateChangeClosed
-                : new StateChangeEventArgs(state, ConnectionState.Closed));
-        if (rollbackFailure is not null)
-            ExceptionDispatchInfo.Capture(rollbackFailure).Throw();
+        FinishClose(previousState, rollbackFailure);
     }
 
     async ValueTask CloseAsyncCore()
     {
-        // The only time SyncObj is null, before the first successful open.
-        if (!HasProxy)
+        // Only Open and Broken retain an active lease.
+        if (!HasLease)
             return;
+        var proxy = _proxy;
 
         Exception? rollbackFailure = null;
         try
@@ -145,38 +129,54 @@ public sealed partial class SlonConnection : IAdoConnection
         {
             rollbackFailure = ex;
         }
-        ConnectionState state;
+        ConnectionState previousState;
         try
         {
-            if (_proxy.InExclusiveScope)
-                await _proxy.ReleaseExclusiveScopeAsync().ConfigureAwait(false);
-
-            state = _state;
-            _state = ConnectionState.Closed;
-            _breakException = null;
+            await proxy.ReleaseExclusiveScopeAsync().ConfigureAwait(false);
+            previousState = TransitionToClosed(proxy);
         }
         catch (Exception ex)
         {
-            lock (BreakSyncObj)
-            {
-                if (_state is not ConnectionState.Broken)
-                {
-                    _state = ConnectionState.Broken;
-                    _breakException = ex;
-                }
-            }
-            throw;
+            RecordCloseFailure(proxy, ex);
+            AdoException.Throw(ex);
+            return;
         }
 
-        if (_stateChangeEventHandlerAdded)
-            OnStateChange(state is ConnectionState.Open
-                ? StateChangeClosed
-                : new StateChangeEventArgs(state, ConnectionState.Closed));
-        if (rollbackFailure is not null)
-            ExceptionDispatchInfo.Capture(rollbackFailure).Throw();
+        FinishClose(previousState, rollbackFailure);
     }
 
-    object BreakSyncObj => this;
+    ConnectionState TransitionToClosed(AdoConnectionProxy proxy)
+    {
+        lock (proxy)
+        {
+            var previousState = _state;
+            _state = ConnectionState.Closed;
+            _breakException = null;
+            return previousState;
+        }
+    }
+
+    void RecordCloseFailure(AdoConnectionProxy proxy, Exception exception)
+    {
+        lock (proxy)
+        {
+            if (_state is ConnectionState.Broken)
+                return;
+
+            _state = ConnectionState.Broken;
+            _breakException = exception;
+        }
+    }
+
+    void FinishClose(ConnectionState previousState, Exception? rollbackFailure)
+    {
+        if (_stateChangeEventHandlerAdded)
+            OnStateChange(previousState is ConnectionState.Open
+                ? StateChangeClosed
+                : new StateChangeEventArgs(previousState, ConnectionState.Closed));
+        if (rollbackFailure is not null)
+            AdoException.Throw(rollbackFailure);
+    }
 
     internal TimeSpan DefaultCommandTimeout => DbDataSource.DefaultCommandTimeout;
     internal void ReportTransactionDisposeRollbackFailure(Exception exception)
@@ -244,7 +244,7 @@ public sealed partial class SlonConnection : IAdoConnection
         {
             try
             {
-                ReleaseOwnedAndLeaked(awaitable: false).GetAwaiter().GetResult();
+                ReleaseOwnedAndLeaked(async: false).GetAwaiter().GetResult();
             }
             finally
             {
@@ -254,14 +254,7 @@ public sealed partial class SlonConnection : IAdoConnection
         finally
         {
             _disposed = true;
-            try
-            {
-                _proxy?.Dispose();
-            }
-            finally
-            {
-                base.Dispose(disposing: true);
-            }
+            base.Dispose(disposing: true);
         }
     }
 
@@ -273,7 +266,7 @@ public sealed partial class SlonConnection : IAdoConnection
         {
             try
             {
-                await ReleaseOwnedAndLeaked(awaitable: true).ConfigureAwait(false);
+                await ReleaseOwnedAndLeaked(async: true).ConfigureAwait(false);
             }
             finally
             {
@@ -283,26 +276,18 @@ public sealed partial class SlonConnection : IAdoConnection
         finally
         {
             _disposed = true;
-            try
-            {
-                if (_proxy is not null)
-                    await _proxy.DisposeAsync().ConfigureAwait(false);
-            }
-            finally
-            {
-                base.Dispose(disposing: true);
-            }
+            base.Dispose(disposing: true);
         }
     }
 
     // Owned statements are ordered through the lease's exclusive pipeline. Only names whose
     // owners were lost go to physical-session maintenance, where no ADO ordering edge remains.
-    ValueTask ReleaseOwnedAndLeaked(bool awaitable)
+    ValueTask ReleaseOwnedAndLeaked(bool async)
     {
         if (_proxy is null)
             return default;
         var pgConnection = _proxy.PgConnection;
-        var owned = UnprepareAllImpl(awaitable);
+        var owned = UnprepareAllCore(async);
         if (_proxy.Tracker.DrainLeakedNames() is { Count: > 0 } leakedNames)
         {
             foreach (var name in leakedNames)
@@ -317,23 +302,25 @@ public sealed partial class SlonConnection : IAdoConnection
     SlonTransaction BeginTransactionCore(IsolationLevel isolationLevel, SlonTransactionOptions options = SlonTransactionOptions.None)
     {
         EnsureConnected();
-        ThrowIfTransactionActive();
+        if (CurrentTransaction is not null)
+            ThrowHelper.ThrowInvalidOperation("A transaction is already in progress; nested transactions are not supported (use a savepoint instead).");
         _pendingTransactionStatement = BeginTransactionSql(isolationLevel, options);
         return CurrentTransaction = new SlonTransaction(this, isolationLevel, options);
     }
 
-    async ValueTask<TTransaction> BeginTransactionAsyncCore<TTransaction>(IsolationLevel isolationLevel,
+    ValueTask<TTransaction> BeginTransactionAsyncCore<TTransaction>(IsolationLevel isolationLevel,
         SlonTransactionOptions options, CancellationToken cancellationToken)
         where TTransaction: DbTransaction
     {
         Debug.Assert(typeof(TTransaction) == typeof(DbTransaction) || typeof(TTransaction) == typeof(SlonTransaction));
         EnsureConnected();
-        ThrowIfTransactionActive();
+        if (CurrentTransaction is not null)
+            ThrowHelper.ThrowInvalidOperation("A transaction is already in progress; nested transactions are not supported (use a savepoint instead).");
         cancellationToken.ThrowIfCancellationRequested();
         _pendingTransactionStatement = BeginTransactionSql(isolationLevel, options);
         var transaction = new SlonTransaction(this, isolationLevel, options);
         CurrentTransaction = transaction;
-        return (TTransaction)(object)transaction;
+        return new((TTransaction)(object)transaction);
     }
 
     internal string? TakePendingTransactionStatement()
@@ -343,18 +330,6 @@ public sealed partial class SlonConnection : IAdoConnection
     {
         if (Interlocked.CompareExchange(ref _pendingTransactionStatement, statement, null) is not null)
             ThrowHelper.ThrowInvalidOperation("The pending transaction statement was replaced unexpectedly.");
-    }
-
-    void ThrowIfTransactionActive()
-    {
-        if (CurrentTransaction is not null)
-            ThrowHelper.ThrowInvalidOperation("A transaction is already in progress; nested transactions are not supported (use a savepoint instead).");
-    }
-
-    void ValidateTransaction(SlonTransaction transaction)
-    {
-        if (!ReferenceEquals(CurrentTransaction, transaction))
-            ThrowHelper.ThrowInvalidOperation("This transaction is not the connection's active transaction (it has already completed, or belongs to another connection).");
     }
 
     // PG BEGIN with the matching isolation level (default = READ COMMITTED). Snapshot maps to REPEATABLE
@@ -380,23 +355,9 @@ public sealed partial class SlonConnection : IAdoConnection
             options.HasFlag(SlonTransactionOptions.Deferrable) ? " DEFERRABLE" : null);
     }
 
-    void ExecuteTransactionStatement(string sql)
-    {
-        using var cmd = new SlonCommand(this, sql);
-        cmd.ExecuteNonQuery();
-    }
-
-    async ValueTask ExecuteTransactionStatementAsync(string sql, CancellationToken cancellationToken)
-    {
-        var cmd = new SlonCommand(this, sql);
-        await using (cmd.ConfigureAwait(false))
-            await cmd.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
-    }
-
     void OpenCore(SlonConnectionOptions options = SlonConnectionOptions.None)
     {
-        ValidateOptions(options);
-        ThrowIfDisposed();
+        ObjectDisposedException.ThrowIf(_disposed, this);
         if (_state is not (ConnectionState.Closed or ConnectionState.Broken))
             ThrowHelper.ThrowInvalidOperation("Connection is already open or being opened.");
         if (_state is ConnectionState.Broken)
@@ -406,13 +367,14 @@ public sealed partial class SlonConnection : IAdoConnection
         AdoConnectionProxy proxy;
         try
         {
-            proxy = DbDataSource.GetProxy(this, DbDataSource.ConnectionTimeout, options);
+            proxy = DbDataSource.GetProxy(DbDataSource.ConnectionTimeout, options);
         }
-        catch
+        catch (Exception ex)
         {
             _state = ConnectionState.Closed;
             _breakException = null;
-            throw;
+            AdoException.Throw(ex);
+            return;
         }
         SetProxy(proxy);
     }
@@ -420,8 +382,7 @@ public sealed partial class SlonConnection : IAdoConnection
     async Task OpenAsyncCore(SlonConnectionOptions options = SlonConnectionOptions.None,
         CancellationToken cancellationToken = default)
     {
-        ValidateOptions(options);
-        ThrowIfDisposed();
+        ObjectDisposedException.ThrowIf(_disposed, this);
         if (_state is not (ConnectionState.Closed or ConnectionState.Broken))
             ThrowHelper.ThrowInvalidOperation("Connection is already open or being opened.");
         if (_state is ConnectionState.Broken)
@@ -432,21 +393,16 @@ public sealed partial class SlonConnection : IAdoConnection
         try
         {
             proxy = await DbDataSource.GetProxyAsync(
-                this, DbDataSource.ConnectionTimeout, cancellationToken, options).ConfigureAwait(false);
+                DbDataSource.ConnectionTimeout, cancellationToken, options).ConfigureAwait(false);
         }
-        catch
+        catch (Exception ex)
         {
             _state = ConnectionState.Closed;
             _breakException = null;
-            throw;
+            AdoException.Throw(ex);
+            return;
         }
         SetProxy(proxy);
-    }
-
-    static void ValidateOptions(SlonConnectionOptions options)
-    {
-        if ((options & ~SlonConnectionOptions.LongRunning) != 0)
-            throw new ArgumentOutOfRangeException(nameof(options), options, "Unsupported connection options.");
     }
 
     internal TFlow Enqueue<TFlow>(TFlow flow)
@@ -461,53 +417,48 @@ public sealed partial class SlonConnection : IAdoConnection
         => EnsureConnected().EnqueueAsync(flow, cancellationToken);
 
     // We should only get here when we are enqueuing and have confirmed we are connected.
-    // Dispatch: explicit-prepare (owningInstance non-null) → connection-local OwnedTracker.
-    // Auto-prepare → workload tracker via the proxy.
+    // Explicit preparation uses a connection-local tracker that stays unallocated until first use
+    // and survives Close-Open. Auto-prepare uses the workload tracker owned by the proxy.
     internal TrackerResult TrackCommand(in CommandDescriptor descriptor, TrackedCommand? tracked = null, object? owningInstance = null)
         => owningInstance is null
-            ? AutoTracker.Track(descriptor, tracked)
-            : OwnedTracker.Track(descriptor, tracked, owningInstance, nameSource: _proxy?.PgConnection);
-
-    // Auto-prepare goes through the workload tracker via the proxy.
-    CommandTracker AutoTracker => _proxy!.Tracker;
-
-    // Explicit-prepare bookkeeping. Lazy because most connections never call Prepare(). The
-    // tracker stays unallocated until first use. Survives Close-Open with the SlonConnection
-    // (Policy A, object-identity continuity for prepared commands).
-    CommandTracker? _ownedTracker;
-    CommandTracker OwnedTracker => _ownedTracker ??= new CommandTracker(maxAuto: 0, autoMinimumUses: 0);
-
-    void UnprepareAllCore() => UnprepareAllImpl(awaitable: false).GetAwaiter().GetResult();
-
-    ValueTask UnprepareAllAsyncCore() => UnprepareAllImpl(awaitable: true);
+            ? _proxy!.Tracker.Track(descriptor, tracked)
+            : (_ownedTracker ??= new CommandTracker(maxAuto: 0, autoMinimumUses: 0))
+                .Track(descriptor, tracked, owningInstance, nameSource: _proxy?.PgConnection);
 
     // Invalidate the TrackedCommands and clear presence locally, then close every name in one
     // exclusive-pipeline flow. Awaiting it confirms the server-side closes landed.
-    ValueTask UnprepareAllImpl(bool awaitable)
+    async ValueTask UnprepareAllCore(bool async)
     {
         if (_ownedTracker is null)
-            return default;
+            return;
         var tracked = _ownedTracker.CollectOwned();
         if (tracked.Length is 0 || _proxy is null)
         {
             _ownedTracker.Dispose();
             _ownedTracker = null;
-            return default;
+            return;
         }
 
         _ownedTracker.Dispose();
         _ownedTracker = null;
-        return CloseOwnedStatements(tracked, awaitable);
+        try
+        {
+            await CloseOwnedStatements(async, tracked).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            AdoException.Throw(ex);
+        }
     }
 
-    ValueTask UnprepareOwned(object owningInstance, bool awaitable)
+    internal ValueTask UnprepareOwned(bool async, object owningInstance)
     {
         if (_ownedTracker is null)
             return default;
-        return CloseOwnedStatements(_ownedTracker.TakeOwned(owningInstance), awaitable);
+        return CloseOwnedStatements(async, _ownedTracker.TakeOwned(owningInstance));
     }
 
-    ValueTask CloseOwnedStatements(TrackedCommand[] tracked, bool awaitable)
+    ValueTask CloseOwnedStatements(bool async, TrackedCommand[] tracked)
     {
         if (tracked.Length is 0 || _proxy is null)
             return default;
@@ -522,8 +473,8 @@ public sealed partial class SlonConnection : IAdoConnection
             pgConnection.RemoveTracked(command);
         }
 
-        var flow = new MaintenanceFlow(names, async: awaitable);
-        if (!awaitable)
+        var flow = new MaintenanceFlow(names, async: async);
+        if (!async)
         {
             _proxy.Enqueue(flow);
             flow.WaitForCompleteSynchronously();
@@ -538,53 +489,46 @@ public sealed partial class SlonConnection : IAdoConnection
             => _ = await completion.ConfigureAwait(false);
     }
 
-    internal void CloseOwned(object owningInstance)
-    {
-        UnprepareOwned(owningInstance, awaitable: false).GetAwaiter().GetResult();
-    }
-
-    internal ValueTask CloseOwnedAsync(object owningInstance)
-        => UnprepareOwned(owningInstance, awaitable: true);
-
     internal void CommitTransaction(SlonTransaction slonTransaction)
     {
-        ValidateTransaction(slonTransaction);
-        ExecuteTransactionStatement("COMMIT");
+        ExecuteTransactionStatement(slonTransaction, "COMMIT");
         CurrentTransaction = null;
     }
 
     internal void RollbackTransaction(SlonTransaction slonTransaction)
     {
-        ValidateTransaction(slonTransaction);
-        ExecuteTransactionStatement("ROLLBACK");
+        ExecuteTransactionStatement(slonTransaction, "ROLLBACK");
         CurrentTransaction = null;
     }
 
     internal async ValueTask CommitTransactionAsync(SlonTransaction slonTransaction, CancellationToken cancellationToken)
     {
-        ValidateTransaction(slonTransaction);
-        await ExecuteTransactionStatementAsync("COMMIT", cancellationToken).ConfigureAwait(false);
+        await ExecuteTransactionStatementAsync(slonTransaction, "COMMIT", cancellationToken).ConfigureAwait(false);
         CurrentTransaction = null;
     }
 
     internal async ValueTask RollbackTransactionAsync(SlonTransaction slonTransaction, CancellationToken cancellationToken)
     {
-        ValidateTransaction(slonTransaction);
-        await ExecuteTransactionStatementAsync("ROLLBACK", cancellationToken).ConfigureAwait(false);
+        await ExecuteTransactionStatementAsync(slonTransaction, "ROLLBACK", cancellationToken).ConfigureAwait(false);
         CurrentTransaction = null;
     }
 
     internal void ExecuteTransactionStatement(SlonTransaction transaction, string sql)
     {
-        ValidateTransaction(transaction);
-        ExecuteTransactionStatement(sql);
+        if (!ReferenceEquals(CurrentTransaction, transaction))
+            ThrowHelper.ThrowInvalidOperation("This transaction is not the connection's active transaction (it has already completed, or belongs to another connection).");
+        using var command = new SlonCommand(this, sql);
+        command.ExecuteNonQuery();
     }
 
     internal async ValueTask ExecuteTransactionStatementAsync(SlonTransaction transaction, string sql,
         CancellationToken cancellationToken)
     {
-        ValidateTransaction(transaction);
-        await ExecuteTransactionStatementAsync(sql, cancellationToken).ConfigureAwait(false);
+        if (!ReferenceEquals(CurrentTransaction, transaction))
+            ThrowHelper.ThrowInvalidOperation("This transaction is not the connection's active transaction (it has already completed, or belongs to another connection).");
+        var command = new SlonCommand(this, sql);
+        await using (command.ConfigureAwait(false))
+            await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
 
     ConnectionState GetState()
@@ -593,22 +537,20 @@ public sealed partial class SlonConnection : IAdoConnection
             return _state;
 
         Debug.Assert(_proxy is not null);
-        if (_proxy.CurrentReadingFlow is not { } flow)
-            return ConnectionState.Open;
-
-        if (flow is CommandFlow commandFlow)
-            return commandFlow.IsResultReady ? ConnectionState.Fetching : ConnectionState.Executing;
-
-        return ConnectionState.Executing;
+        return _proxy.State;
     }
 
-    void IAdoConnection.Break(Exception exception)
+    internal void Break(Exception exception)
     {
-        lock (BreakSyncObj)
+        var proxy = _proxy;
+        if (proxy is null)
+            return;
+
+        lock (proxy)
         {
             // A completion callback may arrive after Close has already settled the lease.
             // Closed and disposed connections are terminal, while Broken retains its first cause.
-            if (_disposed || _state is not ConnectionState.Open)
+            if (!ReferenceEquals(_proxy, proxy) || _disposed || _state is not ConnectionState.Open)
                 return;
 
             _state = ConnectionState.Broken;
@@ -653,40 +595,20 @@ public sealed partial class SlonConnection : DbConnection
     public override ConnectionState State => GetState();
 
     /// <inheritdoc />
-    public override void Open()
-    {
-        try
-        {
-            OpenCore();
-        }
-        catch (Exception ex)
-        {
-            AdoException.Throw(ex);
-        }
-    }
+    public override void Open() => OpenCore();
 
     /// <summary>Opens the connection using the requested connection policy.</summary>
-    public void Open(SlonConnectionOptions options)
-    {
-        try
-        {
-            OpenCore(options);
-        }
-        catch (Exception ex)
-        {
-            AdoException.Throw(ex);
-        }
-    }
+    public void Open(SlonConnectionOptions options) => OpenCore(options);
 
     /// <inheritdoc />
     public override Task OpenAsync(CancellationToken cancellationToken)
-        => OpenAsyncProjected(SlonConnectionOptions.None, cancellationToken);
+        => OpenAsync(SlonConnectionOptions.None, cancellationToken);
 
     /// <summary>Opens the connection asynchronously using the requested connection policy.</summary>
     /// <param name="options">The connection options.</param>
     /// <param name="cancellationToken">A token for cancelling the open operation.</param>
     public Task OpenAsync(SlonConnectionOptions options, CancellationToken cancellationToken = default)
-        => OpenAsyncProjected(options, cancellationToken);
+        => OpenAsyncCore(options, cancellationToken);
 
     /// <inheritdoc />
     public override void ChangeDatabase(string databaseName)
@@ -803,28 +725,21 @@ public sealed partial class SlonConnection : DbConnection
     /// <returns>A new instance of <see cref="Slon.SlonBatch" />.</returns>
     public new SlonBatch CreateBatch() => new(this);
 
-    /// <summary>
-    /// Releases all explicit-prepared commands held by this connection. The server-side
-    /// prepared statements are deallocated and the per-command bookkeeping is cleared.
-    /// Commands that were previously prepared via <see cref="DbCommand.Prepare"/> will be
-    /// re-prepared transparently on next use.
-    /// </summary>
-    public void UnprepareAll()
-    {
-        try
-        {
-            UnprepareAllCore();
-        }
-        catch (Exception ex)
-        {
-            AdoException.Throw(ex);
-        }
-    }
+    /// <summary>Releases all explicitly prepared commands held by this connection.</summary>
+    /// <remarks>
+    /// The server-side prepared statements are deallocated and the per-command bookkeeping is
+    /// cleared. Commands previously prepared through <see cref="DbCommand.Prepare"/> are prepared
+    /// again transparently on their next use.
+    /// </remarks>
+    public void UnprepareAll() => UnprepareAllCore(async: false).GetAwaiter().GetResult();
 
-    /// <summary>
-    /// Asynchronously releases all explicit-prepared commands held by this connection.
-    /// </summary>
-    public ValueTask UnprepareAllAsync() => UnprepareAllAsyncProjected();
+    /// <summary>Asynchronously releases all explicitly prepared commands held by this connection.</summary>
+    /// <remarks>
+    /// The server-side prepared statements are deallocated and the per-command bookkeeping is
+    /// cleared. Commands previously prepared through <see cref="DbCommand.Prepare"/> are prepared
+    /// again transparently on their next use.
+    /// </remarks>
+    public ValueTask UnprepareAllAsync() => UnprepareAllCore(async: true);
 
     /// <inheritdoc />
     protected override DbCommand CreateDbCommand() => CreateCommand();
@@ -833,84 +748,16 @@ public sealed partial class SlonConnection : DbConnection
     protected override DbBatch CreateDbBatch() => CreateBatch();
 
     /// <inheritdoc />
-    public override void Close()
-    {
-        try
-        {
-            CloseCore();
-        }
-        catch (Exception ex)
-        {
-            AdoException.Throw(ex);
-        }
-    }
+    public override void Close() => CloseCore();
 
     /// <inheritdoc />
-    public override Task CloseAsync() => CloseAsyncProjected().AsTask();
+    public override Task CloseAsync() => CloseAsyncCore().AsTask();
 
     /// <inheritdoc />
-    public override ValueTask DisposeAsync() => DisposeAsyncProjected();
+    public override ValueTask DisposeAsync() => DisposeAsyncCore();
 
     /// <inheritdoc />
-    protected override void Dispose(bool disposing)
-    {
-        try
-        {
-            DisposeCore();
-        }
-        catch (Exception ex)
-        {
-            AdoException.Throw(ex);
-        }
-    }
-
-    async Task OpenAsyncProjected(SlonConnectionOptions options, CancellationToken cancellationToken)
-    {
-        try
-        {
-            await OpenAsyncCore(options, cancellationToken).ConfigureAwait(false);
-        }
-        catch (Exception ex)
-        {
-            AdoException.Throw(ex);
-        }
-    }
-
-    async ValueTask UnprepareAllAsyncProjected()
-    {
-        try
-        {
-            await UnprepareAllAsyncCore().ConfigureAwait(false);
-        }
-        catch (Exception ex)
-        {
-            AdoException.Throw(ex);
-        }
-    }
-
-    async ValueTask CloseAsyncProjected()
-    {
-        try
-        {
-            await CloseAsyncCore().ConfigureAwait(false);
-        }
-        catch (Exception ex)
-        {
-            AdoException.Throw(ex);
-        }
-    }
-
-    async ValueTask DisposeAsyncProjected()
-    {
-        try
-        {
-            await DisposeAsyncCore().ConfigureAwait(false);
-        }
-        catch (Exception ex)
-        {
-            AdoException.Throw(ex);
-        }
-    }
+    protected override void Dispose(bool disposing) => DisposeCore();
 
     /// <inheritdoc />
     public override DataTable GetSchema() => GetSchema(null);

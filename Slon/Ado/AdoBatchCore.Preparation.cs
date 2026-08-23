@@ -182,7 +182,7 @@ partial struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
                 return;
 
             if (_connection is not null)
-                _connection.CloseOwned(_fieldRef.Instance);
+                _connection.UnprepareOwned(async: false, _fieldRef.Instance).GetAwaiter().GetResult();
             else if (_dataSource is not null)
                 _ = _dataSource.ReleaseOwnedPreparedCommand(
                     _fieldRef.Instance, awaitable: false);
@@ -194,7 +194,7 @@ partial struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
                 return default;
 
             if (_connection is not null)
-                return _connection.CloseOwnedAsync(_fieldRef.Instance);
+                return _connection.UnprepareOwned(async: true, _fieldRef.Instance);
             return _dataSource?.ReleaseOwnedPreparedCommand(
                 _fieldRef.Instance, awaitable: true) ?? default;
         }

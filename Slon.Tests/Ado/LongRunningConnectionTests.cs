@@ -5,16 +5,6 @@ using Microsoft.Extensions.Time.Testing;
 [TestClass]
 public class LongRunningConnectionTests
 {
-    [TestMethod]
-    public void UnknownOpenOption_IsRejected()
-    {
-        using var dataSource = AdoTestPool.NewIsolatedDataSource();
-        using var connection = dataSource.CreateConnection();
-
-        Assert.ThrowsExactly<ArgumentOutOfRangeException>(
-            () => connection.Open((SlonConnectionOptions)2));
-    }
-
     [ConnectionCreatingTestMethod]
     public async Task DataSourceCommand_IsNotScheduledBehindLongRunningConnection()
     {

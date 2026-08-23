@@ -88,6 +88,9 @@ sealed partial class PgClientProtocol
         public bool IsPipelineEmpty(PgClientFlowSource source)
             => source.Backlog == 0 && _innerPipeline!.Depth == 0;
 
+        public PgClientFlow? ExecutingFlow => _innerControl.ExecutingFlow;
+        public PgClientFlow? ActivatedFlow => _innerControl.ActivatedFlow;
+
         public Task Completion => _innerPipeline!.Completion;
 
         // Inner completion may run inside its source-driver callback. Queue the outer release so that

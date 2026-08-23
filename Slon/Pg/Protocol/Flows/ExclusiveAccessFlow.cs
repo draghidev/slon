@@ -91,6 +91,9 @@ sealed class ExclusiveAccessFlow : PgClientFlow
 
     internal ExclusiveScopeLease CreateLease() => new(this, Volatile.Read(ref _tenure));
 
+    internal PgClientFlow? ExecutingFlow => _state.ExecutingFlow;
+    internal PgClientFlow? ActivatedFlow => _state.ActivatedFlow;
+
     void EnsureTenure(long tenure)
     {
         if (tenure != Volatile.Read(ref _tenure))

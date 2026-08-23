@@ -85,9 +85,9 @@ public sealed class SlonDataSource : DbDataSource
     internal string ServerVersion => GetDbDependencies().BackendInfo.ServerVersionString;
     int DbDepsRevision { get; set; }
 
-    AdoConnectionProxy CreateProxy(PgConnection pgConnection, IAdoConnection connection)
+    AdoConnectionProxy CreateProxy(PgConnection pgConnection)
     {
-        return new(this, pgConnection, connection);
+        return new(this, pgConnection);
     }
 
     ValueTask Initialize(bool async, TimeSpan timeout, CancellationToken cancellationToken)
@@ -136,7 +136,7 @@ public sealed class SlonDataSource : DbDataSource
                             if (Volatile.Read(ref _dbDependencies) is null)
                                 return;
                             using var conn = CreateConnection();
-                            conn.SetProxy(CreateProxy(pgConnection, conn));
+                            conn.SetProxy(CreateProxy(pgConnection));
                             connectionInit(conn, timeout);
                         }
                     : null,
@@ -147,7 +147,7 @@ public sealed class SlonDataSource : DbDataSource
                                 return;
                             var conn = CreateConnection();
                             await using var _ = conn.ConfigureAwait(false);
-                            conn.SetProxy(CreateProxy(pgConnection, conn));
+                            conn.SetProxy(CreateProxy(pgConnection));
                             await asyncConnectionInit(conn, cancellationToken).ConfigureAwait(false);
                         }
                     : null
@@ -832,47 +832,34 @@ public sealed class SlonDataSource : DbDataSource
 
     static Exception NotInitializedException() => new InvalidOperationException("DataSource is not initialized yet, at least one connection needs to be opened first.");
 
-    internal AdoConnectionProxy GetProxy(IAdoConnection connection, TimeSpan timeout)
-    {
-        EnsureInitialized(timeout);
-        return GetScopedProxy(connection, timeout, SlonConnectionOptions.None);
-    }
-
-    internal async ValueTask<AdoConnectionProxy> GetProxyAsync(IAdoConnection connection, TimeSpan timeout, CancellationToken cancellationToken = default)
-    {
-        await EnsureInitializedAsync(timeout, cancellationToken).ConfigureAwait(false);
-        return await GetScopedProxyAsync(
-            connection, timeout, cancellationToken, SlonConnectionOptions.None).ConfigureAwait(false);
-    }
-
-    internal AdoConnectionProxy GetProxy(IAdoConnection connection, TimeSpan timeout,
+    internal AdoConnectionProxy GetProxy(TimeSpan timeout,
         SlonConnectionOptions options)
     {
         EnsureInitialized(timeout);
-        return GetScopedProxy(connection, timeout, options);
+        return GetScopedProxy(timeout, options);
     }
 
-    AdoConnectionProxy GetScopedProxy(IAdoConnection connection, TimeSpan timeout,
+    AdoConnectionProxy GetScopedProxy(TimeSpan timeout,
         SlonConnectionOptions options)
     {
-        var proxy = new AdoConnectionProxy(this, connection);
+        var proxy = new AdoConnectionProxy(this);
         _connectionPool.Get(static (candidate, state) => TryStartExclusiveScope(candidate, state),
             (Proxy: proxy, Async: false, Options: options), timeout);
         proxy.AcquireExclusiveScope();
         return proxy;
     }
 
-    internal async ValueTask<AdoConnectionProxy> GetProxyAsync(IAdoConnection connection,
+    internal async ValueTask<AdoConnectionProxy> GetProxyAsync(
         TimeSpan timeout, CancellationToken cancellationToken, SlonConnectionOptions options)
     {
         await EnsureInitializedAsync(timeout, cancellationToken).ConfigureAwait(false);
-        return await GetScopedProxyAsync(connection, timeout, cancellationToken, options).ConfigureAwait(false);
+        return await GetScopedProxyAsync(timeout, cancellationToken, options).ConfigureAwait(false);
     }
 
-    async ValueTask<AdoConnectionProxy> GetScopedProxyAsync(IAdoConnection connection, TimeSpan timeout,
+    async ValueTask<AdoConnectionProxy> GetScopedProxyAsync(TimeSpan timeout,
         CancellationToken cancellationToken, SlonConnectionOptions options)
     {
-        var proxy = new AdoConnectionProxy(this, connection);
+        var proxy = new AdoConnectionProxy(this);
         await _connectionPool.GetAsync(static (candidate, state) => TryStartExclusiveScope(candidate, state),
             (Proxy: proxy, Async: true, Options: options), timeout, cancellationToken).ConfigureAwait(false);
         await proxy.AcquireExclusiveScopeAsync(cancellationToken).ConfigureAwait(false);

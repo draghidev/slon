@@ -555,7 +555,7 @@ partial struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
         }
 
         if (connection is not null)
-            connection.CloseOwned(_fieldRef.Instance);
+            connection.UnprepareOwned(async: false, _fieldRef.Instance).GetAwaiter().GetResult();
     }
 
     public ValueTask DisposeAsync()
@@ -569,7 +569,7 @@ partial struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
         if (TryGetDataSource(out var dataSource, out var connection))
             return dataSource.ReleaseOwnedPreparedCommand(_fieldRef.Instance, awaitable: true);
 
-        return connection?.CloseOwnedAsync(_fieldRef.Instance) ?? default;
+        return connection?.UnprepareOwned(async: true, _fieldRef.Instance) ?? default;
     }
 
     public void Cancel()
@@ -603,7 +603,7 @@ partial struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
         // reach here: they surface on CommandResult and the flow completes cleanly. OnCompleting runs
         // before terminal publication, so an awaiter observing the fault also observes Broken.
         if (exception is not null && !TryGetDataSource(out _, out var connection) && connection is not null)
-            ((IAdoConnection)connection).Break(exception);
+            connection.Break(exception);
 
         Interlocked.CompareExchange(ref _activeFlow, null, flow);
     }

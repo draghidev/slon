@@ -1,6 +1,7 @@
 namespace Slon.Tests;
 
 using System.Data;
+using Slon.Tests.Pg;
 
 [TestClass]
 public class LifecycleTests
@@ -35,7 +36,7 @@ public class LifecycleTests
         using var connection = dataSource.OpenConnection();
         connection.Close();
 
-        ((IAdoConnection)connection).Break(new IOException("late flow failure"));
+        connection.Break(new IOException("late flow failure"));
 
         Assert.AreEqual(ConnectionState.Closed, connection.State);
     }
@@ -364,7 +365,7 @@ public class LifecycleTests
         var reader = await command.ExecuteReaderAsync(CommandBehavior.CloseConnection, CancellationToken.None);
 
         Assert.IsTrue(await reader.ReadAsync(CancellationToken.None));
-        Assert.AreEqual(ConnectionState.Open, connection.State);
+        Assert.AreEqual(ConnectionState.Fetching, connection.State);
         await reader.DisposeAsync();
         Assert.AreEqual(ConnectionState.Closed, connection.State);
 
@@ -382,9 +383,47 @@ public class LifecycleTests
         var reader = command.ExecuteReader(CommandBehavior.CloseConnection);
 
         Assert.IsTrue(reader.Read());
-        Assert.AreEqual(ConnectionState.Open, connection.State);
+        Assert.AreEqual(ConnectionState.Fetching, connection.State);
         reader.Dispose();
         Assert.AreEqual(ConnectionState.Closed, connection.State);
+    }
+
+    [TestMethod]
+    public void ConnectionStateTracksActiveReader()
+    {
+        using var dataSource = AdoTestPool.NewIsolatedDataSource();
+        using var connection = dataSource.OpenConnection();
+        using var command = connection.CreateCommand("select generate_series(1, 3)");
+
+        using (var reader = command.ExecuteReader())
+        {
+            Assert.AreEqual(ConnectionState.Fetching, connection.State);
+            Assert.IsTrue(reader.Read());
+            Assert.AreEqual(ConnectionState.Fetching, connection.State);
+        }
+
+        Assert.AreEqual(ConnectionState.Open, connection.State);
+    }
+
+    [TestMethod]
+    public async Task ConnectionStateTracksExecutionAndFetching()
+    {
+        await using var blocker = await PgAdvisoryLock.AcquireAsync();
+        await using var dataSource = AdoTestPool.NewIsolatedDataSource();
+        await using var connection = await dataSource.OpenConnectionAsync(CancellationToken.None);
+        await using var command = connection.CreateCommand(
+            $"select pg_advisory_xact_lock({blocker.Key})");
+
+        var execution = command.ExecuteReaderAsync(CancellationToken.None);
+        await blocker.WaitUntilContendedAsync(
+            connection.UnderlyingPgConnection!.Protocol.FlowControl.BackendProcessId);
+        Assert.AreEqual(ConnectionState.Executing, connection.State);
+
+        await blocker.ReleaseAsync();
+        await using (var reader = await execution)
+            Assert.AreEqual(ConnectionState.Fetching, connection.State);
+
+        Assert.AreEqual(ConnectionState.Open, connection.State);
     }
 
     [TestMethod]
