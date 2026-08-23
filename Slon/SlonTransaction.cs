@@ -81,7 +81,8 @@ public sealed class SlonTransaction : DbTransaction
     /// Whether the transaction is deferrable.
     public bool IsDeferrable => _options.HasFlag(SlonTransactionOptions.Deferrable);
 
-    internal void Detach() => _completed = true;
+    // Closing the connection makes this transaction terminal even when no COMMIT or ROLLBACK can be sent.
+    internal void MarkCompleted() => _completed = true;
 
     /// <inheritdoc/>
     protected override void Dispose(bool disposing)

@@ -10,6 +10,20 @@ partial struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
 {
     public void Prepare(DbParameterCollection? parameters)
     {
+        using var activity = StartActivity();
+        try
+        {
+            PrepareCore(parameters);
+        }
+        catch (Exception ex)
+        {
+            SlonTracing.RecordException(activity, ex);
+            AdoException.Throw(ex);
+        }
+    }
+
+    void PrepareCore(DbParameterCollection? parameters)
+    {
         var operation = Preparation.Begin(_fieldRef);
         CommandFlow.Enumerator enumerator = default;
         try
@@ -48,7 +62,22 @@ partial struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
 
     public ValueTask PrepareAsync(DbParameterCollection? parameters,
         CancellationToken cancellationToken = default)
-        => PrepareAsyncCore(_fieldRef, parameters, cancellationToken);
+        => PrepareAsyncProjected(_fieldRef, parameters, cancellationToken);
+
+    static async ValueTask PrepareAsyncProjected(FieldRef<AdoBatchCore<TCommand>> fieldRef,
+        DbParameterCollection? parameters, CancellationToken cancellationToken)
+    {
+        using var activity = fieldRef.Invoke().StartActivity();
+        try
+        {
+            await PrepareAsyncCore(fieldRef, parameters, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            SlonTracing.RecordException(activity, ex);
+            AdoException.Throw(ex);
+        }
+    }
 
     // Async instance methods on structs copy this, so the state machine resolves the live core
     // through its stable field reference instead.

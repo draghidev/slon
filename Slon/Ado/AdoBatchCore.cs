@@ -525,7 +525,9 @@ partial struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
     Activity? StartActivity()
     {
         TryGetDataSource(out var dataSource, out var connection);
-        return SlonTracing.Start(dataSource ?? connection!.DbDataSource, _commands.Count);
+        return dataSource is null && connection is null
+            ? null
+            : SlonTracing.Start(dataSource ?? connection!.DbDataSource, _commands.Count);
     }
 
     public void Add(TCommand command)

@@ -6,6 +6,127 @@ using System.Data;
 public class LifecycleTests
 {
     [TestMethod]
+    public async Task UnboundCommandAndBatch_ReportMissingConnectionWithoutTracingFailure()
+    {
+        using var command = new SlonCommand("select 1");
+        Assert.ThrowsExactly<InvalidOperationException>(() => command.Prepare());
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => command.PrepareAsync(CancellationToken.None));
+        Assert.IsFalse(command.IsReadOnly);
+        Assert.ThrowsExactly<InvalidOperationException>(() => command.ExecuteScalar());
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => command.ExecuteScalarAsync(CancellationToken.None));
+
+        using var batch = new SlonBatch();
+        batch.BatchCommands.Add(batch.CreateBatchCommand("select 1"));
+        Assert.ThrowsExactly<InvalidOperationException>(() => batch.Prepare());
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => batch.PrepareAsync(CancellationToken.None));
+        Assert.IsFalse(batch.IsReadOnly);
+        Assert.ThrowsExactly<InvalidOperationException>(() => batch.ExecuteScalar());
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => batch.ExecuteScalarAsync(CancellationToken.None));
+    }
+
+    [TestMethod]
+    public void LateFlowFailure_DoesNotEscapeAfterConnectionClosed()
+    {
+        using var dataSource = AdoTestPool.NewIsolatedDataSource();
+        using var connection = dataSource.OpenConnection();
+        connection.Close();
+
+        ((IAdoConnection)connection).Break(new IOException("late flow failure"));
+
+        Assert.AreEqual(ConnectionState.Closed, connection.State);
+    }
+
+    [TestMethod]
+    public async Task CancelledOpen_ReturnsToClosedAndCanBeOpenedAgain()
+    {
+        await using var dataSource = AdoTestPool.NewIsolatedDataSource(options => options with
+        {
+            PoolSize = 1
+        });
+        var holder = await dataSource.OpenConnectionAsync(CancellationToken.None);
+        await using (holder.ConfigureAwait(false))
+        {
+            await using var connection = dataSource.CreateConnection();
+            using var cancellation = new CancellationTokenSource();
+            var open = connection.OpenAsync(cancellation.Token);
+            Assert.AreEqual(ConnectionState.Connecting, connection.State);
+
+            cancellation.Cancel();
+            await Assert.ThrowsAsync<OperationCanceledException>(() => open);
+            Assert.AreEqual(ConnectionState.Closed, connection.State);
+
+            await holder.CloseAsync();
+            await connection.OpenAsync(CancellationToken.None);
+            Assert.AreEqual(ConnectionState.Open, connection.State);
+        }
+    }
+
+    [TestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task ThrowingOpenStateHandler_DoesNotHideAcquiredScope(bool async)
+    {
+        const string HandlerFailure = "open state handler failure";
+        using var dataSource = AdoTestPool.NewIsolatedDataSource(options => options with
+        {
+            PoolSize = 1
+        });
+        var connection = dataSource.CreateConnection();
+        connection.StateChange += (_, args) =>
+        {
+            if (args.CurrentState is ConnectionState.Open)
+                throw new InvalidOperationException(HandlerFailure);
+        };
+
+        var exception = async
+            ? await Assert.ThrowsAsync<InvalidOperationException>(
+                () => connection.OpenAsync(CancellationToken.None))
+            : Assert.ThrowsExactly<InvalidOperationException>(connection.Open);
+        Assert.AreEqual(HandlerFailure, exception.Message);
+        Assert.AreEqual(ConnectionState.Open, connection.State);
+        if (async)
+            await connection.DisposeAsync();
+        else
+            connection.Dispose();
+
+        await using var successor = await dataSource.OpenConnectionAsync(CancellationToken.None);
+        Assert.AreEqual(ConnectionState.Open, successor.State);
+    }
+
+    [TestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task ThrowingCloseStateHandler_DoesNotHideReleasedScope(bool async)
+    {
+        const string HandlerFailure = "close state handler failure";
+        await using var dataSource = AdoTestPool.NewIsolatedDataSource(options => options with
+        {
+            PoolSize = 1
+        });
+        await using var connection = await dataSource.OpenConnectionAsync(CancellationToken.None);
+        StateChangeEventHandler handler = (_, args) =>
+        {
+            if (args.CurrentState is ConnectionState.Closed)
+                throw new InvalidOperationException(HandlerFailure);
+        };
+        connection.StateChange += handler;
+
+        var exception = async
+            ? await Assert.ThrowsAsync<InvalidOperationException>(connection.CloseAsync)
+            : Assert.ThrowsExactly<InvalidOperationException>(connection.Close);
+        Assert.AreEqual(HandlerFailure, exception.Message);
+        Assert.AreEqual(ConnectionState.Closed, connection.State);
+
+        connection.StateChange -= handler;
+        await connection.OpenAsync(CancellationToken.None);
+        Assert.AreEqual(ConnectionState.Open, connection.State);
+    }
+
+    [TestMethod]
     public async Task EmptyCommandText_IsRejectedBeforeExecution()
     {
         await using var dataSource = AdoTestPool.NewIsolatedDataSource();
@@ -264,5 +385,47 @@ public class LifecycleTests
         Assert.AreEqual(ConnectionState.Open, connection.State);
         reader.Dispose();
         Assert.AreEqual(ConnectionState.Closed, connection.State);
+    }
+
+    [TestMethod]
+    public async Task CloseConnectionBehavior_ClosesWhenAsyncReaderCreationFails()
+    {
+        await using var dataSource = AdoTestPool.NewIsolatedDataSource(options => options with
+        {
+            PoolSize = 1
+        });
+        await using var connection = await dataSource.OpenConnectionAsync(CancellationToken.None);
+        await using var command = connection.CreateCommand("select $1");
+        command.Parameters.Add(new object());
+
+        await Assert.ThrowsAsync<NotSupportedException>(async () =>
+            await command.ExecuteReaderAsync(CommandBehavior.CloseConnection, CancellationToken.None));
+
+        Assert.AreEqual(ConnectionState.Closed, connection.State);
+        await connection.OpenAsync(CancellationToken.None);
+        command.Parameters.Clear();
+        command.CommandText = "select 42";
+        Assert.AreEqual(42, await command.ExecuteScalarAsync(CancellationToken.None));
+    }
+
+    [TestMethod]
+    public void CloseConnectionBehavior_ClosesWhenSyncReaderCreationFails()
+    {
+        using var dataSource = AdoTestPool.NewIsolatedDataSource(options => options with
+        {
+            PoolSize = 1
+        });
+        using var connection = dataSource.OpenConnection();
+        using var command = connection.CreateCommand("select $1");
+        command.Parameters.Add(new object());
+
+        Assert.ThrowsExactly<NotSupportedException>(() =>
+            command.ExecuteReader(CommandBehavior.CloseConnection));
+
+        Assert.AreEqual(ConnectionState.Closed, connection.State);
+        connection.Open();
+        command.Parameters.Clear();
+        command.CommandText = "select 42";
+        Assert.AreEqual(42, command.ExecuteScalar());
     }
 }

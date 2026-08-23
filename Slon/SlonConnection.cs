@@ -2,6 +2,7 @@ using System.Data;
 using System.Data.Common;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
+using System.Runtime.ExceptionServices;
 using Slon.Pg;
 using Slon.Pg.Protocol;
 using Slon.Pg.Protocol.Flows;
@@ -89,7 +90,15 @@ public sealed partial class SlonConnection : IAdoConnection
         if (!HasProxy)
             return;
 
-        RollbackTransactionOnClose();
+        Exception? rollbackFailure = null;
+        try
+        {
+            RollbackTransactionOnClose();
+        }
+        catch (Exception ex)
+        {
+            rollbackFailure = ex;
+        }
         ConnectionState state;
         try
         {
@@ -114,7 +123,11 @@ public sealed partial class SlonConnection : IAdoConnection
         }
 
         if (_stateChangeEventHandlerAdded)
-            OnStateChange(StateChangeClosed);
+            OnStateChange(state is ConnectionState.Open
+                ? StateChangeClosed
+                : new StateChangeEventArgs(state, ConnectionState.Closed));
+        if (rollbackFailure is not null)
+            ExceptionDispatchInfo.Capture(rollbackFailure).Throw();
     }
 
     async ValueTask CloseAsyncCore()
@@ -123,7 +136,15 @@ public sealed partial class SlonConnection : IAdoConnection
         if (!HasProxy)
             return;
 
-        await RollbackTransactionOnCloseAsync().ConfigureAwait(false);
+        Exception? rollbackFailure = null;
+        try
+        {
+            await RollbackTransactionOnCloseAsync().ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            rollbackFailure = ex;
+        }
         ConnectionState state;
         try
         {
@@ -148,15 +169,14 @@ public sealed partial class SlonConnection : IAdoConnection
         }
 
         if (_stateChangeEventHandlerAdded)
-            OnStateChange(new StateChangeEventArgs(state, ConnectionState.Closed));
+            OnStateChange(state is ConnectionState.Open
+                ? StateChangeClosed
+                : new StateChangeEventArgs(state, ConnectionState.Closed));
+        if (rollbackFailure is not null)
+            ExceptionDispatchInfo.Capture(rollbackFailure).Throw();
     }
 
     object BreakSyncObj => this;
-
-    internal void PerformUserCancellation(TimeSpan? timeout = null)
-    {
-        EnsureConnected().PerformUserCancellation(timeout);
-    }
 
     internal TimeSpan DefaultCommandTimeout => DbDataSource.DefaultCommandTimeout;
     internal void ReportTransactionDisposeRollbackFailure(Exception exception)
@@ -169,7 +189,7 @@ public sealed partial class SlonConnection : IAdoConnection
         var transaction = CurrentTransaction;
         CurrentTransaction = null;
         _pendingTransactionStatement = null;
-        transaction?.Detach();
+        transaction?.MarkCompleted();
     }
 
     void RollbackTransactionOnClose()
@@ -222,14 +242,26 @@ public sealed partial class SlonConnection : IAdoConnection
             return;
         try
         {
-            ReleaseOwnedAndLeaked(awaitable: false).GetAwaiter().GetResult();
-            CloseCore();
+            try
+            {
+                ReleaseOwnedAndLeaked(awaitable: false).GetAwaiter().GetResult();
+            }
+            finally
+            {
+                CloseCore();
+            }
         }
         finally
         {
             _disposed = true;
-            _proxy?.Dispose();
-            base.Dispose(disposing: true);
+            try
+            {
+                _proxy?.Dispose();
+            }
+            finally
+            {
+                base.Dispose(disposing: true);
+            }
         }
     }
 
@@ -239,15 +271,27 @@ public sealed partial class SlonConnection : IAdoConnection
             return;
         try
         {
-            await ReleaseOwnedAndLeaked(awaitable: true).ConfigureAwait(false);
-            await CloseAsyncCore().ConfigureAwait(false);
+            try
+            {
+                await ReleaseOwnedAndLeaked(awaitable: true).ConfigureAwait(false);
+            }
+            finally
+            {
+                await CloseAsyncCore().ConfigureAwait(false);
+            }
         }
         finally
         {
             _disposed = true;
-            if (_proxy is not null)
-                await _proxy.DisposeAsync().ConfigureAwait(false);
-            base.Dispose(disposing: true);
+            try
+            {
+                if (_proxy is not null)
+                    await _proxy.DisposeAsync().ConfigureAwait(false);
+            }
+            finally
+            {
+                base.Dispose(disposing: true);
+            }
         }
     }
 
@@ -355,17 +399,22 @@ public sealed partial class SlonConnection : IAdoConnection
         ThrowIfDisposed();
         if (_state is not (ConnectionState.Closed or ConnectionState.Broken))
             ThrowHelper.ThrowInvalidOperation("Connection is already open or being opened.");
+        if (_state is ConnectionState.Broken)
+            CloseCore();
 
         _state = ConnectionState.Connecting;
+        AdoConnectionProxy proxy;
         try
         {
-            SetProxy(DbDataSource.GetProxy(this, DbDataSource.ConnectionTimeout, options));
+            proxy = DbDataSource.GetProxy(this, DbDataSource.ConnectionTimeout, options);
         }
         catch
         {
-            CloseCore();
+            _state = ConnectionState.Closed;
+            _breakException = null;
             throw;
         }
+        SetProxy(proxy);
     }
 
     async Task OpenAsyncCore(SlonConnectionOptions options = SlonConnectionOptions.None,
@@ -375,19 +424,23 @@ public sealed partial class SlonConnection : IAdoConnection
         ThrowIfDisposed();
         if (_state is not (ConnectionState.Closed or ConnectionState.Broken))
             ThrowHelper.ThrowInvalidOperation("Connection is already open or being opened.");
+        if (_state is ConnectionState.Broken)
+            await CloseAsyncCore().ConfigureAwait(false);
 
         _state = ConnectionState.Connecting;
+        AdoConnectionProxy proxy;
         try
         {
-
-            SetProxy(await DbDataSource.GetProxyAsync(
-                this, DbDataSource.ConnectionTimeout, cancellationToken, options).ConfigureAwait(false));
+            proxy = await DbDataSource.GetProxyAsync(
+                this, DbDataSource.ConnectionTimeout, cancellationToken, options).ConfigureAwait(false);
         }
         catch
         {
-            await CloseAsyncCore().ConfigureAwait(false);
+            _state = ConnectionState.Closed;
+            _breakException = null;
             throw;
         }
+        SetProxy(proxy);
     }
 
     static void ValidateOptions(SlonConnectionOptions options)
@@ -395,8 +448,6 @@ public sealed partial class SlonConnection : IAdoConnection
         if ((options & ~SlonConnectionOptions.LongRunning) != 0)
             throw new ArgumentOutOfRangeException(nameof(options), options, "Unsupported connection options.");
     }
-
-    SlonConnection CloneCore() => _dataSource.CreateConnection();
 
     internal TFlow Enqueue<TFlow>(TFlow flow)
         where TFlow : PgClientFlow
@@ -540,11 +591,11 @@ public sealed partial class SlonConnection : IAdoConnection
 
     void IAdoConnection.Break(Exception exception)
     {
-        EnsureConnected();
         lock (BreakSyncObj)
         {
-            // We'll just keep the first exception.
-            if (_state is ConnectionState.Broken)
+            // A completion callback may arrive after Close has already settled the lease.
+            // Closed and disposed connections are terminal, while Broken retains its first cause.
+            if (_disposed || _state is not ConnectionState.Open)
                 return;
 
             _state = ConnectionState.Broken;
@@ -630,7 +681,7 @@ public sealed partial class SlonConnection : DbConnection
 
     /// <summary>Creates a new object that is a copy of the current instance.</summary>
     /// <returns>A new object that is a copy of this instance.</returns>
-    public SlonConnection Clone() => CloneCore();
+    public SlonConnection Clone() => _dataSource.CreateConnection();
 
     /// <summary>
     /// Begins a database transaction.

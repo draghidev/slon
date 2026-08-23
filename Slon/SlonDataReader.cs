@@ -374,7 +374,14 @@ public sealed partial class SlonDataReader
         }
         catch (Exception)
         {
-            enumerator.Dispose();
+            try
+            {
+                enumerator.Dispose();
+            }
+            finally
+            {
+                connectionToClose?.Close();
+            }
             throw;
         }
     }
@@ -421,7 +428,15 @@ public sealed partial class SlonDataReader
         {
             try
             {
-                await enumerator.DisposeAsync().ConfigureAwait(false);
+                try
+                {
+                    await enumerator.DisposeAsync().ConfigureAwait(false);
+                }
+                finally
+                {
+                    if (connectionToClose is not null)
+                        await connectionToClose.CloseAsync().ConfigureAwait(false);
+                }
             }
             catch (Exception cleanupException)
             {

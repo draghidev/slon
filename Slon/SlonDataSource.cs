@@ -302,16 +302,7 @@ public sealed class SlonDataSource : DbDataSource
         return Volatile.Read(ref _dbDependencies) ?? throw NotInitializedException();
     }
 
-    // True for datasources that dispatch commands across different backends.
-    // Among other effects this impacts cacheability of state derived from unstable backend type information.
-    // Its value should be static for the lifetime of the instance.
-    internal bool IsVirtualDataSource => false;
-    // This is to get back to the multi-host datasource that owns its host sources.
-    // It also helps commands to keep caches intact when switching sources from the same owner.
-    internal SlonDataSource DataSourceOwner => this;
-
     internal TimeSpan ConnectionTimeout => _options.ConnectionTimeout;
-    internal TimeSpan DefaultCancellationTimeout => _options.CancellationTimeout;
     internal TimeSpan DefaultCommandTimeout => _options.CommandTimeout;
     internal void ReportTransactionDisposeRollbackFailure(Exception exception)
         => SlonLogMessages.TransactionDisposeRollbackFailed(_adoLogger, exception);
@@ -322,8 +313,6 @@ public sealed class SlonDataSource : DbDataSource
     internal string DisplayEndpoint { get; }
 
     internal string ServerVersion => GetDbDependencies().BackendInfo.ServerVersionString;
-    internal PgTypeCatalog TypeCatalog => GetDbDependencies().TypeCatalog;
-
     int DbDepsRevision { get; set; }
 
     AdoConnectionProxy CreateProxy(PgConnection pgConnection, IAdoConnection connection)
@@ -597,14 +586,17 @@ public sealed class SlonDataSource : DbDataSource
             : initialization;
     }
 
-    /// Reloads PostgreSQL type metadata and publishes a new serializer snapshot.
-    public void ReloadTypes()
-        => ReloadTypesCore(async: false, CancellationToken.None).AsTask().GetAwaiter().GetResult();
-
-    /// <summary>Reloads PostgreSQL type metadata and publishes a new serializer snapshot.</summary>
-    /// <param name="cancellationToken">A token for cancelling the reload.</param>
-    public ValueTask ReloadTypesAsync(CancellationToken cancellationToken = default)
-        => ReloadTypesCore(async: true, cancellationToken);
+    async ValueTask ReloadTypesAsyncProjected(CancellationToken cancellationToken)
+    {
+        try
+        {
+            await ReloadTypesCore(async: true, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            AdoException.Throw(ex);
+        }
+    }
 
     ValueTask ReloadTypesCore(bool async, CancellationToken cancellationToken)
     {
@@ -852,6 +844,25 @@ public sealed class SlonDataSource : DbDataSource
 
     /// <inheritdoc />
     public override string ConnectionString => _connectionString;
+
+    /// Reloads PostgreSQL type metadata and publishes a new serializer snapshot.
+    public void ReloadTypes()
+    {
+        try
+        {
+            ReloadTypesCore(async: false, CancellationToken.None).AsTask().GetAwaiter().GetResult();
+        }
+        catch (Exception ex)
+        {
+            AdoException.Throw(ex);
+        }
+    }
+
+    /// <summary>Reloads PostgreSQL type metadata and publishes a new serializer snapshot.</summary>
+    /// <param name="cancellationToken">A token for cancelling the reload.</param>
+    public ValueTask ReloadTypesAsync(CancellationToken cancellationToken = default)
+        => ReloadTypesAsyncProjected(cancellationToken);
+
     internal CommandTracker GetCommandTracker(bool initializedOnly = false)
     {
         if (initializedOnly && !_isInitialized)
@@ -898,47 +909,56 @@ public sealed class SlonDataSource : DbDataSource
     /// <inheritdoc />
     protected override DbConnection OpenDbConnection() => OpenConnection();
     /// Creates and opens a connection owned by this datasource.
-    public new SlonConnection OpenConnection()
-    {
-        var connection = CreateConnection();
-        connection.Open();
-        return connection;
-    }
+    public new SlonConnection OpenConnection() => OpenConnectionCore(SlonConnectionOptions.None);
 
     /// <summary>Opens a connection using the requested connection policy.</summary>
-    public SlonConnection OpenConnection(SlonConnectionOptions options)
+    public SlonConnection OpenConnection(SlonConnectionOptions options) => OpenConnectionCore(options);
+
+    SlonConnection OpenConnectionCore(SlonConnectionOptions options)
     {
         var connection = CreateConnection();
-        connection.Open(options);
-        return connection;
+        try
+        {
+            connection.Open(options);
+            return connection;
+        }
+        catch
+        {
+            connection.Dispose();
+            throw;
+        }
     }
-
 
     /// <inheritdoc />
     protected override async ValueTask<DbConnection> OpenDbConnectionAsync(CancellationToken cancellationToken = default)
-    {
-        var connection = CreateConnection();
-        await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
-        return connection;
-    }
+        => await OpenConnectionAsyncCore(SlonConnectionOptions.None, cancellationToken).ConfigureAwait(false);
+
     /// <summary>Creates and asynchronously opens a connection owned by this datasource.</summary>
     /// <param name="cancellationToken">A token for cancelling the open operation.</param>
-    public new async ValueTask<SlonConnection> OpenConnectionAsync(CancellationToken cancellationToken)
-    {
-        var connection = CreateConnection();
-        await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
-        return connection;
-    }
+    public new ValueTask<SlonConnection> OpenConnectionAsync(CancellationToken cancellationToken)
+        => OpenConnectionAsyncCore(SlonConnectionOptions.None, cancellationToken);
 
     /// <summary>Opens a connection asynchronously using the requested connection policy.</summary>
     /// <param name="options">The connection options.</param>
     /// <param name="cancellationToken">A token for cancelling the open operation.</param>
-    public async ValueTask<SlonConnection> OpenConnectionAsync(SlonConnectionOptions options,
+    public ValueTask<SlonConnection> OpenConnectionAsync(SlonConnectionOptions options,
         CancellationToken cancellationToken = default)
+        => OpenConnectionAsyncCore(options, cancellationToken);
+
+    async ValueTask<SlonConnection> OpenConnectionAsyncCore(SlonConnectionOptions options,
+        CancellationToken cancellationToken)
     {
         var connection = CreateConnection();
-        await connection.OpenAsync(options, cancellationToken).ConfigureAwait(false);
-        return connection;
+        try
+        {
+            await connection.OpenAsync(options, cancellationToken).ConfigureAwait(false);
+            return connection;
+        }
+        catch
+        {
+            await connection.DisposeAsync().ConfigureAwait(false);
+            throw;
+        }
     }
 
     /// Creates a batch which executes directly through this datasource.
@@ -971,16 +991,22 @@ public sealed class SlonDataSource : DbDataSource
         if (!disposing || Interlocked.Exchange(ref _disposed, 1) is not 0)
             return;
 
-        _shutdown.Cancel();
-        _lifecycleLock.Wait();
         try
         {
-            (_connectionPool as IDisposable)?.Dispose();
+            _shutdown.Cancel();
         }
         finally
         {
-            _lifecycleLock.Release();
-            _shutdown.Dispose();
+            _lifecycleLock.Wait();
+            try
+            {
+                (_connectionPool as IDisposable)?.Dispose();
+            }
+            finally
+            {
+                _lifecycleLock.Release();
+                _shutdown.Dispose();
+            }
         }
     }
 
@@ -990,17 +1016,23 @@ public sealed class SlonDataSource : DbDataSource
         if (Interlocked.Exchange(ref _disposed, 1) is not 0)
             return;
 
-        _shutdown.Cancel();
-        await _lifecycleLock.WaitAsync().ConfigureAwait(false);
         try
         {
-            if (_connectionPool is not null)
-                await _connectionPool.DisposeAsync().ConfigureAwait(false);
+            _shutdown.Cancel();
         }
         finally
         {
-            _lifecycleLock.Release();
-            _shutdown.Dispose();
+            await _lifecycleLock.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                if (_connectionPool is not null)
+                    await _connectionPool.DisposeAsync().ConfigureAwait(false);
+            }
+            finally
+            {
+                _lifecycleLock.Release();
+                _shutdown.Dispose();
+            }
         }
     }
 

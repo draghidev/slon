@@ -86,6 +86,28 @@ public class SlonDataSourceOptionsTests
     }
 
     [TestMethod]
+    public void RequiredIdentityAndPoolBounds_AreValidatedAtConstruction()
+    {
+        var options = new SlonDataSourceOptions
+        {
+            EndPoint = TestEndPoint.Default,
+            Username = "postgres"
+        };
+
+        Assert.ThrowsExactly<ArgumentNullException>(() => new SlonDataSource(null!));
+        Assert.ThrowsExactly<ArgumentNullException>(() =>
+            new SlonDataSource(options with { EndPoint = null! }));
+        Assert.ThrowsExactly<ArgumentException>(() =>
+            new SlonDataSource(options with { Username = " " }));
+        Assert.ThrowsExactly<ArgumentOutOfRangeException>(() =>
+            new SlonDataSource(options with { MaxPoolSize = 0, MinPoolSize = 0 }));
+        Assert.ThrowsExactly<ArgumentOutOfRangeException>(() =>
+            new SlonDataSource(options with { MaxPoolSize = 1, MinPoolSize = 2 }));
+        Assert.ThrowsExactly<ArgumentOutOfRangeException>(() =>
+            new SlonDataSource(options with { MinPoolSize = -1 }));
+    }
+
+    [TestMethod]
     public void CancellationConvergenceTiming_MustBeFiniteAndOrdered()
     {
         var options = new SlonDataSourceOptions

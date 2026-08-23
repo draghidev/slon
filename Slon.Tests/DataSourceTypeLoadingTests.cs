@@ -1,4 +1,5 @@
 using Slon.Pg;
+using Slon.Pg.Protocol;
 using Slon.Pg.Protocol.Flows;
 using Slon.Pg.Types;
 
@@ -141,19 +142,20 @@ public class DataSourceTypeLoadingTests : ConnectionCreatingTest
                 options => options with { PoolSize = 1 });
             await using (var connection = await dataSource.OpenConnectionAsync()) { }
 
-            var enumType = dataSource.TypeCatalog.GetPgType(
-                dataSource.TypeCatalog.TryGetIdentifiers(enumName, out var enumId, out _)
+            var typeCatalog = dataSource.GetDbDependencies(initializedOnly: true).TypeCatalog;
+            var enumType = typeCatalog.GetPgType(
+                typeCatalog.TryGetIdentifiers(enumName, out var enumId, out _)
                     ? enumId
                     : throw new AssertFailedException("enum type was not loaded"));
             CollectionAssert.AreEqual(new[] { "first", "second" }, enumType.EnumVariants);
 
-            Assert.IsTrue(dataSource.TypeCatalog.TryGetIdentifiers(compositeName, out var compositeId, out _));
-            var fields = dataSource.TypeCatalog.GetPgType(compositeId).CompositeFields;
+            Assert.IsTrue(typeCatalog.TryGetIdentifiers(compositeName, out var compositeId, out _));
+            var fields = typeCatalog.GetPgType(compositeId).CompositeFields;
             Assert.AreEqual(4, fields.Length);
             Assert.AreEqual("number", fields[0].Field.Name);
             Assert.AreEqual("value", fields[1].Field.Name);
             Assert.AreEqual(enumId.Oid, fields[1].Type.Oid);
-            Assert.IsTrue(dataSource.TypeCatalog.TryGetIdentifiers(domainName, out var domainId, out _));
+            Assert.IsTrue(typeCatalog.TryGetIdentifiers(domainName, out var domainId, out _));
             Assert.AreEqual(domainId.Oid, fields[2].Type.Oid);
             Assert.IsTrue(fields[2].Type.IsDomainNotNull);
             Assert.AreEqual("label", fields[3].Field.Name);
@@ -213,10 +215,29 @@ public class DataSourceTypeLoadingTests : ConnectionCreatingTest
         Assert.AreEqual(new DataTypeName("public.sync_reloaded"),
             syncReloaded.TypeCatalog.GetPgType((Oid)8802).DataTypeName);
 
-        factory.Fail = true;
+        factory.Failure = new InvalidOperationException("reload failed");
         await Assert.ThrowsExactlyAsync<InvalidOperationException>(async () =>
             await dataSource.ReloadTypesAsync());
         Assert.AreSame(syncReloaded, dataSource.GetDbDependencies(initializedOnly: true));
+    }
+
+    [TestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task ReloadTypes_ProjectsLowLevelFailures(bool async)
+    {
+        var factory = new ReloadableFactory(PgType.CreateBase(new("public.initial"), oid: 8805));
+        await using var dataSource = new SlonDataSource(AdoTestPool.NewOptions() with
+        {
+            BackendProvider = new ReloadableProvider(factory)
+        });
+        await using (var connection = await dataSource.OpenConnectionAsync()) { }
+        factory.Failure = new PgClientException(new IOException("reload transport failure"));
+
+        if (async)
+            await Assert.ThrowsAsync<SlonException>(() => dataSource.ReloadTypesAsync().AsTask());
+        else
+            Assert.ThrowsExactly<SlonException>(dataSource.ReloadTypes);
     }
 
     [TestMethod]
@@ -304,6 +325,29 @@ public class DataSourceTypeLoadingTests : ConnectionCreatingTest
         await Assert.ThrowsAsync<OperationCanceledException>(async () => await reload);
     }
 
+    [TestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task ThrowingShutdownCallback_DoesNotSkipPoolDisposal(bool async)
+    {
+        var dataSource = new SlonDataSource(AdoTestPool.NewOptions() with
+        {
+            BackendProvider = new ReloadableProvider(new ThrowingShutdownCallbackFactory())
+        });
+        var connection = await dataSource.OpenConnectionAsync(CancellationToken.None);
+        var protocolCompletion = connection.UnderlyingPgConnection!.Protocol.Completion;
+        await connection.CloseAsync();
+
+        if (async)
+            await Assert.ThrowsAsync<AggregateException>(() => dataSource.DisposeAsync().AsTask());
+        else
+            Assert.ThrowsExactly<AggregateException>(dataSource.Dispose);
+
+        await protocolCompletion;
+        await dataSource.DisposeAsync();
+        await connection.DisposeAsync();
+    }
+
     sealed class RecordingProvider(List<string> events) : PostgreSqlBackendProvider
     {
         public int BackendInfoBuilds { get; private set; }
@@ -349,7 +393,7 @@ public class DataSourceTypeLoadingTests : ConnectionCreatingTest
         TaskCompletionSource? _release;
 
         public PgType Baseline { get; set; } = baseline;
-        public bool Fail { get; set; }
+        public Exception? Failure { get; set; }
         public int PopulateCount { get; private set; }
         public Task Entered => _entered?.Task ?? Task.CompletedTask;
         internal override bool RequiresProtocol => false;
@@ -366,8 +410,8 @@ public class DataSourceTypeLoadingTests : ConnectionCreatingTest
             PgTypeCatalogFactoryContext context, PgTypeLoadingOptions options)
         {
             PopulateCount++;
-            if (Fail)
-                throw new InvalidOperationException("reload failed");
+            if (Failure is { } failure)
+                throw failure;
             builder.Add(Baseline);
         }
 
@@ -383,8 +427,8 @@ public class DataSourceTypeLoadingTests : ConnectionCreatingTest
                 _entered = null;
                 _release = null;
             }
-            if (Fail)
-                throw new InvalidOperationException("reload failed");
+            if (Failure is { } failure)
+                throw failure;
             builder.Add(Baseline);
         }
     }
@@ -419,6 +463,31 @@ public class DataSourceTypeLoadingTests : ConnectionCreatingTest
             foreach (var type in PgTypeCatalog.Default.Types)
                 builder.Add(type);
             return ValueTask.CompletedTask;
+        }
+    }
+
+    sealed class ThrowingShutdownCallbackFactory : PgTypeCatalogFactory
+    {
+        internal override bool RequiresProtocol => false;
+
+        protected override void Populate(PgTypeCatalogBuilder builder,
+            PgTypeCatalogFactoryContext context, PgTypeLoadingOptions options)
+            => Populate(builder, context);
+
+        protected override ValueTask PopulateAsync(PgTypeCatalogBuilder builder,
+            PgTypeCatalogFactoryContext context, PgTypeLoadingOptions options,
+            CancellationToken cancellationToken)
+        {
+            Populate(builder, context);
+            return ValueTask.CompletedTask;
+        }
+
+        static void Populate(PgTypeCatalogBuilder builder, PgTypeCatalogFactoryContext context)
+        {
+            _ = context.StoppingToken.Register(static () =>
+                throw new InvalidOperationException("shutdown callback failure"));
+            foreach (var type in PgTypeCatalog.Default.Types)
+                builder.Add(type);
         }
     }
 
