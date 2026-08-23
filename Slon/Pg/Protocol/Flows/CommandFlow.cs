@@ -563,7 +563,7 @@ partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSour
                             describeForPreparation ? describedParameterTypes : descriptor.ParameterTypes,
                             _requestedRowDescription?.Preserve());
                     }
-                    result.Initialize(_commandIndex, descriptor, _requestedRowDescription,
+                    result.Initialize(this, _commandIndex, descriptor, _requestedRowDescription,
                         !resultCommand.DescribeOnly, resultCommand.IsSimple(), _pgError);
                 }
                 ((CommandFlowObserver?)GetObserver(out var observerState))
@@ -793,7 +793,8 @@ partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSour
             // The body is the sole owner of protocol-static row metadata. Recovery consumes only
             // decoder/wire state, so a faulted body can release oversized storage while recovery
             // retains the failed flow's framework tenure.
-            context.GetProtocolStatic<ReadState>().RowDescription.PrepareForReuse();
+            ref readonly var readState = ref context.GetProtocolStatic<ReadState>();
+            readState.Reset();
             PublishBodyTerminated();
         }
         void SetResult(CommandResult<ResultMessageEnumerator>? next)
@@ -1052,6 +1053,8 @@ partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSour
         else
             CompleteEnumerationWithException(exception);
     }
+
+    internal void Fail(Exception exception) => FaultCaller(exception);
 
     protected override void OnReleasing(Exception? exception)
     {

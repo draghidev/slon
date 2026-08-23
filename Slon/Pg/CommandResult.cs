@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
 using Slon.Pg.Protocol;
+using Slon.Pg.Protocol.Flows;
 
 namespace Slon.Pg;
 
@@ -27,11 +28,16 @@ abstract class CommandResult : IDisposable, IAsyncDisposable, IEnumerable<Row>, 
     PgError? _errorMessage;
     Action<CommandResult, object?>? _completionAction;
     object? _completionActionState;
+    CommandFlow _flow = null!;
+
+    private protected CommandResult() {}
 
     // The requested row description is what was returned for this exact command (i.e. commands that requested a describe).
-    protected void Initialize(int index, CommandDescriptor descriptor, RowDescription? requestedRowDescription,
-        bool requestedExecution, bool simpleProtocol, PgError? error = null)
+    protected void Initialize(CommandFlow flow, int index, CommandDescriptor descriptor,
+        RowDescription? requestedRowDescription, bool requestedExecution, bool simpleProtocol, PgError? error = null)
     {
+        if (!ReferenceEquals(_flow, flow))
+            _flow = flow;
         _index = index;
         _descriptor = descriptor;
 
@@ -155,6 +161,13 @@ abstract class CommandResult : IDisposable, IAsyncDisposable, IEnumerable<Row>, 
         Debug.Assert(_completionAction is null);
         _completionAction = action;
         _completionActionState = state;
+    }
+
+    internal void Reset()
+    {
+        _flow = null!;
+        _completionAction = null;
+        _completionActionState = null;
     }
 
     // RecordsAffected is only known once the command has run to its CommandComplete / ErrorResponse.
@@ -282,7 +295,11 @@ abstract class CommandResult : IDisposable, IAsyncDisposable, IEnumerable<Row>, 
             var state = _completionActionState;
             _completionAction = null;
             _completionActionState = null;
-            action(this, state);
+            try { action(this, state); }
+            catch (Exception ex)
+            {
+                _flow.Fail(ex);
+            }
         }
     }
 
@@ -492,10 +509,9 @@ sealed class CommandResult<TEnumerator>(TEnumerator enumerator) : CommandResult
 {
     TEnumerator _messageEnumerator = enumerator;
 
-    internal new void Initialize(int index, CommandDescriptor descriptor, RowDescription? requestedRowDescription,
-        bool requestedExecution, bool simpleProtocol, PgError? error = null)
-        => base.Initialize(index, descriptor, requestedRowDescription, requestedExecution, simpleProtocol,
-            error);
+    internal new void Initialize(CommandFlow flow, int index, CommandDescriptor descriptor,
+        RowDescription? requestedRowDescription, bool requestedExecution, bool simpleProtocol, PgError? error = null)
+        => base.Initialize(flow, index, descriptor, requestedRowDescription, requestedExecution, simpleProtocol, error);
 
     protected override BackendMessage GetCurrentMessage()
     {

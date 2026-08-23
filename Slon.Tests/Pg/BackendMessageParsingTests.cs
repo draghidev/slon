@@ -309,12 +309,12 @@ public class BackendMessageParsingTests
     {
         var description = new RowDescription();
         description.Initialize(new SequenceReader<byte>(new ReadOnlySequence<byte>(RowDescriptionBody(256))));
-        description.PrepareForReuse();
+        description.Reset();
         Assert.AreEqual(0, description.FieldCount);
         Assert.ThrowsExactly<IndexOutOfRangeException>(() => _ = description[0]);
 
         description.Initialize(new SequenceReader<byte>(new ReadOnlySequence<byte>(RowDescriptionBody(257))));
-        description.PrepareForReuse();
+        description.Reset();
         Assert.AreEqual(0, description.FieldCount);
 
         static byte[] RowDescriptionBody(short fieldCount)

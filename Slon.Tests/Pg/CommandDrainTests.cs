@@ -20,6 +20,12 @@ public class CommandDrainTests : ConnectionCreatingTest
             => Entered.TrySetResult();
     }
 
+    sealed class ThrowingCompletionObserver(Exception exception) : CommandFlowObserver
+    {
+        internal override void OnCommandResult(CommandFlow flow, CommandResult result, object? state)
+            => result.OnCompleted(static (_, state) => throw (Exception)state!, exception);
+    }
+
     sealed class ReleaseOrderingFlow : PgClientFlow
     {
         readonly ManualResetEventSlim _continueRelease = new();
@@ -158,6 +164,34 @@ public class CommandDrainTests : ConnectionCreatingTest
         await Dispose(e, useAsyncDispose);
 
         await PgTestPool.RunAsync(protocol, "select 1");
+    }
+
+    [TestMethod]
+    public async Task CommandResultCompletionCallback_FaultsOnlyOwningFlow()
+    {
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
+        var violation = new InvalidOperationException("synthetic command-result completion failure");
+        var flow = new CommandFlow(async: true, new CommandFlowOptions
+        {
+            Commands = new(Command.Create("select 1")),
+            Observer = new ThrowingCompletionObserver(violation)
+        });
+        var successor = new CommandFlow(async: true, Command.Create("select 1"));
+        Assert.IsTrue(protocol.TryQueue(flow));
+        Assert.IsTrue(protocol.TryQueue(successor));
+
+        var enumerator = flow.GetAsyncEnumerator();
+        Assert.IsTrue(await enumerator.MoveNextAsync());
+        var rows = enumerator.Current.GetAsyncEnumerator();
+        Assert.IsTrue(await rows.MoveNextAsync());
+        Assert.IsFalse(await rows.MoveNextAsync());
+        var failure = await Assert.ThrowsAsync<InvalidOperationException>(
+            async () => await enumerator.MoveNextAsync());
+        Assert.AreSame(violation, failure);
+
+        var successorEnumerator = successor.GetAsyncEnumerator();
+        while (await successorEnumerator.MoveNextAsync()) { }
+        await successorEnumerator.DisposeAsync();
     }
 
     [TestMethod]

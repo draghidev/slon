@@ -22,6 +22,13 @@ partial class CommandFlow
             ReadPromise = new();
             RowDescription = new();
         }
+
+        public void Reset()
+        {
+            CommandResult.Reset();
+            ResultMessageEnumerator.Reset();
+            RowDescription.Reset();
+        }
     }
 
     // This is a struct to make CommandResult<T> specialize.
@@ -42,6 +49,8 @@ partial class CommandFlow
 
         public void Initialize(CommandFlow flow, PgDecoder decoder)
             => _messageEnumerator.Initialize(flow, decoder);
+
+        public void Reset() => _messageEnumerator.Reset();
 
         public (PgError Error, TransactionStatus TransactionStatus)? CompleteError
             => _messageEnumerator.CompleteError;
@@ -261,6 +270,17 @@ partial class CommandFlow
                 // A command is immediately done if we haven't submitted an execute.
                 _done = Command.DescribeOnly;
                 _first = !_done;
+            }
+
+            public void Reset()
+            {
+                _flow = null!;
+                _decoder = null!;
+                _exceptionDispatchInfo = null;
+                _completeError = null;
+                _disposed = true;
+                _first = false;
+                _done = true;
             }
 
             public (PgError Error, TransactionStatus TransactionStatus)? CompleteError

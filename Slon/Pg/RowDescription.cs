@@ -115,7 +115,7 @@ sealed class RowDescription
 
     // Called when the owning flow retires, after its final CommandResult tenure has ended. An unusually
     // wide description no longer needs to remain rooted; normal high-water storage is kept for reuse.
-    public void PrepareForReuse()
+    public void Reset()
     {
         if (_fields.Length > MaxRetainedFieldCapacity)
             _fields = [];
