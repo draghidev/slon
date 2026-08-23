@@ -25,4 +25,16 @@ public class SlonConnectionTests
             () => connection.ChangeDatabaseAsync("other"));
         Assert.AreSame(dataSource, connection.DbDataSource);
     }
+
+    [TestMethod]
+    public void AmbientTransactionsAreExplicitlyRejected()
+    {
+        using var dataSource = AdoTestPool.NewIsolatedDataSource();
+        using var connection = dataSource.CreateConnection();
+        using var transaction = new System.Transactions.CommittableTransaction();
+
+        var exception = Assert.ThrowsExactly<NotSupportedException>(
+            () => connection.EnlistTransaction(transaction));
+        StringAssert.Contains(exception.Message, nameof(SlonTransaction));
+    }
 }

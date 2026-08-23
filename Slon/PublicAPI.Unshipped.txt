@@ -83,6 +83,7 @@ override Slon.SlonConnection.ConnectionTimeout.get -> int
 override Slon.SlonConnection.Database.get -> string!
 override Slon.SlonConnection.DataSource.get -> string!
 override Slon.SlonConnection.DisposeAsync() -> System.Threading.Tasks.ValueTask
+override Slon.SlonConnection.EnlistTransaction(System.Transactions.Transaction? transaction) -> void
 override Slon.SlonConnection.GetSchema() -> System.Data.DataTable!
 override Slon.SlonConnection.GetSchema(string? collectionName) -> System.Data.DataTable!
 override Slon.SlonConnection.GetSchema(string? collectionName, string?[]? restrictions) -> System.Data.DataTable!
@@ -164,8 +165,15 @@ override Slon.SlonTransaction.Commit() -> void
 override Slon.SlonTransaction.CommitAsync(System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task!
 override Slon.SlonTransaction.DisposeAsync() -> System.Threading.Tasks.ValueTask
 override Slon.SlonTransaction.IsolationLevel.get -> System.Data.IsolationLevel
+override Slon.SlonTransaction.Release(string! savepointName) -> void
+override Slon.SlonTransaction.ReleaseAsync(string! savepointName, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task!
 override Slon.SlonTransaction.Rollback() -> void
+override Slon.SlonTransaction.Rollback(string! savepointName) -> void
 override Slon.SlonTransaction.RollbackAsync(System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task!
+override Slon.SlonTransaction.RollbackAsync(string! savepointName, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task!
+override Slon.SlonTransaction.Save(string! savepointName) -> void
+override Slon.SlonTransaction.SaveAsync(string! savepointName, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.Task!
+override Slon.SlonTransaction.SupportsSavepoints.get -> bool
 Slon.PostgreSqlAuthenticationOptions
 Slon.PostgreSqlAuthenticationOptions.AllowInsecureTransport.get -> bool
 Slon.PostgreSqlAuthenticationOptions.AllowInsecureTransport.init -> void

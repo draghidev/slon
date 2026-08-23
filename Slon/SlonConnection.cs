@@ -574,6 +574,19 @@ public sealed partial class SlonConnection : IAdoConnection
         CurrentTransaction = null;
     }
 
+    internal void ExecuteTransactionStatement(SlonTransaction transaction, string sql)
+    {
+        ValidateTransaction(transaction);
+        ExecuteTransactionStatement(sql);
+    }
+
+    internal async ValueTask ExecuteTransactionStatementAsync(SlonTransaction transaction, string sql,
+        CancellationToken cancellationToken)
+    {
+        ValidateTransaction(transaction);
+        await ExecuteTransactionStatementAsync(sql, cancellationToken).ConfigureAwait(false);
+    }
+
     ConnectionState GetState()
     {
         if (_state is not ConnectionState.Open)
@@ -678,6 +691,12 @@ public sealed partial class SlonConnection : DbConnection
     public override Task ChangeDatabaseAsync(string databaseName, CancellationToken cancellationToken = default)
         => Task.FromException(new NotSupportedException(
             $"Database selection is owned by {nameof(SlonDataSource)}. Create or use a data source for '{databaseName}'."));
+
+    /// <inheritdoc />
+    public override void EnlistTransaction(System.Transactions.Transaction? transaction)
+        => throw new NotSupportedException(
+            $"{nameof(SlonConnection)} does not support ambient transactions. " +
+            $"Use an explicit {nameof(SlonTransaction)} instead.");
 
     /// <summary>Creates a new object that is a copy of the current instance.</summary>
     /// <returns>A new object that is a copy of this instance.</returns>

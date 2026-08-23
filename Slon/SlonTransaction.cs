@@ -65,6 +65,62 @@ public sealed class SlonTransaction : DbTransaction
         _completed = true;
     }
 
+    /// <inheritdoc/>
+    public override bool SupportsSavepoints => true;
+
+    /// <inheritdoc/>
+    public override void Save(string savepointName)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        _connection.ExecuteTransactionStatement(this, SavepointStatement("SAVEPOINT", savepointName));
+    }
+
+    /// <inheritdoc/>
+    public override async Task SaveAsync(string savepointName, CancellationToken cancellationToken = default)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        await _connection.ExecuteTransactionStatementAsync(
+            this, SavepointStatement("SAVEPOINT", savepointName), cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <inheritdoc/>
+    public override void Rollback(string savepointName)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        _connection.ExecuteTransactionStatement(this, SavepointStatement("ROLLBACK TO SAVEPOINT", savepointName));
+    }
+
+    /// <inheritdoc/>
+    public override async Task RollbackAsync(string savepointName, CancellationToken cancellationToken = default)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        await _connection.ExecuteTransactionStatementAsync(
+            this, SavepointStatement("ROLLBACK TO SAVEPOINT", savepointName), cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <inheritdoc/>
+    public override void Release(string savepointName)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        _connection.ExecuteTransactionStatement(this, SavepointStatement("RELEASE SAVEPOINT", savepointName));
+    }
+
+    /// <inheritdoc/>
+    public override async Task ReleaseAsync(string savepointName, CancellationToken cancellationToken = default)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        await _connection.ExecuteTransactionStatementAsync(
+            this, SavepointStatement("RELEASE SAVEPOINT", savepointName), cancellationToken).ConfigureAwait(false);
+    }
+
+    static string SavepointStatement(string operation, string savepointName)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(savepointName);
+        if (savepointName.Contains('\0'))
+            throw new ArgumentException("Savepoint names cannot contain a null character.", nameof(savepointName));
+        return string.Concat(operation, " \"", savepointName.Replace("\"", "\"\"", StringComparison.Ordinal), "\"");
+    }
+
     /// <summary>Gets the connection while this transaction remains active.</summary>
     /// <returns>The associated connection, or <see langword="null" /> after completion or disposal.</returns>
     public new SlonConnection? Connection => _completed ? null : _connection;

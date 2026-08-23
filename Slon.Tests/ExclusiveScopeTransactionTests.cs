@@ -73,6 +73,27 @@ public class ExclusiveScopeTransactionTests : ConnectionCreatingTest
     }
 
     [TestMethod]
+    public async Task Async_Savepoint_RollsBackPartialWorkAndCanBeReleased()
+    {
+        await using var ds = AdoTestPool.NewIsolatedDataSource();
+        await using var conn = await ds.OpenConnectionAsync(CancellationToken.None);
+        var t = "slon_tx_" + Guid.NewGuid().ToString("N");
+        await Exec(conn, $"CREATE TEMP TABLE {t} (x int)");
+        await using (var tx = await conn.BeginTransactionAsync())
+        {
+            Assert.IsTrue(tx.SupportsSavepoints);
+            const string savepoint = "partial \"work\"";
+            await tx.SaveAsync(savepoint);
+            Assert.AreEqual(1, await Exec(conn, $"INSERT INTO {t} VALUES (1)"));
+            await tx.RollbackAsync(savepoint);
+            Assert.AreEqual(1, await Exec(conn, $"INSERT INTO {t} VALUES (2)"));
+            await tx.ReleaseAsync(savepoint);
+            await tx.CommitAsync();
+        }
+        Assert.AreEqual(1, await Exec(conn, $"DELETE FROM {t}"));
+    }
+
+    [TestMethod]
     public async Task Async_DisposeWithoutCommit_RollsBack()
     {
         await using var ds = AdoTestPool.NewIsolatedDataSource();
@@ -98,6 +119,25 @@ public class ExclusiveScopeTransactionTests : ConnectionCreatingTest
             tx.Commit();
         }
         Assert.AreEqual(3, ExecSync(conn, $"DELETE FROM {t}"), "committed rows must persist");
+    }
+
+    [TestMethod]
+    public void Sync_Savepoint_RollsBackPartialWorkAndCanBeReleased()
+    {
+        using var ds = AdoTestPool.NewIsolatedDataSource();
+        using var conn = ds.OpenConnection();
+        var t = "slon_tx_" + Guid.NewGuid().ToString("N");
+        ExecSync(conn, $"CREATE TEMP TABLE {t} (x int)");
+        using (var tx = conn.BeginTransaction())
+        {
+            tx.Save("partial");
+            Assert.AreEqual(1, ExecSync(conn, $"INSERT INTO {t} VALUES (1)"));
+            tx.Rollback("partial");
+            Assert.AreEqual(1, ExecSync(conn, $"INSERT INTO {t} VALUES (2)"));
+            tx.Release("partial");
+            tx.Commit();
+        }
+        Assert.AreEqual(1, ExecSync(conn, $"DELETE FROM {t}"));
     }
 
     [TestMethod]
