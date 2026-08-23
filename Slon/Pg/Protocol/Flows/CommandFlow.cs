@@ -432,6 +432,7 @@ partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSour
         return new ValueTask(this, _executePipelinedCore.Version);
     }
 
+    [RuntimeAsyncMethodGeneration(false)]
     [AsyncMethodBuilder(typeof(PromiseAsyncValueTaskMethodBuilder))]
     async ValueTask ExecutePipelined(Context context)
     {

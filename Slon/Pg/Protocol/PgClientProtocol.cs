@@ -1305,6 +1305,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
                 PromiseAsyncValueTaskMethodBuilder<PipelineItemResult>.Promise = null;
             }
 
+            [RuntimeAsyncMethodGeneration(false)]
             [AsyncMethodBuilder(typeof(PromiseAsyncValueTaskMethodBuilder<>))]
             static async ValueTask<PipelineItemResult> ExecuteCore(
                 Control control, PgClientFlow item, CancellationToken cancellationToken)

@@ -392,6 +392,7 @@ abstract class StreamPipeReader : PipeReader
             PromiseAsyncValueTaskMethodBuilder<ReadResult>.Promise = null;
         }
 
+        [RuntimeAsyncMethodGeneration(false)]
         [AsyncMethodBuilder(typeof(PromiseAsyncValueTaskMethodBuilder<>))]
         async ValueTask<ReadResult> ReadAsyncCore(int minimumSize,
             AutoResetCancellationTokenSource? tokenSource, CancellationToken cancellationToken)

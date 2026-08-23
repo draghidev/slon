@@ -101,6 +101,7 @@ sealed class MaintenanceFlow : PgClientFlow
             return new(new FlowTasks(trailingExecutionTask: flushTask, pipelineTask: ReadPhase()));
         }
 
+        [RuntimeAsyncMethodGeneration(false)]
         [AsyncMethodBuilder(typeof(PromiseAsyncValueTaskMethodBuilder))]
         async ValueTask ReadPhase()
         {

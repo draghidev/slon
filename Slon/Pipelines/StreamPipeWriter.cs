@@ -317,6 +317,7 @@ abstract class StreamPipeWriter : PipeWriter, IOutputWriter
             PromiseAsyncValueTaskMethodBuilder<FlushResult>.Promise = null;
         }
 
+        [RuntimeAsyncMethodGeneration(false)]
         [AsyncMethodBuilder(typeof(PromiseAsyncValueTaskMethodBuilder<>))]
         async ValueTask<FlushResult> FlushAsyncCore(AutoResetCancellationTokenSource? tokenSource, bool writeToStream, ReadOnlyMemory<byte> data, CancellationToken cancellationToken)
         {
