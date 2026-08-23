@@ -433,7 +433,7 @@ static class CommandExtensions
         }
         if (message.EnsureExpectedOrError(PgTypes.BackendType.ParameterDescription) is { } parameterError)
             return (parameterError, default, null);
-        var parameterTypes = ParameterDescription.Parse(message.BodyReader);
+        var parameterTypes = ParameterDescriptionMessage.Create(message).ParameterTypes;
 
         if (!decoder.TryGetNext(out message))
         {
@@ -494,7 +494,7 @@ static class CommandExtensions
         message = decoder.TryGetNext(out current) ? current : decoder.GetNext();
         if (message.EnsureExpectedOrError(PgTypes.BackendType.ParameterDescription) is { } parameterError)
             return (parameterError, default, null);
-        var parameterTypes = ParameterDescription.Parse(message.BodyReader);
+        var parameterTypes = ParameterDescriptionMessage.Create(message).ParameterTypes;
 
         message = decoder.TryGetNext(out current) ? current : decoder.GetNext();
         if (message.EnsureExpectedOrError(PgTypes.BackendType.RowDescription, PgTypes.BackendType.NoData)
