@@ -682,7 +682,9 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public bool TryGetNext(out BackendMessage message)
+    internal bool TryMoveNext() => TryMoveNextCore();
+
+    bool TryMoveNextCore()
     {
         while (true)
         {
@@ -697,7 +699,6 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
                 {
                     var moved = TryMoveNext(_pipe);
                     Debug.Assert(moved);
-                    message = _pipe.Current;
                     return true;
                 }
 
@@ -713,7 +714,6 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
                 TryMoveNext(_pipe);
                 if (handled)
                     continue;
-                message = Current;
                 return true;
             }
 
@@ -725,7 +725,6 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
         }
 
         unavailable:
-        message = default;
         return false;
     }
 
@@ -760,6 +759,14 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
     }
 
     public bool MoveNext()
+    {
+        if (TryMoveNext())
+            return true;
+        return MoveNextSlow();
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    bool MoveNextSlow()
     {
         var timeoutSet = false;
         try

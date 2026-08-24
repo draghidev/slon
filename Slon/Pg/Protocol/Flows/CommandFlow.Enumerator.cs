@@ -10,7 +10,7 @@ partial class CommandFlow
     // just before terminal completion and strand the consumer (see MoveNextRearm.tla). Never hold it while
     // dispatching the gate, which may run the body inline.
     Slon.Threading.SpinLock _rearmLock;
-    CommandResult<ResultMessageEnumerator>? _enumeratorCurrent;
+    CommandResult? _enumeratorCurrent;
     bool _enumeratorCompleted;
     bool _isResultReady;
     // Consumer-thread-only. The first call uses the initial source generation; later calls rearm it.

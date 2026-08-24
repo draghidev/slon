@@ -200,12 +200,12 @@ static class CommandExtensions
         static async ValueTask<(PgError?, RowDescription?)> ReadSimpleAsync(
             PgDecoder decoder, RowDescription rowDescription)
         {
-            if (!decoder.TryGetNext(out var message))
+            if (!decoder.TryMoveNext())
             {
                 if (!await decoder.MoveNextAsync().ConfigureAwait(false))
                     decoder.ThrowUnexpectedEof();
-                message = decoder.Current;
             }
+            var message = decoder.Current;
             if (message.EnsureExpectedOrError(PgTypes.BackendType.RowDescription, PgTypes.BackendType.NoData)
                     is var result && result.Error is { } describeError)
                 return (describeError, null);
@@ -227,12 +227,12 @@ static class CommandExtensions
                     return default!;
             }
 
-            if (!decoder.TryGetNext(out message))
+            if (!decoder.TryMoveNext())
             {
                 if (!await decoder.MoveNextAsync().ConfigureAwait(false))
                     decoder.ThrowUnexpectedEof();
-                message = decoder.Current;
             }
+            message = decoder.Current;
             message.DebugEnsureExpected(PgTypes.BackendType.DataRow, PgTypes.BackendType.CommandComplete);
             return (null, requestedRowDescription);
         }
@@ -243,12 +243,12 @@ static class CommandExtensions
             BackendMessage message;
             if (readParse)
             {
-                if (!decoder.TryGetNext(out message))
+                if (!decoder.TryMoveNext())
                 {
                     if (!await decoder.MoveNextAsync().ConfigureAwait(false))
                         decoder.ThrowUnexpectedEof();
-                    message = decoder.Current;
                 }
+                message = decoder.Current;
                 if (message.EnsureExpectedOrError(PgTypes.BackendType.ParseComplete) is { } parseError)
                     return (parseError, null);
 
@@ -256,12 +256,12 @@ static class CommandExtensions
                 Debug.Assert(message.Header.BodyLength is 0);
             }
 
-            if (!decoder.TryGetNext(out message))
+            if (!decoder.TryMoveNext())
             {
                 if (!await decoder.MoveNextAsync().ConfigureAwait(false))
                     decoder.ThrowUnexpectedEof();
-                message = decoder.Current;
             }
+            message = decoder.Current;
             if (message.EnsureExpectedOrError(PgTypes.BackendType.BindComplete) is { } bindError)
                 return (bindError, null);
 
@@ -271,12 +271,12 @@ static class CommandExtensions
             RowDescription? requestedRowDescription = null;
             if (readDescribe)
             {
-                if (!decoder.TryGetNext(out message))
+                if (!decoder.TryMoveNext())
                 {
                     if (!await decoder.MoveNextAsync().ConfigureAwait(false))
                         decoder.ThrowUnexpectedEof();
-                    message = decoder.Current;
                 }
+                message = decoder.Current;
                 if (message.EnsureExpectedOrError(PgTypes.BackendType.RowDescription, PgTypes.BackendType.NoData)
                         is var result && result.Error is { } describeError)
                     return (describeError, null);
@@ -300,12 +300,12 @@ static class CommandExtensions
 
             if (readExecute)
             {
-                if (!decoder.TryGetNext(out message))
+                if (!decoder.TryMoveNext())
                 {
                     if (!await decoder.MoveNextAsync().ConfigureAwait(false))
                         decoder.ThrowUnexpectedEof();
-                    message = decoder.Current;
                 }
+                message = decoder.Current;
                 message.DebugEnsureExpected(PgTypes.BackendType.DataRow, PgTypes.BackendType.CommandComplete);
             }
 
@@ -330,7 +330,7 @@ static class CommandExtensions
 
         static (PgError?, RowDescription?) ReadSimpleSync(PgDecoder decoder, RowDescription rowDescription)
         {
-            var message = decoder.TryGetNext(out var m) ? m : decoder.GetNext();
+            var message = decoder.GetNext();
             if (message.EnsureExpectedOrError(PgTypes.BackendType.RowDescription, PgTypes.BackendType.NoData)
                     is var result && result.Error is { } describeError)
                 return (describeError, null);
@@ -351,7 +351,7 @@ static class CommandExtensions
                     return default!;
             }
 
-            message = decoder.TryGetNext(out m) ? m : decoder.GetNext();
+            message = decoder.GetNext();
             message.DebugEnsureExpected(PgTypes.BackendType.DataRow, PgTypes.BackendType.CommandComplete);
             return (null, requestedRowDescription);
         }
@@ -362,14 +362,14 @@ static class CommandExtensions
             BackendMessage message;
             if (readParse)
             {
-                message = decoder.TryGetNext(out var m) ? m : decoder.GetNext();
+                message = decoder.GetNext();
                 if (message.EnsureExpectedOrError(PgTypes.BackendType.ParseComplete) is { } parseError)
                     return (parseError, null);
 
                 Debug.Assert(message.Header.BodyLength is 0);
             }
 
-            message = decoder.TryGetNext(out var bm) ? bm : decoder.GetNext();
+            message = decoder.GetNext();
             if (message.EnsureExpectedOrError(PgTypes.BackendType.BindComplete) is { } bindError)
                 return (bindError, null);
 
@@ -378,7 +378,7 @@ static class CommandExtensions
             RowDescription? requestedRowDescription = null;
             if (readDescribe)
             {
-                message = decoder.TryGetNext(out var dm) ? dm : decoder.GetNext();
+                message = decoder.GetNext();
                 if (message.EnsureExpectedOrError(PgTypes.BackendType.RowDescription, PgTypes.BackendType.NoData)
                         is var result && result.Error is { } describeError)
                     return (describeError, null);
@@ -401,7 +401,7 @@ static class CommandExtensions
 
             if (readExecute)
             {
-                message = decoder.TryGetNext(out var em) ? em : decoder.GetNext();
+                message = decoder.GetNext();
                 message.DebugEnsureExpected(PgTypes.BackendType.DataRow, PgTypes.BackendType.CommandComplete);
             }
 
@@ -414,31 +414,31 @@ static class CommandExtensions
         this Command command, PgDecoder decoder, RowDescription rowDescription)
     {
         Debug.Assert(command.DescribeForPreparation);
-        if (!decoder.TryGetNext(out var message))
+        if (!decoder.TryMoveNext())
         {
             if (!await decoder.MoveNextAsync().ConfigureAwait(false))
                 decoder.ThrowUnexpectedEof();
-            message = decoder.Current;
         }
+        var message = decoder.Current;
         if (message.EnsureExpectedOrError(PgTypes.BackendType.ParseComplete) is { } parseError)
             return (parseError, default, null);
 
-        if (!decoder.TryGetNext(out message))
+        if (!decoder.TryMoveNext())
         {
             if (!await decoder.MoveNextAsync().ConfigureAwait(false))
                 decoder.ThrowUnexpectedEof();
-            message = decoder.Current;
         }
+        message = decoder.Current;
         if (message.EnsureExpectedOrError(PgTypes.BackendType.ParameterDescription) is { } parameterError)
             return (parameterError, default, null);
         var parameterTypes = ParameterDescriptionMessage.Create(message).ParameterTypes;
 
-        if (!decoder.TryGetNext(out message))
+        if (!decoder.TryMoveNext())
         {
             if (!await decoder.MoveNextAsync().ConfigureAwait(false))
                 decoder.ThrowUnexpectedEof();
-            message = decoder.Current;
         }
+        message = decoder.Current;
         if (message.EnsureExpectedOrError(PgTypes.BackendType.RowDescription, PgTypes.BackendType.NoData)
                 is var result && result.Error is { } describeError)
             return (describeError, default, null);
@@ -448,21 +448,21 @@ static class CommandExtensions
         if (result.Type is PgTypes.BackendType.NoData)
             Debug.Assert(message.Header.BodyLength is 0);
 
-        if (!decoder.TryGetNext(out message))
+        if (!decoder.TryMoveNext())
         {
             if (!await decoder.MoveNextAsync().ConfigureAwait(false))
                 decoder.ThrowUnexpectedEof();
-            message = decoder.Current;
         }
+        message = decoder.Current;
         if (message.EnsureExpectedOrError(PgTypes.BackendType.BindComplete) is { } bindError)
             return (bindError, default, null);
 
-        if (!decoder.TryGetNext(out message))
+        if (!decoder.TryMoveNext())
         {
             if (!await decoder.MoveNextAsync().ConfigureAwait(false))
                 decoder.ThrowUnexpectedEof();
-            message = decoder.Current;
         }
+        message = decoder.Current;
         if (message.EnsureExpectedOrError(PgTypes.BackendType.RowDescription, PgTypes.BackendType.NoData)
                 is var portalResult && portalResult.Error is { } portalDescribeError)
             return (portalDescribeError, default, null);
@@ -485,16 +485,16 @@ static class CommandExtensions
         this in Command command, PgDecoder decoder, RowDescription rowDescription)
     {
         Debug.Assert(command.DescribeForPreparation);
-        var message = decoder.TryGetNext(out var current) ? current : decoder.GetNext();
+        var message = decoder.GetNext();
         if (message.EnsureExpectedOrError(PgTypes.BackendType.ParseComplete) is { } parseError)
             return (parseError, default, null);
 
-        message = decoder.TryGetNext(out current) ? current : decoder.GetNext();
+        message = decoder.GetNext();
         if (message.EnsureExpectedOrError(PgTypes.BackendType.ParameterDescription) is { } parameterError)
             return (parameterError, default, null);
         var parameterTypes = ParameterDescriptionMessage.Create(message).ParameterTypes;
 
-        message = decoder.TryGetNext(out current) ? current : decoder.GetNext();
+        message = decoder.GetNext();
         if (message.EnsureExpectedOrError(PgTypes.BackendType.RowDescription, PgTypes.BackendType.NoData)
                 is var result && result.Error is { } describeError)
             return (describeError, default, null);
@@ -504,11 +504,11 @@ static class CommandExtensions
         if (result.Type is PgTypes.BackendType.NoData)
             Debug.Assert(message.Header.BodyLength is 0);
 
-        message = decoder.TryGetNext(out current) ? current : decoder.GetNext();
+        message = decoder.GetNext();
         if (message.EnsureExpectedOrError(PgTypes.BackendType.BindComplete) is { } bindError)
             return (bindError, default, null);
 
-        message = decoder.TryGetNext(out current) ? current : decoder.GetNext();
+        message = decoder.GetNext();
         if (message.EnsureExpectedOrError(PgTypes.BackendType.RowDescription, PgTypes.BackendType.NoData)
                 is var portalResult && portalResult.Error is { } portalDescribeError)
             return (portalDescribeError, default, null);
@@ -580,8 +580,9 @@ static class CommandExtensions
 
         // Reading the following RFQ may retire the batch which owns the ErrorResponse body.
         errorMessage = errorMessage?.Preserve();
-        if (!decoder.TryGetNext(out var message))
+        if (!decoder.TryMoveNext())
             return Core(decoder, errorMessage);
+        var message = decoder.Current;
 
         // When an error is returned while we expect an RFQ it's going to be some unexpected server issue, just throw it.
         if (message.TryCreateError(out var syncError))

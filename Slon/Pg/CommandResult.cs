@@ -7,7 +7,8 @@ using Slon.Pg.Protocol.Flows;
 
 namespace Slon.Pg;
 
-abstract class CommandResult : IDisposable, IAsyncDisposable, IEnumerable<Row>, IAsyncEnumerable<Row>
+sealed class CommandResult(CommandFlow.ResultMessageEnumerator messageEnumerator)
+    : IDisposable, IAsyncDisposable, IEnumerable<Row>, IAsyncEnumerable<Row>
 {
     public enum RowBuffering : byte
     {
@@ -30,10 +31,8 @@ abstract class CommandResult : IDisposable, IAsyncDisposable, IEnumerable<Row>, 
     object? _completionActionState;
     CommandFlow _flow = null!;
 
-    private protected CommandResult() {}
-
     // The requested row description is what was returned for this exact command (i.e. commands that requested a describe).
-    protected void Initialize(CommandFlow flow, int index, CommandDescriptor descriptor,
+    internal void Initialize(CommandFlow flow, int index, CommandDescriptor descriptor,
         RowDescription? requestedRowDescription, bool requestedExecution, bool simpleProtocol, PgError? error = null)
     {
         if (!ReferenceEquals(_flow, flow))
@@ -261,8 +260,8 @@ abstract class CommandResult : IDisposable, IAsyncDisposable, IEnumerable<Row>, 
 
     // Disposing the CommandResult skips going through our enumerator, the results won't be accessed anyway.
     // We do expose disposal methods so any I/O can easily be done the way the user expects it (sync or async)
-    public abstract void Dispose();
-    public abstract ValueTask DisposeAsync();
+    public void Dispose() => messageEnumerator.Dispose();
+    public ValueTask DisposeAsync() => messageEnumerator.DisposeAsync();
 
     void CompleteCommand(BackendMessage message)
     {
@@ -309,9 +308,10 @@ abstract class CommandResult : IDisposable, IAsyncDisposable, IEnumerable<Row>, 
         return _row;
     }
 
-    protected abstract BackendMessage GetCurrentMessage();
-    protected abstract bool MoveNextMessage();
-    protected abstract ValueTask<bool> MoveNextMessageAsync();
+    BackendMessage GetCurrentMessage() => messageEnumerator.Current;
+    bool MoveNextMessage() => messageEnumerator.MoveNext();
+    CommandFlow.MoveNextStatus TryMoveNextMessage() => messageEnumerator.TryMoveNext();
+    ValueTask<bool> MoveNextMessageAsync() => messageEnumerator.MoveNextAsync();
 
     public struct RowEnumerator(CommandResult instance, RowBuffering buffering) : IEnumerator<Row>, IAsyncEnumerator<Row>
     {
@@ -327,7 +327,7 @@ abstract class CommandResult : IDisposable, IAsyncDisposable, IEnumerable<Row>, 
             return message;
         }
 
-        bool PublishRow(BackendMessage message)
+        bool PublishRow(in BackendMessage message)
         {
             (_row ??= instance.GetRow()).InitializeRow(message);
             return true;
@@ -380,11 +380,11 @@ abstract class CommandResult : IDisposable, IAsyncDisposable, IEnumerable<Row>, 
             if (_row is { HasColumnLease: true } leasedRow)
                 return MoveNextAfterRevokeAsync(leasedRow);
 
-            var task = instance.MoveNextMessageAsync();
-            if (!task.IsCompletedSuccessfully)
-                return MoveNextAsyncCore(task);
+            var status = instance.TryMoveNextMessage();
+            if (status is CommandFlow.MoveNextStatus.RequiresInput)
+                return MoveNextAsyncCore(instance.MoveNextMessageAsync());
 
-            if (!task.Result)
+            if (status is CommandFlow.MoveNextStatus.EndOfSequence)
             {
                 if (instance._requestedExecution && instance._commandCompleteMessage is null && instance._errorMessage is null)
                     ThrowHelper.ThrowInvalidOperation("Underlying message enumerator completed before CommandComplete was returned.");
@@ -398,19 +398,20 @@ abstract class CommandResult : IDisposable, IAsyncDisposable, IEnumerable<Row>, 
             if (current.Header.Type is PgTypes.BackendType.DataRow)
             {
                 if (buffering is RowBuffering.Buffered && !current.Buffered)
-                {
-                    var bufferTask = current.BufferBodyAsync(default);
-                    if (!bufferTask.IsCompletedSuccessfully)
-                    {
-                        var row = _row ??= instance.GetRow();
-                        return BufferRowAsync(bufferTask, row);
-                    }
-                    current = instance.GetCurrentMessage();
-                }
-                return new(PublishRow(current));
+                    return BufferCurrentRow(in current);
+                return new(PublishRow(in current));
             }
 
             return new(HandleUncommon(current));
+        }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        ValueTask<bool> BufferCurrentRow(in BackendMessage current)
+        {
+            var bufferTask = current.BufferBodyAsync(default);
+            if (!bufferTask.IsCompletedSuccessfully)
+                return BufferRowAsync(bufferTask, _row ??= instance.GetRow());
+            return new(PublishRow(instance.GetCurrentMessage()));
         }
 
         [MethodImpl(MethodImplOptions.NoInlining)]
@@ -502,29 +503,4 @@ abstract class CommandResult : IDisposable, IAsyncDisposable, IEnumerable<Row>, 
     IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
     IAsyncEnumerator<Row> IAsyncEnumerable<Row>.GetAsyncEnumerator(CancellationToken cancellationToken)
         => GetAsyncEnumerator(cancellationToken);
-}
-
-sealed class CommandResult<TEnumerator>(TEnumerator enumerator) : CommandResult
-    where TEnumerator : IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMessage>
-{
-    TEnumerator _messageEnumerator = enumerator;
-
-    internal new void Initialize(CommandFlow flow, int index, CommandDescriptor descriptor,
-        RowDescription? requestedRowDescription, bool requestedExecution, bool simpleProtocol, PgError? error = null)
-        => base.Initialize(flow, index, descriptor, requestedRowDescription, requestedExecution, simpleProtocol, error);
-
-    protected override BackendMessage GetCurrentMessage()
-    {
-        return GetCurrent(_messageEnumerator);
-
-        // Disambiguate Current without having to do a cast.
-        static BackendMessage GetCurrent<T>(T enumerator) where T : IEnumerator<BackendMessage> => enumerator.Current;
-    }
-
-    protected override bool MoveNextMessage() => _messageEnumerator.MoveNext();
-    protected override ValueTask<bool> MoveNextMessageAsync() => _messageEnumerator.MoveNextAsync();
-
-    public override void Dispose() => _messageEnumerator.Dispose();
-    public override ValueTask DisposeAsync() => _messageEnumerator.DisposeAsync();
-
 }

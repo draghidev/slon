@@ -503,12 +503,12 @@ partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSour
                     // DataRow/CommandComplete prelude. Await the decoder directly so a read wake resumes
                     // this outer body rather than a nested parser coroutine; the second message normally
                     // comes from the same batch and is consumed synchronously.
-                    if (!_decoder.TryGetNext(out var message))
+                    if (!_decoder.TryMoveNext())
                     {
                         if (!await _decoder.MoveNextAsync().ConfigureAwait(false))
                             _decoder.ThrowUnexpectedEof();
-                        message = _decoder.Current;
                     }
+                    var message = _decoder.Current;
 
                     if (message.EnsureExpectedOrError(PgTypes.BackendType.BindComplete) is { } bindError)
                     {
@@ -517,12 +517,12 @@ partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSour
                     }
                     else
                     {
-                        if (!_decoder.TryGetNext(out message))
+                        if (!_decoder.TryMoveNext())
                         {
                             if (!await _decoder.MoveNextAsync().ConfigureAwait(false))
                                 _decoder.ThrowUnexpectedEof();
-                            message = _decoder.Current;
                         }
+                        message = _decoder.Current;
                         message.DebugEnsureExpected(PgTypes.BackendType.DataRow, PgTypes.BackendType.CommandComplete);
                         _pgError = null;
                         _requestedRowDescription = null;
@@ -569,7 +569,7 @@ partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSour
                         MarkBodyInitiatedDrain();
                 }
 
-                CommandResult<ResultMessageEnumerator> result;
+                CommandResult result;
                 {
                     ref readonly var readState = ref context.GetProtocolStatic<ReadState>();
                     readState.ResultMessageEnumerator.Initialize(this, _decoder);
@@ -664,7 +664,7 @@ partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSour
                 {
                     while (_decoder.Current.Header.Type is PgTypes.BackendType.DataRow)
                     {
-                        if (!_decoder.TryGetNext(out _))
+                        if (!_decoder.TryMoveNext())
                             await _decoder.GetNextAsync().ConfigureAwait(false);
                     }
                     result.CompleteNonQuery(_decoder.Current);
@@ -734,8 +734,9 @@ partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSour
             // The framework observes trailing write failure before releasing this flow.
             if (_readFlowRfq)
             {
-                if (_decoder.TryGetNext(out var message))
+                if (_decoder.TryMoveNext())
                 {
+                    var message = _decoder.Current;
                     if (message.EnsureExpectedOrError(PgTypes.BackendType.ReadyForQuery) is { } rfqError)
                         PgErrorException.Throw(rfqError);
                 }
@@ -818,7 +819,7 @@ partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSour
             readState.Reset();
             PublishBodyTerminated();
         }
-        void SetResult(CommandResult<ResultMessageEnumerator>? next)
+        void SetResult(CommandResult? next)
         {
             var completed = next is null;
             if (completed)

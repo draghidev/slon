@@ -8,10 +8,17 @@ namespace Slon.Pg.Protocol.Flows;
 
 partial class CommandFlow
 {
+    internal enum MoveNextStatus : byte
+    {
+        RequiresInput,
+        EndOfSequence,
+        Moved
+    }
+
     internal struct ReadState
     {
         public ResultMessageEnumerator ResultMessageEnumerator { get; }
-        public CommandResult<ResultMessageEnumerator> CommandResult { get; }
+        public CommandResult CommandResult { get; }
         public ValueTaskSourcePromise<bool> ReadPromise { get; }
         public RowDescription RowDescription { get; }
 
@@ -31,13 +38,15 @@ partial class CommandFlow
         }
     }
 
-    // This is a struct to make CommandResult<T> specialize.
+    // The value wrapper lets ReadState and CommandResult share one MessageEnumerator instance
+    // without an interface or another adapter allocation.
     public readonly struct ResultMessageEnumerator() : IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMessage>
     {
         readonly MessageEnumerator _messageEnumerator = new();
         public bool MoveNext() => _messageEnumerator.MoveNext();
         public ValueTask<bool> MoveNextAsync() => _messageEnumerator.MoveNextAsync();
         public BackendMessage Current => _messageEnumerator.Current;
+        internal MoveNextStatus TryMoveNext() => _messageEnumerator.TryMoveNext();
 
         public void Dispose() => _messageEnumerator.Dispose();
         public ValueTask DisposeAsync() => _messageEnumerator.DisposeAsync();
@@ -95,8 +104,10 @@ partial class CommandFlow
 
                 try
                 {
-                    if (_decoder.TryGetNext(out var message))
+                    BackendMessage message;
+                    if (_decoder.TryMoveNext())
                     {
+                        message = _decoder.Current;
                         DebugEnsureExpected(message);
                         if (message.Header.Type is not PgTypes.BackendType.DataRow)
                             _done = true;
@@ -118,21 +129,9 @@ partial class CommandFlow
 
             public ValueTask<bool> MoveNextAsync()
             {
-                if (_first)
-                    return new(EnumerateFirst());
-
-                _exceptionDispatchInfo?.Throw();
-                if (_done)
-                    return new(false);
-
-                // We don't capture TryGetNext errors, we assume no IO will happen and it prevents inlining of this method.
-                if (_decoder.TryGetNext(out var message))
-                {
-                    DebugEnsureExpected(message);
-                    if (message.Header.Type is not PgTypes.BackendType.DataRow)
-                        _done = true;
-                    return new(true);
-                }
+                var status = TryMoveNext();
+                if (status is not MoveNextStatus.RequiresInput)
+                    return new(status is MoveNextStatus.Moved);
 
                 return Core();
 
@@ -152,6 +151,30 @@ partial class CommandFlow
                         throw;
                     }
                 }
+            }
+
+            public MoveNextStatus TryMoveNext()
+            {
+                if (_first)
+                {
+                    _ = EnumerateFirst();
+                    return MoveNextStatus.Moved;
+                }
+
+                _exceptionDispatchInfo?.Throw();
+                if (_done)
+                    return MoveNextStatus.EndOfSequence;
+
+                if (_decoder.TryMoveNext())
+                {
+                    var message = _decoder.Current;
+                    DebugEnsureExpected(message);
+                    if (message.Header.Type is not PgTypes.BackendType.DataRow)
+                        _done = true;
+                    return MoveNextStatus.Moved;
+                }
+
+                return MoveNextStatus.RequiresInput;
             }
 
             public BackendMessage Current
@@ -236,10 +259,14 @@ partial class CommandFlow
                     {
                         while (true)
                         {
-                            if (decoder.TryGetNext(out var message) && message.Header.Type is not PgTypes.BackendType.DataRow)
-                                break;
+                            if (decoder.TryMoveNext())
+                            {
+                                if (decoder.Current.Header.Type is not PgTypes.BackendType.DataRow)
+                                    break;
+                                continue;
+                            }
 
-                            message = await decoder.GetNextAsync().ConfigureAwait(false);
+                            var message = await decoder.GetNextAsync().ConfigureAwait(false);
                             if (message.Header.Type is not PgTypes.BackendType.DataRow)
                                 break;
                         }
