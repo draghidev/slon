@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using Slon.Pg.Serialization.Converters;
 using Slon.Pg.Types;
 
@@ -10,6 +11,7 @@ sealed partial class PgSerializerOptions
 {
     readonly Dictionary<Type, Mapping> _byClrType = new();
     readonly Dictionary<PgTypeId, Mapping> _byPgTypeId = new();
+    readonly ConditionalWeakTable<RowDescription, PgSerializerReadCache> _readCaches = new();
 
     internal PgSerializerOptions(PgTypeCatalog typeCatalog)
     {
@@ -42,6 +44,9 @@ sealed partial class PgSerializerOptions
             : _typeCatalog.GetOid(typeId);
 
     internal DataTypeName GetDataTypeName(PgTypeId typeId) => _typeCatalog.GetDataTypeName(typeId);
+
+    internal PgSerializerReadCache GetReadCache(RowDescription rowDescription)
+        => _readCaches.GetValue(rowDescription, static _ => new());
 
     public PgTypeInfo GetTypeInfo(Type? type, PgTypeId? pgTypeId = null,
         DataFormat? fieldFormat = null)

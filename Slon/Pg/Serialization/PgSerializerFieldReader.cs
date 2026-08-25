@@ -10,6 +10,8 @@ struct PgSerializerFieldReader
     PgConversionContext _conversionContext = PgConversionContext.Empty;
     RowDescription? _rowDescription;
     ReadFieldBinding[] _bindings = [];
+    ReadFieldBinding[] _objectBindings = [];
+    PgSerializerReadCache? _bindingCache;
     int _bindingCount;
     internal PgSerializerFieldReader(PgSerializerOptions options)
     {
@@ -20,11 +22,23 @@ struct PgSerializerFieldReader
     internal void Initialize(CommandResult result)
     {
         _rowDescription = result.GetMetadata().RowDescription;
-        if (_bindings.Length > MaxRetainedBindingCapacity)
-            _bindings = [];
+        if (_rowDescription is { IsPreserved: true } preserved)
+        {
+            _bindingCache = GetOptions().GetReadCache(preserved);
+            _bindings = _bindingCache.TypedSnapshot;
+            _objectBindings = _bindingCache.ObjectSnapshot;
+            _bindingCount = Math.Max(_bindings.Length, _objectBindings.Length);
+        }
         else
-            _bindings.AsSpan(0, _bindingCount).Clear();
-        _bindingCount = 0;
+        {
+            if (_bindingCache is not null || _bindings.Length > MaxRetainedBindingCapacity)
+                _bindings = [];
+            else
+                _bindings.AsSpan(0, _bindingCount).Clear();
+            _bindingCache = null;
+            _objectBindings = [];
+            _bindingCount = 0;
+        }
     }
 
     internal T Read<T>(Row row, int ordinal, bool sequential = false)
@@ -79,9 +93,15 @@ struct PgSerializerFieldReader
         var requestedType = typeof(T);
         if ((uint)ordinal < (uint)_bindingCount)
         {
-            ref var cached = ref _bindings[ordinal];
-            if (ReferenceEquals(cached.RequestedType, requestedType))
-                return ref cached.Binding;
+            var bindings = requestedType == typeof(object) && _bindingCache is not null
+                ? _objectBindings
+                : _bindings;
+            if ((uint)ordinal < (uint)bindings.Length)
+            {
+                ref readonly var cached = ref bindings[ordinal];
+                if (ReferenceEquals(cached.RequestedType, requestedType))
+                    return ref cached.Binding;
+            }
         }
         return ref ResolveBinding(ordinal, requestedType);
     }
@@ -90,14 +110,33 @@ struct PgSerializerFieldReader
     ref readonly PgFieldBinding ResolveBinding(int ordinal, Type requestedType)
     {
         ref readonly var field = ref GetField(ordinal);
-        if (_bindings.Length <= ordinal)
-            Array.Resize(ref _bindings, _rowDescription!.FieldCount);
-        _bindingCount = Math.Max(_bindingCount, ordinal + 1);
-
-        ref var cached = ref _bindings[ordinal];
         var format = field.Format is PgFormat.Binary ? DataFormat.Binary : DataFormat.Text;
         var info = GetOptions().GetTypeInfo(requestedType, field.TypeOid, format);
-        cached = new(requestedType, info.BindField(_conversionContext, format));
+        var resolved = new ReadFieldBinding(
+            requestedType, info.BindField(_conversionContext, format));
+
+        if (_bindingCache is { } cache)
+        {
+            if (requestedType == typeof(object))
+                _objectBindings = cache.GetOrAddObject(
+                    ordinal, resolved, _rowDescription!.FieldCount);
+            else
+                _bindings = cache.GetOrAddTyped(
+                    ordinal, resolved, _rowDescription!.FieldCount);
+            _bindingCount = Math.Max(_bindings.Length, _objectBindings.Length);
+        }
+        else
+        {
+            if (_bindings.Length <= ordinal)
+                Array.Resize(ref _bindings, _rowDescription!.FieldCount);
+            _bindingCount = Math.Max(_bindingCount, ordinal + 1);
+            _bindings[ordinal] = resolved;
+        }
+
+        var resolvedBindings = requestedType == typeof(object) && _bindingCache is not null
+            ? _objectBindings
+            : _bindings;
+        ref readonly var cached = ref resolvedBindings[ordinal];
         return ref cached.Binding;
     }
 
@@ -159,9 +198,52 @@ struct PgSerializerFieldReader
                 state.Sequential), cancellationToken);
     }
 
-    struct ReadFieldBinding(Type requestedType, PgFieldBinding binding)
+}
+
+readonly struct ReadFieldBinding
+{
+    public readonly Type? RequestedType;
+    public readonly PgFieldBinding Binding;
+
+    public ReadFieldBinding(Type requestedType, PgFieldBinding binding)
     {
-        public Type RequestedType = requestedType;
-        public PgFieldBinding Binding = binding;
+        RequestedType = requestedType;
+        Binding = binding;
+    }
+}
+
+sealed class PgSerializerReadCache
+{
+    ReadFieldBinding[] _typedBindings = [];
+    ReadFieldBinding[] _objectBindings = [];
+
+    internal ReadFieldBinding[] TypedSnapshot => Volatile.Read(ref _typedBindings);
+    internal ReadFieldBinding[] ObjectSnapshot => Volatile.Read(ref _objectBindings);
+
+    internal ReadFieldBinding[] GetOrAddTyped(int ordinal, ReadFieldBinding resolved,
+        int fieldCount) => GetOrAdd(ref _typedBindings, ordinal, resolved, fieldCount);
+
+    internal ReadFieldBinding[] GetOrAddObject(int ordinal, ReadFieldBinding resolved,
+        int fieldCount) => GetOrAdd(ref _objectBindings, ordinal, resolved, fieldCount);
+
+    static ReadFieldBinding[] GetOrAdd(ref ReadFieldBinding[] location, int ordinal,
+        ReadFieldBinding resolved, int fieldCount)
+    {
+        while (true)
+        {
+            var current = Volatile.Read(ref location);
+            if ((uint)ordinal < (uint)current.Length)
+            {
+                ref readonly var cached = ref current[ordinal];
+                if (ReferenceEquals(cached.RequestedType, resolved.RequestedType))
+                    return current;
+            }
+
+            var next = new ReadFieldBinding[Math.Max(fieldCount, ordinal + 1)];
+            current.CopyTo(next, 0);
+            next[ordinal] = resolved;
+            if (ReferenceEquals(Interlocked.CompareExchange(ref location, next, current), current))
+                return next;
+        }
     }
 }

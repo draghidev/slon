@@ -22,6 +22,7 @@ sealed class RowDescription
     int _fieldCount;
     Dictionary<string, int>? _nameIndex;
     Dictionary<string, int>? _insensitiveNameIndex;
+    bool _preserved;
 
     static readonly StringComparer InsensitiveNameComparer =
         CultureInfo.InvariantCulture.CompareInfo.GetStringComparer(
@@ -110,8 +111,13 @@ sealed class RowDescription
             : new()
             {
                 _fields = _fields.AsSpan(0, _fieldCount).ToArray(),
-                _fieldCount = _fieldCount
+                _fieldCount = _fieldCount,
+                _preserved = true
             };
+
+    // Preserved descriptions have statement lifetime and may safely key higher-level caches.
+    // The protocol-static instance is reused for unrelated results and must never do so.
+    internal bool IsPreserved => _preserved;
 
     // Called when the owning flow retires, after its final CommandResult tenure has ended. An unusually
     // wide description no longer needs to remain rooted; normal high-water storage is kept for reuse.
@@ -125,6 +131,7 @@ sealed class RowDescription
         _fieldCount = 0;
         _nameIndex = null;
         _insensitiveNameIndex = null;
+        _preserved = false;
     }
 
     public bool IsNoData => ReferenceEquals(this, NoData);
