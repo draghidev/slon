@@ -72,8 +72,9 @@ public class AdoCommandFlowFactoryBenchmark : ClientBenchmark
         var factory = new AdoCommandFlowFactory<SlonBatchCommand>(
             _commandOwner, MemoryMarshal.CreateSpan(ref _preparedCommand, 1), _dependencies);
         _optionsSink = factory.Create(
-            [], CommandBehavior.Default, explicitlyPrepared: true, enableErrorBarriers: false,
-            TimeSpan.Zero, pgConnection: _pgConnection);
+            [], CommandBehavior.Default, explicitlyPrepared: true,
+            allowAutoPreparation: true, enableErrorBarriers: false,
+            timeout: TimeSpan.Zero, pgConnection: _pgConnection);
     }
 
     [Benchmark]
@@ -82,8 +83,9 @@ public class AdoCommandFlowFactoryBenchmark : ClientBenchmark
         var factory = new AdoCommandFlowFactory<SlonBatchCommand>(
             _commandOwner, MemoryMarshal.CreateSpan(ref _untrackedCommand, 1), _dependencies);
         _optionsSink = factory.Create(
-            [], CommandBehavior.Default, explicitlyPrepared: false, enableErrorBarriers: false,
-            TimeSpan.Zero, pgConnection: _pgConnection);
+            [], CommandBehavior.Default, explicitlyPrepared: false,
+            allowAutoPreparation: true, enableErrorBarriers: false,
+            timeout: TimeSpan.Zero, pgConnection: _pgConnection);
     }
 
     [Benchmark]
@@ -102,18 +104,20 @@ public class AdoCommandFlowFactoryBenchmark : ClientBenchmark
     [Benchmark]
     public int CreatePreparedCommand()
         => AdoCommandFactory.CreateCommand(
-            _preparedCommand, enableErrorBarriers: false, CommandBehavior.Default,
-            _preparedTracker, dbParameters: null, TimeSpan.Zero, preparing: false,
-            _dependencies.SerializerOptions, _dependencies.ParameterWriter)
+            _preparedCommand, allowAutoPreparation: true, enableErrorBarriers: false,
+            behavior: CommandBehavior.Default, _preparedTracker, dbParameters: null,
+            timeout: TimeSpan.Zero, preparing: false, _dependencies.SerializerOptions,
+            _dependencies.ParameterWriter)
             .Item1.Descriptor.ParameterTypes.Count;
 
     [Benchmark]
     public void CreatePreparedCommandOptions()
     {
         var result = AdoCommandFactory.CreateCommand(
-            _preparedCommand, enableErrorBarriers: false, CommandBehavior.Default,
-            _preparedTracker, dbParameters: null, TimeSpan.Zero, preparing: false,
-            _dependencies.SerializerOptions, _dependencies.ParameterWriter);
+            _preparedCommand, allowAutoPreparation: true, enableErrorBarriers: false,
+            behavior: CommandBehavior.Default, _preparedTracker, dbParameters: null,
+            timeout: TimeSpan.Zero, preparing: false, _dependencies.SerializerOptions,
+            _dependencies.ParameterWriter);
         _optionsSink = new AdoCommandFlowOptions
         {
             Commands = new(result.Item1)
@@ -123,9 +127,10 @@ public class AdoCommandFlowFactoryBenchmark : ClientBenchmark
     [Benchmark]
     public int CreateUntrackedCommand()
         => AdoCommandFactory.CreateCommand(
-            _untrackedCommand, enableErrorBarriers: false, CommandBehavior.Default,
-            default, dbParameters: null, TimeSpan.Zero, preparing: false,
-            _dependencies.SerializerOptions, _dependencies.ParameterWriter)
+            _untrackedCommand, allowAutoPreparation: true, enableErrorBarriers: false,
+            behavior: CommandBehavior.Default, default, dbParameters: null,
+            timeout: TimeSpan.Zero, preparing: false, _dependencies.SerializerOptions,
+            _dependencies.ParameterWriter)
             .Item1.Descriptor.ParameterTypes.Count;
 
     [GlobalCleanup]
