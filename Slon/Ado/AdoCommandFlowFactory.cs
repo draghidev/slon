@@ -1,7 +1,6 @@
 using System.Buffers;
 using System.Data;
 using System.Data.Common;
-using System.Runtime.CompilerServices;
 using Slon.Pg;
 using Slon.Pg.Protocol.Flows;
 
@@ -53,8 +52,8 @@ readonly ref struct AdoCommandFlowFactory<TCommand>(
             {
                 ref var adoCommand = ref commands[i];
                 var batchCommand = !preparing && !explicitlyPrepared
-                    && typeof(TCommand) == typeof(SlonBatchCommand)
-                    ? Unsafe.As<TCommand, SlonBatchCommand>(ref adoCommand)
+                    && adoCommand is SlonBatchCommand concreteBatchCommand
+                    ? concreteBatchCommand
                     : null;
                 batchCommand?.ResetRecordsAffected();
                 TrackerContext trackerContext = default;
