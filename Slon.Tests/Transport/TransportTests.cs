@@ -224,30 +224,47 @@ public class TransportTests
         listener.Start();
         var endpoint = (IPEndPoint)listener.LocalEndpoint;
         var allowRead = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var expectedLength = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
 
         var clientSocket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp)
         {
             SendBufferSize = 4096
         };
         await clientSocket.ConnectAsync(endpoint);
-        // Kernels may clamp or scale SO_SNDBUF. Base the pressure on the effective value instead of
-        // assuming the requested size, with room for TLS and socket-stack buffering above it.
-        var payloadLength = Math.Max(64 * 1024, checked(clientSocket.SendBufferSize * 8));
-        var serverTask = AcceptAndDecrypt(listener, cert, allowRead.Task, payloadLength);
+        var serverTask = AcceptAndDecrypt(listener, cert, allowRead.Task, expectedLength.Task);
         var inner = new SocketStreamConnection.SealedNetworkStream(clientSocket, ownsSocket: true);
         await using var clientSsl = new SslStream(inner, leaveInnerStreamOpen: false,
             userCertificateValidationCallback: (_, _, _, _) => true);
         await clientSsl.AuthenticateAsClientAsync("localhost");
 
-        var payload = new byte[payloadLength];
+        // A constrained SO_SNDBUF does not bound the complete loopback/TLS buffering path. Keep
+        // submitting bounded records while the peer is held until the transport actually parks on
+        // WouldBlock instead of assuming one platform-specific payload size must do so.
+        const int ChunkLength = 256 * 1024;
+        const int MaximumPayloadLength = 32 * 1024 * 1024;
+        var payload = new byte[MaximumPayloadLength];
         Random.Shared.NextBytes(payload);
         var signal = new ResumeSignal();
-        ValueTask writeTask;
-        using (new PgEncoder.ResumableWriteScope(signal))
-            writeTask = clientSsl.WriteAsync(payload);
+        ValueTask writeTask = default;
+        var submitted = 0;
+        while (submitted < payload.Length)
+        {
+            var count = Math.Min(ChunkLength, payload.Length - submitted);
+            using (new PgEncoder.ResumableWriteScope(signal))
+                writeTask = clientSsl.WriteAsync(payload.AsMemory(submitted, count));
+            submitted += count;
+            if (!writeTask.IsCompleted)
+                break;
+            await writeTask;
+        }
 
-        Assert.IsFalse(writeTask.IsCompleted,
-            "with the peer held and a constrained send buffer, the TLS write must reach WouldBlock");
+        expectedLength.SetResult(submitted);
+        if (writeTask.IsCompleted)
+        {
+            allowRead.SetResult();
+            _ = await serverTask;
+            Assert.Fail($"Unable to induce socket backpressure after writing {submitted} bytes.");
+        }
 
         allowRead.SetResult();
         while (!writeTask.IsCompleted)
@@ -262,7 +279,7 @@ public class TransportTests
         }
         await writeTask;
 
-        CollectionAssert.AreEqual(payload, await serverTask);
+        CollectionAssert.AreEqual(payload.AsSpan(0, submitted).ToArray(), await serverTask);
     }
 
     [TestMethod]
@@ -357,9 +374,10 @@ public class TransportTests
     }
 
     static async Task<byte[]> AcceptAndDecrypt(TcpListener listener, X509Certificate2 cert,
-        Task allowRead, int length)
+        Task allowRead, Task<int> expectedLength)
     {
         var serverSocket = await listener.AcceptSocketAsync();
+        serverSocket.ReceiveBufferSize = 4096;
         await using var serverNet = new NetworkStream(serverSocket, ownsSocket: true);
         await using var serverSsl = new SslStream(serverNet, leaveInnerStreamOpen: false);
         await serverSsl.AuthenticateAsServerAsync(cert, clientCertificateRequired: false,
@@ -367,6 +385,7 @@ public class TransportTests
             checkCertificateRevocation: false);
         await allowRead;
 
+        var length = await expectedLength;
         var result = new byte[length];
         var total = 0;
         while (total < result.Length)
