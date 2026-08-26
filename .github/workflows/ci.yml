@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          path: Slon
+      - uses: actions/checkout@v6
+        with:
+          repository: draghidev/pipelining
+          path: Draghi
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+
+      - run: dotnet restore Slon.slnx
+        working-directory: Slon
+      - run: dotnet build Slon.slnx -c Release --no-restore
+        working-directory: Slon
+      - run: ./test.sh
+        working-directory: Slon

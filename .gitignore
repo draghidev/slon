@@ -1,0 +1,13 @@
+**/bin/
+**/obj/
+.idea/
+.vs/
+*.suo
+*.user
+*.DotSettings.user
+TestResults/
+BenchmarkDotNet.Artifacts/
+artifacts/
+*.nupkg
+*.snupkg
+.DS_Store

@@ -1,0 +1,7 @@
+<Solution>
+  <Project Path="../Draghi/Draghi.Pipelining/Draghi.Pipelining.csproj" />
+  <Project Path="Slon/Slon.csproj" />
+  <Project Path="Slon.Tests/Slon.Tests.csproj" />
+  <Project Path="Slon.Benchmark/Slon.Benchmark.csproj" />
+  <Project Path="Slon.ProductionWorkload/Slon.ProductionWorkload.csproj" />
+</Solution>
