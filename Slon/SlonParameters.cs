@@ -127,6 +127,7 @@ public sealed partial class SlonParameters
 
     readonly List<ParameterItem> _parameters;
     PgSerializerOptions? _parameterResolutionOptions;
+    int _mutationRevision;
 
     // Dictionary lookups for GetValue to improve performance.
     Dictionary<string, int>? _caseInsensitiveLookup;
@@ -136,22 +137,35 @@ public sealed partial class SlonParameters
     internal ParameterTypeResolution GetOrResolveTypeInfo(int index, PgSerializerOptions options,
         PgTypeId? preparedTypeId, bool allowUnspecified)
     {
-        ref var item = ref GetItemRef(index);
+        EnsureParameterResolutionOptions(options);
+        var mutationRevision = _mutationRevision;
+        var item = _parameters[index];
         var value = item.Value;
 
-        if (allowUnspecified && value is (null or DBNull))
-            return AdoParameterTypeResolver.Resolve(
-                value, options, preparedTypeId, allowUnspecified);
+        if (!(allowUnspecified && value is (null or DBNull))
+            && item.TryGetTypeResolution(options, preparedTypeId, out var cachedResolution))
+            return cachedResolution;
 
-        EnsureParameterResolutionOptions(options);
-        if (item.TryGetTypeResolution(options, preparedTypeId, out var resolution))
-            return resolution;
-
-        resolution = AdoParameterTypeResolver.Resolve(
+        var parameter = value as SlonParameter;
+        var typeRevision = parameter?.TypeRevision ?? 0;
+        var resolution = AdoParameterTypeResolver.Resolve(
             value, options, preparedTypeId, allowUnspecified);
-        item = item.WithTypeResolution(resolution,
-            resolvedForPreparedType: preparedTypeId is not null);
+        if (_mutationRevision != mutationRevision
+            || !ReferenceEquals(_parameterResolutionOptions, options)
+            || parameter is not null && parameter.TypeRevision != typeRevision)
+            ThrowModifiedDuringResolution();
+
+        if (resolution.IsResolved)
+        {
+            ref var current = ref GetItemRef(index);
+            current = current.WithTypeResolution(resolution,
+                resolvedForPreparedType: preparedTypeId is not null);
+        }
         return resolution;
+
+        static void ThrowModifiedDuringResolution()
+            => throw new InvalidOperationException(
+                "The parameter collection was modified during type resolution.");
     }
 
     internal PgTypeId GetResolvedParameterType(int index)
@@ -282,6 +296,7 @@ public sealed partial class SlonParameters
         {
             var parameter = CreateParameter(p.Name, p.Value);
             p = ParameterItem.Create(p.Name, parameter);
+            AdvanceMutationRevision();
             return parameter;
         }
     }
@@ -291,6 +306,7 @@ public sealed partial class SlonParameters
     {
         var item = CreateItem(parameterName, value);
         _parameters.Add(item);
+        AdvanceMutationRevision();
         LookupAdd(item.Name, _parameters.Count - 1);
         return _parameters.Count - 1;
     }
@@ -309,6 +325,7 @@ public sealed partial class SlonParameters
         var item = CreateItem(parameterName, value).PreserveTypeResolutionFrom(current);
         var oldName = current.Name;
         current = item;
+        AdvanceMutationRevision();
         LookupChangeName(item, oldName, index);
     }
 
@@ -316,6 +333,7 @@ public sealed partial class SlonParameters
     {
         var item = CreateItem(parameterName, value);
         _parameters.Insert(index, item);
+        AdvanceMutationRevision();
         // Positional parameters still shift the indices of named parameters after them.
         LookupInsert(item.Name, index);
     }
@@ -324,6 +342,7 @@ public sealed partial class SlonParameters
     {
         var item = _parameters[index];
         _parameters.RemoveAt(index);
+        AdvanceMutationRevision();
         if (_parameters.Count is 0)
             _parameterResolutionOptions = null;
         if (!LookupEnabled)
@@ -464,6 +483,8 @@ public sealed partial class SlonParameters
     internal NameValueEnumerator GetStructEnumerator() => new(this);
 
     SlonParameter CreateParameter(string parameterName, object? value) => new(parameterName, value);
+
+    void AdvanceMutationRevision() => _mutationRevision = checked(_mutationRevision + 1);
 }
 
 // Public surface and ADO.NET
@@ -754,6 +775,8 @@ public sealed partial class SlonParameters : DbParameterCollection,
     public override void Clear()
     {
         LookupClear();
+        if (_parameters.Count is not 0)
+            AdvanceMutationRevision();
         _parameters.Clear();
         _parameterResolutionOptions = null;
     }
