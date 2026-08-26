@@ -25,23 +25,23 @@ static class SequenceReaderExtensions
     /// True if successful. <paramref name="value"/> will be default if failed (due to lack of space).
     /// </returns>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    static unsafe bool TryPeek<T>(ref this SequenceReader<byte> reader, out T value) where T : unmanaged
+    static bool TryPeek<T>(ref this SequenceReader<byte> reader, out T value) where T : unmanaged
     {
         ReadOnlySpan<byte> span = reader.UnreadSpan;
-        if (span.Length < sizeof(T))
+        if (span.Length < Unsafe.SizeOf<T>())
             return TryPeekMultisegment(ref reader, out value);
 
-        value = Unsafe.ReadUnaligned<T>(ref MemoryMarshal.GetReference(span));
+        value = MemoryMarshal.Read<T>(span);
         return true;
     }
 
-    static unsafe bool TryPeekMultisegment<T>(ref SequenceReader<byte> reader, out T value) where T : unmanaged
+    static bool TryPeekMultisegment<T>(ref SequenceReader<byte> reader, out T value) where T : unmanaged
     {
-        Debug.Assert(reader.UnreadSpan.Length < sizeof(T));
+        Debug.Assert(reader.UnreadSpan.Length < Unsafe.SizeOf<T>());
 
         // Not enough data in the current segment, try to peek for the data we need.
         T buffer = default;
-        Span<byte> tempSpan = new Span<byte>(&buffer, sizeof(T));
+        var tempSpan = MemoryMarshal.AsBytes(new Span<T>(ref buffer));
 
         if (!reader.TryCopyTo(tempSpan))
         {
@@ -49,7 +49,7 @@ static class SequenceReaderExtensions
             return false;
         }
 
-        value = Unsafe.ReadUnaligned<T>(ref MemoryMarshal.GetReference(tempSpan));
+        value = buffer;
         return true;
     }
 
