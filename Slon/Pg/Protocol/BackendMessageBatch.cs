@@ -1,6 +1,7 @@
 using System.Buffers;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using Slon.Pipelines;
 using static Slon.Pg.Protocol.PgTypes;
 
@@ -181,8 +182,9 @@ struct BackendMessageBatch(ReadOnlySequence<byte> buffer)
         {
             FastReadOnlySequence<T> prev;
 
-            // If it's out-of-range of the first, has to resolve next segment, or not an array, let slice handle it.
-            if (GetFirstSpan(out var array).Length <= offset || array.Array is null)
+            // If it's out-of-range of the first, has to resolve another segment, or is not backed by
+            // one array, let Slice handle it.
+            if (!SequenceMarshal.TryGetArray(_sequence, out var array) || array.Count <= offset)
             {
                 prev = new(_sequence.Slice(0, offset), offset);
                 _sequence = _sequence.Slice(offset);
@@ -190,9 +192,9 @@ struct BackendMessageBatch(ReadOnlySequence<byte> buffer)
             else
             {
                 Debug.Assert(offset <= int.MaxValue);
-                Debug.Assert(_sequence.Start.GetInteger() == StartInteger(ref _sequence), "Unexpected flags on single segment start integer.");
-                prev = new(new(array.Array, array.Offset, (int)offset), offset);
-                StartInteger(ref _sequence) += (int)offset;
+                var arrayInstance = array.Array!;
+                prev = new(new(arrayInstance, array.Offset, (int)offset), offset);
+                _sequence = new(arrayInstance, array.Offset + (int)offset, array.Count - (int)offset);
             }
 
             _length -= offset;
@@ -204,13 +206,9 @@ struct BackendMessageBatch(ReadOnlySequence<byte> buffer)
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         ReadOnlySpan<T> GetFirstSpan(out ArraySegment<T> array)
         {
-            var startObject = StartObject(ref _sequence);
-            if (startObject is not null && startObject.GetType() == typeof(T[]))
+            if (SequenceMarshal.TryGetArray(_sequence, out array))
             {
                 Debug.Assert(_sequence.IsSingleSegment);
-                Debug.Assert(_sequence.Start.GetInteger() == StartInteger(ref _sequence), "Unexpected flags on single segment start integer.");
-                var offset = StartInteger(ref _sequence);
-                array = new ArraySegment<T>(Unsafe.As<T[]>(startObject), offset, GetIndex(default, EndInteger(ref _sequence)) - offset);
                 return array.AsSpan();
             }
 
@@ -218,16 +216,5 @@ struct BackendMessageBatch(ReadOnlySequence<byte> buffer)
             return _sequence.FirstSpan;
         }
 
-        [UnsafeAccessor(UnsafeAccessorKind.Field, Name = "_startObject")]
-        static extern ref object? StartObject(ref ReadOnlySequence<T> buffer);
-
-        [UnsafeAccessor(UnsafeAccessorKind.Field, Name = "_startInteger")]
-        static extern ref int StartInteger(ref ReadOnlySequence<T> buffer);
-
-        [UnsafeAccessor(UnsafeAccessorKind.Field, Name = "_endInteger")]
-        static extern ref int EndInteger(ref ReadOnlySequence<T> buffer);
-
-        [UnsafeAccessor(UnsafeAccessorKind.StaticMethod, Name = "GetIndex")]
-        static extern int GetIndex(ReadOnlySequence<T> buffer, int indexAndFlags);
     }
 }

@@ -2,6 +2,7 @@ using System.Buffers;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using static Slon.Pg.Protocol.PgTypes;
 
 namespace Slon.Pg.Protocol;
@@ -58,21 +59,7 @@ readonly struct BackendMessage
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     static void WriteGranularly(ref ReadOnlySequence<byte> destination, in ReadOnlySequence<byte> value)
-    {
-        ref var source = ref Unsafe.AsRef(in value);
-        ref var destinationStartObject = ref StartObject(ref destination);
-        var sourceStartObject = StartObject(ref source);
-        if (!ReferenceEquals(destinationStartObject, sourceStartObject))
-            destinationStartObject = sourceStartObject;
-
-        ref var destinationEndObject = ref EndObject(ref destination);
-        var sourceEndObject = EndObject(ref source);
-        if (!ReferenceEquals(destinationEndObject, sourceEndObject))
-            destinationEndObject = sourceEndObject;
-
-        StartInteger(ref destination) = StartInteger(ref source);
-        EndInteger(ref destination) = EndInteger(ref source);
-    }
+        => destination = value;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static void SetSequence(ref ReadOnlySequence<byte> destination, in ReadOnlySequence<byte> value)
@@ -114,13 +101,11 @@ readonly struct BackendMessage
     {
         offset += BackendHeader.ByteCount;
         ref var buffer = ref Unsafe.AsRef(in _buffer);
-        var startObject = StartObject(ref buffer);
         ReadOnlySpan<byte> firstSpan;
-        if (startObject is not null && startObject.GetType() == typeof(byte[]))
+        if (SequenceMarshal.TryGetArray(buffer, out var array))
         {
             Debug.Assert(buffer.IsSingleSegment);
-            var start = StartInteger(ref buffer);
-            firstSpan = Unsafe.As<byte[]>(startObject).AsSpan(start, buffer.End.GetInteger() - start);
+            firstSpan = array.AsSpan();
         }
         else
         {
@@ -142,14 +127,11 @@ readonly struct BackendMessage
         Debug.Assert(_buffered);
         offset += BackendHeader.ByteCount;
         ref var buffer = ref Unsafe.AsRef(in _buffer);
-        var startObject = StartObject(ref buffer);
         ReadOnlyMemory<byte> firstMemory;
-        if (startObject is not null && startObject.GetType() == typeof(byte[]))
+        if (SequenceMarshal.TryGetArray(buffer, out var array))
         {
             Debug.Assert(buffer.IsSingleSegment);
-            var start = StartInteger(ref buffer);
-            firstMemory = new(Unsafe.As<byte[]>(startObject), start,
-                buffer.End.GetInteger() - start);
+            firstMemory = array.AsMemory();
         }
         else
         {
@@ -164,18 +146,6 @@ readonly struct BackendMessage
         memory = default;
         return false;
     }
-
-    [UnsafeAccessor(UnsafeAccessorKind.Field, Name = "_startObject")]
-    static extern ref object? StartObject(ref ReadOnlySequence<byte> buffer);
-
-    [UnsafeAccessor(UnsafeAccessorKind.Field, Name = "_startInteger")]
-    static extern ref int StartInteger(ref ReadOnlySequence<byte> buffer);
-
-    [UnsafeAccessor(UnsafeAccessorKind.Field, Name = "_endObject")]
-    static extern ref object? EndObject(ref ReadOnlySequence<byte> buffer);
-
-    [UnsafeAccessor(UnsafeAccessorKind.Field, Name = "_endInteger")]
-    static extern ref int EndInteger(ref ReadOnlySequence<byte> buffer);
 
     public SequenceReader<byte> BodyReader => new(GetSequence());
 
