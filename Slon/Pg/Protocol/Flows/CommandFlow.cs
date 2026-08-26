@@ -103,6 +103,14 @@ partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSour
         Volatile.Write(ref _draining, true);
     }
 
+    // Result publication orders these body-owned fields before the consumer can observe the
+    // CommandResult. IsComplete is consumer-owned after that handoff. A behavior-limited reader may
+    // consider its visible result final while later commands still exist, so use the physical
+    // command index rather than an ADO-visible result count.
+    bool IsFullyConsumedFinalResult
+        => _isResultReady && _commandIndex >= CommandCount - 1
+            && _enumeratorCurrent is { IsComplete: true };
+
     // A body-initiated drain keeps the consumer attached for terminal cancellation or close delivery.
     void MarkBodyInitiatedDrain() => Volatile.Write(ref _draining, true);
 

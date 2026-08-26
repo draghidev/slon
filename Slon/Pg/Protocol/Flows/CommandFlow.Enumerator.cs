@@ -305,8 +305,19 @@ partial class CommandFlow
             // pump: its gate may already be faulted while its handoff continuation is pending.
             if (flow.IsEnumerationCompleted)
             {
-                if (flow.TransferLiveBodyToDrain() && flow.WaitForDrainOnDispose)
-                    flow.AwaitDrainOnDisposeSynchronously();
+                FinishCompletedDisposal(flow);
+                return;
+            }
+
+            // The final result's terminal message has already been consumed. Only the outer
+            // enumeration's false publication remains, so finish through the ordinary consumer
+            // path rather than reclassifying structural terminality as autonomous abandonment.
+            if (flow.IsFullyConsumedFinalResult)
+            {
+                if (MoveNext())
+                    ThrowHelper.ThrowInvalidOperation(
+                        "A fully consumed physical final result produced another result.");
+                FinishCompletedDisposal(flow);
                 return;
             }
 
@@ -358,6 +369,12 @@ partial class CommandFlow
                     continuation.Invoke();
                 }
             }
+
+            static void FinishCompletedDisposal(CommandFlow flow)
+            {
+                if (flow.TransferLiveBodyToDrain() && flow.WaitForDrainOnDispose)
+                    flow.AwaitDrainOnDisposeSynchronously();
+            }
         }
 
         /// <inheritdoc />
@@ -367,11 +384,10 @@ partial class CommandFlow
                 return new();
 
             if (flow.IsEnumerationCompleted)
-            {
-                // A completed awaited drain may still have errors to surface.
-                flow.TransferLiveBodyToDrain();
-                return flow.WaitForDrainOnDispose ? flow.AwaitDrainOnDispose() : new();
-            }
+                return FinishCompletedDisposalAsync(flow);
+
+            if (flow.IsFullyConsumedFinalResult)
+                return FinishFinalResultAsync(this, flow);
 
             // Mark autonomous drain, open the async result gate, and wake any synchronous rendezvous.
             // Pipeline tenure keeps successors behind the body until it reaches RFQ.
@@ -382,6 +398,21 @@ partial class CommandFlow
             if (flow.WaitForDrainOnDispose)
                 return flow.AwaitDrainOnDispose();
             return new();
+
+            static async ValueTask FinishFinalResultAsync(Enumerator enumerator, CommandFlow flow)
+            {
+                if (await enumerator.MoveNextAsync().ConfigureAwait(false))
+                    ThrowHelper.ThrowInvalidOperation(
+                        "A fully consumed physical final result produced another result.");
+                await FinishCompletedDisposalAsync(flow).ConfigureAwait(false);
+            }
+
+            static ValueTask FinishCompletedDisposalAsync(CommandFlow flow)
+            {
+                // A completed awaited drain may still have errors to surface.
+                flow.TransferLiveBodyToDrain();
+                return flow.WaitForDrainOnDispose ? flow.AwaitDrainOnDispose() : new();
+            }
         }
 
         /// <inheritdoc />
