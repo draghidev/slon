@@ -18,7 +18,7 @@ using Slon.Transport;
 
 namespace Slon.Pg.Protocol;
 
-enum ProtocolStatus
+enum ProtocolStatus : int
 {
     Created,
     Ready,
