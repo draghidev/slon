@@ -37,8 +37,10 @@ partial class CommandFlow
             Exception fault = errors.Count == 1 ? errors[0] : new AggregateException(errors);
             _enumeratorMoveNextTaskSource.TrySetException(fault, runContinuationsAsynchronously: true);
         }
-        else if (_deliverCancelOce && !_consumerDisposed)
-            _enumeratorMoveNextTaskSource.TrySetException(new OperationCanceledException(_cancelDeliverToken), runContinuationsAsynchronously: true);
+        else if (Volatile.Read(ref _cancellationState) is { DeliverOce: true } cancellation
+                 && !_consumerDisposed)
+            _enumeratorMoveNextTaskSource.TrySetException(
+                new OperationCanceledException(cancellation.DeliverToken), runContinuationsAsynchronously: true);
         else
             _enumeratorMoveNextTaskSource.TrySetResult(false, runContinuationsAsynchronously: true);
         // _enumeratorCompleted was set by the caller (SetResult's completed branch) before this runs.
@@ -48,11 +50,12 @@ partial class CommandFlow
     // Cancellation stops waiting; it does not stop the autonomous drain or escape from disposal.
     async ValueTask AwaitDrainOnDispose()
     {
+        var cancellationToken = Volatile.Read(ref _cancellationState)?.FlowToken ?? default;
         try
         {
-            await WaitForComplete(_flowCancellationToken).ConfigureAwait(false);
+            await WaitForComplete(cancellationToken).ConfigureAwait(false);
         }
-        catch (OperationCanceledException) when (_flowCancellationToken.IsCancellationRequested)
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
             // Caller cancelled the wait; unwind. The body drains autonomously in the background.
         }
@@ -68,11 +71,12 @@ partial class CommandFlow
 
     void AwaitDrainOnDisposeSynchronously()
     {
+        var cancellationToken = Volatile.Read(ref _cancellationState)?.FlowToken ?? default;
         try
         {
-            WaitForCompleteSynchronously(_flowCancellationToken);
+            WaitForCompleteSynchronously(cancellationToken);
         }
-        catch (OperationCanceledException) when (_flowCancellationToken.IsCancellationRequested)
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
             // Caller cancelled the wait; the body continues draining autonomously.
         }
@@ -117,13 +121,21 @@ partial class CommandFlow
             return;
         if (_callerInteractionCore.CloseException is { } latched)
             _enumeratorMoveNextTaskSource.TrySetException(latched, runContinuationsAsynchronously: true);
-        else if (Volatile.Read(ref _cancelRequested) || EffectiveCancellationToken.IsCancellationRequested)
-            _enumeratorMoveNextTaskSource.TrySetException(
-                new OperationCanceledException(EffectiveCancellationToken.IsCancellationRequested ? EffectiveCancellationToken : _cancelDeliverToken),
-                runContinuationsAsynchronously: true);
-        // Rearming after a clean terminal still needs to complete the new generation.
-        else if (IsEnumerationCompleted)
-            _enumeratorMoveNextTaskSource.TrySetResult(false, runContinuationsAsynchronously: true);
+        else
+        {
+            var cancellation = Volatile.Read(ref _cancellationState);
+            var effectiveCancellationToken = EffectiveCancellationToken;
+            if (cancellation is { } && Volatile.Read(ref cancellation.Requested)
+                || effectiveCancellationToken.IsCancellationRequested)
+                _enumeratorMoveNextTaskSource.TrySetException(
+                    new OperationCanceledException(effectiveCancellationToken.IsCancellationRequested
+                        ? effectiveCancellationToken
+                        : cancellation!.DeliverToken),
+                    runContinuationsAsynchronously: true);
+            // Rearming after a clean terminal still needs to complete the new generation.
+            else if (IsEnumerationCompleted)
+                _enumeratorMoveNextTaskSource.TrySetResult(false, runContinuationsAsynchronously: true);
+        }
     }
 
     public readonly struct Enumerator(CommandFlow flow) : IEnumerator<CommandResult>, IAsyncEnumerator<CommandResult>
@@ -226,7 +238,7 @@ partial class CommandFlow
 
             if (cancellationToken.IsCancellationRequested)
             {
-                flow._callerCancellationToken = cancellationToken;
+                flow.GetOrCreateCancellationState().CallerToken = cancellationToken;
                 if (flow.RequestCancel(cancellationToken, CancellationScope.CurrentWindow))
                 {
                     flow._callerInteractionCore.ResumeBody(runContinuationsAsynchronously: false);
@@ -246,7 +258,7 @@ partial class CommandFlow
                 // distinguish a pre-fired cancellation from a clean end.
                 if (cancellationToken.CanBeCanceled)
                 {
-                    flow._callerCancellationToken = cancellationToken;
+                    flow.GetOrCreateCancellationState().CallerToken = cancellationToken;
                     flow._enumeratorMoveNextTaskSource.CanCompleteConcurrently = true;
                 }
 

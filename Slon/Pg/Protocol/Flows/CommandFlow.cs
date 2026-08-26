@@ -40,23 +40,8 @@ partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSour
     CommandList _commands;
     TimeSpan? _pendingTimeout;
     FlowCallerInteractionCore<FlowCallerInteractionCoreResult> _callerInteractionCore;
-    // Per-read caller token: overlaid by MoveNextAsync(ct) for a single read.
-    CancellationToken _callerCancellationToken;
-    // Flow-scoped token, bound at submission or enumeration and retained across results.
-    CancellationToken _flowCancellationToken;
-    CancellationTokenRegistration _callerCancellationTokenRegistration;
-    CancellationTokenRegistration _flowCancellationTokenRegistration;
-    // Callbacks only latch cancellation and wake the body. The body delivers cancellation at its
-    // terminal, after releasing pipeline promise tenure.
-    bool _cancelRequested;
-    int _cancellationScope;
-    int _backendCancellationTiming;
-    int _subsequentBackendCancellationTiming;
-    // The token to carry on the terminal OCE, captured when the body observes the cancel.
-    CancellationToken _cancelDeliverToken;
-    TaskCompletionSource? _cancelDelivery;
-    // Set by the body's cancel drain transition; the terminal SetResult delivers OCE (not a clean end).
-    bool _deliverCancelOce;
+    // Cancellation is cold; keep its tokens, registrations and attribution state off ordinary flows.
+    CancellationState? _cancellationState;
     // Errors encountered while draining are surfaced by a waiting DisposeAsync. Live consumers observe
     // their errors directly, and the list remains unallocated on the successful path.
     List<Exception>? _drainErrors;
@@ -134,7 +119,6 @@ partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSour
     ValueTaskSourcePromise<bool>? _pipelinePromise;
     Context _context;
     bool _contextPublished;
-    object? _cancellationEpisodeKey;
     ValueTask _task;
     // Consumer terminality, body terminality, and framework release are distinct phases. Start and
     // pre-start termination race during shutdown, so one atomic state owns that decision.
@@ -142,6 +126,40 @@ partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSour
     const int BodyRunning = 1;
     const int BodyTerminated = 2;
     int _bodyState;
+
+    sealed class CancellationState
+    {
+        internal CancellationToken CallerToken;
+        internal CancellationToken FlowToken;
+        internal CancellationTokenRegistration CallerRegistration;
+        internal CancellationTokenRegistration FlowRegistration;
+        internal bool Requested;
+        internal int Scope;
+        internal int Timing;
+        internal int SubsequentTiming;
+        internal CancellationToken DeliverToken;
+        internal TaskCompletionSource? Delivery;
+        internal object? EpisodeKey;
+        internal bool DeliverOce;
+
+        internal void Reset()
+        {
+            CallerToken = default;
+            FlowToken = default;
+            CallerRegistration.Dispose();
+            CallerRegistration = default;
+            FlowRegistration.Dispose();
+            FlowRegistration = default;
+            Requested = false;
+            Scope = (int)CancellationScope.None;
+            Timing = (int)BackendCancellationTiming.AfterGrace;
+            SubsequentTiming = (int)BackendCancellationTiming.AfterGrace;
+            DeliverToken = default;
+            Delivery = null;
+            EpisodeKey = null;
+            DeliverOce = false;
+        }
+    }
     CommandFlow() : base(supportsDeferredFlush: true)
     {
         _callerInteractionCore.Initialize();
@@ -212,9 +230,13 @@ partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSour
     // The token in force for the current read: the flow token once fired (whole-flow cancel), else the
     // per-read token if cancelable, else the flow token.
     CancellationToken EffectiveCancellationToken
-        => _flowCancellationToken.IsCancellationRequested ? _flowCancellationToken
-            : _callerCancellationToken.CanBeCanceled ? _callerCancellationToken
-            : _flowCancellationToken;
+        => GetEffectiveCancellationToken(Volatile.Read(ref _cancellationState));
+
+    static CancellationToken GetEffectiveCancellationToken(CancellationState? cancellation)
+        => cancellation is null ? default
+            : cancellation.FlowToken.IsCancellationRequested ? cancellation.FlowToken
+            : cancellation.CallerToken.CanBeCanceled ? cancellation.CallerToken
+            : cancellation.FlowToken;
 
     public int CommandCount => _commands.Count;
     internal virtual int VisibleCommandCount => _commands.VisibleCount;
@@ -226,8 +248,10 @@ partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSour
     }
 
     // Bind at submission because eager writing precedes the first MoveNextAsync.
-    internal override void BindCallerToken(CancellationToken cancellationToken) => _flowCancellationToken = cancellationToken;
-    internal override CancellationToken MigrationCancellationToken => _flowCancellationToken;
+    internal override void BindCallerToken(CancellationToken cancellationToken)
+        => GetOrCreateCancellationState().FlowToken = cancellationToken;
+    internal override CancellationToken MigrationCancellationToken
+        => Volatile.Read(ref _cancellationState)?.FlowToken ?? default;
 
     public Enumerator GetAsyncEnumerator(CancellationToken cancellationToken = default)
     {
@@ -235,7 +259,7 @@ partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSour
         // must not replace the flow token captured at submission.
         _enumeratorMoveNextTaskSource.CanCompleteConcurrently = true;
         if (cancellationToken.CanBeCanceled)
-            _flowCancellationToken = cancellationToken;
+            GetOrCreateCancellationState().FlowToken = cancellationToken;
         return new(this);
     }
 
@@ -268,11 +292,14 @@ partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSour
     {
         _context = context;
         Volatile.Write(ref _contextPublished, true);
-        if (_flowCancellationToken.IsCancellationRequested)
-            RequestCancel(_flowCancellationToken, CancellationScope.RemainingFlow);
-        else if (Volatile.Read(ref _cancelRequested))
-            RequestBackendCancellation((BackendCancellationTiming)Volatile.Read(ref _backendCancellationTiming),
-                Volatile.Read(ref _cancelDelivery));
+        if (Volatile.Read(ref _cancellationState) is { } cancellation)
+        {
+            if (cancellation.FlowToken.IsCancellationRequested)
+                RequestCancel(cancellation.FlowToken, CancellationScope.RemainingFlow);
+            else if (Volatile.Read(ref cancellation.Requested))
+                RequestBackendCancellation((BackendCancellationTiming)Volatile.Read(ref cancellation.Timing),
+                    Volatile.Read(ref cancellation.Delivery));
+        }
         ValueTask writeTask;
         try
         {
@@ -443,17 +470,10 @@ partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSour
                 // Registrations only latch and wake; terminal delivery remains body-owned. Dispose them
                 // before promise tenure ends so callbacks cannot reach the next flow. Do not rearm after
                 // consumer disposal, where a persistent cancellation could escape its intended wait.
-                if (_callerCancellationToken.CanBeCanceled && !IsDraining)
-                {
-                    Debug.Assert(IsAsync);
-                    _callerCancellationTokenRegistration = _callerCancellationToken.UnsafeRegister(static (state, token)
-                        => ((CommandFlow)state!).RequestCancelAndWake(token, CancellationScope.CurrentWindow), this);
-                }
-                if (_flowCancellationToken.CanBeCanceled && !IsDraining)
-                {
-                    _flowCancellationTokenRegistration = _flowCancellationToken.UnsafeRegister(static (state, token)
-                        => ((CommandFlow)state!).RequestCancelAndWake(token, CancellationScope.RemainingFlow), this);
-                }
+                if (Volatile.Read(ref _cancellationState) is { } cancellationAtReadStart && !IsDraining
+                    && (cancellationAtReadStart.CallerToken.CanBeCanceled
+                        || cancellationAtReadStart.FlowToken.CanBeCanceled))
+                    RegisterCancellationCallbacks(cancellationAtReadStart);
                 // After close, a fresh command must not consume bytes left by its predecessor. A draining
                 // flow may continue reading its own response to restore RFQ.
                 if (!IsDraining && context.IsProtocolClosed)
@@ -532,16 +552,18 @@ partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSour
                 }
 
                 // Await in-flight callbacks before releasing shared promise tenure.
-                if (_callerCancellationToken.CanBeCanceled)
-                    await _callerCancellationTokenRegistration.DisposeAsync().ConfigureAwait(false);
-                if (_flowCancellationToken.CanBeCanceled)
-                    await _flowCancellationTokenRegistration.DisposeAsync().ConfigureAwait(false);
+                var cancellation = Volatile.Read(ref _cancellationState);
+                if (cancellation is not null)
+                    await DisposeCancellationRegistrations(cancellation).ConfigureAwait(false);
                 // Cancellation switches to autonomous drain; terminal delivery follows RFQ and tenure release.
-                if ((Volatile.Read(ref _cancelRequested) || EffectiveCancellationToken.IsCancellationRequested)
-                    && !IsEnumerationCompleted)
+                var effectiveCancellationToken = GetEffectiveCancellationToken(cancellation);
+                if ((cancellation is { } && Volatile.Read(ref cancellation.Requested)
+                     || effectiveCancellationToken.IsCancellationRequested) && !IsEnumerationCompleted)
                 {
-                    _cancelDeliverToken = EffectiveCancellationToken.IsCancellationRequested ? EffectiveCancellationToken : _cancelDeliverToken;
-                    _deliverCancelOce = true;
+                    cancellation ??= GetOrCreateCancellationState();
+                    if (effectiveCancellationToken.IsCancellationRequested)
+                        cancellation.DeliverToken = effectiveCancellationToken;
+                    cancellation.DeliverOce = true;
                     if (!IsDraining)
                         MarkBodyInitiatedDrain();
                 }
@@ -743,7 +765,7 @@ partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSour
             CompleteEnumerationWithException(context.FlowTerminationException);
             throw;
         }
-        catch (OperationCanceledException ex) when (ex.CancellationToken == _callerCancellationToken || ex.CancellationToken == _flowCancellationToken)
+        catch (OperationCanceledException ex) when (IsCancellationToken(ex.CancellationToken))
         {
             CompleteEnumerationWithException(ex);
             throw;
@@ -760,10 +782,8 @@ partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSour
             // command sequence and drain every remaining RFQ window; reaching each RFQ requests
             // cancellation for the next window through OnCancellationWindowCompleted. Recovery is
             // reserved for a failure of this semantic drain, where only wire obligations remain.
-            if (_callerCancellationToken.CanBeCanceled)
-                await _callerCancellationTokenRegistration.DisposeAsync().ConfigureAwait(false);
-            if (_flowCancellationToken.CanBeCanceled)
-                await _flowCancellationTokenRegistration.DisposeAsync().ConfigureAwait(false);
+            if (Volatile.Read(ref _cancellationState) is { } cancellation)
+                await DisposeCancellationRegistrations(cancellation).ConfigureAwait(false);
             ((CommandFlowObserver?)GetObserver(out var observerState))
                 ?.OnDrainStarted(this, observerState);
             try
@@ -806,8 +826,8 @@ partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSour
             }
             else
             {
-                if (_callerCancellationToken.CanBeCanceled)
-                    _callerCancellationToken = CancellationToken.None;
+                if (Volatile.Read(ref _cancellationState) is { } cancellation)
+                    cancellation.CallerToken = default;
 
                 if (!ReferenceEquals(_enumeratorCurrent, next))
                     _enumeratorCurrent = next;
@@ -850,6 +870,37 @@ partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSour
         }
     }
 
+    void RegisterCancellationCallbacks(CancellationState cancellation)
+    {
+        if (cancellation.CallerToken.CanBeCanceled)
+        {
+            Debug.Assert(IsAsync);
+            cancellation.CallerRegistration = cancellation.CallerToken.UnsafeRegister(static (state, token)
+                => ((CommandFlow)state!).RequestCancelAndWake(token, CancellationScope.CurrentWindow), this);
+        }
+        if (cancellation.FlowToken.CanBeCanceled)
+        {
+            cancellation.FlowRegistration = cancellation.FlowToken.UnsafeRegister(static (state, token)
+                => ((CommandFlow)state!).RequestCancelAndWake(token, CancellationScope.RemainingFlow), this);
+        }
+    }
+
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
+    async ValueTask DisposeCancellationRegistrations(CancellationState cancellation)
+    {
+        if (cancellation.CallerToken.CanBeCanceled)
+            await cancellation.CallerRegistration.DisposeAsync().ConfigureAwait(false);
+        if (cancellation.FlowToken.CanBeCanceled)
+            await cancellation.FlowRegistration.DisposeAsync().ConfigureAwait(false);
+    }
+
+    bool IsCancellationToken(CancellationToken token)
+    {
+        var cancellation = Volatile.Read(ref _cancellationState);
+        return cancellation is not null
+            && (token == cancellation.CallerToken || token == cancellation.FlowToken);
+    }
+
     // Cancellation callbacks only latch intent and wake the body. The body delivers cancellation after
     // it has restored the wire boundary and is ready to release execution tenure.
     internal Task CancelAsync()
@@ -866,13 +917,22 @@ partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSour
         return delivery.Task;
     }
 
+    CancellationState GetOrCreateCancellationState()
+    {
+        if (Volatile.Read(ref _cancellationState) is { } cancellation)
+            return cancellation;
+        var created = new CancellationState();
+        return Interlocked.CompareExchange(ref _cancellationState, created, null) ?? created;
+    }
+
     TaskCompletionSource GetOrCreateCancelDelivery()
     {
-        var delivery = Volatile.Read(ref _cancelDelivery);
+        var cancellation = GetOrCreateCancellationState();
+        var delivery = Volatile.Read(ref cancellation.Delivery);
         if (delivery is not null)
             return delivery;
         var created = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        return Interlocked.CompareExchange(ref _cancelDelivery, created, null) ?? created;
+        return Interlocked.CompareExchange(ref cancellation.Delivery, created, null) ?? created;
     }
 
     bool RequestCancel(CancellationToken token, CancellationScope scope,
@@ -882,35 +942,36 @@ partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSour
     {
         if (IsEnumerationCompleted && !allowCompletedEnumeration)
             return false;
-        _cancelDeliverToken = token;
-        var observedScope = Volatile.Read(ref _cancellationScope);
+        var cancellation = GetOrCreateCancellationState();
+        cancellation.DeliverToken = token;
+        var observedScope = Volatile.Read(ref cancellation.Scope);
         while ((int)scope > observedScope)
         {
-            var priorScope = Interlocked.CompareExchange(ref _cancellationScope, (int)scope, observedScope);
+            var priorScope = Interlocked.CompareExchange(ref cancellation.Scope, (int)scope, observedScope);
             if (priorScope == observedScope)
                 break;
             observedScope = priorScope;
         }
-        Volatile.Write(ref _cancelRequested, true);
+        Volatile.Write(ref cancellation.Requested, true);
         Volatile.Write(ref _draining, true);
-        var observedTiming = Volatile.Read(ref _backendCancellationTiming);
+        var observedTiming = Volatile.Read(ref cancellation.Timing);
         while ((int)timing > observedTiming)
         {
-            var priorTiming = Interlocked.CompareExchange(ref _backendCancellationTiming, (int)timing, observedTiming);
+            var priorTiming = Interlocked.CompareExchange(ref cancellation.Timing, (int)timing, observedTiming);
             if (priorTiming == observedTiming)
                 break;
             observedTiming = priorTiming;
         }
-        var observedSubsequentTiming = Volatile.Read(ref _subsequentBackendCancellationTiming);
+        var observedSubsequentTiming = Volatile.Read(ref cancellation.SubsequentTiming);
         while ((int)subsequentTiming > observedSubsequentTiming)
         {
-            var priorTiming = Interlocked.CompareExchange(ref _subsequentBackendCancellationTiming,
+            var priorTiming = Interlocked.CompareExchange(ref cancellation.SubsequentTiming,
                 (int)subsequentTiming, observedSubsequentTiming);
             if (priorTiming == observedSubsequentTiming)
                 break;
             observedSubsequentTiming = priorTiming;
         }
-        var delivery = Volatile.Read(ref _cancelDelivery);
+        var delivery = Volatile.Read(ref cancellation.Delivery);
         RequestBackendCancellation(timing, delivery);
         return true;
     }
@@ -919,7 +980,9 @@ partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSour
     {
         if (!RequestCancel(token, scope))
             return;
-        var delivery = Volatile.Read(ref _cancelDelivery);
+        var delivery = Volatile.Read(ref _cancellationState) is { } cancellation
+            ? Volatile.Read(ref cancellation.Delivery)
+            : null;
         _callerInteractionCore.ResumeBody(runContinuationsAsynchronously: true);
         _callerInteractionCore.WakeBody(useDedicatedDriver: !IsAsync && delivery is not null);
     }
@@ -927,19 +990,19 @@ partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSour
     void RequestBackendCancellation(BackendCancellationTiming timing = BackendCancellationTiming.AfterGrace,
         TaskCompletionSource? delivery = null)
     {
-        // Cancellation which wins before body entry remains latched in _cancelRequested and is
+        // Cancellation which wins before body entry remains latched in the cancellation state and is
         // replayed immediately after the execution context is published.
-        if (Volatile.Read(ref _contextPublished))
+        if (Volatile.Read(ref _contextPublished) && Volatile.Read(ref _cancellationState) is { } cancellation)
         {
-            var key = Volatile.Read(ref _cancellationEpisodeKey);
+            var key = Volatile.Read(ref cancellation.EpisodeKey);
             if (key is null)
             {
                 var created = new object();
-                key = Interlocked.CompareExchange(ref _cancellationEpisodeKey, created, null) ?? created;
+                key = Interlocked.CompareExchange(ref cancellation.EpisodeKey, created, null) ?? created;
             }
             _context.RequestBackendCancellation(this, CancellationWindow, timing, delivery,
-                key, Volatile.Read(ref _cancellationScope),
-                (BackendCancellationTiming)Volatile.Read(ref _subsequentBackendCancellationTiming));
+                key, Volatile.Read(ref cancellation.Scope),
+                (BackendCancellationTiming)Volatile.Read(ref cancellation.SubsequentTiming));
         }
     }
 
@@ -948,7 +1011,8 @@ partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSour
 
     bool IsOwnCancellation(PgError error)
     {
-        if (!Volatile.Read(ref _cancelRequested) || error.SqlState != PgErrorCodes.QueryCanceled)
+        if (Volatile.Read(ref _cancellationState) is not { } cancellation
+            || !Volatile.Read(ref cancellation.Requested) || error.SqlState != PgErrorCodes.QueryCanceled)
             return false;
         // PgDecoder records each ErrorResponse arrival exactly once. Classification may inspect the
         // preserved error through several command-result paths, so it must not report the same strike.
@@ -1058,7 +1122,8 @@ partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSour
 
     protected override void OnReleasing(Exception? exception)
     {
-        Volatile.Read(ref _cancelDelivery)?.TrySetResult();
+        if (Volatile.Read(ref _cancellationState) is { } cancellation)
+            Volatile.Read(ref cancellation.Delivery)?.TrySetResult();
         _commands.Return();
     }
 
@@ -1081,20 +1146,11 @@ partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSour
         _enumeratorCurrent = default;
         _isResultReady = false;
         _callerInteractionCore.Reset();
-        _callerCancellationToken = default;
-        _flowCancellationToken = default;
-        _callerCancellationTokenRegistration.Dispose();
-        _callerCancellationTokenRegistration = default;
-        _flowCancellationTokenRegistration.Dispose();
-        _flowCancellationTokenRegistration = default;
-        _cancelRequested = false;
-        _cancellationScope = (int)CancellationScope.None;
-        _backendCancellationTiming = (int)BackendCancellationTiming.AfterGrace;
-        _subsequentBackendCancellationTiming = (int)BackendCancellationTiming.AfterGrace;
-        _cancelDeliverToken = default;
-        _cancelDelivery = null;
-        _cancellationEpisodeKey = null;
-        _deliverCancelOce = false;
+        if (_cancellationState is { } cancellation)
+        {
+            cancellation.Reset();
+            _cancellationState = null;
+        }
         _drainErrors = null;
         _consumeNonQuery = false;
         _nonQueryRecordsAffected = 0;
