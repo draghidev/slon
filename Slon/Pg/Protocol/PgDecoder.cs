@@ -154,7 +154,6 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
 
         return Core(cancellationToken);
 
-        [AsyncMethodBuilder(typeof(NonContextRestoringPoolingValueTaskMethodBuilder<>))]
         async ValueTask<CurrentSegmentBuffer> Core(CancellationToken cancellationToken)
         {
             var timeoutSet = false;
@@ -222,7 +221,6 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
 
         return Core(cancellationToken);
 
-        [AsyncMethodBuilder(typeof(NonContextRestoringPoolingValueTaskMethodBuilder<>))]
         async ValueTask<CurrentSegmentBuffer> Core(CancellationToken cancellationToken)
         {
             var timeoutSet = false;
@@ -462,7 +460,6 @@ sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMes
 
 
         [MethodImpl(MethodImplOptions.NoInlining)]
-        [AsyncMethodBuilder(typeof(NonContextRestoringPoolingValueTaskMethodBuilder<>))]
         async ValueTask<bool> MoveNextAsyncCore(ValueTask<ReadResult>? readTask, ValueTask<int>? directReadTask, ValueTask<bool>? messageHandledTask, CancellationToken cancellationToken, PgClientFlow? frontierFlow = null)
         {
             var timeoutSet = false;

@@ -1773,7 +1773,6 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
             }
         }
 
-        [AsyncMethodBuilder(typeof(NonContextRestoringPoolingValueTaskMethodBuilder<>))]
         internal ValueTask<FlowTasks> Execute(PgClientFlow flow)
         {
             return flow.GetExecutionControl(this).ExecuteAuto();

@@ -197,7 +197,6 @@ static class CommandExtensions
             readDescribe: command.DescribeOnly || !command.Descriptor.IsPrepared || command.Descriptor.PreparedRowDescription is null,
             readExecute: !command.DescribeOnly);
 
-        [AsyncMethodBuilder(typeof(NonContextRestoringPoolingValueTaskMethodBuilder<>))]
         static async ValueTask<(PgError?, RowDescription?)> ReadSimpleAsync(
             PgDecoder decoder, RowDescription rowDescription)
         {
@@ -238,7 +237,6 @@ static class CommandExtensions
             return (null, requestedRowDescription);
         }
 
-        [AsyncMethodBuilder(typeof(NonContextRestoringPoolingValueTaskMethodBuilder<>))]
         static async ValueTask<(PgError?, RowDescription?)> ReadExtendedAsync(
             PgDecoder decoder, RowDescription rowDescription, bool readParse, bool readDescribe, bool readExecute)
         {
@@ -594,7 +592,6 @@ static class CommandExtensions
             ? new((errorMessage, transactionStatus))
             : new(result: null);
 
-        [AsyncMethodBuilder(typeof(NonContextRestoringPoolingValueTaskMethodBuilder<>))]
         static async ValueTask<(PgError, TransactionStatus)?> Core(PgDecoder decoder, PgError? errorMessage)
         {
             var message = await decoder.GetNextAsync().ConfigureAwait(false);

@@ -479,7 +479,6 @@ sealed class Row : PgFieldReader
             return new(GetValue<T>(ordinal));
         return Core(ordinal, cancellationToken);
 
-        [AsyncMethodBuilder(typeof(NonContextRestoringPoolingValueTaskMethodBuilder<>))]
         async ValueTask<T> Core(int ordinal, CancellationToken cancellationToken)
         {
             await _bodyReader.BufferAllAsync(cancellationToken).ConfigureAwait(false);

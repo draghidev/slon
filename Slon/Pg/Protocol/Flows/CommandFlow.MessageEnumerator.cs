@@ -136,7 +136,6 @@ partial class CommandFlow
 
                 return Core();
 
-                [AsyncMethodBuilder(typeof(NonContextRestoringPoolingValueTaskMethodBuilder<>))]
                 async ValueTask<bool> Core()
                 {
                     try
@@ -218,7 +217,6 @@ partial class CommandFlow
                     return ValueTask.FromException(ex);
                 }
 
-                [AsyncMethodBuilder(typeof(NonContextRestoringPoolingValueTaskMethodBuilder))]
                 async ValueTask AwaitCompletion(ValueTask<(PgError, TransactionStatus)?> completion)
                 {
                     try
@@ -232,7 +230,6 @@ partial class CommandFlow
                     }
                 }
 
-                [AsyncMethodBuilder(typeof(NonContextRestoringPoolingValueTaskMethodBuilder))]
                 async ValueTask DrainRowsAndComplete(PgDecoder decoder)
                 {
                     try
