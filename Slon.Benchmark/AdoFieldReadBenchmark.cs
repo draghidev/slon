@@ -75,6 +75,7 @@ public class AdoFieldReadBenchmark : ClientBenchmark
 public class FieldReadBenchmark
 {
     static readonly byte[] IntBytes = [0, 0, 0, 42];
+    static readonly byte[] RowBytes = [0, 0, 0, 42, 0, 0, 0, 43];
     static readonly byte[] TextBytes = "field-value"u8.ToArray();
 
     readonly ReusableFieldReader _reader = new();
@@ -87,6 +88,15 @@ public class FieldReadBenchmark
     {
         var reader = _reader.Open(IntBytes);
         return _intConverter.Read<int>(reader);
+    }
+
+    [Benchmark]
+    public int ReusableSiblingInt32()
+    {
+        var first = _reader.Open(RowBytes.AsMemory(0, sizeof(int)));
+        var result = _intConverter.Read<int>(first);
+        var second = _reader.Open(RowBytes.AsMemory(sizeof(int), sizeof(int)));
+        return result + _intConverter.Read<int>(second);
     }
 
     [Benchmark]

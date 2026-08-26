@@ -1,6 +1,7 @@
 using System.Buffers;
 using System.Buffers.Binary;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using Slon.Buffers;
 using Slon.Pg.Serialization;
 
@@ -12,6 +13,9 @@ class PgFieldReader : IDisposable, IAsyncDisposable
 {
     ReadOnlySequence<byte> _buffer;
     ReadOnlyMemory<byte> _memory;
+    byte[]? _memoryArray;
+    int _memoryOffset;
+    int _memoryLength;
     IInputReader? _source;
     long _position;
     int _fieldSize;
@@ -57,7 +61,7 @@ class PgFieldReader : IDisposable, IAsyncDisposable
             _source = null;
             _buffer = default;
         }
-        SetMemory(ref _memory, buffer);
+        SetMemory(buffer);
         _position = 0;
         _fieldSize = buffer.Length;
         _activeView = null;
@@ -81,6 +85,9 @@ class PgFieldReader : IDisposable, IAsyncDisposable
         _source = source;
         _buffer = buffer;
         _memory = default;
+        _memoryArray = null;
+        _memoryOffset = 0;
+        _memoryLength = 0;
         _position = 0;
         _fieldSize = fieldSize;
         _released = 0;
@@ -100,7 +107,7 @@ class PgFieldReader : IDisposable, IAsyncDisposable
     {
         if (_contiguous)
         {
-            view = new(_memory.Span);
+            view = new(MemorySpan);
             return true;
         }
         view = default;
@@ -170,7 +177,7 @@ class PgFieldReader : IDisposable, IAsyncDisposable
             return false;
         }
         CheckBounds(count);
-        bytes = _memory.Span.Slice(checked((int)_position), count);
+        bytes = MemorySpan.Slice(checked((int)_position), count);
         _position += count;
         return true;
     }
@@ -236,7 +243,7 @@ class PgFieldReader : IDisposable, IAsyncDisposable
         if (_contiguous)
         {
             var position = checked((int)_position);
-            var memory = _memory.Slice(position, count);
+            var memory = Memory.Slice(position, count);
             var result = new ReadOnlySequence<byte>(memory);
             _position += count;
             return result;
@@ -276,7 +283,7 @@ class PgFieldReader : IDisposable, IAsyncDisposable
         CheckBounds(destination.Length);
         if (_contiguous)
         {
-            _memory.Span.Slice(checked((int)_position), destination.Length).CopyTo(destination);
+            MemorySpan.Slice(checked((int)_position), destination.Length).CopyTo(destination);
             _position += destination.Length;
             return;
         }
@@ -325,7 +332,7 @@ class PgFieldReader : IDisposable, IAsyncDisposable
         CheckBounds(count);
         if (_contiguous)
         {
-            bytes = _memory.Span.Slice(checked((int)_position), count);
+            bytes = MemorySpan.Slice(checked((int)_position), count);
             _position += count;
             return true;
         }
@@ -630,25 +637,45 @@ class PgFieldReader : IDisposable, IAsyncDisposable
             => _reader.EndNestedRead(_previousEnd, _nestedEnd, _consumeRemainder, async: true);
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    static void SetMemory(ref ReadOnlyMemory<byte> destination, ReadOnlyMemory<byte> value)
+    ReadOnlySpan<byte> MemorySpan
     {
-        // The cursor lives on Row. Avoid issuing a checked write barrier when repeated reads
-        // publish another slice over the same buffered backend-message array.
-        ref var destinationObject = ref MemoryObject(ref destination);
-        var valueObject = MemoryObject(ref value);
-        if (!ReferenceEquals(destinationObject, valueObject))
-            destinationObject = valueObject;
-        MemoryIndex(ref destination) = MemoryIndex(ref value);
-        MemoryLength(ref destination) = MemoryLength(ref value);
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        get => _memoryArray is { } array
+            ? array.AsSpan(_memoryOffset, _memoryLength)
+            : _memory.Span;
     }
 
-    [UnsafeAccessor(UnsafeAccessorKind.Field, Name = "_object")]
-    static extern ref object? MemoryObject(ref ReadOnlyMemory<byte> memory);
+    ReadOnlyMemory<byte> Memory
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        get => _memoryArray is { } array
+            ? new(array, _memoryOffset, _memoryLength)
+            : _memory;
+    }
 
-    [UnsafeAccessor(UnsafeAccessorKind.Field, Name = "_index")]
-    static extern ref int MemoryIndex(ref ReadOnlyMemory<byte> memory);
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    void SetMemory(ReadOnlyMemory<byte> value)
+    {
+        if (MemoryMarshal.TryGetArray(value, out var segment))
+        {
+            var array = segment.Array!;
+            var previousArray = _memoryArray;
+            if (!ReferenceEquals(previousArray, array))
+            {
+                _memoryArray = array;
+                if (previousArray is null && !_memory.Equals(default))
+                    _memory = default;
+            }
+            _memoryOffset = segment.Offset;
+            _memoryLength = segment.Count;
+            return;
+        }
 
-    [UnsafeAccessor(UnsafeAccessorKind.Field, Name = "_length")]
-    static extern ref int MemoryLength(ref ReadOnlyMemory<byte> memory);
+        if (_memoryArray is not null)
+            _memoryArray = null;
+        if (!_memory.Equals(value))
+            _memory = value;
+        _memoryOffset = 0;
+        _memoryLength = value.Length;
+    }
 }
