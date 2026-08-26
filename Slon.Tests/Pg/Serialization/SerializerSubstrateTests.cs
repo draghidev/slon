@@ -14,6 +14,11 @@ public class SerializerSubstrateTests
         Value = 42
     }
 
+    enum SByteEnum : sbyte
+    {
+        Negative = -1
+    }
+
     [TestMethod]
     public void PrimitiveConverters_RoundTripBinaryValues()
     {
@@ -40,6 +45,20 @@ public class SerializerSubstrateTests
 
         var value = converter.Read<TestEnum>(new PgReader(output.WrittenMemory));
         Assert.AreEqual(TestEnum.Value, value);
+    }
+
+    [TestMethod]
+    public void UnderlyingSByteConverter_PreservesNegativeEnumValues()
+    {
+        PgConverter converter = new EnumUnderlyingConverter<sbyte>(typeof(SByteEnum));
+        var output = new ArrayBufferWriter<byte>();
+        var writer = new PgWriter(output);
+        converter.Write(writer, SByteEnum.Negative);
+        writer.EndWrite(sizeof(short));
+
+        CollectionAssert.AreEqual(new byte[] { 0xff, 0xff }, output.WrittenSpan.ToArray());
+        Assert.AreEqual(SByteEnum.Negative,
+            converter.Read<SByteEnum>(new PgReader(output.WrittenMemory)));
     }
     [TestMethod]
     public async Task PgWriter_ResumesAcrossTinyOutputWindowsAndValidatesSize()

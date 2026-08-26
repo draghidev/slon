@@ -26,7 +26,8 @@ interface IEnumUnderlyingConverter
             TypeCode.Int32 or TypeCode.UInt32 => Unsafe.BitCast<int, T>(reader.ReadInt32()),
             TypeCode.Int64 or TypeCode.UInt64 => Unsafe.BitCast<long, T>(reader.ReadInt64()),
             TypeCode.Int16 or TypeCode.UInt16 => Unsafe.BitCast<short, T>(reader.ReadInt16()),
-            TypeCode.Byte or TypeCode.SByte => Unsafe.BitCast<byte, T>(checked((byte)reader.ReadInt16())),
+            TypeCode.Byte => Unsafe.BitCast<byte, T>(checked((byte)reader.ReadInt16())),
+            TypeCode.SByte => Unsafe.BitCast<sbyte, T>(checked((sbyte)reader.ReadInt16())),
             _ => throw new NotSupportedException()
         };
 
@@ -55,8 +56,11 @@ interface IEnumUnderlyingConverter
             case TypeCode.Int16 or TypeCode.UInt16:
                 writer.WriteInt16(Unsafe.BitCast<T, short>(value));
                 break;
-            case TypeCode.Byte or TypeCode.SByte:
+            case TypeCode.Byte:
                 writer.WriteInt16(Unsafe.BitCast<T, byte>(value));
+                break;
+            case TypeCode.SByte:
+                writer.WriteInt16(Unsafe.BitCast<T, sbyte>(value));
                 break;
             default: throw new NotSupportedException();
         }
@@ -83,7 +87,8 @@ interface IEnumUnderlyingConverter
             TypeCode.Int32 or TypeCode.UInt32 => Enum.ToObject(enumType, reader.ReadInt32()),
             TypeCode.Int64 or TypeCode.UInt64 => Enum.ToObject(enumType, reader.ReadInt64()),
             TypeCode.Int16 or TypeCode.UInt16 => Enum.ToObject(enumType, reader.ReadInt16()),
-            TypeCode.Byte or TypeCode.SByte => Enum.ToObject(enumType, checked((byte)reader.ReadInt16())),
+            TypeCode.Byte => Enum.ToObject(enumType, checked((byte)reader.ReadInt16())),
+            TypeCode.SByte => Enum.ToObject(enumType, checked((sbyte)reader.ReadInt16())),
             _ => throw new NotSupportedException()
         };
 }
