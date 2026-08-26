@@ -1183,23 +1183,23 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         PipelineScheduler ActivationScheduler { get; }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public void CompleteItem(PgClientFlow item, int remainingDepth, Exception? exception)
+        public void CompleteItem(PgClientFlow item, Exception? exception)
         {
             if (exception is PgClientClosedException && _control.ClosedException is not null)
                 exception = _control.FlowTerminationException;
-            // OnReleasing (protocol bookkeeping: ActivatedFlow release, read-state recycle) must run
+            // OnReleasing (cancellation activation release and read-state recycle) must run
             // BEFORE Release (user-visible terminal): Release fires the flow's completed observer,
             // which may Reset() and re-enqueue the SAME instance. If that next tenure's Activate lands
-            // before OnReleasing's depth-0 CAS, the comparand matches the new activation (ABA) and
+            // before OnReleasing's owner CAS, the comparand matches the new activation (ABA) and
             // severs a live binding. Ordering OnReleasing first closes this by causality. Recovery
             // items take the hardened path (capture + try/finally) out-of-line to keep this inlineable.
             if (item is ResyncRecoveryFlow { FailedFlow: { } failedFlow } recovery)
             {
-                CompleteRecoveryItem(recovery, failedFlow, remainingDepth, exception);
+                CompleteRecoveryItem(recovery, failedFlow, exception);
                 return;
             }
 
-            _control.OnReleasing(item, remainingDepth);
+            _control.OnReleasing(item);
             if (exception is PgProtocolException)
                 exception = new PgClientException(exception);
             item.GetExecutionControl(_control).Release(exception);
@@ -1207,18 +1207,17 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
             // an outer flow that left a transaction open is unscoped poison. Inner-scope / failed flows are
             // exempt (handled in GuardWireIdleOnHandoff).
             _control.GuardWireIdleOnHandoff(exception);
-            _control.OnReleased(remainingDepth);
         }
 
         [MethodImpl(MethodImplOptions.NoInlining)]
-        void CompleteRecoveryItem(ResyncRecoveryFlow resyncRecovery, PgClientFlow failedFlow, int remainingDepth, Exception? exception)
+        void CompleteRecoveryItem(ResyncRecoveryFlow resyncRecovery, PgClientFlow failedFlow, Exception? exception)
         {
             // Capture the binding BEFORE Release fires the resyncRecovery's completed observer:
             // completion is the reuse gate, and a Reset on reuse clears the binding (same
             // causality as the OnReleasing-before-Release ordering below).
             var failureException = resyncRecovery.FailureException!;
 
-            _control.OnReleasing(resyncRecovery, remainingDepth);
+            _control.OnReleasing(resyncRecovery);
             try
             {
                 resyncRecovery.GetExecutionControl(_control).Release(exception);
@@ -1258,9 +1257,10 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
                     _control.RecoveryCompleted();
 
                 failedFlow.GetExecutionControl(_control).Release(combined);
-                _control.OnReleased(remainingDepth);
             }
         }
+
+        public void OnIdle() => _control.OnIdle();
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public ValueTask<PipelineItemResult> ExecuteItemAsync(PgClientFlow item, bool pipelineTaskRecovery, CancellationToken cancellationToken)
@@ -1813,27 +1813,27 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         internal void ReleaseAdmissionBarrier() => protocol.ReleaseAdmissionBarrier();
         internal void ReleaseWireCapacity() => protocol.ReleaseWireCapacity();
 
-        internal void OnReleasing(PgClientFlow flow, int remainingDepth)
+        internal void OnReleasing(PgClientFlow flow)
         {
             protocol._serverParameterState.CommitFlow();
             ClearCancellationActivation(flow);
-            protocol.OnFlowReleased(flow, poolFacing && remainingDepth is 0);
+            var idle = ActivatedFlow is null;
+            protocol.OnFlowReleased(flow, poolFacing && idle);
             // Inner exclusive-scope subflows are not pool load units; only the outer pipeline reports
             // admission-to-retirement lifetimes to its host.
             if (poolFacing)
                 protocol._loadObserver?.OnFlowReleased(
                     flow.GetExecutionControl(this).StallsPipeline);
 
-            // At pipeline park release the rooted read-state buffers. Pool idle is published only
-            // after Release fires the reusable flow's terminal observer; depth zero here is not yet
-            // a pool-placement boundary.
-            if (remainingDepth is 0)
+            // Draghi clears the activated slot only at the exact idle edge and before CompleteItem.
+            // Release the shared read objects before the flow's terminal observer can reuse them.
+            if (idle)
                 _commandFlowReadState = new();
         }
 
-        internal void OnReleased(int remainingDepth)
+        internal void OnIdle()
         {
-            if (!poolFacing || remainingDepth is not 0 || !protocol.IsSchedulable)
+            if (!poolFacing || !protocol.IsSchedulable)
                 return;
 
             if (protocol.Outstanding is not 0)

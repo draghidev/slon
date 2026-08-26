@@ -226,7 +226,7 @@ sealed class EmptyProtocol<TMode> : IPoolConnection<EmptyProtocol<TMode>>
 
     bool TryQueueFlow<TState>(EmptyFlow<TMode> flow, Func<TState, bool>? predicate, TState state)
     {
-        UnboundedQueueSource<EmptyFlow<TMode>>.EnqueueResult enqueue;
+        UnboundedQueueSource<EmptyFlow<TMode>>.EnqueueSignal enqueue;
         lock (_syncRoot)
         {
             if (_status != ProtocolStatus.Ready)
@@ -237,7 +237,7 @@ sealed class EmptyProtocol<TMode> : IPoolConnection<EmptyProtocol<TMode>>
 
             enqueue = _pipeline.Enqueue(flow);
         }
-        enqueue.Execute();
+        enqueue.Signal();
         return true;
     }
 
@@ -298,11 +298,10 @@ sealed class EmptyProtocol<TMode> : IPoolConnection<EmptyProtocol<TMode>>
         public bool RunEnqueueAsynchronously { get; }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public void CompleteItem(EmptyFlow<TMode> item, int remainingDepth, Exception? exception)
-        {
-            ((IProtocolFlow)item).Complete(exception);
-            _protocol.FlowControl.OnCompleted(item, remainingDepth);
-        }
+        public void CompleteItem(EmptyFlow<TMode> item, Exception? exception)
+            => ((IProtocolFlow)item).Complete(exception);
+
+        public void OnIdle() => _protocol.FlowControl.OnIdle();
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public ValueTask<PipelineItemResult> ExecuteItemAsync(EmptyFlow<TMode> item, bool pipelineTaskRecovery, CancellationToken cancellationToken)
@@ -330,7 +329,7 @@ sealed class EmptyProtocol<TMode> : IPoolConnection<EmptyProtocol<TMode>>
                 _protocol.FlowControl.Activate(item);
         }
 
-        public bool TryRecoverItemFailure(PipelineItemFailureContext context, EmptyFlow<TMode> failedItem, CancellationToken cancellationToken, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out EmptyFlow<TMode>? recoveryItem)
+        public bool TryRecoverItemFailure(in PipelineItemFailureContext context, EmptyFlow<TMode> failedItem, CancellationToken cancellationToken, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out EmptyFlow<TMode>? recoveryItem)
         {
             recoveryItem = null;
             return false;
@@ -357,13 +356,10 @@ sealed class EmptyProtocol<TMode> : IPoolConnection<EmptyProtocol<TMode>>
             }
         }
 
-        internal void OnCompleted(EmptyFlow<TMode> flow, int remainingDepth)
+        internal void OnIdle()
         {
             if (typeof(TMode) == typeof(PooledUserCompleted))
-            {
-                if (remainingDepth is 0)
-                    protocol._poolRegistration.SignalAvailability(isIdle: true);
-            }
+                protocol._poolRegistration.SignalAvailability(isIdle: true);
         }
     }
 }
