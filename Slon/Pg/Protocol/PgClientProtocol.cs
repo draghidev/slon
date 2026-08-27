@@ -87,7 +87,7 @@ public sealed class PgClientProtocolOptions
     public TimeSpan CancellationRetryInterval { get; set; } = TimeSpan.FromSeconds(1);
     internal PgSessionResetOptions SessionReset { get; set; } = new();
     public int DataRowStreamingThreshold { get; set; } = BackendMessageBatch.Segmenter.DefaultDataRowStreamingThreshold;
-    internal int MaxInFlightFlowsPerWire { get; set; }
+    public int MaxInFlightFlowsPerWire { get; set; }
     public ILoggerFactory LoggerFactory { get; set; } = NullLoggerFactory.Instance;
     // Datasource bootstrap supplies this. A standalone raw protocol can omit backend identity and
     // operate with the explicit lower-level compatibility capabilities instead.
@@ -181,6 +181,7 @@ public sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
     PgDecoder _pgDecoder = null!;
 
     LoadObserver? _loadObserver;
+    Action? _externalAdmissionAvailable;
     Heartbeat? _heartbeat;
     Action? _admissionAvailable;
     PipelineScheduler _executionScheduler = null!;
@@ -246,8 +247,18 @@ public sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
     internal bool IsCompleted => Status is ProtocolStatus.Completed;
     // Draining immediately vetoes new pool placement, before terminal completion.
     internal bool IsDraining => Status is ProtocolStatus.Draining or ProtocolStatus.Completed;
-    internal bool IsSchedulable
+    public bool IsSchedulable
         => Status is ProtocolStatus.Ready && Volatile.Read(ref _admissionBlocked) == 0 && _source.HasCapacity;
+
+    /// Registers the pool-facing callback invoked when this protocol may accept work after an
+    /// idle, capacity, or recovery edge. Registration after startup intentionally does not replay
+    /// the protocol's initial idle edge.
+    public void SetAdmissionAvailableCallback(Action callback)
+    {
+        ArgumentNullException.ThrowIfNull(callback);
+        if (Interlocked.CompareExchange(ref _externalAdmissionAvailable, callback, null) is not null)
+            throw new InvalidOperationException("The admission-availability callback was already configured.");
+    }
 
     internal void SetFlowBindingContext(PgClientFlowBindingContext context)
     {
@@ -263,7 +274,7 @@ public sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
             ThrowHelper.ThrowInvalidOperation("The protocol inert-flow migration handler was already configured.");
     }
 
-    internal bool TryBeginPruning()
+    public bool TryBeginPruning()
     {
         lock (_syncRoot)
         {
@@ -565,7 +576,11 @@ public sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
     [MethodImpl(MethodImplOptions.NoInlining)]
     void NotifyAdmissionAvailable()
     {
-        try { _admissionAvailable?.Invoke(); }
+        try
+        {
+            _admissionAvailable?.Invoke();
+            Volatile.Read(ref _externalAdmissionAvailable)?.Invoke();
+        }
         catch (Exception ex)
         {
             SlonLogMessages.UnobservedCallbackException(

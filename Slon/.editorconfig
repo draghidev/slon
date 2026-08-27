@@ -60,6 +60,18 @@ dotnet_diagnostic.CS1591.severity = none
 dotnet_diagnostic.RS0016.severity = none
 dotnet_diagnostic.RS0022.severity = none
 
+[Pooling/**/*.cs]
+dotnet_diagnostic.CS1591.severity = none
+dotnet_diagnostic.RS0016.severity = none
+dotnet_diagnostic.RS0022.severity = none
+dotnet_diagnostic.RS0041.severity = none
+
+[Pooling/*.cs]
+dotnet_diagnostic.CS1591.severity = none
+dotnet_diagnostic.RS0016.severity = none
+dotnet_diagnostic.RS0022.severity = none
+dotnet_diagnostic.RS0041.severity = none
+
 [Ado/AdoSerializerOptions.cs]
 dotnet_diagnostic.CS1591.severity = none
 dotnet_diagnostic.RS0016.severity = none

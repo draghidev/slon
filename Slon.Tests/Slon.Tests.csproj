@@ -6,7 +6,7 @@
         <Nullable>enable</Nullable>
         <IsPackable>false</IsPackable>
         <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
-        <NoWarn>$(NoWarn);SLONPG001</NoWarn>
+        <NoWarn>$(NoWarn);SLONPG001;SLONPOOL001</NoWarn>
     </PropertyGroup>
 
     <ItemGroup>

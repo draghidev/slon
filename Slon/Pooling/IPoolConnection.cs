@@ -1,7 +1,8 @@
 namespace Slon.Pooling;
 
 /// Used for pools to identify idle protocols and compare the load of busy protocols.
-interface IPoolConnection<TSelf>
+[Experimental(ExperimentalDiagnostics.Pooling)]
+public interface IPoolConnection<TSelf>
     where TSelf : class, IPoolConnection<TSelf>
 {
     /// Initiates terminal completion and completes only after the connection is fully quiet.
@@ -26,7 +27,8 @@ interface IPoolConnection<TSelf>
     void Start(ConnectionPool<TSelf>.Registration registration);
 }
 
-interface IPoolConnectionFactory<T>
+[Experimental(ExperimentalDiagnostics.Pooling)]
+public interface IPoolConnectionFactory<T>
     where T : class, IPoolConnection<T>
 {
     /// Must observe <paramref name="timeout"/>. Pool disposal waits for an in-progress create.

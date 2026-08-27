@@ -11,7 +11,8 @@ using Microsoft.Extensions.Logging.Abstractions;
 
 namespace Slon.Pooling;
 
-sealed class ConnectionPoolOptions
+[Experimental(ExperimentalDiagnostics.Pooling)]
+public sealed class ConnectionPoolOptions
 {
     /// Minimum number of connections preserved by statistical idle pruning.
     public int MinConnections { get; set; }
@@ -28,7 +29,8 @@ sealed class ConnectionPoolOptions
     public string? MetricsName { get; set; }
 }
 
-sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSource
+[Experimental(ExperimentalDiagnostics.Pooling)]
+public sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSource
     where T : class, IPoolConnection<T>
 {
     public readonly struct Registration

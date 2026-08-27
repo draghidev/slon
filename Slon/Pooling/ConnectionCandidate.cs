@@ -1,6 +1,7 @@
 namespace Slon.Pooling;
 
-readonly struct ConnectionCandidate<T>(T connection, CancellationToken cancellationToken, bool isIdleCandidate = true)
+[Experimental(ExperimentalDiagnostics.Pooling)]
+public readonly struct ConnectionCandidate<T>(T connection, CancellationToken cancellationToken, bool isIdleCandidate = true)
 {
     public T Connection { get; } = connection;
 
