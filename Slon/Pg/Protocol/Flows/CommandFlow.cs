@@ -1161,7 +1161,7 @@ public partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
             CompleteEnumerationWithException(exception);
     }
 
-    internal void Fail(Exception exception) => FaultCaller(exception);
+    internal override void Fail(Exception exception) => FaultCaller(exception);
 
     protected override void OnReleasing(Exception? exception)
     {

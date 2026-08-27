@@ -398,6 +398,10 @@ public abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSour
 
     protected virtual void OnHeartbeat(TimeSpan interval) {}
     protected virtual void OnAbort(Exception exception) {}
+    /// Terminates the flow from a result callback. Result-producing flows route the fault to their
+    /// consumer and framework completion. Other flows never hand out results.
+    internal virtual void Fail(Exception exception)
+        => throw new InvalidOperationException("This flow does not produce command results.", exception);
     /// Graceful-shutdown observation point. Fires while StoppingToken is set but before the
     /// AbortToken escalation. Flow types whose body can park on a non-IO rendezvous (CommandFlow's
     /// GateTask) override this to wake it so the body short-circuits instead of waiting for
