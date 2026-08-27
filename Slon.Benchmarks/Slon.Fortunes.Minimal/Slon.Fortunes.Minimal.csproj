@@ -5,10 +5,12 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <IsPackable>false</IsPackable>
+    <NoWarn>$(NoWarn);SLONPG001</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>
     <ProjectReference Include="../../Slon/Slon.csproj" />
+    <Compile Include="../Shared/RawSlonProtocolPool.cs" Link="RawSlonProtocolPool.cs" />
   </ItemGroup>
 
   <ItemGroup>

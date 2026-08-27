@@ -29,7 +29,6 @@ jobs:
       DRIVER: slon
       CONNECTION_STRING: "Host={{databaseServer}};Database=hello_world;Username=benchmarkdbuser;Password=benchmarkdbpass"
       DATABASE_CONNECTIONS: "{{ cores | minus: 2 }}"
-      SLON_PIPELINING: 64
 
   platform-postgresql-npgsql:
     sources:

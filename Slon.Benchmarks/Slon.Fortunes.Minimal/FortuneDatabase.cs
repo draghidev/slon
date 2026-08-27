@@ -1,6 +1,6 @@
 using System.Globalization;
-using System.Net;
 using Npgsql;
+using Slon.Fortunes;
 
 namespace Slon.Fortunes.Minimal;
 
@@ -27,8 +27,7 @@ internal abstract class FortuneDatabase : IAsyncDisposable
         {
             ("postgresql", "slon") => SlonFortuneDatabase.CreateAsync(
                 connectionString,
-                connectionCount,
-                PositiveSetting(configuration, "SLON_PIPELINING")),
+                connectionCount),
             ("postgresql", "npgsql") => ValueTask.FromResult<FortuneDatabase>(
                 new NpgsqlFortuneDatabase(connectionString, connectionCount)),
             _ => throw new InvalidOperationException("The database selection is invalid."),
@@ -82,87 +81,27 @@ internal abstract class FortuneDatabase : IAsyncDisposable
 
 internal sealed class SlonFortuneDatabase : FortuneDatabase
 {
-    private readonly SlonDataSource _dataSource;
-    private readonly SlonCommand _command;
+    private readonly RawSlonProtocolPool _pool;
 
-    private SlonFortuneDatabase(SlonDataSource dataSource, SlonCommand command)
-    {
-        _dataSource = dataSource;
-        _command = command;
-    }
+    private SlonFortuneDatabase(RawSlonProtocolPool pool) => _pool = pool;
 
     public static async ValueTask<FortuneDatabase> CreateAsync(
         string connectionString,
-        int connectionCount,
-        int pipeliningLimit)
+        int connectionCount)
     {
-        var builder = new NpgsqlConnectionStringBuilder(connectionString);
-        var dataSource = new SlonDataSource(new SlonDataSourceOptions
-        {
-            EndPoint = new DnsEndPoint(
-                RequiredPostgreSqlValue("Host", builder.Host),
-                builder.Port),
-            Database = RequiredPostgreSqlValue("Database", builder.Database),
-            Username = RequiredPostgreSqlValue("Username", builder.Username),
-            Password = builder.Password,
-            PoolSize = connectionCount,
-            MaxInFlightOperationsPerWire = pipeliningLimit,
-            Ssl = new PostgreSqlSslOptions
-            {
-                Mode = PostgreSqlSslMode.Disable,
-            },
-        });
-
-        try
-        {
-            var command = dataSource.CreateCommand(Query);
-            try
-            {
-                await command.PrepareAsync();
-                return new SlonFortuneDatabase(dataSource, command);
-            }
-            catch
-            {
-                await command.DisposeAsync();
-                throw;
-            }
-        }
-        catch
-        {
-            await dataSource.DisposeAsync();
-            throw;
-        }
+        return new SlonFortuneDatabase(await RawSlonProtocolPool.CreateAsync(
+            connectionString, connectionCount).ConfigureAwait(false));
     }
 
     public override async ValueTask<List<Fortune>> LoadAsync(
         CancellationToken cancellationToken)
     {
-        await using var reader = await _command.ExecuteReaderAsync(cancellationToken);
-        List<Fortune> fortunes = [];
-        while (await reader.ReadAsync(cancellationToken))
-        {
-            fortunes.Add(new Fortune(reader.GetInt32(0), reader.GetString(1)));
-        }
-
+        var fortunes = await _pool.LoadAsync(
+            static (id, message) => new Fortune(id, message), cancellationToken).ConfigureAwait(false);
         return Complete(fortunes);
     }
 
-    public override async ValueTask DisposeAsync()
-    {
-        try
-        {
-            await _command.DisposeAsync();
-        }
-        finally
-        {
-            await _dataSource.DisposeAsync();
-        }
-    }
-
-    private static string RequiredPostgreSqlValue(string name, string? value) =>
-        string.IsNullOrWhiteSpace(value)
-            ? throw new InvalidOperationException($"PostgreSQL {name} is required.")
-            : value;
+    public override ValueTask DisposeAsync() => _pool.DisposeAsync();
 }
 
 internal sealed class NpgsqlFortuneDatabase : FortuneDatabase
