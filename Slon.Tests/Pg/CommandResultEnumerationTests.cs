@@ -128,4 +128,34 @@ public class CommandResultEnumerationTests
         await e.DisposeAsync();
         await PgTestPool.RunAsync(protocol, "select 1");
     }
+
+    // Reset must clear the terminal enumeration state, or a reused flow reports exhaustion before
+    // its next tenure publishes anything.
+    [ConnectionCreatingTestMethod]
+    public async Task Reset_ClearsEnumerationCompleted_ForNextTenure()
+    {
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
+        var flow = new ResettableCommandFlow(async: true, Command.Create("select 1"));
+        for (var tenure = 0; tenure < 2; tenure++)
+        {
+            if (tenure > 0)
+            {
+                flow.Reset();
+                flow.Initialize(async: true, Command.Create("select 2"));
+            }
+            protocol.Queue(flow);
+            var e = flow.GetAsyncEnumerator();
+            Assert.IsTrue(await e.MoveNextAsync(), $"tenure {tenure} must publish its result");
+            await e.Current.DisposeAsync();
+            Assert.IsFalse(await e.MoveNextAsync());
+            await e.DisposeAsync();
+        }
+    }
+
+    // Pooling a timeout-armed flow is refused by Reset. Opt out so the reset path itself is testable.
+    sealed class ResettableCommandFlow(bool async, params ReadOnlySpan<Command> commands)
+        : CommandFlow(async, commands)
+    {
+        protected override bool EnableActivationTimeout => false;
+    }
 }

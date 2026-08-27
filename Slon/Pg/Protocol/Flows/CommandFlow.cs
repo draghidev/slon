@@ -1157,6 +1157,7 @@ public partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
         // before the flow is queued, so a live flow is always in concurrent-completion mode.
         _enumeratorMoveNextTaskSource.CanCompleteConcurrently = false;
         _enumeratorCurrent = default;
+        _enumeratorCompleted = false;
         _isResultReady = false;
         _callerInteractionCore.Reset();
         if (_cancellationState is { } cancellation)
