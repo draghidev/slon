@@ -1115,9 +1115,10 @@ public class ConnectionPoolTests
             CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
         await entered.Task;
 
+        var acceptingAttempts = new StrongBox<int>();
         var accepting = pool.GetAsync(
-            static (_, _) => true,
-            state: 0,
+            static (_, attempts) => Interlocked.Increment(ref attempts.Value) > 1,
+            acceptingAttempts,
             timeout: default).AsTask();
         await WaitUntilAsync(() => pool.WaiterCount == 2,
             "the compatible waiter must link while the first waiter remains coordinator-owned in Trying");
@@ -1400,6 +1401,81 @@ public class ConnectionPoolTests
 
         connection.RunInitialWorkToIdle();
         Assert.AreSame(connection, await newcomer);
+    }
+
+    [TestMethod]
+    public async Task BusyCapacityNewcomer_DoesNotConsumeParkedIdleWaiterOpportunity()
+    {
+        await using var pool = new ConnectionPool<AdmissionConnection>(
+            new AdmissionConnectionFactory(), new() { MaxConnections = 2 });
+
+        var busy = (await pool.GetUnqualifiedAsync(default)).Transfer();
+        var unavailable = (await pool.GetUnqualifiedAsync(default)).Transfer();
+        busy.MarkBusy();
+        unavailable.EnterRecovery();
+
+        var idleOnly = pool.GetAsync(
+            static (candidate, _) => candidate.IsIdleCandidate,
+            state: 0,
+            timeout: default).AsTask();
+        await WaitUntilAsync(() => pool.WaiterCount == 1,
+            "the idle-only renter must be parked before the multiplexed newcomer arrives");
+
+        var multiplexed = pool.GetAsync(
+            static (candidate, _) =>
+            {
+                if (candidate.IsIdleCandidate)
+                    return false;
+                candidate.Connection.MarkBusy();
+                return true;
+            },
+            state: 0,
+            timeout: default).AsTask();
+
+        Assert.AreSame(busy, await multiplexed.WaitAsync(TimeSpan.FromSeconds(1)),
+            "unowned busy capacity should not wait behind an incompatible idle-only renter");
+        Assert.IsFalse(idleOnly.IsCompleted,
+            "busy placement must not consume or complete the older renter's idle opportunity");
+        Assert.AreEqual(1, pool.WaiterCount);
+
+        unavailable.CompleteRecovery();
+        unavailable.RunInitialWorkToIdle();
+        Assert.AreSame(unavailable, await idleOnly.WaitAsync(TimeSpan.FromSeconds(1)));
+    }
+
+    [TestMethod]
+    public async Task BusyCapacityNewcomer_ContinuesAfterFirstCandidatePairRejects()
+    {
+        await using var pool = new ConnectionPool<AdmissionConnection>(
+            new AdmissionConnectionFactory(), new() { MaxConnections = 4 });
+        var connections = new AdmissionConnection[4];
+        for (var i = 0; i < connections.Length; i++)
+        {
+            connections[i] = (await pool.GetUnqualifiedAsync(default)).Transfer();
+            connections[i].MarkBusy();
+        }
+
+        using var cancellation = new CancellationTokenSource();
+        var idleOnly = pool.GetAsync(
+            static (candidate, _) => candidate.IsIdleCandidate,
+            state: 0,
+            timeout: default,
+            cancellationToken: cancellation.Token).AsTask();
+        await WaitUntilAsync(() => pool.WaiterCount == 1,
+            "the idle-only renter must establish demand before busy placement");
+
+        var attempts = new StrongBox<int>();
+        var multiplexed = pool.GetAsync(
+            static (candidate, attempts) =>
+                !candidate.IsIdleCandidate && Interlocked.Increment(ref attempts.Value) == 3,
+            attempts,
+            timeout: default).AsTask();
+
+        _ = await multiplexed.WaitAsync(TimeSpan.FromSeconds(1));
+        Assert.AreEqual(3, attempts.Value,
+            "both candidates from the first pair must reject before the next pair is attempted");
+        cancellation.Cancel();
+        await Assert.ThrowsExactlyAsync<TaskCanceledException>(() => idleOnly);
     }
 
     [TestMethod]

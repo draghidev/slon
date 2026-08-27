@@ -53,6 +53,8 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
     object SyncObj { get; } = new();
 
     readonly ConnectionSlot[] _connections;
+    long _slotStateGeneration;
+    long _fullyInstalledGeneration = -1;
 
     /// Test diagnostic. This unsynchronized slot snapshot may be stale.
     internal string DescribeSlots()
@@ -256,11 +258,17 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
         var completion = connection.Completion;
         if (completion.IsCompleted)
         {
-            SignalAvailability();
+            OnConnectionCompleted();
             return;
         }
 
-        completion.ConfigureAwait(false).GetAwaiter().UnsafeOnCompleted(SignalAvailability);
+        completion.ConfigureAwait(false).GetAwaiter().UnsafeOnCompleted(OnConnectionCompleted);
+    }
+
+    void OnConnectionCompleted()
+    {
+        Interlocked.Increment(ref _slotStateGeneration);
+        SignalAvailability();
     }
 
     void SignalAvailability(object registration, T connection, bool isIdle)
@@ -506,9 +514,9 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
         CancellationToken cancellationToken, bool exhaustive, long maxIdleGeneration,
         out ConnectionFuture? future,
         [NotNullWhen(true)]out T? connection,
-        out bool consumedIdleToken)
+        out bool completedBusyScan)
     {
-        consumedIdleToken = false;
+        completedBusyScan = false;
         // Prefer idle reuse, then growth, then multiplexing.
 
         // A rejected token returns at the tail. Walk at most one bounded cycle so later tokens
@@ -566,7 +574,6 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
                             PublishIdle(idleRegistration, idle);
                         future = null;
                         connection = idle;
-                        consumedIdleToken = true;
                         return true;
                     }
                 }
@@ -586,6 +593,17 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
                 RecordIdleRemovalForPruning();
         }
 
+        var slotGeneration = Volatile.Read(ref _slotStateGeneration);
+        if (!exhaustive && Volatile.Read(ref _fullyInstalledGeneration) == slotGeneration)
+        {
+            future = null;
+            completedBusyScan = true;
+            if (TryScheduleBusy(schedule, state, cancellationToken, out connection))
+                return true;
+            connection = null;
+            return false;
+        }
+
         var connections = _connections;
         // Randomize the walk start so concurrent renters do not converge on slot zero.
         var startIndex = connections.Length > 1
@@ -595,6 +613,7 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
         future = null;
         // Claim empty/completed slots immediately; retain two busy candidates for load comparison.
         T? busyFirst = null, busySecond = null;
+        var allSlotsInstalled = true;
         for (var i = startIndex; i < startIndex + connections.Length; i++)
         {
             var slotIndex = i < connections.Length ? i : i - connections.Length;
@@ -602,10 +621,14 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
             if (TryGetConnection(ref slot, out var conn))
             {
                 // Completed slot, reclaim and open new in its place.
-                if (conn.Completion.IsCompleted && TryClaimSlot(ref slot, slotIndex, conn, ref future))
+                if (conn.Completion.IsCompleted)
                 {
-                    connection = default;
-                    return false;
+                    allSlotsInstalled = false;
+                    if (TryClaimSlot(ref slot, slotIndex, conn, ref future))
+                    {
+                        connection = default;
+                        return false;
+                    }
                 }
 
                 // The idle queue is the sole idle rendezvous; the slot walk only samples busy work.
@@ -617,11 +640,17 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
             }
             else if (TryClaimSlot(ref slot, slotIndex, conn, ref future))
             {
+                allSlotsInstalled = false;
                 // Empty slot, open new.
                 connection = default;
                 return false;
             }
+            else
+                allSlotsInstalled = false;
         }
+
+        if (allSlotsInstalled && slotGeneration == Volatile.Read(ref _slotStateGeneration))
+            Volatile.Write(ref _fullyInstalledGeneration, slotGeneration);
 
         if (exhaustive)
         {
@@ -663,6 +692,59 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
 
         future = null;
         connection = default;
+        return false;
+    }
+
+    // Demand can represent an idle token, opener right, finite wire slot, or a renter-specific
+    // predicate. A caller which can use uncapped multiplexing capacity may still sample existing
+    // busy wires, but must not dequeue identity tokens or claim/open slots on this path.
+    bool TryScheduleBusy<TState>(Func<ConnectionCandidate<T>, TState, bool> schedule, TState state,
+        CancellationToken cancellationToken, [NotNullWhen(true)] out T? connection)
+    {
+        var connections = _connections;
+        var startIndex = connections.Length > 1
+            ? NextRandomStart(connections.Length)
+            : 0;
+        T? first = null;
+        for (var i = startIndex; i < startIndex + connections.Length; i++)
+        {
+            ref var slot = ref connections[i < connections.Length ? i : i - connections.Length];
+            if (!TryReadInstalledConnection(ref slot, out var candidate) || candidate.IsIdle)
+                continue;
+
+            if (first is null)
+            {
+                first = candidate;
+                continue;
+            }
+
+            var pick = first.CompareTo(candidate) > 0 ? candidate : first;
+            if (DoSchedule(new(pick, cancellationToken, isIdleCandidate: false), schedule, state))
+            {
+                connection = pick;
+                return true;
+            }
+
+            var runnerUp = ReferenceEquals(pick, first) ? candidate : first;
+            if (DoSchedule(new(runnerUp, cancellationToken, isIdleCandidate: false), schedule, state))
+            {
+                connection = runnerUp;
+                return true;
+            }
+
+            // Both advisory candidates raced out of eligibility. Continue from the current slot;
+            // every pool line is read at most once by this acquisition.
+            first = null;
+        }
+
+        if (first is not null &&
+            DoSchedule(new(first, cancellationToken, isIdleCandidate: false), schedule, state))
+        {
+            connection = first;
+            return true;
+        }
+
+        connection = null;
         return false;
     }
 
@@ -811,9 +893,12 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
     // Publication transfers opener ownership. Future visibility and its generation are fused:
     // otherwise a later waiter can claim the slot between Complete and the availability bell.
     void SettleOpener(ConnectionFuture future, T? conn)
-        => _waiters.PublishAvailability(
+    {
+        Interlocked.Increment(ref _slotStateGeneration);
+        _waiters.PublishAvailability(
             static (state, _) => state.Future.Complete(state.Connection),
             (Future: future, Connection: conn), publishWhenDisposed: true);
+    }
 
     T GetCore<TState>(Func<ConnectionCandidate<T>, TState, bool> schedule, TState state, TimeSpan timeout)
     {
@@ -824,15 +909,24 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
 
         ThrowIfDisposed();
 
-        if (!_waiters.HasDemand)
+        var hasDemand = _waiters.HasDemand;
+        var completedBusyScan = false;
+        if (!hasDemand)
         {
             if (TrySchedule(schedule, state, CancellationToken.None, exhaustive: false,
-                long.MaxValue, out var future, out var conn, out _))
+                long.MaxValue, out var future, out var conn, out completedBusyScan))
                 return conn;
 
             if (future is not null)
                 return OpenConnection(future, schedule, state, timeout);
+
+            hasDemand = _waiters.HasDemand;
         }
+
+        if (hasDemand &&
+            !completedBusyScan &&
+            TryScheduleBusy(schedule, state, CancellationToken.None, out var busy))
+            return busy;
 
         return WaitForAvailability(schedule, state, timeout);
 
@@ -843,15 +937,24 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
             {
                 ThrowIfDisposed();
 
-                if (!_waiters.HasDemand)
+                var hasDemand = _waiters.HasDemand;
+                var completedBusyScan = false;
+                if (!hasDemand)
                 {
                     if (TrySchedule(schedule, state, CancellationToken.None, exhaustive: false,
-                        long.MaxValue, out var future, out var conn, out _))
+                        long.MaxValue, out var future, out var conn, out completedBusyScan))
                         return ReportAdmission(conn, waited: false, reportAdmissions);
 
                     if (future is not null)
                         return ReportAdmission(OpenConnection(future, schedule, state, timeout), waited: false, reportAdmissions);
+
+                    hasDemand = _waiters.HasDemand;
                 }
+
+                if (hasDemand &&
+                    !completedBusyScan &&
+                    TryScheduleBusy(schedule, state, CancellationToken.None, out var busy))
+                    return ReportAdmission(busy, waited: false, reportAdmissions);
 
                 return ReportAdmission(WaitForAvailability(schedule, state, timeout), waited: true, reportAdmissions);
             }
@@ -870,16 +973,18 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
         => new(this, Get(static (_, _) => true, (object?)null, timeout));
 
     ValueTask<T> GetCoreAsync<TState>(Func<ConnectionCandidate<T>, TState, bool> schedule, TState state,
-        TimeSpan timeout, CancellationToken cancellationToken = default)
+        TimeSpan timeout, CancellationToken cancellationToken)
     {
         ThrowIfDisposed();
 
         var reportAdmissions = _metrics?.AdmissionsEnabled is true;
         var reportTimeouts = _metrics?.AdmissionTimeoutsEnabled is true;
-        if (!_waiters.HasDemand)
+        var hasDemand = _waiters.HasDemand;
+        var completedBusyScan = false;
+        if (!hasDemand)
         {
             if (TrySchedule(schedule, state, cancellationToken, exhaustive: false,
-                long.MaxValue, out var future, out var conn, out _))
+                long.MaxValue, out var future, out var conn, out completedBusyScan))
                 return new(ReportAdmission(conn, waited: false, reportAdmissions));
 
             if (future is not null)
@@ -889,7 +994,14 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
                     ? ObserveAdmissionAsync(task, waited: false, reportAdmissions, reportTimeouts, _metrics!)
                     : task;
             }
+
+            hasDemand = _waiters.HasDemand;
         }
+
+        if (hasDemand &&
+            !completedBusyScan &&
+            TryScheduleBusy(schedule, state, cancellationToken, out var busy))
+            return new(ReportAdmission(busy, waited: false, reportAdmissions));
 
         var waitTask = WaitForAvailabilityAsync(schedule, state, timeout, cancellationToken);
         return reportAdmissions || reportTimeouts
@@ -1180,6 +1292,7 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
         if (!ReferenceEquals(Interlocked.CompareExchange(ref slot.Item, candidate, observed), observed))
             return false;
 
+        Interlocked.Increment(ref _slotStateGeneration);
         candidate.BindSlot(slotIndex);
         Volatile.Write(ref slot.Registration, candidate);
         return true;
@@ -1211,6 +1324,16 @@ sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable, IPoolMetricsSour
         Debug.Assert(value is null or ConnectionFuture);
         connection = null;
         return false;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    static bool TryReadInstalledConnection(
+        ref ConnectionSlot slot, [NotNullWhen(true)] out T? connection)
+    {
+        // The demand fast path does not own slot reclamation. Reading only installed connections
+        // keeps it free of CAS writes and future unwrapping on cross-core pool state.
+        connection = Volatile.Read(ref slot.Item) as T;
+        return connection is not null;
     }
 
     static bool TryGetConnection(ref ConnectionSlot slot, [NotNullWhen(true)]out T? connection,
