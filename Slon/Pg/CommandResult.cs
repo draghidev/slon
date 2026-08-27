@@ -34,10 +34,10 @@ public sealed class CommandResult
     PgError? _errorMessage;
     Action<CommandResult, object?>? _completionAction;
     object? _completionActionState;
-    CommandFlow _flow = null!;
+    PgClientFlow _flow = null!;
 
     // The requested row description is what was returned for this exact command (i.e. commands that requested a describe).
-    internal void Initialize(CommandFlow flow, int index, CommandDescriptor descriptor,
+    internal void Initialize(PgClientFlow flow, int index, CommandDescriptor descriptor,
         RowDescription? requestedRowDescription, bool requestedExecution, bool simpleProtocol, PgError? error = null)
     {
         if (!ReferenceEquals(_flow, flow))
