@@ -9,7 +9,8 @@ namespace Slon.Pg;
 
 // Supports structural equality, for preparation information.
 // Discriminated union over prepared and unprepared parameter types.
-readonly struct ParameterTypeList : IEquatable<ParameterTypeList>
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+public readonly struct ParameterTypeList : IEquatable<ParameterTypeList>
 {
     readonly object _source;
     readonly ParameterWriter? _writer;
@@ -36,7 +37,7 @@ readonly struct ParameterTypeList : IEquatable<ParameterTypeList>
         _count = source.Count;
     }
 
-    public ushort PgCount => checked((ushort)Count);
+    internal ushort PgCount => checked((ushort)Count);
     public int Count => _count;
 
     public ParameterTypeList Preserve(Func<PgTypeId, Oid>? oidLookup = null)

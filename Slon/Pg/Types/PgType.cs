@@ -2,7 +2,8 @@ using System.Collections.Immutable;
 
 namespace Slon.Pg.Types;
 
-readonly record struct PgType
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+public readonly record struct PgType
 {
     PgType(DataTypeName dataTypeName, Oid? oid)
     {
@@ -87,7 +88,8 @@ readonly record struct PgType
         => new(new PgTypeData.Composite(fields), dataTypeName, oid);
 }
 
-enum PgTypeKind
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+public enum PgTypeKind
 {
     /// A base type.
     Base,

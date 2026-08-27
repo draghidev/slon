@@ -13,7 +13,8 @@ enum PgParameterValueOperationKind : byte
     WriteAsync
 }
 
-ref struct PgParameterValueOperation
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+public ref struct PgParameterValueOperation
 {
     ref PgParameterValueOperationResult _result;
     readonly PgWriter _writer;
@@ -69,7 +70,8 @@ struct PgParameterValueOperationResult
 
 // Serializer-backed parameter writer. Sources provide values and resolved type information;
 // this component owns binding storage, PgWriter tenure and converter failure cleanup.
-abstract class PgSerializerParameterWriter<TSource> : ParameterWriter
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+public abstract class PgSerializerParameterWriter<TSource> : ParameterWriter
     where TSource : class
 {
     public abstract int GetParameterCount(TSource source);

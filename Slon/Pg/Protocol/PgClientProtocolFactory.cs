@@ -11,7 +11,8 @@ namespace Slon.Pg.Protocol;
 // Full wire-session construction shared by raw protocol hosts and PgConnection. This layer owns
 // transport connection, TLS negotiation/fallback, protocol options, startup, and CancelRequest.
 // Pooling, prepared-statement tracking, and ADO connection lifetime belong to PgConnectionFactory.
-sealed class PgClientProtocolFactory
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+public sealed class PgClientProtocolFactory
 {
     readonly PgClientOptions _clientOptions;
     readonly TransportConnection.Factory _transportConnectionFactory;

@@ -2,13 +2,15 @@ using System.Diagnostics;
 
 namespace Slon.Pg.Serialization;
 
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
 public enum DataFormat : byte
 {
     Binary,
     Text
 }
 
-static class DataFormatExtensions
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+public static class DataFormatExtensions
 {
     public static DataFormat ToDataFormat(this PgFormat format) => format switch
     {

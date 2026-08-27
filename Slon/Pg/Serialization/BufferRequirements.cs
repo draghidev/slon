@@ -2,6 +2,7 @@ using System.Runtime.CompilerServices;
 
 namespace Slon.Pg.Serialization;
 
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
 public readonly struct BufferRequirements : IEquatable<BufferRequirements>
 {
     readonly Size _read;

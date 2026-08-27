@@ -10,8 +10,11 @@ using Slon.Runtime.CompilerServices;
 
 namespace Slon.Pg;
 
-sealed class Row : PgFieldReader
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+public sealed class Row : PgFieldReader
 {
+    internal Row() { }
+
     BackendMessage.Accessor _messageAccessor;
     RowDescription _rowDescription = null!;
     BackendMessageBodyReader? _bodyReader;

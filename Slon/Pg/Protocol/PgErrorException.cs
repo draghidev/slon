@@ -3,6 +3,7 @@ using System.Diagnostics.CodeAnalysis;
 
 namespace Slon.Pg.Protocol;
 
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
 public sealed class PgErrorException : Exception
 {
     // Throwing is the escape boundary: the exception can propagate anywhere and be inspected long
@@ -10,25 +11,25 @@ public sealed class PgErrorException : Exception
     // underlying field bytes (one copy) up front, while the buffer is still valid. The field
     // accessors then decode lazily from that owned copy - safe to read from anywhere.
     internal PgErrorException(PgError error) : base(BuildMessage(error))
-        => OriginalPgError = error.Preserve();
+        => Error = error.Preserve();
 
-    internal PgError OriginalPgError { get; }
+    public PgError Error { get; }
 
-    public string Severity => OriginalPgError.Severity;
-    public string SqlState => OriginalPgError.SqlState;
-    public string MessageText => OriginalPgError.MessageText;
-    public string? Detail => OriginalPgError.Detail;
-    public string? Hint => OriginalPgError.Hint;
-    public int Position => OriginalPgError.Position;
-    public string? Where => OriginalPgError.Where;
-    public string? SchemaName => OriginalPgError.SchemaName;
-    public string? TableName => OriginalPgError.TableName;
-    public string? ColumnName => OriginalPgError.ColumnName;
-    public string? ConstraintName => OriginalPgError.ConstraintName;
-    public bool IsTransient => OriginalPgError.IsTransientError;
+    public string Severity => Error.Severity;
+    public string SqlState => Error.SqlState;
+    public string MessageText => Error.MessageText;
+    public string? Detail => Error.Detail;
+    public string? Hint => Error.Hint;
+    public int Position => Error.Position;
+    public string? Where => Error.Where;
+    public string? SchemaName => Error.SchemaName;
+    public string? TableName => Error.TableName;
+    public string? ColumnName => Error.ColumnName;
+    public string? ConstraintName => Error.ConstraintName;
+    public bool IsTransient => Error.IsTransientError;
     /// True when this operation was cancelled by a CancelRequest issued for an earlier
     /// pipelined operation on the same PostgreSQL connection.
-    public bool IsCollateralCancellation => OriginalPgError.IsCollateralCancellation;
+    public bool IsCollateralCancellation => Error.IsCollateralCancellation;
 
     // Eager: built at throw time while the buffer is valid, so Message renders anywhere the exception
     // travels. Replaces the base "Exception of type ... was thrown".

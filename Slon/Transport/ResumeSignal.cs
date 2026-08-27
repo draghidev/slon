@@ -8,21 +8,25 @@ namespace Slon.Transport;
 //
 // Completion runs the continuation inline so the resumed coroutine retries the write on the
 // thread that observed writability. Dispatching here would add a hop to every backpressure cycle.
-sealed class ResumeSignal : IValueTaskSource
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+public sealed class ResumeSignal : IValueTaskSource
 {
     Slon.Threading.Tasks.Sources.ManualResetValueTaskSourceCore<bool> _core;
     bool _pending;
     Deadline? _pendingDeadline;
 
     public bool IsPending => Volatile.Read(ref _pending);
-    public static Deadline? CreateDeadline(TimeSpan timeout)
+    internal static Deadline? CreateDeadline(TimeSpan timeout)
         => timeout == default || timeout == Timeout.InfiniteTimeSpan
             ? null
             : new Deadline(timeout);
     public TimeSpan GetRemainingTimeout()
         => _pendingDeadline?.GetRemaining() ?? Timeout.InfiniteTimeSpan;
 
-    public ValueTask Pending(Deadline? deadline = null)
+    public ValueTask WaitAsync(TimeSpan timeout = default)
+        => Pending(CreateDeadline(timeout));
+
+    internal ValueTask Pending(Deadline? deadline = null)
     {
         _pendingDeadline = deadline;
         Volatile.Write(ref _pending, true);

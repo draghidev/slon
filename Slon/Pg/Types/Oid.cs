@@ -1,6 +1,7 @@
 namespace Slon.Pg.Types;
 
-readonly struct Oid(uint value) : IEquatable<Oid>
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+public readonly struct Oid(uint value) : IEquatable<Oid>
 {
     public static explicit operator uint(Oid oid) => oid.Value;
     public static implicit operator Oid(uint oid) => new(oid);

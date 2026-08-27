@@ -2,13 +2,15 @@ using System.Collections.Immutable;
 
 namespace Slon.Pg.Types;
 
-sealed class PgTypeLoadingOptions
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+public sealed class PgTypeLoadingOptions
 {
     public required ImmutableArray<string> Schemas { get; init; }
     public required bool LoadTableComposites { get; init; }
 }
 
-sealed class PgTypeLoadingOptionsBuilder
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+public sealed class PgTypeLoadingOptionsBuilder
 {
     readonly List<string> _schemas = [];
     bool _loadTableComposites;

@@ -1,6 +1,7 @@
 namespace Slon.Pg;
 
-interface IFieldDecoder<T, TState>
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+public interface IFieldDecoder<T, TState>
 {
     static abstract T Read(PgFieldReader reader, TState state);
     static abstract ValueTask<T> ReadAsync(PgFieldReader reader, TState state,
@@ -8,7 +9,8 @@ interface IFieldDecoder<T, TState>
 }
 
 [Flags]
-enum FieldReadMode : byte
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+public enum FieldReadMode : byte
 {
     None = 0,
     BufferedView = 1,

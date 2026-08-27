@@ -7,7 +7,8 @@ namespace Slon.Text;
 // PostgreSQL protocol C-string whose encoded form is reused across Parse/Bind/Close operations.
 // Defined as a struct wrapping a class so default cheaply represents the unnamed statement/portal.
 [DebuggerDisplay("{_core,nq}")]
-readonly struct EncodedCString
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+public readonly struct EncodedCString
 {
     readonly Core? _core;
 

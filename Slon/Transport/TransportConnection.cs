@@ -2,14 +2,16 @@ using System.IO.Pipelines;
 
 namespace Slon.Transport;
 
-class TransportConnectionOptions
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+public sealed class TransportConnectionOptions
 {
     public int ReaderSegmentSize { get; init; } = TransportConnection.DefaultReaderSegmentSize;
     public int WriterSegmentSize { get; init; } = TransportConnection.DefaultWriterSegmentSize;
     public bool UseZeroByteReads { get; init; } = true;
 }
 
-abstract class TransportConnection
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+public abstract class TransportConnection
 {
     public readonly struct ResumableWrite(ResumeSignal? signal, TimeSpan timeout)
     {

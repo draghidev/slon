@@ -7,34 +7,36 @@ namespace Slon.Pg.Serialization;
 /// <summary>
 /// Datasource-scoped serializer resolution over one immutable PostgreSQL type catalog.
 /// </summary>
-sealed partial class PgSerializerOptions
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+public sealed partial class PgSerializerOptions
 {
     readonly Dictionary<Type, Mapping> _byClrType = new();
     readonly Dictionary<PgTypeId, Mapping> _byPgTypeId = new();
     readonly ConditionalWeakTable<RowDescription, PgSerializerReadCache> _readCaches = new();
 
-    internal PgSerializerOptions(PgTypeCatalog typeCatalog)
+    public PgSerializerOptions(PgTypeCatalog typeCatalog)
     {
         _typeCatalog = typeCatalog;
 
-        Add<bool>(new BoolConverter(), DataTypeNames.Bool);
-        Add<short>(new Int2Converter<short>(), DataTypeNames.Int2);
-        Add<int>(new Int4Converter<int>(), DataTypeNames.Int4);
-        Add<long>(new Int8Converter<long>(), DataTypeNames.Int8);
-        Add<float>(new RealConverter<float>(), DataTypeNames.Float4);
-        Add<double>(new DoubleConverter<double>(), DataTypeNames.Float8);
-        Add<Guid>(new GuidUuidConverter(), DataTypeNames.Uuid);
+        AddBuiltInMapping<bool>(new BoolConverter(), DataTypeNames.Bool);
+        AddBuiltInMapping<short>(new Int2Converter<short>(), DataTypeNames.Int2);
+        AddBuiltInMapping<int>(new Int4Converter<int>(), DataTypeNames.Int4);
+        AddBuiltInMapping<long>(new Int8Converter<long>(), DataTypeNames.Int8);
+        AddBuiltInMapping<float>(new RealConverter<float>(), DataTypeNames.Float4);
+        AddBuiltInMapping<double>(new DoubleConverter<double>(), DataTypeNames.Float8);
+        AddBuiltInMapping<Guid>(new GuidUuidConverter(), DataTypeNames.Uuid);
         var stringConverter = TextConverter.CreateStringConverter();
-        Add<string>(stringConverter, DataTypeNames.Text);
-        Add<string>(stringConverter, DataTypeNames.Varchar, defaultForClrType: false);
-        Add<string>(stringConverter, DataTypeNames.Bpchar, defaultForClrType: false);
-        Add<string>(stringConverter, DataTypeNames.Name, defaultForClrType: false);
-        Add<TextReader>(TextConverter.CreateTextReaderConverter(), DataTypeNames.Text,
+        AddBuiltInMapping<string>(stringConverter, DataTypeNames.Text);
+        AddBuiltInMapping<string>(stringConverter, DataTypeNames.Varchar, defaultForClrType: false);
+        AddBuiltInMapping<string>(stringConverter, DataTypeNames.Bpchar, defaultForClrType: false);
+        AddBuiltInMapping<string>(stringConverter, DataTypeNames.Name, defaultForClrType: false);
+        AddBuiltInMapping<TextReader>(TextConverter.CreateTextReaderConverter(), DataTypeNames.Text,
             defaultForPgType: false);
-        Add<Stream>(new StreamConverter(), DataTypeNames.Bytea, defaultForPgType: false);
+        AddBuiltInMapping<Stream>(new StreamConverter(), DataTypeNames.Bytea, defaultForPgType: false);
     }
 
     readonly PgTypeCatalog _typeCatalog;
+    public PgTypeCatalog TypeCatalog => _typeCatalog;
     internal PgConversionContext ConversionContext { get; } = PgConversionContext.Empty;
     internal bool PortableTypeIds => _typeCatalog.IsPortable;
 
@@ -98,19 +100,35 @@ sealed partial class PgSerializerOptions
 
     private static partial bool IsAdoFieldProjection(Type type);
 
-    void Add<T>(PgConverter<T> converter, DataTypeName dataTypeName, bool defaultForPgType = true,
+    public void AddMapping<T>(PgConverter<T> converter, DataTypeName dataTypeName,
+        bool defaultForPgType = true,
         bool defaultForClrType = true)
+    {
+        ArgumentNullException.ThrowIfNull(converter);
+        if (!AddMappingCore(converter, dataTypeName, defaultForPgType, defaultForClrType))
+            throw new ArgumentException(
+                $"PostgreSQL type '{dataTypeName}' does not exist in this serializer's type catalog.",
+                nameof(dataTypeName));
+    }
+
+    void AddBuiltInMapping<T>(PgConverter<T> converter, DataTypeName dataTypeName,
+        bool defaultForPgType = true, bool defaultForClrType = true)
+        => AddMappingCore(converter, dataTypeName, defaultForPgType, defaultForClrType);
+
+    bool AddMappingCore<T>(PgConverter<T> converter, DataTypeName dataTypeName,
+        bool defaultForPgType, bool defaultForClrType)
     {
         // Synthetic and deliberately restricted catalogs need not contain every built-in.
         // Resolution advertises only mappings whose PostgreSQL identity exists in this snapshot.
         if (!_typeCatalog.TryGetIdentifiers(dataTypeName.Value, out var canonicalTypeId, out _))
-            return;
+            return false;
 
         var mapping = new Mapping(this, typeof(T), converter, dataTypeName);
         if (defaultForClrType)
             _byClrType.Add(typeof(T), mapping);
         if (defaultForPgType)
             _byPgTypeId.Add(canonicalTypeId, mapping);
+        return true;
     }
 
     sealed class Mapping

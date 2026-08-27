@@ -5,7 +5,8 @@ namespace Slon.Pg.Types;
 /// <summary>
 /// A discriminated union of <see cref="Oid" /> and <see cref="DataTypeName" />.
 /// </summary>
-readonly struct PgTypeId: IEquatable<PgTypeId>
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+public readonly struct PgTypeId: IEquatable<PgTypeId>
 {
     readonly DataTypeName _dataTypeName;
     readonly Oid _oid;
@@ -37,7 +38,7 @@ readonly struct PgTypeId: IEquatable<PgTypeId>
         return false;
     }
 
-    public bool Equals(PgTypeId other, PgTypeIdEquality equality) => equality switch
+    internal bool Equals(PgTypeId other, PgTypeIdEquality equality) => equality switch
     {
         PgTypeIdEquality.Default => Equals(other),
         PgTypeIdEquality.Oid => Oid == other.Oid,

@@ -16,13 +16,13 @@ public class CommandDrainTests : ConnectionCreatingTest
     {
         public TaskCompletionSource Entered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
-        internal override void OnCommandResult(CommandFlow flow, CommandResult result, object? state)
+        protected internal override void OnCommandResult(CommandFlow flow, CommandResult result, object? state)
             => Entered.TrySetResult();
     }
 
     sealed class ThrowingCompletionObserver(Exception exception) : CommandFlowObserver
     {
-        internal override void OnCommandResult(CommandFlow flow, CommandResult result, object? state)
+        protected internal override void OnCommandResult(CommandFlow flow, CommandResult result, object? state)
             => result.OnCompleted(static (_, state) => throw (Exception)state!, exception);
     }
 

@@ -4,6 +4,7 @@
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <NoWarn>$(NoWarn);SLONPG001</NoWarn>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="../Slon/Slon.csproj" />

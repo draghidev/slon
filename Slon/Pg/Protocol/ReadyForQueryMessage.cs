@@ -41,7 +41,8 @@ readonly struct ReadyForQueryMessage
     }
 }
 
-enum TransactionStatus : byte
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+public enum TransactionStatus : byte
 {
     /// <summary>
     /// Unknown status
@@ -69,4 +70,3 @@ enum TransactionStatus : byte
     /// </summary>
     Pending = byte.MaxValue,
 }
-

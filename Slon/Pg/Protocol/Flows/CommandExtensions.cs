@@ -4,7 +4,8 @@ using Slon.Runtime.CompilerServices;
 
 namespace Slon.Pg.Protocol.Flows;
 
-static class CommandExtensions
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+public static class CommandExtensions
 {
     // TODO this requires quite some work, including having to support text format param/field values. Maybe not worth it to support at all for queries.
     [MethodImpl(MethodImplOptions.AggressiveInlining)]

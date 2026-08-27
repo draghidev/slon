@@ -43,7 +43,7 @@ sealed class ConfiguredBackendProvider(PostgreSqlCompatibilityProfile profile) :
             ? PostgreSqlTypeCatalogFactory.Instance
             : PgTypeCatalogFactory.FromBaseline(PgTypeCatalog.Default);
 
-    public override string? ResolveSessionResetCommand(
+    internal override string? ResolveSessionResetCommand(
         PgSessionResetOptions options, PgBackendInfo backendInfo)
     {
         if (options.HasAllActionsEnabled && profile.SessionResetCommand is not null)

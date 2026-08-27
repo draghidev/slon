@@ -8,7 +8,8 @@ using static Slon.Pg.Protocol.PgTypes;
 
 namespace Slon.Pg.Protocol;
 
-readonly struct PgEncoder
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+public readonly struct PgEncoder
 {
     public readonly ref struct ResumableWriteScope
     {

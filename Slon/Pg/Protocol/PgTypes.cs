@@ -8,7 +8,8 @@ using static Slon.Pg.Protocol.PgTypes;
 
 namespace Slon.Pg.Protocol;
 
-static class PgTypes
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+public static class PgTypes
 {
     public enum BackendType: byte
     {
@@ -58,7 +59,7 @@ static class PgTypes
         Authentication = (byte) 'p',
     }
 
-    public readonly struct Header
+    internal readonly struct Header
     {
         public const int ByteCount = sizeof(int) + sizeof(byte);
 

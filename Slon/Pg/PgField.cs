@@ -9,7 +9,8 @@ interface IColumnLease
 
 // A tenure-bound field handle. Consumers provide a decoder; this layer owns the reusable cursor
 // and any view or column lease retained from it.
-readonly struct PgField(Row row, int ordinal)
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+public readonly struct PgField(Row row, int ordinal)
 {
     public ref readonly RowDescriptionField Metadata => ref row.GetFieldMetadata(ordinal);
     public bool IsPast => row.IsColumnPast(ordinal);

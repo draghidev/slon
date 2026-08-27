@@ -42,7 +42,7 @@ sealed class MaintenanceFlow : PgClientFlow
     {
         internal static readonly ObserverImpl Instance = new();
 
-        internal override void OnCompleted(PgClientFlow flow, Exception? exception, object? state)
+        protected internal override void OnCompleted(PgClientFlow flow, Exception? exception, object? state)
         {
             var conn = (PgConnection)state!;
             conn.OnMaintenanceFlowCompleted((MaintenanceFlow)flow);
@@ -148,7 +148,7 @@ sealed class MaintenanceFlow : PgClientFlow
         {
             var message = await decoder.GetNextAuto().ConfigureAwait(false);
             if (message.Header.Type is BackendType.ErrorResponse)
-                PgErrorException.Throw(ErrorOrNoticeMessage.Create(message, []));
+                PgErrorException.Throw(new(ErrorOrNoticeMessage.Create(message, [])));
             if (message.Header.Type is BackendType.ReadyForQuery)
                 return ValueTask.CompletedTask;
         }

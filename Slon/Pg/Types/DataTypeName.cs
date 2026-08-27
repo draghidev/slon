@@ -6,7 +6,8 @@ namespace Slon.Pg.Types;
 /// Represents the fully-qualified name of a PostgreSQL type.
 /// </summary>
 [DebuggerDisplay("{DisplayName,nq}")]
-readonly struct DataTypeName : IEquatable<DataTypeName>
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+public readonly struct DataTypeName : IEquatable<DataTypeName>
 {
     const char InvalidIdentifier = '-';
     const string InvalidIdentifierString = "-";

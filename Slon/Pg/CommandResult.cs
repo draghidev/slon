@@ -7,9 +7,14 @@ using Slon.Pg.Protocol.Flows;
 
 namespace Slon.Pg;
 
-sealed class CommandResult(CommandFlow.ResultMessageEnumerator messageEnumerator)
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+public sealed class CommandResult
     : IDisposable, IAsyncDisposable, IEnumerable<Row>, IAsyncEnumerable<Row>
 {
+    readonly CommandFlow.ResultMessageEnumerator _messageEnumerator;
+
+    internal CommandResult(CommandFlow.ResultMessageEnumerator messageEnumerator)
+        => _messageEnumerator = messageEnumerator;
     public enum RowBuffering : byte
     {
         Buffered,
@@ -260,8 +265,8 @@ sealed class CommandResult(CommandFlow.ResultMessageEnumerator messageEnumerator
 
     // Disposing the CommandResult skips going through our enumerator, the results won't be accessed anyway.
     // We do expose disposal methods so any I/O can easily be done the way the user expects it (sync or async)
-    public void Dispose() => messageEnumerator.Dispose();
-    public ValueTask DisposeAsync() => messageEnumerator.DisposeAsync();
+    public void Dispose() => _messageEnumerator.Dispose();
+    public ValueTask DisposeAsync() => _messageEnumerator.DisposeAsync();
 
     void CompleteCommand(BackendMessage message)
     {
@@ -280,7 +285,7 @@ sealed class CommandResult(CommandFlow.ResultMessageEnumerator messageEnumerator
                 break;
             case PgTypes.BackendType.ErrorResponse:
                 // TODO fill out expected types.
-                _errorMessage = ErrorOrNoticeMessage.Create(message, []);
+                _errorMessage = new(ErrorOrNoticeMessage.Create(message, []));
                 break;
         }
 
@@ -308,34 +313,40 @@ sealed class CommandResult(CommandFlow.ResultMessageEnumerator messageEnumerator
         return _row;
     }
 
-    BackendMessage GetCurrentMessage() => messageEnumerator.Current;
-    bool MoveNextMessage() => messageEnumerator.MoveNext();
-    CommandFlow.MoveNextStatus TryMoveNextMessage() => messageEnumerator.TryMoveNext();
-    ValueTask<bool> MoveNextMessageAsync() => messageEnumerator.MoveNextAsync();
+    BackendMessage GetCurrentMessage() => _messageEnumerator.Current;
+    bool MoveNextMessage() => _messageEnumerator.MoveNext();
+    CommandFlow.MoveNextStatus TryMoveNextMessage() => _messageEnumerator.TryMoveNext();
+    ValueTask<bool> MoveNextMessageAsync() => _messageEnumerator.MoveNextAsync();
 
-    public struct RowEnumerator(CommandResult instance, RowBuffering buffering) : IEnumerator<Row>, IAsyncEnumerator<Row>
+    public struct RowEnumerator : IEnumerator<Row>, IAsyncEnumerator<Row>
     {
+        readonly CommandResult? _instance;
+        readonly RowBuffering _buffering;
         Row? _row;
+
+        internal RowEnumerator(CommandResult instance, RowBuffering buffering)
+            => (_instance, _buffering) = (instance, buffering);
 
         BackendMessage PrepareRow(BackendMessage message)
         {
-            if (buffering is RowBuffering.Buffered && !message.Buffered)
+            if (_buffering is RowBuffering.Buffered && !message.Buffered)
             {
                 message.BufferBody();
-                message = instance.GetCurrentMessage();
+                message = _instance!.GetCurrentMessage();
             }
             return message;
         }
 
         bool PublishRow(in BackendMessage message)
         {
-            (_row ??= instance.GetRow()).InitializeRow(message);
+            (_row ??= _instance!.GetRow()).InitializeRow(message);
             return true;
         }
 
         public bool MoveNext()
         {
             // Check for null so we can use a default struct value to respresent no more rows (ADO layer uses this).
+            var instance = _instance;
             if (instance is null)
                 return false;
 
@@ -374,6 +385,7 @@ sealed class CommandResult(CommandFlow.ResultMessageEnumerator messageEnumerator
         public ValueTask<bool> MoveNextAsync()
         {
             // Check for null so we can use a default struct value to respresent no more rows (ADO layer uses this).
+            var instance = _instance;
             if (instance is null)
                 return new(false);
 
@@ -397,7 +409,7 @@ sealed class CommandResult(CommandFlow.ResultMessageEnumerator messageEnumerator
             var current = instance.GetCurrentMessage();
             if (current.Header.Type is PgTypes.BackendType.DataRow)
             {
-                if (buffering is RowBuffering.Buffered && !current.Buffered)
+                if (_buffering is RowBuffering.Buffered && !current.Buffered)
                     return BufferCurrentRow(in current);
                 return new(PublishRow(in current));
             }
@@ -408,6 +420,7 @@ sealed class CommandResult(CommandFlow.ResultMessageEnumerator messageEnumerator
         [MethodImpl(MethodImplOptions.NoInlining)]
         ValueTask<bool> BufferCurrentRow(in BackendMessage current)
         {
+            var instance = _instance!;
             var bufferTask = current.BufferBodyAsync(default);
             if (!bufferTask.IsCompletedSuccessfully)
                 return BufferRowAsync(bufferTask, _row ??= instance.GetRow());
@@ -424,6 +437,7 @@ sealed class CommandResult(CommandFlow.ResultMessageEnumerator messageEnumerator
         [MethodImpl(MethodImplOptions.NoInlining)]
         bool HandleUncommon(in BackendMessage current)
         {
+            var instance = _instance!;
             var type = current.Header.Type;
             switch (type)
             {
@@ -443,6 +457,7 @@ sealed class CommandResult(CommandFlow.ResultMessageEnumerator messageEnumerator
         [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
         async ValueTask<bool> MoveNextAsyncCore(ValueTask<bool> task)
         {
+            var instance = _instance!;
             if (!await task.ConfigureAwait(false))
             {
                 if (instance._requestedExecution && instance._commandCompleteMessage is null && instance._errorMessage is null)
@@ -456,7 +471,7 @@ sealed class CommandResult(CommandFlow.ResultMessageEnumerator messageEnumerator
             var current = instance.GetCurrentMessage();
             if (current.Header.Type is PgTypes.BackendType.DataRow)
             {
-                if (buffering is RowBuffering.Buffered && !current.Buffered)
+                if (_buffering is RowBuffering.Buffered && !current.Buffered)
                     await current.BufferBodyAsync(default).ConfigureAwait(false);
                 return PublishRow(instance.GetCurrentMessage());
             }
@@ -469,7 +484,7 @@ sealed class CommandResult(CommandFlow.ResultMessageEnumerator messageEnumerator
         async ValueTask<bool> BufferRowAsync(ValueTask task, Row row)
         {
             await task.ConfigureAwait(false);
-            row.InitializeRow(instance.GetCurrentMessage());
+            row.InitializeRow(_instance!.GetCurrentMessage());
             return true;
         }
 
@@ -485,6 +500,7 @@ sealed class CommandResult(CommandFlow.ResultMessageEnumerator messageEnumerator
         // We enumerate all so we always get to store the error or command complete message.
         public void Dispose()
         {
+            var instance = _instance;
             if (instance is null)
                 return;
             instance.Complete();
@@ -492,7 +508,7 @@ sealed class CommandResult(CommandFlow.ResultMessageEnumerator messageEnumerator
 
         // We enumerate all so we always get to store the error or command complete message.
         public ValueTask DisposeAsync()
-            => instance?.CompleteAsync() ?? default;
+            => _instance?.CompleteAsync() ?? default;
 
         object IEnumerator.Current => Current;
         void IEnumerator.Reset() => throw new NotSupportedException();

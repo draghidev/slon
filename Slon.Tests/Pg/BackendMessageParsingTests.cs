@@ -158,10 +158,10 @@ public class BackendMessageParsingTests
     [TestMethod]
     public void PgErrorException_RendersSelfDiagnosingMessage()
     {
-        PgError error = ErrorOrNoticeMessage.FromFieldBlock(Block(
+        PgError error = new(ErrorOrNoticeMessage.FromFieldBlock(Block(
             ('S', "FATAL"),
             ('C', "53300"),
-            ('M', "sorry, too many clients already")));
+            ('M', "sorry, too many clients already"))));
 
         var ex = Assert.Throws<PgErrorException>(() => PgErrorException.Throw(error));
 

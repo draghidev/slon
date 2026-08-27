@@ -5,7 +5,8 @@ namespace Slon.Pg.Types;
 /// <summary>
 /// Well-known PostgreSQL data type names.
 /// </summary>
-static class DataTypeNames
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+public static class DataTypeNames
 {
     public static bool IsWellKnownUnqualifiedName(ReadOnlySpan<char> name) => name switch
     {

@@ -19,8 +19,48 @@ dotnet_diagnostic.RS0017.severity = error
 dotnet_diagnostic.RS0026.severity = none
 dotnet_diagnostic.RS0027.severity = none
 
-# The lower-level protocol and serializer surface remains experimental.
+# The lower-level protocol, serializer, and transport surface remains experimental.
 [Pg/**/*.cs]
+dotnet_diagnostic.CS1591.severity = none
+dotnet_diagnostic.RS0016.severity = none
+dotnet_diagnostic.RS0022.severity = none
+
+[Pg/*.cs]
+dotnet_diagnostic.CS1591.severity = none
+dotnet_diagnostic.RS0016.severity = none
+dotnet_diagnostic.RS0022.severity = none
+
+[Transport/**/*.cs]
+dotnet_diagnostic.CS1591.severity = none
+dotnet_diagnostic.RS0016.severity = none
+dotnet_diagnostic.RS0022.severity = none
+
+[Transport/*.cs]
+dotnet_diagnostic.CS1591.severity = none
+dotnet_diagnostic.RS0016.severity = none
+dotnet_diagnostic.RS0022.severity = none
+
+[Text/**/*.cs]
+dotnet_diagnostic.CS1591.severity = none
+dotnet_diagnostic.RS0016.severity = none
+dotnet_diagnostic.RS0022.severity = none
+
+[Text/*.cs]
+dotnet_diagnostic.CS1591.severity = none
+dotnet_diagnostic.RS0016.severity = none
+dotnet_diagnostic.RS0022.severity = none
+
+[Buffers/**/*.cs]
+dotnet_diagnostic.CS1591.severity = none
+dotnet_diagnostic.RS0016.severity = none
+dotnet_diagnostic.RS0022.severity = none
+
+[Buffers/*.cs]
+dotnet_diagnostic.CS1591.severity = none
+dotnet_diagnostic.RS0016.severity = none
+dotnet_diagnostic.RS0022.severity = none
+
+[Ado/AdoSerializerOptions.cs]
 dotnet_diagnostic.CS1591.severity = none
 dotnet_diagnostic.RS0016.severity = none
 dotnet_diagnostic.RS0022.severity = none

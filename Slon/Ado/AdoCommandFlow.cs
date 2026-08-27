@@ -20,7 +20,7 @@ sealed class AdoCommandFlowObserver<TCommand> : CommandFlowObserver
 {
     internal static readonly AdoCommandFlowObserver<TCommand> Instance = new();
 
-    internal override void OnStarted(CommandFlow flow, object? state)
+    protected internal override void OnStarted(CommandFlow flow, object? state)
     {
         switch (((AdoCommandFlow<TCommand>)flow).LifetimeOwner)
         {
@@ -33,10 +33,10 @@ sealed class AdoCommandFlowObserver<TCommand> : CommandFlowObserver
         }
     }
 
-    internal override void OnCommandResult(CommandFlow flow, CommandResult result, object? state)
+    protected internal override void OnCommandResult(CommandFlow flow, CommandResult result, object? state)
         => ((AdoCommandFlow<TCommand>)flow).ObserveResult(result);
 
-    internal override void OnCompleting(PgClientFlow flow, Exception? exception, object? state)
+    protected internal override void OnCompleting(PgClientFlow flow, Exception? exception, object? state)
     {
         switch (((AdoCommandFlow<TCommand>)flow).LifetimeOwner)
         {

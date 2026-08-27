@@ -10,6 +10,10 @@ protocol API and a layered ADO.NET implementation over the same pooled, multiple
 Slon targets .NET 10 and is under active pre-release hardening. The source and public API are not
 yet a compatibility promise, and no production package has been published.
 
+The lower-level protocol, transport, type, and serializer APIs are marked with
+`Experimental("SLONPG001")`. Consumers must explicitly opt in by suppressing `SLONPG001` while
+that surface is still evolving.
+
 ## Why Slon
 
 A PostgreSQL connection has one ordered wire, but producing requests and consuming responses are

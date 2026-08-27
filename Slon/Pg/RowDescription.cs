@@ -6,7 +6,8 @@ using Slon.Pg.Types;
 
 namespace Slon.Pg;
 
-readonly record struct RowDescriptionField(
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+public readonly record struct RowDescriptionField(
     string Name,
     Oid TableOid,
     short ColumnAttributeNumber,
@@ -15,8 +16,11 @@ readonly record struct RowDescriptionField(
     int TypeModifier,
     PgFormat Format);
 
-sealed class RowDescription
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+public sealed class RowDescription
 {
+    public RowDescription() { }
+
     const int MaxRetainedFieldCapacity = 256;
     RowDescriptionField[] _fields = [];
     int _fieldCount;
@@ -60,7 +64,7 @@ sealed class RowDescription
         return result;
     }
 
-    public void Initialize(SequenceReader<byte> reader, Encoding? encoding = null)
+    internal void Initialize(SequenceReader<byte> reader, Encoding? encoding = null)
     {
         _nameIndex = null;
         _insensitiveNameIndex = null;
@@ -121,7 +125,7 @@ sealed class RowDescription
 
     // Called when the owning flow retires, after its final CommandResult tenure has ended. An unusually
     // wide description no longer needs to remain rooted; normal high-water storage is kept for reuse.
-    public void Reset()
+    internal void Reset()
     {
         if (_fields.Length > MaxRetainedFieldCapacity)
             _fields = [];

@@ -14,7 +14,7 @@ public class FlowSourceTests
 
         public ReleasingSyncFlow() => IsAsync = false;
 
-        protected override FlowHandoffEvent? HandoffEvent => Handoff;
+        private protected override FlowHandoffEvent? HandoffEvent => Handoff;
         protected override ValueTask<FlowTasks> ExecuteAuto(Context context) => new(new FlowTasks());
         protected override void OnStopping(Exception exception) => Handoff.Set();
         // Reproduce a waiter consuming the early OnStopping edge before terminal publication.

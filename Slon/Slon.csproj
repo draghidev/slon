@@ -8,7 +8,7 @@
         <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
         <TargetsForTfmSpecificBuildOutput>$(TargetsForTfmSpecificBuildOutput);IncludeProjectReferenceDlls</TargetsForTfmSpecificBuildOutput>
         <TargetsForTfmSpecificContentInPackage>$(TargetsForTfmSpecificContentInPackage);IncludeReferenceAssemblies</TargetsForTfmSpecificContentInPackage>
-        <NoWarn>$(NoWarn);NU5131;DRAGHI001</NoWarn>
+        <NoWarn>$(NoWarn);NU5131;DRAGHI001;SLONPG001</NoWarn>
     </PropertyGroup>
 
     <ItemGroup>

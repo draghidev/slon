@@ -8,8 +8,10 @@ using Slon.Threading;
 
 namespace Slon.Pg;
 
-sealed class PgClientOptions
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+public sealed class PgClientOptions
 {
+    PostgreSqlSslOptions _ssl = new();
     internal static readonly TimeSpan DefaultReadTimeout = TimeSpan.FromSeconds(30);
 
     internal TimeSpan HeartbeatInterval { get; init; } = Heartbeat.DefaultInterval;
@@ -25,11 +27,15 @@ sealed class PgClientOptions
     public required string Username { get; init; }
     public string? Password { get; init; }
     public string? Database { get; init; }
-    public PostgreSqlSslOptions Ssl { get; internal set; } = new();
+    public PostgreSqlSslOptions Ssl
+    {
+        get => _ssl;
+        init => _ssl = value;
+    }
     internal bool AllowInsecureTransport { get; init; }
     internal OAuthTokenCache? OAuthTokens { get; init; }
     internal PostgreSqlIntegratedSecurityOptions? IntegratedSecurity { get; init; }
-    internal ILoggerFactory LoggerFactory { get; init; } = NullLoggerFactory.Instance;
+    public ILoggerFactory LoggerFactory { get; init; } = NullLoggerFactory.Instance;
 
     public TimeSpan ReadTimeout { get; init; } = DefaultReadTimeout;
     public TimeSpan WriteTimeout { get; init; } = TimeSpan.FromSeconds(10);
@@ -50,7 +56,7 @@ sealed class PgClientOptions
     internal PgClientOptions WithSsl(PostgreSqlSslOptions ssl)
     {
         var copy = (PgClientOptions)MemberwiseClone();
-        copy.Ssl = ssl;
+        copy._ssl = ssl;
         return copy;
     }
 

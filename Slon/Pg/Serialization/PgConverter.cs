@@ -7,6 +7,7 @@ using static Slon.Pg.Serialization.Converters.IEnumUnderlyingConverter;
 
 namespace Slon.Pg.Serialization;
 
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
 public abstract class PgConverter
 {
     internal virtual bool RequiresReaderCleanup => true;
@@ -300,6 +301,7 @@ public abstract class PgConverter
     }
 }
 
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
 public abstract class PgConverter<T> : PgConverter
 {
     private protected PgConverter() : base(typeof(T), default(T) is null) { }
@@ -458,6 +460,7 @@ static class PgConverterExtensions
     }
 }
 
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
 public readonly struct BindContext
 {
     /// <summary>The data format selected for this bind.</summary>
@@ -550,6 +553,7 @@ public readonly struct BindContext
 /// parameter layer treats database null sentinels as a first-class null expression alongside CLR null.
 /// Typed composites generally use <see cref="Default"/>. These create a new serialization scope where database null sentinels are not recognized.
 /// </remarks>
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
 public enum NestedObjectDbNullHandling
 {
     /// <summary>CLR null becomes a database null. Database null sentinels are passed through to the nested converter.</summary>
@@ -601,6 +605,7 @@ class MultiWriteState : IDisposable
 /// callers within the same scope, so consumers must treat it as a read-through reference and avoid
 /// per-call allocation.
 /// </summary>
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
 public sealed class PgConversionContext
 {
     /// <summary>An empty context, suitable for inner probes that don't read any session state.</summary>
@@ -652,12 +657,14 @@ public sealed class PgConversionContext
 /// receives. Hosts call-scoped state that doesn't belong on the long-lived <see cref="PgConversionContext"/>
 /// Consumers read <see cref="PgConversionContext"/> for session state.
 /// </summary>
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
 public readonly struct DescriptorContext
 {
     public PgConversionContext ConversionContext { get; init; }
 }
 
 /// A converter's description of itself for a given <see cref="DescriptorContext"/> (or invariant).
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
 public readonly struct ConverterDescriptor
 {
     /// <summary>

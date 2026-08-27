@@ -1,6 +1,7 @@
 namespace Slon.Pg.Protocol;
 
 /// <summary>Raised when a PostgreSQL exchange violates protocol invariants.</summary>
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
 public class PgProtocolException : IOException
 {
     // Construction is protocol-owned. Recovery depends on the more precise internal subtype below,

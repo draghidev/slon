@@ -4,7 +4,8 @@ using System.Buffers.Text;
 namespace Slon.Pg.Protocol;
 
 // The command tag of a successfully-executed command. https://www.postgresql.org/docs/current/protocol-message-formats.html
-enum StatementType : byte
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+public enum StatementType : byte
 {
     Unknown = 0,
     Empty,          // EmptyQueryResponse - the portal came from an empty query string, no tag at all.
@@ -30,7 +31,8 @@ enum StatementType : byte
 // is three value-type scalars, parsed eagerly into inline fields - so it needs no body view and no
 // Preserve: the values survive any buffer recycle for free. (RecordsAffected forces the parse to be
 // eager-while-on-message anyway, since it's read after the command when the view could be stale.)
-readonly struct CommandCompleteMessage
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+public readonly struct CommandCompleteMessage
 {
     public StatementType StatementType { get; }
     public uint Oid { get; }
@@ -40,7 +42,7 @@ readonly struct CommandCompleteMessage
         or StatementType.Copy or StatementType.Move or StatementType.Fetch or StatementType.CreateTableAs
             ? (long)Rows
             : 0;
-    public long BatchRecordsAffected => StatementType is StatementType.Select ? -1 : RecordsAffected;
+    internal long BatchRecordsAffected => StatementType is StatementType.Select ? -1 : RecordsAffected;
 
     CommandCompleteMessage(StatementType statementType, uint oid, ulong rows)
     {
@@ -52,7 +54,7 @@ readonly struct CommandCompleteMessage
     /// EmptyQueryResponse: the portal was created from an empty query string. No tag, no rows.
     public bool IsEmptyQuery => StatementType is StatementType.Empty;
 
-    public static CommandCompleteMessage Create(in BackendMessage message)
+    internal static CommandCompleteMessage Create(in BackendMessage message)
     {
         message.EnsureExpected(PgTypes.BackendType.EmptyQueryResponse, PgTypes.BackendType.CommandComplete);
         message.EnsureBuffered();

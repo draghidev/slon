@@ -12,6 +12,7 @@ enum FlushMode : byte
     NonBlocking
 }
 
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
 public sealed class PgWriter
 {
     readonly IBufferWriter<byte> _writer;

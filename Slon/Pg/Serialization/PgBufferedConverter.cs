@@ -1,5 +1,6 @@
 namespace Slon.Pg.Serialization;
 
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
 public abstract class PgBufferedConverter<T> : PgConverter<T>
 {
     internal sealed override bool RequiresReaderCleanup => false;

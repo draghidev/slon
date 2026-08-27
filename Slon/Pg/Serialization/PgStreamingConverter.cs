@@ -3,6 +3,7 @@ using System.Runtime.CompilerServices;
 
 namespace Slon.Pg.Serialization;
 
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
 public abstract class PgStreamingConverter<T> : PgConverter<T>
 {
     protected PgStreamingConverter()

@@ -2,7 +2,8 @@ using System.Collections.Frozen;
 
 namespace Slon.Pg.Types;
 
-sealed partial class PgTypeCatalog
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+public sealed partial class PgTypeCatalog
 {
     // An OID-backed catalog may be shared across physical endpoints only when their relevant
     // catalog OIDs and type shapes are exactly aligned. Physical cluster membership is neither

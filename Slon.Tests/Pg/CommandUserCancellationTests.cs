@@ -43,7 +43,7 @@ public class CommandUserCancellationTests : ConnectionCreatingTest
     {
         public TaskCompletionSource Started { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
-        internal override void OnDrainStarted(CommandFlow flow, object? state)
+        protected internal override void OnDrainStarted(CommandFlow flow, object? state)
             => Started.TrySetResult();
     }
 

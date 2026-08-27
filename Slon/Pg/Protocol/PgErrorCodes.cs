@@ -8,7 +8,8 @@ namespace Slon.Pg.Protocol;
 /// <remarks>
 /// See https://www.postgresql.org/docs/current/static/errcodes-appendix.html
 /// </remarks>
-static class PgErrorCodes
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+public static class PgErrorCodes
 {
     #region Class 00 - Successful Completion
 

@@ -153,11 +153,12 @@ readonly struct ErrorOrNoticeMessage
         => new(fieldBlock, [], isNotice, unhandled: true);
 }
 
-sealed class PgError
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+public sealed class PgError
 {
     readonly ErrorOrNoticeMessage _message;
 
-    public PgError(ErrorOrNoticeMessage message)
+    internal PgError(ErrorOrNoticeMessage message)
     {
         if (message.IsNotice)
             throw new ArgumentException("Cannot be constructed from a notice message.", nameof(message));
@@ -194,19 +195,17 @@ sealed class PgError
     /// See <see cref="ErrorOrNoticeMessage.Preserve"/>.
     public PgError Preserve() => new(_message.Preserve());
 
-    public static implicit operator PgError(ErrorOrNoticeMessage message) => new(message);
 }
 
 sealed class PgNotice
 {
     readonly ErrorOrNoticeMessage _message;
 
-    public PgNotice(ErrorOrNoticeMessage message)
+    internal PgNotice(ErrorOrNoticeMessage message)
     {
         if (!message.IsNotice)
             throw new ArgumentException("Cannot be constructed from an error message.", nameof(message));
         _message = message;
     }
 
-    public static implicit operator PgNotice(ErrorOrNoticeMessage message) => new(message);
 }

@@ -1,6 +1,7 @@
 namespace Slon.Pg.Protocol;
 
-readonly struct FlowTasks(ValueTask trailingExecutionTask, ValueTask pipelineTask)
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+public readonly struct FlowTasks(ValueTask trailingExecutionTask, ValueTask pipelineTask)
 {
     public ValueTask TrailingExecutionTask { get; } = trailingExecutionTask;
     public ValueTask PipelineTask { get; } = pipelineTask;

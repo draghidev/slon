@@ -6,8 +6,11 @@ namespace Slon.Pg;
 
 // Protocol-facing parameter serialization component. The protocol owns Bind framing; the
 // component projects parameter types and owns its per-wire writer and per-execution write state.
-abstract class ParameterWriter
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+public abstract class ParameterWriter
 {
+    private protected ParameterWriter() { }
+
     internal struct WriteLease : IDisposable
     {
         readonly object _source;

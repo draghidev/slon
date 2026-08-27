@@ -40,7 +40,7 @@ partial class CommandFlow
 
     // The value wrapper lets ReadState and CommandResult share one MessageEnumerator instance
     // without an interface or another adapter allocation.
-    public readonly struct ResultMessageEnumerator() : IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMessage>
+    internal readonly struct ResultMessageEnumerator() : IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMessage>
     {
         readonly MessageEnumerator _messageEnumerator = new();
         public bool MoveNext() => _messageEnumerator.MoveNext();

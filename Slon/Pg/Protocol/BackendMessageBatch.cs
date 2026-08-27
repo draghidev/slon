@@ -60,7 +60,7 @@ struct BackendMessageBatch(ReadOnlySequence<byte> buffer)
         buffer = fastSeq.Sequence;
         Debug.Assert(fastSeq.Length <= uint.MaxValue);
         bufferLength = unchecked((uint)fastSeq.Length);
-        header = (BackendHeader)protoHeader;
+        header = BackendHeader.FromHeader(protoHeader);
         return true;
     }
 

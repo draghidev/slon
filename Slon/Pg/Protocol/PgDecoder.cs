@@ -15,7 +15,8 @@ namespace Slon.Pg.Protocol;
 // drive the pipe against this shell's CTS. The physical wire state lives in the pipe; each
 // exclusive scope gets its own shell with the scope token over the shared pipe, and the
 // single-pump invariant keeps only one shell active at a time.
-sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMessage>
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+public sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMessage>
 {
     readonly ProtocolReadPipe _pipe;
     readonly CancellationToken _abortToken;

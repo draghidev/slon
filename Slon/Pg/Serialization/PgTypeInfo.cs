@@ -6,7 +6,8 @@ namespace Slon.Pg.Serialization;
 /// A resolved CLR/PostgreSQL type pairing. Resolution is datasource-scoped; execution captures
 /// the containing serializer options so a catalog reload cannot move underneath a command.
 /// </summary>
-sealed class PgTypeInfo
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+public sealed class PgTypeInfo
 {
     readonly BufferRequirements _binaryRequirements;
     readonly bool _descriptorIsInvariant;
@@ -87,13 +88,24 @@ sealed class PgTypeInfo
     }
 }
 
-readonly struct PgFieldBinding(DataFormat dataFormat, Size bufferRequirement, PgConverter converter,
-    bool isBindingInvariant, bool requiresReaderCleanup, bool resultIsColumnLease)
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+public readonly struct PgFieldBinding
 {
-    public DataFormat DataFormat { get; } = dataFormat;
-    public Size BufferRequirement { get; } = bufferRequirement;
-    public PgConverter Converter { get; } = converter;
-    public bool IsBindingInvariant { get; } = isBindingInvariant;
-    public bool RequiresReaderCleanup { get; } = requiresReaderCleanup;
-    public bool ResultIsColumnLease { get; } = resultIsColumnLease;
+    internal PgFieldBinding(DataFormat dataFormat, Size bufferRequirement, PgConverter converter,
+        bool isBindingInvariant, bool requiresReaderCleanup, bool resultIsColumnLease)
+    {
+        DataFormat = dataFormat;
+        BufferRequirement = bufferRequirement;
+        Converter = converter;
+        IsBindingInvariant = isBindingInvariant;
+        RequiresReaderCleanup = requiresReaderCleanup;
+        ResultIsColumnLease = resultIsColumnLease;
+    }
+
+    public DataFormat DataFormat { get; }
+    public Size BufferRequirement { get; }
+    public PgConverter Converter { get; }
+    public bool IsBindingInvariant { get; }
+    public bool RequiresReaderCleanup { get; }
+    public bool ResultIsColumnLease { get; }
 }

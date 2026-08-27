@@ -4,6 +4,7 @@ namespace Slon.Pg.Protocol;
 /// Indicates that this operation failed because a shared-wire event not owned by it reached it.
 /// The inner exception preserves the concrete protocol or PostgreSQL failure.
 /// </summary>
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
 public sealed class PgCollateralException : PgClientException
 {
     internal PgCollateralException(PgCollateralSource collateralSource, Exception cause)
@@ -32,6 +33,7 @@ public sealed class PgCollateralException : PgClientException
 }
 
 /// <summary>Identifies the source of a collateral PostgreSQL operation failure.</summary>
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
 public enum PgCollateralSource : byte
 {
     /// <summary>Another client-side failure condemned the shared protocol.</summary>

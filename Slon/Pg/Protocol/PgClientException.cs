@@ -1,6 +1,7 @@
 namespace Slon.Pg.Protocol;
 
 /// <summary>Base exception for failures produced by the PostgreSQL client.</summary>
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
 public class PgClientException : IOException
 {
     internal const string Summary = "The PostgreSQL client could not complete the operation.";

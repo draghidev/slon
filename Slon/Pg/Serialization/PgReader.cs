@@ -7,6 +7,7 @@ namespace Slon.Pg.Serialization;
 
 // Serializer vocabulary over Row's reusable, transport-neutral field cursor. The value wrapper
 // keeps serialization out of wire ownership without allocating a cursor for every field.
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
 public readonly struct PgReader : IDisposable, IAsyncDisposable
 {
     readonly PgFieldReader _reader;

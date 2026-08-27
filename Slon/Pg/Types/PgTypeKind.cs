@@ -49,9 +49,11 @@ abstract record PgTypeData
 }
 
 /// Base field type shared between tables and composites.
-readonly record struct Field(string Name, PgTypeId PgTypeId, int TypeModifier);
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+public readonly record struct Field(string Name, PgTypeId PgTypeId, int TypeModifier);
 
-sealed record PgCompositeFieldType(Field Field)
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+public sealed record PgCompositeFieldType(Field Field)
 {
     // Equality describes the catalog-independent field declaration. The mutable link is resolved
     // exactly once while sealing a catalog snapshot and deliberately does not participate in equality.

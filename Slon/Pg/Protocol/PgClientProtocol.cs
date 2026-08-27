@@ -27,7 +27,8 @@ enum ProtocolStatus : int
 }
 
 [Flags]
-enum FlowEnqueueOptions : byte
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+public enum FlowEnqueueOptions : byte
 {
     None = 0,
     RequireExistingPipeline = 1,
@@ -40,7 +41,8 @@ interface IProtocolStatic<T>
     ref readonly T Value { get; }
 }
 
-sealed class PgClientProtocolOptions
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+public sealed class PgClientProtocolOptions
 {
     public PgClientProtocolOptions()
     {
@@ -101,7 +103,8 @@ sealed class PgClientProtocolOptions
     internal Action? ReadTimeoutArmed { get; set; }
 }
 
-sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+public sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
 {
     internal abstract class LoadObserver
     {
@@ -221,7 +224,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         FlowControl = new Control(this, poolFacing: true);
     }
 
-    public string CurrentSearchPath { get; set; } = "public";
+    public string CurrentSearchPath { get; internal set; } = "public";
 
     internal Control FlowControl { get; }
     CancellationToken AbortToken => _close.AbortToken;
@@ -1151,7 +1154,7 @@ sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         }
     }
 
-    public struct Enumerator
+    internal struct Enumerator
     {
         Pipeline<PgClientFlow, Policy, PgClientFlowSource, PgClientFlowSource.Enumerator>.Enumerator _inner;
 

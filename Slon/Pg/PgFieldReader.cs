@@ -9,7 +9,8 @@ namespace Slon.Pg;
 
 // Reusable, field-bounded transport cursor. Serializer and other higher-level readers wrap this
 // state rather than becoming part of Row's tenure machinery.
-class PgFieldReader : IDisposable, IAsyncDisposable
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+public class PgFieldReader : IDisposable, IAsyncDisposable
 {
     ReadOnlySequence<byte> _buffer;
     ReadOnlyMemory<byte> _memory;
@@ -606,7 +607,7 @@ class PgFieldReader : IDisposable, IAsyncDisposable
         Dispose();
     }
 
-    public readonly struct NestedReadScope : IDisposable, IAsyncDisposable
+    internal readonly struct NestedReadScope : IDisposable, IAsyncDisposable
     {
         readonly PgFieldReader _reader;
         readonly int _previousEnd;

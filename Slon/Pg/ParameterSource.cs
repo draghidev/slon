@@ -2,7 +2,8 @@ using System.Collections.Immutable;
 
 namespace Slon.Pg;
 
-readonly struct ParameterSource
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+public readonly struct ParameterSource
 {
     readonly object? _state;
     readonly ParameterWriter? _writer;

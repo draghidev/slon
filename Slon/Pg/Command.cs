@@ -6,14 +6,15 @@ using Slon.Text;
 
 namespace Slon.Pg;
 
-readonly struct Command()
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+public readonly struct Command()
 {
     // Whether the command only describes itself, without execution, also redescribes prepared commands.
     public bool DescribeOnly { get; init; } = false;
     // Parse and describe the statement, then describe a NULL-bound probe portal for its concrete row metadata.
     public bool DescribeForPreparation { get; init; } = false;
     // Process the complete response, but omit it from the flow enumerator.
-    public bool SuppressEnumeration { get; init; } = false;
+    internal bool SuppressEnumeration { get; init; } = false;
     public bool WithSync { get; init; } = false;
     public bool PreferSimple { get; init; } = false;
     public CommandDescriptor Descriptor { get; init; } = default;
@@ -30,13 +31,15 @@ readonly struct Command()
         => new() { Descriptor = descriptor };
 }
 
-enum PgFormat : short
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+public enum PgFormat : short
 {
     Text = 0,
     Binary = 1
 }
 
-readonly struct CommandList
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+public readonly struct CommandList
 {
     readonly Command _command;
     readonly Command[]? _commands;
@@ -72,7 +75,7 @@ readonly struct CommandList
 
     public int Count => _commands is null ? 1 : _count;
 
-    public int VisibleCount
+    internal int VisibleCount
     {
         get
         {
@@ -119,7 +122,8 @@ readonly struct CommandList
     }
 }
 
-readonly struct CommandMetadata
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+public readonly struct CommandMetadata
 {
     // Which original command this result belongs to, important for prepared commands and multi result simple protocol commands.
     public int CommandIndex { get; init; }

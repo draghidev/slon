@@ -9,7 +9,7 @@ sealed class ExclusiveAccessFlow : PgClientFlow
     {
         internal static readonly ObserverImpl Instance = new();
 
-        internal override void OnCompleted(PgClientFlow completed, Exception? exception, object? state)
+        protected internal override void OnCompleted(PgClientFlow completed, Exception? exception, object? state)
         {
             var flow = (ExclusiveAccessFlow)completed;
             if (!Volatile.Read(ref flow._acquired) && !flow._consumerGone.Task.IsCompleted)
@@ -73,7 +73,7 @@ sealed class ExclusiveAccessFlow : PgClientFlow
     }
 
     // Non-null only for caller-thread execution of a synchronous scope.
-    protected override FlowHandoffEvent? HandoffEvent => _handoffEvent;
+    private protected override FlowHandoffEvent? HandoffEvent => _handoffEvent;
 
     protected override void OnReset()
     {

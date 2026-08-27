@@ -1,6 +1,7 @@
 namespace Slon.Pg.Protocol;
 
-enum CancelRequestState
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+public enum CancelRequestState
 {
     /// The attempt ended after PostgreSQL accepted the request connection.
     Sent,

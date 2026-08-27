@@ -6,7 +6,8 @@ using Slon.Runtime;
 
 namespace Slon.Transport;
 
-sealed class SocketStreamConnection : TransportConnection
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+public sealed class SocketStreamConnection : TransportConnection
 {
     readonly Factory _factory;
     readonly SealedNetworkStream _networkStream;
@@ -137,7 +138,7 @@ sealed class SocketStreamConnection : TransportConnection
     {
         readonly EndPoint _endPoint;
 
-        internal Factory(EndPoint endPoint, TransportConnectionOptions? options = null) : base(options)
+        public Factory(EndPoint endPoint, TransportConnectionOptions? options = null) : base(options)
         {
             _endPoint = endPoint;
         }

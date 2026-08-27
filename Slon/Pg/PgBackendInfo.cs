@@ -4,7 +4,8 @@ namespace Slon.Pg;
 
 // Immutable backend identity. Capabilities are a separate value because protocol behavior also
 // consumes them directly, without depending on the type catalog or serializer layers.
-sealed class PgBackendInfo
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+public sealed class PgBackendInfo
 {
     internal PgBackendInfo(PgBackendInfoBuilder builder)
     {
@@ -20,7 +21,8 @@ sealed class PgBackendInfo
     public PgBackendCapabilities Capabilities { get; }
 }
 
-readonly record struct PgBackendCapabilities
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+public readonly record struct PgBackendCapabilities
 {
     // Compatibility defaults for the standalone raw protocol, which has no datasource backend
     // provider. Datasource-owned protocols replace this value from their startup-built BackendInfo.
@@ -112,7 +114,8 @@ readonly record struct PgBackendCompatibilityShape(
             capabilities.HasIntegerDateTimes);
 }
 
-sealed class PgBackendInfoBuilder
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+public sealed class PgBackendInfoBuilder
 {
     public PgBackendInfoBuilder(IReadOnlyDictionary<string, string> serverParameters)
     {
@@ -201,7 +204,8 @@ sealed class PgBackendInfoBuilder
 // Low-level backend negotiation seam. This class belongs with the protocol-facing backend
 // identity rather than datasource/type-catalog composition, so it can become a stable package
 // boundary independently. New optional behavior should be added as virtual methods with defaults.
-abstract class PgBackendInfoProvider
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+public abstract class PgBackendInfoProvider
 {
     public abstract PgBackendInfo CreateBackendInfo(
         IReadOnlyDictionary<string, string> serverParameters);
@@ -209,7 +213,7 @@ abstract class PgBackendInfoProvider
     public virtual void ValidateConnectionCompatibility(PgBackendInfo expected, PgBackendInfo actual)
         => PgBackendCompatibility.ValidateConnectionCompatibility(expected, actual);
 
-    public virtual string? ResolveSessionResetCommand(
+    internal virtual string? ResolveSessionResetCommand(
         PgSessionResetOptions options, PgBackendInfo backendInfo)
         => options.ResolveCommand(backendInfo.Capabilities);
 }

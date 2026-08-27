@@ -8,7 +8,8 @@ using static Slon.Pg.Protocol.PgTypes;
 namespace Slon.Pg.Protocol;
 
 [DebuggerDisplay("{DebuggerDisplay,nq}")]
-readonly struct BackendMessage
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+public readonly struct BackendMessage
 {
     string DebuggerDisplay => $"Type = {Header.Type}, Length = {Header.MessageLength}";
 
@@ -31,7 +32,7 @@ readonly struct BackendMessage
         _length = header.Length;
     }
 
-    public BackendMessage(BackendHeader header, ReadOnlySequence<byte> buffer, BackendMessageContext context, short token)
+    internal BackendMessage(BackendHeader header, ReadOnlySequence<byte> buffer, BackendMessageContext context, short token)
         : this(header, buffer, context, token, buffer.Length >= header.MessageLength) {}
 
     internal static void Initialize(ref BackendMessage destination, BackendHeader header, ReadOnlySequence<byte> buffer,
@@ -287,7 +288,7 @@ readonly struct BackendMessage
     }
 
     [Conditional("DEBUG")]
-    public void DebugEnsureBuffered()
+    internal void DebugEnsureBuffered()
     {
         Debug.Assert(Buffered, $"Message type: {Type} was expected to be buffered.");
     }
@@ -320,7 +321,7 @@ readonly struct BackendMessage
     PgError CreateError(ReadOnlySpan<BackendType> expected, bool unhandled = true)
     {
         Debug.Assert(Type is BackendType.ErrorResponse);
-        return ErrorOrNoticeMessage.Create(this, expected, unhandled);
+        return new(ErrorOrNoticeMessage.Create(this, expected, unhandled));
     }
 
     internal void MarkPriorCancellationExposure()
@@ -343,7 +344,8 @@ readonly struct BackendMessage
     internal long BufferedLength => _buffer.Length;
 }
 
-readonly struct BackendHeader
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+public readonly struct BackendHeader
 {
     public const int ByteCount = Header.ByteCount;
 
@@ -378,7 +380,7 @@ readonly struct BackendHeader
 
     // Consistently not inlined for some reason?
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static implicit operator BackendHeader(Header header) => new(header);
+    internal static BackendHeader FromHeader(Header header) => new(header);
 
     public override string ToString() => $"Type: {Type}, Length: {Length}";
 }

@@ -1,6 +1,7 @@
 namespace Slon.Pg.Types;
 
-sealed class PgTypeCatalogBuilder
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+public sealed class PgTypeCatalogBuilder
 {
     readonly Dictionary<string, PgType> _typesByName = new(StringComparer.Ordinal);
     readonly Dictionary<uint, PgType> _typesByOid = [];

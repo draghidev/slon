@@ -4,10 +4,11 @@ using System.Threading.Tasks.Sources;
 
 namespace Slon.Pg.Protocol;
 
-abstract class PgClientFlowObserver
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+public abstract class PgClientFlowObserver
 {
-    internal virtual void OnCompleting(PgClientFlow flow, Exception? exception, object? state) { }
-    internal virtual void OnCompleted(PgClientFlow flow, Exception? exception, object? state) { }
+    protected internal virtual void OnCompleting(PgClientFlow flow, Exception? exception, object? state) { }
+    protected internal virtual void OnCompleted(PgClientFlow flow, Exception? exception, object? state) { }
 }
 
 // Per-wire composition supplied by the owner above the raw protocol. The protocol treats this as
@@ -72,7 +73,8 @@ sealed class FlowHandoffEvent : ManualResetEventSlim
     }
 }
 
-abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgClientFlow>, IThreadPoolWorkItem
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+public abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgClientFlow>, IThreadPoolWorkItem
 {
     PgClientProtocol.Control? _pendingActivationControl;
     FlowEnqueueOptions _enqueueOptions;
@@ -418,7 +420,7 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
     // it is reachable only by the flow's own subclasses (which override it) and by ExecutionControl (the
     // nested write-side handle) - the source pulls it via ExecutionControl.HandoffEvent, never off a
     // bare flow ref. Keeps the handoff primitive off PgClientFlow's internal API, like _rfqCount.
-    protected virtual FlowHandoffEvent? HandoffEvent => null;
+    private protected virtual FlowHandoffEvent? HandoffEvent => null;
 
     PgClientFlow IValueTaskSource<PgClientFlow>.GetResult(short token)
     {
@@ -473,7 +475,7 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
 
         internal int OutstandingRfqCount => _executionControl.RfqCount;
 
-        public ref readonly TState GetProtocolStatic<TState>()
+        internal ref readonly TState GetProtocolStatic<TState>()
             => ref _executionControl.GetProtocolStatic<TState>();
 
         public PgEncoder GetEncoder()
@@ -511,8 +513,16 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
     // compiler checks IsCompleted and only schedules via (Unsafe)OnCompleted(Action) when not ready.
     // Direct dispatchers (CommandFlow's shared-promise pattern) instead use IsCompleted +
     // (Unsafe)OnCompleted(Action<object?>, object?) to register without a closure allocation.
-    protected readonly struct DecoderAwaitable(ExecutionControl control, CancellationToken cancellationToken, bool auto) : ICriticalNotifyCompletion
+    protected readonly struct DecoderAwaitable : ICriticalNotifyCompletion
     {
+        readonly ExecutionControl control;
+        readonly CancellationToken cancellationToken;
+        readonly bool auto;
+
+        internal DecoderAwaitable(ExecutionControl control, CancellationToken cancellationToken, bool auto)
+            => (this.control, this.cancellationToken, this.auto) =
+                (control, cancellationToken, auto);
+
         public DecoderAwaitable GetAwaiter() => this;
 
         // Sync-flow auto path claims completed up front so the await machinery takes the sync shortcut
@@ -578,8 +588,17 @@ abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgCl
 
     // The ConfigureAwait(false) variant: skips scheduling-context capture. Action overloads are
     // for the C# `await` syntax (compiler calls UnsafeOnCompleted on ICriticalNotifyCompletion).
-    protected readonly struct ConfiguredDecoderAwaitable(ExecutionControl control, CancellationToken cancellationToken, bool continueOnCapturedContext) : ICriticalNotifyCompletion
+    protected readonly struct ConfiguredDecoderAwaitable : ICriticalNotifyCompletion
     {
+        readonly ExecutionControl control;
+        readonly CancellationToken cancellationToken;
+        readonly bool continueOnCapturedContext;
+
+        internal ConfiguredDecoderAwaitable(ExecutionControl control,
+            CancellationToken cancellationToken, bool continueOnCapturedContext)
+            => (this.control, this.cancellationToken, this.continueOnCapturedContext) =
+                (control, cancellationToken, continueOnCapturedContext);
+
         public ConfiguredDecoderAwaitable GetAwaiter() => this;
         // See IsDecoderSettled: a faulted activation must complete the await so GetResult
         // rethrows into the body's catch paths.

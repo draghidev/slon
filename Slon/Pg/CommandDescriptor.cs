@@ -5,7 +5,8 @@ using Slon.Text;
 
 namespace Slon.Pg;
 
-readonly struct CommandDescriptor
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+public readonly struct CommandDescriptor
 {
     readonly object? _rowDescriptionOrCommandText;
     readonly EncodedCString _commandName;

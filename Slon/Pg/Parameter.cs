@@ -3,7 +3,8 @@ using Slon.Pg.Types;
 namespace Slon.Pg;
 
 // A complete protocol value used directly without a deferred parameter writer.
-readonly struct Parameter
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+public readonly struct Parameter
 {
     readonly object? _value;
     readonly Oid _oid;

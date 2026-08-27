@@ -61,11 +61,11 @@ public class AdoErrorSurfacingTests
     [TestMethod]
     public void BackendTerminationProjection_PreservesPostgreSqlTransience()
     {
-        PgError error = ErrorOrNoticeMessage.FromFieldBlock(ErrorBlock(
+        PgError error = new(ErrorOrNoticeMessage.FromFieldBlock(ErrorBlock(
             ('S', "FATAL"),
             ('V', "FATAL"),
             ('C', PgErrorCodes.AdminShutdown),
-            ('M', "terminating connection due to administrator command")));
+            ('M', "terminating connection due to administrator command"))));
         var lowLevel = new PgCollateralException(
             PgCollateralSource.BackendTermination,
             new PgErrorException(error));

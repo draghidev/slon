@@ -2,6 +2,7 @@ using System.Diagnostics;
 
 namespace Slon.Pg.Serialization;
 
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
 public enum SizeKind
 {
     Unknown,
@@ -10,6 +11,7 @@ public enum SizeKind
 }
 
 [DebuggerDisplay("{ToString(),nq}")]
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
 public readonly struct Size : IEquatable<Size>
 {
     readonly int _value;

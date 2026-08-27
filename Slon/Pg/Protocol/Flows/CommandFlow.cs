@@ -7,14 +7,16 @@ using FlowCallerInteractionCoreResult = System.ValueTuple;
 
 namespace Slon.Pg.Protocol.Flows;
 
-abstract class CommandFlowObserver : PgClientFlowObserver
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+public abstract class CommandFlowObserver : PgClientFlowObserver
 {
-    internal virtual void OnStarted(CommandFlow flow, object? state) { }
-    internal virtual void OnCommandResult(CommandFlow flow, CommandResult result, object? state) { }
-    internal virtual void OnDrainStarted(CommandFlow flow, object? state) { }
+    protected internal virtual void OnStarted(CommandFlow flow, object? state) { }
+    protected internal virtual void OnCommandResult(CommandFlow flow, CommandResult result, object? state) { }
+    protected internal virtual void OnDrainStarted(CommandFlow flow, object? state) { }
 }
 
-readonly struct CommandFlowOptions
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+public readonly struct CommandFlowOptions
 {
     public CommandFlowObserver? Observer { get; init; }
     public object? ObserverState { get; init; }
@@ -23,7 +25,8 @@ readonly struct CommandFlowOptions
     public TimeSpan? PendingTimeout { get; init; }
 }
 
-partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSource<FlowCallerInteractionCoreResult>, IValueTaskSource
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+public partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSource<FlowCallerInteractionCoreResult>, IValueTaskSource
 {
     static readonly TimeSpan ConsumerDrainCancellationGracePeriod = TimeSpan.FromSeconds(1);
 
@@ -1074,7 +1077,7 @@ partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSour
     bool IsBodyTerminated => Volatile.Read(ref _bodyState) == BodyTerminated;
 
     // Source handoff finishes before body/consumer rendezvous begins, so both reuse the same wait event.
-    protected override FlowHandoffEvent? HandoffEvent => _callerInteractionCore.GetWaitEvent();
+    private protected override FlowHandoffEvent? HandoffEvent => _callerInteractionCore.GetWaitEvent();
 
     // Return the rendezvous directly. An async wrapper could signal the disposer before registering the
     // body's continuation, causing a late ThreadPool dispatch instead of caller-thread drain execution.

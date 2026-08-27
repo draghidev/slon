@@ -3,7 +3,8 @@ using System.Runtime.CompilerServices;
 
 namespace Slon.Pg.Serialization;
 
-readonly ref struct PgReadView
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+public readonly ref struct PgReadView
 {
     readonly ReadOnlySpan<byte> _bytes;
 

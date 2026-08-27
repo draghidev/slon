@@ -6,7 +6,8 @@ namespace Slon.Pg.Types;
 
 // Query shape and row parsing form one contract. Dialects customize through capabilities and
 // catalog plugins, or replace the complete factory; selectively overriding SQL is not safe.
-sealed class PostgreSqlTypeCatalogFactory : PgTypeCatalogFactory
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+public sealed class PostgreSqlTypeCatalogFactory : PgTypeCatalogFactory
 {
     public static PostgreSqlTypeCatalogFactory Instance { get; } = new();
 

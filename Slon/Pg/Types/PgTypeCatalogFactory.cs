@@ -3,7 +3,8 @@ using Slon.Pg.Protocol;
 
 namespace Slon.Pg.Types;
 
-abstract class PgTypeCatalogFactory
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+public abstract class PgTypeCatalogFactory
 {
     // Kept internal while Queue exposes the internal flow composition model. A future external
     // dialect API must lift query/result processing rather than publishing PgClientFlow machinery.
@@ -98,7 +99,8 @@ abstract class PgTypeCatalogFactory
     }
 }
 
-sealed class PgTypeCatalogFactoryContext
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+public sealed class PgTypeCatalogFactoryContext
 {
     readonly PgClientProtocol? _protocol;
     readonly CancellationToken _stoppingToken;
