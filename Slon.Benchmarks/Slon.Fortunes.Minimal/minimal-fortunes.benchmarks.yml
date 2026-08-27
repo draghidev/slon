@@ -1,0 +1,88 @@
+imports:
+  - https://raw.githubusercontent.com/dotnet/crank/main/src/Microsoft.Crank.Jobs.Wrk/wrk.yml
+  - https://raw.githubusercontent.com/aspnet/Benchmarks/main/scenarios/aspnet.profiles.standard.yml
+
+variables:
+  serverPort: 5000
+  npgsqlConnections: 256
+  # Override this value to benchmark an unmerged Slon branch or commit.
+  branchOrCommit: main
+
+jobs:
+  minimal-postgresql-slon:
+    sources:
+      Slon:
+        repository: https://github.com/draghidev/slon.git
+        branchOrCommit: "{{branchOrCommit}}"
+      Draghi:
+        repository: https://github.com/draghidev/pipelining.git
+        branchOrCommit: main
+    project: Slon/Slon.Benchmarks/Slon.Fortunes.Minimal/Slon.Fortunes.Minimal.csproj
+    framework: net10.0
+    patchReferences: true
+    readyStateText: Application started.
+    arguments: "--urls {{serverScheme}}://{{serverAddress}}:{{serverPort}}"
+    variables:
+      serverScheme: http
+    environmentVariables:
+      DATABASE: postgresql
+      DRIVER: slon
+      CONNECTION_STRING: "Host={{databaseServer}};Database=hello_world;Username=benchmarkdbuser;Password=benchmarkdbpass"
+      DATABASE_CONNECTIONS: "{{ cores | minus: 2 }}"
+      SLON_PIPELINING: 16
+
+  minimal-postgresql-npgsql:
+    sources:
+      Slon:
+        repository: https://github.com/draghidev/slon.git
+        branchOrCommit: "{{branchOrCommit}}"
+      Draghi:
+        repository: https://github.com/draghidev/pipelining.git
+        branchOrCommit: main
+    project: Slon/Slon.Benchmarks/Slon.Fortunes.Minimal/Slon.Fortunes.Minimal.csproj
+    framework: net10.0
+    patchReferences: true
+    readyStateText: Application started.
+    arguments: "--urls {{serverScheme}}://{{serverAddress}}:{{serverPort}}"
+    variables:
+      serverScheme: http
+    environmentVariables:
+      DATABASE: postgresql
+      DRIVER: npgsql
+      CONNECTION_STRING: "Host={{databaseServer}};Database=hello_world;Username=benchmarkdbuser;Password=benchmarkdbpass;Maximum Pool Size={{ npgsqlConnections }};No Reset On Close=true;Enlist=false;Max Auto Prepare=4"
+      DATABASE_CONNECTIONS: "{{ npgsqlConnections }}"
+
+  postgresql:
+    source:
+      repository: https://github.com/TechEmpower/FrameworkBenchmarks.git
+      branchOrCommit: master
+      dockerFile: toolset/databases/postgres/postgres.dockerfile
+      dockerImageName: postgres_te
+      dockerContextDirectory: toolset/databases/postgres
+    readyStateText: ready to accept connections
+    noClean: true
+
+scenarios:
+  minimal-postgresql-slon:
+    db:
+      job: postgresql
+    application:
+      job: minimal-postgresql-slon
+    load:
+      job: wrk
+      variables:
+        presetHeaders: html
+        path: /fortunes
+        connections: 512
+
+  minimal-postgresql-npgsql:
+    db:
+      job: postgresql
+    application:
+      job: minimal-postgresql-npgsql
+    load:
+      job: wrk
+      variables:
+        presetHeaders: html
+        path: /fortunes
+        connections: 512
