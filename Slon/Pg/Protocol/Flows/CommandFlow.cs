@@ -583,7 +583,7 @@ public partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
                 CommandResult result;
                 {
                     ref readonly var readState = ref context.GetProtocolStatic<ReadState>();
-                    readState.ResultMessageEnumerator.Initialize(this, _decoder);
+                    readState.ResultMessageEnumerator.Initialize(_commands.ItemRef(_commandIndex), _decoder);
                     result = _enumeratorCurrent ?? readState.CommandResult;
 
                     ref readonly var resultCommand = ref _commands.ItemRef(_commandIndex);
