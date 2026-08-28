@@ -28,7 +28,8 @@ internal abstract class FortuneDatabase : IAsyncDisposable
             ("postgresql", "slon") => CreateSlonAsync(
                 connectionString,
                 connectionCount,
-                configuration["SLON_POOL_MODE"]),
+                configuration["SLON_POOL_MODE"],
+                configuration["SLON_CONSUMPTION_MODE"]),
             ("postgresql", "npgsql") => ValueTask.FromResult<FortuneDatabase>(
                 new NpgsqlFortuneDatabase(connectionString, connectionCount)),
             _ => throw new InvalidOperationException("The database selection is invalid."),
@@ -80,28 +81,41 @@ internal abstract class FortuneDatabase : IAsyncDisposable
     }
 
     static ValueTask<FortuneDatabase> CreateSlonAsync(
-        string connectionString, int connectionCount, string? configuredMode)
+        string connectionString, int connectionCount, string? configuredPoolMode,
+        string? configuredConsumptionMode)
     {
-        var mode = string.IsNullOrWhiteSpace(configuredMode)
+        var poolMode = string.IsNullOrWhiteSpace(configuredPoolMode)
             ? "raw"
-            : configuredMode.Trim().ToLowerInvariant();
-        Console.WriteLine($"Slon pool mode: {mode}.");
-        return mode switch
+            : configuredPoolMode.Trim().ToLowerInvariant();
+        var consumptionMode = ParseConsumptionMode(configuredConsumptionMode);
+        Console.WriteLine($"Slon pool mode: {poolMode}; consumption mode: {consumptionMode.ToString().ToLowerInvariant()}.");
+        return poolMode switch
         {
-            "raw" => RawSlonFortuneDatabase.CreateAsync(connectionString, connectionCount),
-            "connection" => ConnectionSlonFortuneDatabase.CreateAsync(connectionString, connectionCount),
+            "raw" => RawSlonFortuneDatabase.CreateAsync(connectionString, connectionCount, consumptionMode),
+            "connection" => ConnectionSlonFortuneDatabase.CreateAsync(connectionString, connectionCount, consumptionMode),
             _ => throw new ArgumentOutOfRangeException(
-                "SLON_POOL_MODE", configuredMode, "Expected 'raw' or 'connection'."),
+                "SLON_POOL_MODE", configuredPoolMode, "Expected 'raw' or 'connection'."),
         };
     }
+
+    static SlonConsumptionMode ParseConsumptionMode(string? configuredMode)
+        => string.IsNullOrWhiteSpace(configuredMode)
+            ? SlonConsumptionMode.Stream
+            : configuredMode.Trim().ToLowerInvariant() switch
+            {
+                "stream" => SlonConsumptionMode.Stream,
+                "collect" => SlonConsumptionMode.Collect,
+                _ => throw new ArgumentOutOfRangeException(
+                    "SLON_CONSUMPTION_MODE", configuredMode, "Expected 'stream' or 'collect'."),
+            };
 }
 
 internal sealed class RawSlonFortuneDatabase(RawSlonProtocolPool pool) : FortuneDatabase
 {
     public static async ValueTask<FortuneDatabase> CreateAsync(
-        string connectionString, int connectionCount)
+        string connectionString, int connectionCount, SlonConsumptionMode consumptionMode)
         => new RawSlonFortuneDatabase(await RawSlonProtocolPool.CreateAsync(
-            connectionString, connectionCount).ConfigureAwait(false));
+            connectionString, connectionCount, consumptionMode).ConfigureAwait(false));
 
     public override async ValueTask<List<Fortune>> LoadAsync(
         CancellationToken cancellationToken)
@@ -117,9 +131,9 @@ internal sealed class RawSlonFortuneDatabase(RawSlonProtocolPool pool) : Fortune
 internal sealed class ConnectionSlonFortuneDatabase(FullSlonConnectionPool pool) : FortuneDatabase
 {
     public static async ValueTask<FortuneDatabase> CreateAsync(
-        string connectionString, int connectionCount)
+        string connectionString, int connectionCount, SlonConsumptionMode consumptionMode)
         => new ConnectionSlonFortuneDatabase(await FullSlonConnectionPool.CreateAsync(
-            connectionString, connectionCount).ConfigureAwait(false));
+            connectionString, connectionCount, consumptionMode).ConfigureAwait(false));
 
     public override async ValueTask<List<Fortune>> LoadAsync(CancellationToken cancellationToken)
     {

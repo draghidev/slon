@@ -13,14 +13,18 @@ internal sealed class FullSlonConnectionPool : IAsyncDisposable
 {
     const string Query = "SELECT id, message FROM fortune";
     readonly ConnectionPool<ProtocolConnection> _pool;
-    readonly Command _command;
+    readonly ReaderDrivenCommandOptions _options;
+    readonly SlonConsumptionMode _consumptionMode;
 
-    FullSlonConnectionPool(ConnectionPool<ProtocolConnection> pool, Command command)
-        => (_pool, _command) = (pool, command);
+    FullSlonConnectionPool(ConnectionPool<ProtocolConnection> pool, Command command,
+        SlonConsumptionMode consumptionMode)
+        => (_pool, _options, _consumptionMode) =
+            (pool, new ReaderDrivenCommandOptions(command), consumptionMode);
 
     internal static async ValueTask<FullSlonConnectionPool> CreateAsync(
         string connectionString,
-        int connectionCount)
+        int connectionCount,
+        SlonConsumptionMode consumptionMode)
     {
         var builder = new NpgsqlConnectionStringBuilder(connectionString);
         var clientOptions = new PgClientOptions
@@ -53,14 +57,14 @@ internal sealed class FullSlonConnectionPool : IAsyncDisposable
                 MaxConnections = connectionCount,
                 ConnectionIdleLifetime = Timeout.InfiniteTimeSpan,
             });
-        return new(pool, command);
+        return new(pool, command, consumptionMode);
     }
 
     public async ValueTask<List<T>> LoadAsync<T>(
         Func<int, string, T> create,
         CancellationToken cancellationToken)
     {
-        var flow = new ReaderDrivenCommandFlow(_command);
+        var flow = new ReaderDrivenCommandFlow(_options);
         await _pool.GetAsync(
             static (candidate, item) => candidate.Connection.Protocol.TryQueue(
                 item,
@@ -72,10 +76,21 @@ internal sealed class FullSlonConnectionPool : IAsyncDisposable
             Timeout.InfiniteTimeSpan,
             cancellationToken).ConfigureAwait(false);
 
-        List<T> values = [];
-        await foreach (var result in flow)
-        await foreach (var row in result)
-            values.Add(create(row.GetValue<int>(0), row.GetValue<string>(1)));
+        var values = new CollectList<T>(create);
+        if (_consumptionMode is SlonConsumptionMode.Collect)
+        {
+            await flow.CollectAsync(values, static (state, row) =>
+            {
+                var list = (CollectList<T>)state!;
+                list.Add(list.Create(row.GetValue<int>(0), row.GetValue<string>(1)));
+            }, cancellationToken).ConfigureAwait(false);
+        }
+        else
+        {
+            await foreach (var result in flow)
+            await foreach (var row in result)
+                values.Add(create(row.GetValue<int>(0), row.GetValue<string>(1)));
+        }
         return values;
     }
 
@@ -83,22 +98,21 @@ internal sealed class FullSlonConnectionPool : IAsyncDisposable
 
     static async ValueTask<Command> PrepareAsync(PgClientProtocol protocol)
     {
-        var command = Command.Create(Query, commandName: new EncodedCString("fortunes")) with
-        {
-            DescribeOnly = true,
-            DescribeForPreparation = true,
-            WithSync = true,
-        };
+        var command = Command.Create(Query, commandName: new EncodedCString("fortunes"));
         var flow = protocol.Queue(new CommandFlow(async: true, command));
+        Command? prepared = null;
         await foreach (var result in flow)
         {
             var metadata = result.GetMetadata();
-            return Command.Create(CommandDescriptor.CreatePrepared(
+            prepared = Command.Create(CommandDescriptor.CreatePrepared(
                 metadata.CommandName,
                 metadata.ParameterTypes.Preserve(),
                 metadata.RowDescription?.Preserve()));
+            await foreach (var _ in result) { }
+            _ = result.GetCommandComplete();
         }
-        throw new InvalidOperationException("PostgreSQL preparation returned no command result.");
+        return prepared ??
+            throw new InvalidOperationException("PostgreSQL preparation returned no command result.");
     }
 
     static string RequiredPostgreSqlValue(string name, string? value)
@@ -158,5 +172,10 @@ internal sealed class FullSlonConnectionPool : IAsyncDisposable
                 throw;
             }
         }
+    }
+
+    sealed class CollectList<T>(Func<int, string, T> create) : List<T>
+    {
+        internal Func<int, string, T> Create { get; } = create;
     }
 }
