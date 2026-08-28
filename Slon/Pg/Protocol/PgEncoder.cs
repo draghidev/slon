@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using System.Collections.Immutable;
 using System.Runtime.CompilerServices;
 using System.Text;
@@ -231,6 +232,89 @@ public readonly struct PgEncoder
         _writer.WriteUShort(0); // parameters
         _writer.WriteUShort(1); // result format codes
         _writer.WriteUShort(1); // all binary
+    }
+
+    // Executes a prepared statement without parameters and with default result formats: Bind on the
+    // unnamed portal, an optional portal Describe, an optional Execute, then syncCount Sync messages,
+    // all written through one reserved span. A flow appends at most one Sync of its own beside the
+    // command's, so syncCount is bounded to two.
+    internal void WritePreparedExecution(EncodedCString commandName, bool describe, bool execute, int syncCount)
+    {
+        WritePreparedExecutionCore(_writer, ClientEncoding, commandName, describe, execute, syncCount);
+        _executionControl.OnMessageWrite(FrontendType.Bind);
+        if (describe)
+            _executionControl.OnMessageWrite(FrontendType.Describe);
+        if (execute)
+            _executionControl.OnMessageWrite(FrontendType.Execute);
+        for (var i = 0; i < syncCount; i++)
+            _executionControl.OnMessageWrite(FrontendType.Sync);
+    }
+
+    // Each message is still armed and advanced on its own so the per-message declared-length check
+    // holds. The reserved span stays valid across the advances because the buffering writer only
+    // reallocates on a reservation it cannot satisfy.
+    internal static void WritePreparedExecutionCore(ProtocolDataWriter writer, Encoding encoding,
+        EncodedCString commandName, bool describe, bool execute, int syncCount)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(syncCount);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(syncCount, 2);
+
+        const int header = sizeof(byte) + sizeof(uint);
+        const int describeBody = sizeof(byte) + 1; // 'P' and the unnamed portal
+        const int executeBody = sizeof(byte) + sizeof(int); // unnamed portal, all rows
+        var commandNameBytes = commandName.AsNullTerminatedSpan(encoding);
+        var bindBody = checked(1 + commandNameBytes.Length + 4 * sizeof(ushort));
+        var total = checked(header + bindBody
+            + (describe ? header + describeBody : 0)
+            + (execute ? header + executeBody : 0)
+            + syncCount * header);
+        var span = writer.GetSpan(total);
+
+        writer.StartMessage(header + bindBody);
+        WriteHeader(span, FrontendType.Bind, bindBody);
+        span[header] = 0; // unnamed portal
+        commandNameBytes.CopyTo(span.Slice(header + 1));
+        var formats = span.Slice(header + 1 + commandNameBytes.Length);
+        BinaryPrimitives.WriteUInt16BigEndian(formats, 0); // parameter format codes
+        BinaryPrimitives.WriteUInt16BigEndian(formats.Slice(2), 0); // parameters
+        BinaryPrimitives.WriteUInt16BigEndian(formats.Slice(4), 1); // result format codes
+        BinaryPrimitives.WriteUInt16BigEndian(formats.Slice(6), 1); // all binary
+        writer.Advance(header + bindBody);
+        span = span.Slice(header + bindBody);
+
+        if (describe)
+        {
+            writer.StartMessage(header + describeBody);
+            WriteHeader(span, FrontendType.Describe, describeBody);
+            span[header] = (byte)'P';
+            span[header + 1] = 0;
+            writer.Advance(header + describeBody);
+            span = span.Slice(header + describeBody);
+        }
+
+        if (execute)
+        {
+            writer.StartMessage(header + executeBody);
+            WriteHeader(span, FrontendType.Execute, executeBody);
+            span[header] = 0; // unnamed portal
+            BinaryPrimitives.WriteUInt32BigEndian(span.Slice(header + 1), 0); // all rows
+            writer.Advance(header + executeBody);
+            span = span.Slice(header + executeBody);
+        }
+
+        for (var i = 0; i < syncCount; i++)
+        {
+            writer.StartMessage(header);
+            WriteHeader(span, FrontendType.Sync, 0);
+            writer.Advance(header);
+            span = span.Slice(header);
+        }
+
+        static void WriteHeader(Span<byte> span, FrontendType type, int bodyLength)
+        {
+            span[0] = type.ToByte();
+            BinaryPrimitives.WriteUInt32BigEndian(span.Slice(1), checked((uint)(sizeof(uint) + bodyLength)));
+        }
     }
 
     public void WriteBind(EncodedCString commandName = default, EncodedCString portalName = default,

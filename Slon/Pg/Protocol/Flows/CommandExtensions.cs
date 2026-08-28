@@ -12,6 +12,23 @@ public static class CommandExtensions
     public static bool IsSimple(this in Command command) =>
         command.PreferSimple && command.WithSync && !command.DescribeOnly && !command.Descriptor.IsPrepared && command.Descriptor.ParameterTypes.Count is 0;
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    static bool CanWritePreparedExecution(in Command command, in CommandDescriptor descriptor)
+        => descriptor.IsPrepared && command.Parameters.Count is 0
+            && descriptor.ParameterTypes.Count is 0 && command.ResultFormats.Length is 0;
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    static ValueTask WritePreparedExecutionAsync(
+        in Command command, in CommandDescriptor descriptor, PgEncoder encoder, bool appendSync,
+        CancellationToken cancellationToken)
+    {
+        encoder.WritePreparedExecution(descriptor.CommandName,
+            describe: command.DescribeOnly || descriptor.PreparedRowDescription is null,
+            execute: !command.DescribeOnly,
+            syncCount: (command.WithSync ? 1 : 0) + (appendSync ? 1 : 0));
+        return encoder.FlushAsync(cancellationToken);
+    }
+
     // Sync/async pair at the command-list (full composition) level. No *Auto wrapper here.
     // Callers picking sync vs async make that choice once at this level rather than threading
     // a mode flag through every encoder helper underneath. Keeping the list loop in this state
