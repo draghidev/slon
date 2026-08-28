@@ -12,13 +12,16 @@ internal sealed class RawSlonProtocolPool : IAsyncDisposable
 {
     const string Query = "SELECT id, message FROM fortune";
     readonly Slot[] _slots;
+    readonly SlonConsumptionMode _consumptionMode;
     int _nextSlot = -1;
 
-    RawSlonProtocolPool(Slot[] slots) => _slots = slots;
+    RawSlonProtocolPool(Slot[] slots, SlonConsumptionMode consumptionMode)
+        => (_slots, _consumptionMode) = (slots, consumptionMode);
 
     internal static async ValueTask<RawSlonProtocolPool> CreateAsync(
         string connectionString,
-        int connectionCount)
+        int connectionCount,
+        SlonConsumptionMode consumptionMode)
     {
         var builder = new NpgsqlConnectionStringBuilder(connectionString);
         var clientOptions = new PgClientOptions
@@ -47,7 +50,8 @@ internal sealed class RawSlonProtocolPool : IAsyncDisposable
                 var protocol = await factory.CreateAsync().ConfigureAwait(false);
                 try
                 {
-                    slots[created] = new(protocol, await PrepareAsync(protocol).ConfigureAwait(false));
+                    var command = await PrepareAsync(protocol).ConfigureAwait(false);
+                    slots[created] = new(protocol, new ReaderDrivenCommandOptions(command));
                 }
                 catch
                 {
@@ -55,7 +59,7 @@ internal sealed class RawSlonProtocolPool : IAsyncDisposable
                     throw;
                 }
             }
-            return new(slots);
+            return new(slots, consumptionMode);
         }
         catch
         {
@@ -70,13 +74,22 @@ internal sealed class RawSlonProtocolPool : IAsyncDisposable
         CancellationToken cancellationToken)
     {
         var slot = GetSlot();
-        var flow = new ReaderDrivenCommandFlow(slot.Command);
+        var flow = new ReaderDrivenCommandFlow(slot.Options);
         if (!slot.Protocol.TryQueue(flow, cancellationToken: cancellationToken))
             throw new InvalidOperationException("The selected PostgreSQL protocol is unavailable.");
 
-        List<T> values = [];
-        await foreach (var result in flow)
+        var values = new CollectList<T>(create);
+        if (_consumptionMode is SlonConsumptionMode.Collect)
         {
+            await flow.CollectAsync(values, static (state, row) =>
+            {
+                var list = (CollectList<T>)state!;
+                list.Add(list.Create(row.GetValue<int>(0), row.GetValue<string>(1)));
+            }, cancellationToken).ConfigureAwait(false);
+        }
+        else
+        {
+            await foreach (var result in flow)
             await foreach (var row in result)
                 values.Add(create(row.GetValue<int>(0), row.GetValue<string>(1)));
         }
@@ -106,22 +119,21 @@ internal sealed class RawSlonProtocolPool : IAsyncDisposable
 
     static async ValueTask<Command> PrepareAsync(PgClientProtocol protocol)
     {
-        var command = Command.Create(Query, commandName: new EncodedCString("fortunes")) with
-        {
-            DescribeOnly = true,
-            DescribeForPreparation = true,
-            WithSync = true,
-        };
+        var command = Command.Create(Query, commandName: new EncodedCString("fortunes"));
         var flow = protocol.Queue(new CommandFlow(async: true, command));
+        Command? prepared = null;
         await foreach (var result in flow)
         {
             var metadata = result.GetMetadata();
-            return Command.Create(CommandDescriptor.CreatePrepared(
+            prepared = Command.Create(CommandDescriptor.CreatePrepared(
                 metadata.CommandName,
                 metadata.ParameterTypes.Preserve(),
                 metadata.RowDescription?.Preserve()));
+            await foreach (var _ in result) { }
+            _ = result.GetCommandComplete();
         }
-        throw new InvalidOperationException("PostgreSQL preparation returned no command result.");
+        return prepared ??
+            throw new InvalidOperationException("PostgreSQL preparation returned no command result.");
     }
 
     static string RequiredPostgreSqlValue(string name, string? value) =>
@@ -129,9 +141,20 @@ internal sealed class RawSlonProtocolPool : IAsyncDisposable
             ? throw new InvalidOperationException($"PostgreSQL {name} is required.")
             : value;
 
-    sealed class Slot(PgClientProtocol protocol, Command command)
+    sealed class Slot(PgClientProtocol protocol, ReaderDrivenCommandOptions options)
     {
         internal PgClientProtocol Protocol { get; } = protocol;
-        internal Command Command { get; } = command;
+        internal ReaderDrivenCommandOptions Options { get; } = options;
     }
+
+    sealed class CollectList<T>(Func<int, string, T> create) : List<T>
+    {
+        internal Func<int, string, T> Create { get; } = create;
+    }
+}
+
+internal enum SlonConsumptionMode
+{
+    Stream,
+    Collect,
 }
