@@ -318,33 +318,79 @@ public sealed class CommandResult
     CommandFlow.MoveNextStatus TryMoveNextMessage() => _messageEnumerator.TryMoveNext();
     ValueTask<bool> MoveNextMessageAsync() => _messageEnumerator.MoveNextAsync();
 
+    enum CollectStep
+    {
+        Completed,
+        RequiresInput,
+        RequiresBody,
+        RequiresLeaseRevoke,
+        Faulted
+    }
+
     // Consumes this result's rows on the caller's frame, invoking the collector synchronously for
-    // each buffered row. Already-buffered rows cost no awaitable. The collector's first exception
-    // ends the callbacks and is returned; the remaining rows are left for the flow's drain. Reaches
-    // the command's terminal message and records it, as row enumeration does.
+    // each buffered row. Already-buffered rows are consumed by the synchronous loop below so the
+    // loop's state stays in registers; only genuine input, an unbuffered body, or an outstanding
+    // column lease suspends this frame. The collector's first exception ends the callbacks and is
+    // returned; the remaining rows are left for the flow's drain. Reaches the command's terminal
+    // message and records it, as row enumeration does.
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
     internal async ValueTask<Exception?> CollectRowsAsync(object? state, Action<object?, Row> collector)
     {
-        Row? row = null;
+        var currentIsPending = false;
         while (true)
         {
-            if (row is { HasColumnLease: true })
-                await row.RevokeColumnLeaseAsync().ConfigureAwait(false);
+            var step = CollectBufferedRows(state, collector, currentIsPending, out var fault);
+            currentIsPending = false;
+            switch (step)
+            {
+                case CollectStep.Completed:
+                    return null;
+                case CollectStep.Faulted:
+                    if (_row.HasColumnLease)
+                        await _row.RevokeColumnLeaseAsync().ConfigureAwait(false);
+                    return fault;
+                case CollectStep.RequiresLeaseRevoke:
+                    await _row.RevokeColumnLeaseAsync().ConfigureAwait(false);
+                    break;
+                case CollectStep.RequiresInput:
+                    if (!await MoveNextMessageAsync().ConfigureAwait(false))
+                    {
+                        EnsureTerminalRecorded();
+                        return null;
+                    }
+                    currentIsPending = true;
+                    break;
+                case CollectStep.RequiresBody:
+                    await GetCurrentMessage().BufferBodyAsync(default).ConfigureAwait(false);
+                    currentIsPending = true;
+                    break;
+            }
+        }
+    }
 
-            var status = TryMoveNextMessage();
-            if (status is CommandFlow.MoveNextStatus.RequiresInput)
+    // The synchronous half of collection. currentIsPending: the caller already moved to a message
+    // (after a read or a body buffering) that this loop must process before moving again.
+    CollectStep CollectBufferedRows(object? state, Action<object?, Row> collector, bool currentIsPending,
+        out Exception? fault)
+    {
+        fault = null;
+        var row = _row;
+        while (true)
+        {
+            if (!currentIsPending)
             {
-                if (!await MoveNextMessageAsync().ConfigureAwait(false))
-                    status = CommandFlow.MoveNextStatus.EndOfSequence;
-                else
-                    status = CommandFlow.MoveNextStatus.Moved;
+                if (row.HasColumnLease)
+                    return CollectStep.RequiresLeaseRevoke;
+                var status = TryMoveNextMessage();
+                if (status is CommandFlow.MoveNextStatus.RequiresInput)
+                    return CollectStep.RequiresInput;
+                if (status is CommandFlow.MoveNextStatus.EndOfSequence)
+                {
+                    EnsureTerminalRecorded();
+                    return CollectStep.Completed;
+                }
             }
-            if (status is CommandFlow.MoveNextStatus.EndOfSequence)
-            {
-                if (_requestedExecution && _commandCompleteMessage is null && _errorMessage is null)
-                    ThrowHelper.ThrowInvalidOperation("Underlying message enumerator completed before CommandComplete was returned.");
-                return null;
-            }
+            currentIsPending = false;
 
             var current = GetCurrentMessage();
             if (current.Header.Type is not PgTypes.BackendType.DataRow)
@@ -355,19 +401,16 @@ public sealed class CommandResult
                     case PgTypes.BackendType.CommandComplete:
                     case PgTypes.BackendType.ErrorResponse:
                         CompleteCommand(current);
-                        return null;
+                        return CollectStep.Completed;
                     default:
                         ThrowHelper.ThrowUnhandledCase(current.Header.Type);
-                        return null;
+                        return CollectStep.Completed;
                 }
             }
 
             if (!current.Buffered)
-            {
-                await current.BufferBodyAsync(default).ConfigureAwait(false);
-                current = GetCurrentMessage();
-            }
-            row ??= GetRow();
+                return CollectStep.RequiresBody;
+            _firstRowEnumerated = true;
             row.InitializeRow(current);
             try
             {
@@ -375,11 +418,16 @@ public sealed class CommandResult
             }
             catch (Exception exception)
             {
-                if (row.HasColumnLease)
-                    await row.RevokeColumnLeaseAsync().ConfigureAwait(false);
-                return exception;
+                fault = exception;
+                return CollectStep.Faulted;
             }
         }
+    }
+
+    void EnsureTerminalRecorded()
+    {
+        if (_requestedExecution && _commandCompleteMessage is null && _errorMessage is null)
+            ThrowHelper.ThrowInvalidOperation("Underlying message enumerator completed before CommandComplete was returned.");
     }
 
     public struct RowEnumerator : IEnumerator<Row>, IAsyncEnumerator<Row>
