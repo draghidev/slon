@@ -33,6 +33,7 @@ public sealed class ReaderDrivenCommandFlow : PgClientFlow, IValueTaskSource<boo
     bool _readFlowRfq;
     // Set by the consumer once it has started reading, so a drain knows whether to publish nothing.
     bool _consumerDetached;
+    bool _consumerObservedCompletion;
 
     // Completed once the request is written and activation settled, faulted by teardown before then.
     Slon.Threading.Tasks.Sources.ManualResetValueTaskSourceCore<bool> _readySource;
@@ -223,7 +224,41 @@ public sealed class ReaderDrivenCommandFlow : PgClientFlow, IValueTaskSource<boo
             await new ValueTask<bool>(this, _readySource.Version).ConfigureAwait(false);
             _consumerDetached = false;
             RegisterCancellation(cancellationToken);
-            var result = await ReadResultAsync().ConfigureAwait(false);
+            CommandResult result;
+            if (!_commands.ItemRef(0).DescribeOnly
+                && _commands.ItemRef(0).Descriptor is { IsPrepared: true, PreparedRowDescription: not null })
+            {
+                var decoder = _decoder!;
+                if (_context.IsProtocolClosed)
+                    throw _context.FlowTerminationException;
+                decoder.UseReadTimeout(_commands.ItemRef(0).Timeout);
+                PgError? error;
+                if (!decoder.TryMoveNext())
+                {
+                    if (!await decoder.MoveNextAsync().ConfigureAwait(false))
+                        decoder.ThrowUnexpectedEof();
+                }
+                if (decoder.Current.EnsureExpectedOrError(PgTypes.BackendType.BindComplete) is { } bindError)
+                {
+                    error = bindError;
+                }
+                else
+                {
+                    if (!decoder.TryMoveNext())
+                    {
+                        if (!await decoder.MoveNextAsync().ConfigureAwait(false))
+                            decoder.ThrowUnexpectedEof();
+                    }
+                    decoder.Current.DebugEnsureExpected(
+                        PgTypes.BackendType.DataRow, PgTypes.BackendType.CommandComplete);
+                    error = null;
+                }
+                result = InitializeResult(error, null);
+            }
+            else
+            {
+                result = await ReadResultAsync().ConfigureAwait(false);
+            }
             _current = result;
             // Publish the idle state, then recheck the latches. A latch that landed between the read
             // and this publication found no idle owner to take over, so this frame must act on it.
@@ -270,6 +305,8 @@ public sealed class ReaderDrivenCommandFlow : PgClientFlow, IValueTaskSource<boo
         }
         if (deliver is not null)
             throw deliver;
+        Debug.Assert(IsCompleted);
+        _consumerObservedCompletion = true;
         return false;
     }
 
@@ -535,7 +572,9 @@ public sealed class ReaderDrivenCommandFlow : PgClientFlow, IValueTaskSource<boo
                     return ValueTask.FromException(
                         ThrowHelper.ThrowInvalidOperation("Cannot dispose the flow while a read is in progress."));
                 default:
-                    return WaitForDrainOnDispose ? DisposeCompletedAsync() : default;
+                    return !WaitForDrainOnDispose || _consumerObservedCompletion
+                        ? default
+                        : DisposeCompletedAsync();
             }
         }
     }
@@ -593,7 +632,7 @@ public sealed class ReaderDrivenCommandFlow : PgClientFlow, IValueTaskSource<boo
                     ThrowHelper.ThrowInvalidOperation("Cannot dispose the flow while a read is in progress.");
                     return;
                 default:
-                    if (WaitForDrainOnDispose)
+                    if (WaitForDrainOnDispose && !_consumerObservedCompletion)
                         DisposeCompleted();
                     return;
             }
@@ -748,6 +787,7 @@ public sealed class ReaderDrivenCommandFlow : PgClientFlow, IValueTaskSource<boo
         _drainError = null;
         _readFlowRfq = false;
         _consumerDetached = false;
+        _consumerObservedCompletion = false;
         _readySource.Reset();
         _pipelineTaskSource.Reset();
         _flowToken = default;
