@@ -174,8 +174,10 @@ public class PostgreSqlSslTests
         await Assert.ThrowsExactlyAsync<System.Security.Authentication.AuthenticationException>(async () =>
             await CreateFactory(listener, PostgreSqlSslNegotiation.Direct,
                 PostgreSqlSslMode.VerifyFull).CreateAsync());
+        // The server observes the client's rejection as a reset or, on newer runtimes, as the
+        // handshake alert itself.
         try { await server; }
-        catch (IOException) { }
+        catch (Exception ex) when (ex is IOException or System.Security.Authentication.AuthenticationException) { }
     }
 
     [TestMethod]
@@ -189,8 +191,10 @@ public class PostgreSqlSslTests
         await Assert.ThrowsExactlyAsync<System.Security.Authentication.AuthenticationException>(async () =>
             await CreateFactory(listener, PostgreSqlSslNegotiation.Direct,
                 PostgreSqlSslMode.VerifyCA).CreateAsync());
+        // The server observes the client's rejection as a reset or, on newer runtimes, as the
+        // handshake alert itself.
         try { await server; }
-        catch (IOException) { }
+        catch (Exception ex) when (ex is IOException or System.Security.Authentication.AuthenticationException) { }
     }
 
     [TestMethod]
