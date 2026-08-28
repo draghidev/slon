@@ -20,6 +20,8 @@ partial class CommandFlow
         public ResultMessageEnumerator ResultMessageEnumerator { get; }
         public CommandResult CommandResult { get; }
         public ValueTaskSourcePromise<bool> ReadPromise { get; }
+        // The reader-driven collect body's promise: one per wire, single-pumped by decoder ownership.
+        public ValueTaskSourcePromise<bool> CollectPromise { get; }
         public RowDescription RowDescription { get; }
 
         public ReadState()
@@ -27,6 +29,7 @@ partial class CommandFlow
             ResultMessageEnumerator = new();
             CommandResult = new(ResultMessageEnumerator);
             ReadPromise = new();
+            CollectPromise = new();
             RowDescription = new();
         }
 

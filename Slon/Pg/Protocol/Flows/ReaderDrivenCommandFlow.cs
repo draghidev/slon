@@ -36,6 +36,9 @@ public sealed class ReaderDrivenCommandFlow : PgClientFlow, IValueTaskSource<boo
     Slon.Threading.Tasks.Sources.ManualResetValueTaskSourceCore<bool> _readySource;
     // The framework's pipeline task, completed by whichever frame consumes RFQ.
     Slon.Threading.Tasks.Sources.ManualResetValueTaskSourceCore<bool> _pipelineTaskSource;
+    // Collect completion: separate from the ready source, which activation completes for a streaming
+    // consumer whether or not one exists yet.
+    Slon.Threading.Tasks.Sources.ManualResetValueTaskSourceCore<bool> _collectSource;
 
     // Cancellation, close, and failure state is cold. A successful uncancelled operation carries one
     // null reference instead of two registrations, three tokens, their latches, and two exceptions.
@@ -70,6 +73,7 @@ public sealed class ReaderDrivenCommandFlow : PgClientFlow, IValueTaskSource<boo
         IsAsync = true;
         _readySource.CanCompleteConcurrently = true;
         _pipelineTaskSource.CanCompleteConcurrently = true;
+        _collectSource.CanCompleteConcurrently = true;
     }
 
     protected override bool EnableActivationTimeout => true;
@@ -157,6 +161,17 @@ public sealed class ReaderDrivenCommandFlow : PgClientFlow, IValueTaskSource<boo
         Volatile.Write(ref _decoder, activation.GetResult());
         if (IsCancelRequested)
             RequestBackendCancellation();
+        Interlocked.MemoryBarrier();
+        if (Volatile.Read(ref _collectArmed) != 0)
+        {
+            // Collect mode: the body starts on this wake. Off the executor strand it runs inline, as
+            // the parked consumer frame did; on the strand it is deferred the same way.
+            if (onExecutorStrand)
+                ThreadPool.UnsafeQueueUserWorkItem(static state => ((ReaderDrivenCommandFlow)state!).TryStartCollectBody(), this, preferLocal: true);
+            else
+                TryStartCollectBody();
+            return;
+        }
         if (!_readySource.TrySetResult(true, runContinuationsAsynchronously: onExecutorStrand))
         {
             // Teardown released the consumer while this flow waited for its turn. Nothing reads the
@@ -174,6 +189,7 @@ public sealed class ReaderDrivenCommandFlow : PgClientFlow, IValueTaskSource<boo
     {
         Interlocked.CompareExchange(ref GetOrCreateColdState().TerminalException, exception, null);
         _readySource.TrySetException(exception, runContinuationsAsynchronously: true);
+        _collectSource.TrySetException(exception, runContinuationsAsynchronously: true);
     }
 
     void CompletePipelineTask(Exception? exception, bool runContinuationsAsynchronously = false)
@@ -238,6 +254,21 @@ public sealed class ReaderDrivenCommandFlow : PgClientFlow, IValueTaskSource<boo
     /// drained to its boundary and the exception is then delivered here. A command error is
     /// delivered as PgErrorException. Cancellation and close follow the enumerating consumer's rules.
     /// The flow must not have been enumerated.
+    // Collection runs as a body on the protocol's collect promise rather than in the caller's frame:
+    // the caller parks only in its own frame, and the body's state machine box is the promise's,
+    // allocated once per wire. The body is single-pumped by decoder ownership (activation to Finish).
+    const int CollectTokenFlag = 0x4000;
+    static readonly Action<object?> s_collectBodyCompleted =
+        static state => ((ReaderDrivenCommandFlow)state!).OnCollectBodyCompleted();
+
+    object? _collectState;
+    Action<object?, Row>? _collector;
+    int _collectArmed;
+    int _collectStarted;
+    short _collectBodyToken;
+    Exception? _collectorFault;
+    PgError? _collectError;
+
     public ValueTask CollectAsync(object? state, Action<object?, Row> collector,
         CancellationToken cancellationToken = default)
     {
@@ -250,99 +281,145 @@ public sealed class ReaderDrivenCommandFlow : PgClientFlow, IValueTaskSource<boo
         if (Interlocked.CompareExchange(ref _phase, PhaseReading, PhaseInitial) != PhaseInitial)
             return ValueTask.FromException(
                 ThrowHelper.ThrowInvalidOperation("Collection requires a flow that has not been read."));
-        return CollectCoreAsync(state, collector, cancellationToken);
+
+        _collectState = state;
+        _collector = collector;
+        _consumerDetached = false;
+        RegisterCancellation(cancellationToken);
+        var version = _collectSource.Version;
+        Debug.Assert(version < CollectTokenFlag);
+        var completion = new ValueTask(this, (short)(version | CollectTokenFlag));
+
+        // Arm with a full fence, then probe activation; the activation side publishes the decoder
+        // with a full fence, then probes the arm. Both may observe each other; the start CAS resolves.
+        Interlocked.Exchange(ref _collectArmed, 1);
+        if (Volatile.Read(ref _decoder) is not null)
+            TryStartCollectBody();
+        return completion;
     }
 
-    // The single frame owns the decoder from activation to RFQ, so no idle state is ever published
-    // and no takeover can occur. Latches are observed at the terminal, as LastAsync observes them.
-#if !NET11_0_OR_GREATER
-    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
-#endif
-    async ValueTask CollectCoreAsync(object? state, Action<object?, Row> collector, CancellationToken cancellationToken)
+    void TryStartCollectBody()
     {
-        Exception? collectorFault;
-        PgError? commandError;
-        Exception? deliver;
+        if (Interlocked.CompareExchange(ref _collectStarted, 1, 0) != 0)
+            return;
+        var promise = _context.GetProtocolStatic<CommandFlow.ReadState>().CollectPromise;
+        ValueTask body;
+        using (PromiseAsyncValueTaskMethodBuilder.BeginCallScope(promise))
+            body = CollectBodyAsync();
+        if (body.IsCompleted)
+        {
+            OnCollectBodyCompleted(body);
+            return;
+        }
+        _collectBodyToken = promise.Token;
+        ((IValueTaskSource)promise).OnCompleted(s_collectBodyCompleted, this, _collectBodyToken,
+            ValueTaskSourceOnCompletedFlags.None);
+    }
+
+    void OnCollectBodyCompleted()
+    {
+        var promise = _context.GetProtocolStatic<CommandFlow.ReadState>().CollectPromise;
+        OnCollectBodyCompleted(new ValueTask(promise, _collectBodyToken));
+    }
+
+    // Runs after the body released the promise, so the next flow's body can start once this flow's
+    // pipeline task completes in Finish.
+    void OnCollectBodyCompleted(ValueTask body)
+    {
+        Exception? bodyFault = null;
         try
         {
-            await new ValueTask<bool>(this, _readySource.Version).ConfigureAwait(false);
-            _consumerDetached = false;
-            RegisterCancellation(cancellationToken);
-            CommandResult result;
-            if (!_options.Template.DescribeOnly
-                && _options.Template.Descriptor is { IsPrepared: true, PreparedRowDescription: not null })
-            {
-                var decoder = _decoder!;
-                if (_context.IsProtocolClosed)
-                    throw _context.FlowTerminationException;
-                decoder.UseReadTimeout(_options.Template.Timeout);
-                PgError? error;
-                if (!decoder.TryMoveNext())
-                {
-                    if (!await decoder.MoveNextAsync().ConfigureAwait(false))
-                        decoder.ThrowUnexpectedEof();
-                }
-                if (decoder.Current.EnsureExpectedOrError(PgTypes.BackendType.BindComplete) is { } bindError)
-                {
-                    error = bindError;
-                }
-                else
-                {
-                    if (!decoder.TryMoveNext())
-                    {
-                        if (!await decoder.MoveNextAsync().ConfigureAwait(false))
-                            decoder.ThrowUnexpectedEof();
-                    }
-                    decoder.Current.DebugEnsureExpected(
-                        PgTypes.BackendType.DataRow, PgTypes.BackendType.CommandComplete);
-                    error = null;
-                }
-                result = InitializeResult(error, null);
-            }
-            else
-            {
-                result = await ReadResultAsync().ConfigureAwait(false);
-            }
-            _current = result;
-
-            collectorFault = await result.CollectRowsAsync(state, collector).ConfigureAwait(false);
-            commandError = result.Error;
-            if (collectorFault is null)
-            {
-                // The loop consumed the terminal; exactly one ReadyForQuery follows it (the command's
-                // own Sync or the appended one). Read it here rather than through the enumerator's
-                // completion and the generic drain.
-                var decoder = _decoder!;
-                if (!decoder.TryMoveNext())
-                {
-                    if (!await decoder.MoveNextAsync().ConfigureAwait(false))
-                        decoder.ThrowUnexpectedEof();
-                }
-                if (decoder.Current.EnsureExpectedOrError(PgTypes.BackendType.ReadyForQuery) is { } rfqError)
-                    PgErrorException.Throw(rfqError);
-                await DisposeRegistrationsAsync().ConfigureAwait(false);
-                Finish(result);
-            }
-            else
-            {
-                // Consumes whatever the faulted collector left, reads RFQ, resets the shared read
-                // state and completes the pipeline task.
-                await DrainCoreAsync(result).ConfigureAwait(false);
-            }
-            deliver = Volatile.Read(ref _coldState)?.TerminalException;
+            body.GetAwaiter().GetResult();
         }
         catch (Exception ex)
         {
-            FaultFromOwner(ex);
-            throw;
+            bodyFault = ex;
         }
+        if (bodyFault is not null)
+        {
+            FaultFromOwner(bodyFault);
+            _collectSource.TrySetException(bodyFault);
+            return;
+        }
+
+        var result = _current!;
+        DisposeRegistrations();
+        Finish(result);
         _consumerObservedCompletion = true;
+        var deliver = Volatile.Read(ref _coldState)?.TerminalException;
         if (deliver is not null)
-            throw deliver;
-        if (collectorFault is not null)
-            ExceptionDispatchInfo.Throw(collectorFault);
-        if (commandError is { } pgError && !IsOwnCancellation(pgError))
-            PgErrorException.Throw(pgError);
+            _collectSource.TrySetException(deliver);
+        else if (_collectorFault is { } collectorFault)
+            _collectSource.TrySetException(collectorFault);
+        else if (_collectError is { } pgError && !IsOwnCancellation(pgError))
+            _collectSource.TrySetException(PgErrorException.Create(pgError));
+        else
+            _collectSource.TrySetResult(true);
+    }
+
+    // The body owns the decoder from activation to the RFQ. It never publishes ResultReady, so no
+    // takeover can occur; latches are observed at the terminal, as LastAsync observes them.
+#if !NET11_0_OR_GREATER
+    [RuntimeAsyncMethodGeneration(false)]
+#endif
+    [AsyncMethodBuilder(typeof(PromiseAsyncValueTaskMethodBuilder))]
+    async ValueTask CollectBodyAsync()
+    {
+        CommandResult result;
+        if (!_options.Template.DescribeOnly
+            && _options.Template.Descriptor is { IsPrepared: true, PreparedRowDescription: not null })
+        {
+            var decoder = _decoder!;
+            if (_context.IsProtocolClosed)
+                throw _context.FlowTerminationException;
+            decoder.UseReadTimeout(_options.Template.Timeout);
+            PgError? error;
+            if (!decoder.TryMoveNext())
+            {
+                if (!await decoder.MoveNextAsync().ConfigureAwait(false))
+                    decoder.ThrowUnexpectedEof();
+            }
+            if (decoder.Current.EnsureExpectedOrError(PgTypes.BackendType.BindComplete) is { } bindError)
+            {
+                error = bindError;
+            }
+            else
+            {
+                if (!decoder.TryMoveNext())
+                {
+                    if (!await decoder.MoveNextAsync().ConfigureAwait(false))
+                        decoder.ThrowUnexpectedEof();
+                }
+                decoder.Current.DebugEnsureExpected(
+                    PgTypes.BackendType.DataRow, PgTypes.BackendType.CommandComplete);
+                error = null;
+            }
+            result = InitializeResult(error, null);
+        }
+        else
+        {
+            result = await ReadResultAsync().ConfigureAwait(false);
+        }
+        _current = result;
+
+        _collectorFault = await result.CollectRowsAsync(_collectState, _collector!).ConfigureAwait(false);
+        _collectError = result.Error;
+        if (_collectorFault is not null)
+        {
+            // Consume whatever the faulted collector left before the terminal.
+            await _context.GetProtocolStatic<CommandFlow.ReadState>().ResultMessageEnumerator
+                .DisposeAsync().ConfigureAwait(false);
+        }
+
+        // Exactly one ReadyForQuery follows the terminal (the command's own Sync or the appended one).
+        var rfqDecoder = _decoder!;
+        if (!rfqDecoder.TryMoveNext())
+        {
+            if (!await rfqDecoder.MoveNextAsync().ConfigureAwait(false))
+                rfqDecoder.ThrowUnexpectedEof();
+        }
+        if (rfqDecoder.Current.EnsureExpectedOrError(PgTypes.BackendType.ReadyForQuery) is { } rfqError)
+            PgErrorException.Throw(rfqError);
     }
 
 #if !NET11_0_OR_GREATER
@@ -957,7 +1034,14 @@ public sealed class ReaderDrivenCommandFlow : PgClientFlow, IValueTaskSource<boo
         _consumerObservedCompletion = false;
         _readySource.Reset();
         _pipelineTaskSource.Reset();
+        _collectSource.Reset();
         _coldState = null;
+        _collectState = null;
+        _collector = null;
+        _collectArmed = 0;
+        _collectStarted = 0;
+        _collectorFault = null;
+        _collectError = null;
         WaitForDrainOnDispose = true;
     }
 
@@ -966,10 +1050,26 @@ public sealed class ReaderDrivenCommandFlow : PgClientFlow, IValueTaskSource<boo
     void IValueTaskSource<bool>.OnCompleted(Action<object?> continuation, object? state, short token, ValueTaskSourceOnCompletedFlags flags)
         => _readySource.OnCompleted(continuation, state, token, flags);
 
-    void IValueTaskSource.GetResult(short token) => _pipelineTaskSource.GetResult(token);
-    ValueTaskSourceStatus IValueTaskSource.GetStatus(short token) => _pipelineTaskSource.GetStatus(token);
+    // Tokens with the collect flag address the collect completion (the ready source in collect mode);
+    // the rest address the pipeline task.
+    void IValueTaskSource.GetResult(short token)
+    {
+        if ((token & CollectTokenFlag) != 0)
+            _collectSource.GetResult((short)(token & ~CollectTokenFlag));
+        else
+            _pipelineTaskSource.GetResult(token);
+    }
+    ValueTaskSourceStatus IValueTaskSource.GetStatus(short token)
+        => (token & CollectTokenFlag) != 0
+            ? _collectSource.GetStatus((short)(token & ~CollectTokenFlag))
+            : _pipelineTaskSource.GetStatus(token);
     void IValueTaskSource.OnCompleted(Action<object?> continuation, object? state, short token, ValueTaskSourceOnCompletedFlags flags)
-        => _pipelineTaskSource.OnCompleted(continuation, state, token, flags);
+    {
+        if ((token & CollectTokenFlag) != 0)
+            _collectSource.OnCompleted(continuation, state, (short)(token & ~CollectTokenFlag), flags);
+        else
+            _pipelineTaskSource.OnCompleted(continuation, state, token, flags);
+    }
 
     public readonly struct Enumerator(ReaderDrivenCommandFlow flow) : IAsyncEnumerator<CommandResult>, IDisposable
     {
