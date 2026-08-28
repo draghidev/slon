@@ -1536,8 +1536,9 @@ public sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
                     : (null, 0);
             }
         }
+        // Full fence: the coordinator's activation skip-gate probes its intent flag after this store.
         internal void PublishCancellationActivation(PgClientFlow flow)
-            => Volatile.Write(ref protocol.FlowControl._cancellationActivatedFlow, flow);
+            => Interlocked.Exchange(ref protocol.FlowControl._cancellationActivatedFlow, flow);
         void SubstituteCancellationActivation(PgClientFlow from, PgClientFlow to)
             => Interlocked.CompareExchange(
                 ref protocol.FlowControl._cancellationActivatedFlow, to, from);

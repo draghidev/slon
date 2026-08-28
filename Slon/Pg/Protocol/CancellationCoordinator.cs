@@ -122,6 +122,10 @@ sealed class CancellationCoordinator<TOwner> : IDisposable
 
     internal ValueTask WaitForCancellationAttempt()
     {
+        // The common case has no sender in flight. A dispatch that starts after this read would also
+        // start after the locked read; the lock added no ordering for this caller.
+        if (Volatile.Read(ref _activeDispatch) is null)
+            return default;
         lock (_lock)
             return _activeDispatch is { } lease
                 ? lease.WaitForCompletion(_abortToken)
@@ -328,7 +332,14 @@ sealed class CancellationCoordinator<TOwner> : IDisposable
     }
 
     internal void OnOwnerActivated()
-        => TryDispatchNextCancellation();
+    {
+        // Skip-gate: the intent side publishes its flag with a full fence before probing the
+        // activation owner, and the activation side publishes the owner with a full fence before
+        // probing this flag, so at least one side observes the other.
+        if (!Volatile.Read(ref _hasCancellationIntents))
+            return;
+        TryDispatchNextCancellation();
+    }
 
     void StartDispatch(DispatchLease lease)
     {
