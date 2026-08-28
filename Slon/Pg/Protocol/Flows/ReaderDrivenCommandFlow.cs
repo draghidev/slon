@@ -359,9 +359,7 @@ public sealed class ReaderDrivenCommandFlow : PgClientFlow, IValueTaskSource<boo
 
     // The body owns the decoder from activation to the RFQ. It never publishes ResultReady, so no
     // takeover can occur; latches are observed at the terminal, as LastAsync observes them.
-#if !NET11_0_OR_GREATER
     [RuntimeAsyncMethodGeneration(false)]
-#endif
     [AsyncMethodBuilder(typeof(PromiseAsyncValueTaskMethodBuilder))]
     async ValueTask CollectBodyAsync()
     {
