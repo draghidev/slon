@@ -56,8 +56,8 @@ partial class CommandFlow
         BackendMessage IEnumerator<BackendMessage>.Current => _messageEnumerator.Current;
         object? IEnumerator.Current => ((IEnumerator)_messageEnumerator).Current;
 
-        public void Initialize(CommandFlow flow, PgDecoder decoder)
-            => _messageEnumerator.Initialize(flow, decoder);
+        public void Initialize(in Command command, PgDecoder decoder)
+            => _messageEnumerator.Initialize(command, decoder);
 
         public void Reset() => _messageEnumerator.Reset();
 
@@ -66,15 +66,16 @@ partial class CommandFlow
 
         sealed class MessageEnumerator : IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMessage>
         {
-            CommandFlow _flow = null!;
+            // Completion needs only these two command facts. Retaining them keeps the protocol-static
+            // enumerator independent of the flow and avoids holding a reference-bearing command copy.
+            bool _describeOnly;
+            bool _withSync;
             PgDecoder _decoder = null!;
             bool _disposed;
             bool _first;
             bool _done;
             ExceptionDispatchInfo? _exceptionDispatchInfo;
             (PgError, TransactionStatus)? _completeError;
-
-            Command Command => _flow._commands[_flow._commandIndex];
 
             // An Execute response consists of DataRow messages followed by one terminal message.
             [Conditional("DEBUG")]
@@ -197,7 +198,7 @@ partial class CommandFlow
                     {
                         while (decoder.GetNext().Header.Type is PgTypes.BackendType.DataRow) {}
                     }
-                    _completeError = Command.Complete(_decoder);
+                    _completeError = CommandExtensions.Complete(_describeOnly, _withSync, _decoder);
                 }
                 catch (Exception ex)
                 {
@@ -224,7 +225,7 @@ partial class CommandFlow
                     if (decoder.TryGetCurrent(out var current)
                         && current.Header.Type is not PgTypes.BackendType.DataRow)
                     {
-                        var completion = Command.CompleteAsync(decoder);
+                        var completion = CommandExtensions.CompleteAsync(_describeOnly, _withSync, decoder);
                         if (completion.IsCompletedSuccessfully)
                         {
                             _completeError = completion.Result;
@@ -270,7 +271,7 @@ partial class CommandFlow
                             if (message.Header.Type is not PgTypes.BackendType.DataRow)
                                 break;
                         }
-                        _completeError = await Command.CompleteAsync(decoder).ConfigureAwait(false);
+                        _completeError = await CommandExtensions.CompleteAsync(_describeOnly, _withSync, decoder).ConfigureAwait(false);
                     }
                     catch (Exception ex)
                     {
@@ -280,10 +281,10 @@ partial class CommandFlow
                 }
             }
 
-            public void Initialize(CommandFlow flow, PgDecoder decoder)
+            public void Initialize(in Command command, PgDecoder decoder)
             {
-                if (!ReferenceEquals(_flow, flow))
-                    _flow = flow;
+                _describeOnly = command.DescribeOnly;
+                _withSync = command.WithSync;
                 if (!ReferenceEquals(_decoder, decoder))
                     _decoder = decoder;
 
@@ -292,13 +293,14 @@ partial class CommandFlow
                 _completeError = null;
 
                 // A command is immediately done if we haven't submitted an execute.
-                _done = Command.DescribeOnly;
+                _done = _describeOnly;
                 _first = !_done;
             }
 
             public void Reset()
             {
-                _flow = null!;
+                _describeOnly = false;
+                _withSync = false;
                 _decoder = null!;
                 _exceptionDispatchInfo = null;
                 _completeError = null;

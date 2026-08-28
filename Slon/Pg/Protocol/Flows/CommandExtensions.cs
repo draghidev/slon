@@ -533,9 +533,14 @@ public static class CommandExtensions
     /// If more commands before the next Sync are expected these would be discarded and absent from the message stream.
     /// In case of an error inside an explicit transaction block all commands until rollback are affected.
     public static (PgError, TransactionStatus)? Complete(this in Command command, PgDecoder decoder)
+        => Complete(command.DescribeOnly, command.WithSync, decoder);
+
+    // Completion depends only on whether an Execute was written and whether a Sync follows it, so a
+    // reader can retain those two facts instead of the command.
+    internal static (PgError, TransactionStatus)? Complete(bool describeOnly, bool withSync, PgDecoder decoder)
     {
         PgError? errorMessage = null;
-        if (!command.DescribeOnly)
+        if (!describeOnly)
         {
             // https://www.postgresql.org/docs/current/protocol-flow.html#PROTOCOL-FLOW-EXT-QUERY
             // "Therefore, an Execute phase is always terminated by the appearance of exactly one of these messages:
@@ -544,7 +549,7 @@ public static class CommandExtensions
                 PgTypes.BackendType.CommandComplete, PgTypes.BackendType.EmptyQueryResponse, PgTypes.BackendType.PortalSuspended);
         }
 
-        if (!command.WithSync)
+        if (!withSync)
             return errorMessage is not null ? (errorMessage, TransactionStatus.Unknown) : null;
 
         // Reading the following RFQ may retire the batch which owns the ErrorResponse body.
@@ -565,9 +570,12 @@ public static class CommandExtensions
     /// If more commands before the next Sync are expected these would be discarded and absent from the message stream.
     /// In case of an error inside an explicit transaction block all commands until rollback are affected.
     public static ValueTask<(PgError, TransactionStatus)?> CompleteAsync(this in Command command, PgDecoder decoder)
+        => CompleteAsync(command.DescribeOnly, command.WithSync, decoder);
+
+    internal static ValueTask<(PgError, TransactionStatus)?> CompleteAsync(bool describeOnly, bool withSync, PgDecoder decoder)
     {
         PgError? errorMessage = null;
-        if (!command.DescribeOnly)
+        if (!describeOnly)
         {
             // https://www.postgresql.org/docs/current/protocol-flow.html#PROTOCOL-FLOW-EXT-QUERY
             // "Therefore, an Execute phase is always terminated by the appearance of exactly one of these messages:
@@ -576,7 +584,7 @@ public static class CommandExtensions
                 PgTypes.BackendType.CommandComplete, PgTypes.BackendType.EmptyQueryResponse, PgTypes.BackendType.PortalSuspended);
         }
 
-        if (!command.WithSync)
+        if (!withSync)
             return errorMessage is not null ? new((errorMessage, TransactionStatus.Unknown)) : new(result: null);
 
         // Reading the following RFQ may retire the batch which owns the ErrorResponse body.
