@@ -167,7 +167,7 @@ public sealed class ReaderDrivenCommandFlow : PgClientFlow, IValueTaskSource<boo
             // Collect mode: the body starts on this wake. Off the executor strand it runs inline, as
             // the parked consumer frame did; on the strand it is deferred the same way.
             if (onExecutorStrand)
-                ThreadPool.UnsafeQueueUserWorkItem(static state => ((ReaderDrivenCommandFlow)state!).TryStartCollectBody(), this, preferLocal: true);
+                _context.SubmitDetached(static state => ((ReaderDrivenCommandFlow)state!).TryStartCollectBody(), this);
             else
                 TryStartCollectBody();
             return;

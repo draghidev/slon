@@ -1577,6 +1577,10 @@ public sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
             }
         }
         // Full fence: the coordinator's activation skip-gate probes its intent flag after this store.
+        // Runs a flow-side continuation off the executor strand on the activation scheduler, the
+        // same place an activation wake runs.
+        internal void SubmitDetached(Action<object?> action, object? state)
+            => protocol._activationScheduler.SubmitDetached(action, state, preferLocal: true);
         internal void PublishCancellationActivation(PgClientFlow flow)
             => Interlocked.Exchange(ref protocol.FlowControl._cancellationActivatedFlow, flow);
         void SubstituteCancellationActivation(PgClientFlow from, PgClientFlow to)
