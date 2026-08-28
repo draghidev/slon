@@ -65,7 +65,7 @@ internal sealed class RawSlonProtocolPool : IAsyncDisposable
         }
     }
 
-    internal async ValueTask<List<T>> LoadAsync<T>(
+    public async ValueTask<List<T>> LoadAsync<T>(
         Func<int, string, T> create,
         CancellationToken cancellationToken)
     {
@@ -110,10 +110,17 @@ internal sealed class RawSlonProtocolPool : IAsyncDisposable
         {
             DescribeOnly = true,
             DescribeForPreparation = true,
+            WithSync = true,
         };
         var flow = protocol.Queue(new CommandFlow(async: true, command));
         await foreach (var result in flow)
-            return Command.Create(result.GetMetadata().ToPreparedDescriptor());
+        {
+            var metadata = result.GetMetadata();
+            return Command.Create(CommandDescriptor.CreatePrepared(
+                metadata.CommandName,
+                metadata.ParameterTypes.Preserve(),
+                metadata.RowDescription?.Preserve()));
+        }
         throw new InvalidOperationException("PostgreSQL preparation returned no command result.");
     }
 

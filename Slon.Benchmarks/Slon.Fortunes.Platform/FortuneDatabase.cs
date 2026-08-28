@@ -28,9 +28,10 @@ internal abstract class FortuneDatabase : IAsyncDisposable
 
         return (selectedDatabase, selectedDriver) switch
         {
-            ("postgresql", "slon") => SlonFortuneDatabase.CreateAsync(
+            ("postgresql", "slon") => CreateSlonAsync(
                 requiredConnectionString,
-                connectionCount),
+                connectionCount,
+                Environment.GetEnvironmentVariable("SLON_POOL_MODE")),
             ("postgresql", "npgsql") =>
                 ValueTask.FromResult<FortuneDatabase>(
                     new NpgsqlFortuneDatabase(requiredConnectionString, connectionCount)),
@@ -69,31 +70,57 @@ internal abstract class FortuneDatabase : IAsyncDisposable
         string.IsNullOrWhiteSpace(value)
             ? throw new InvalidOperationException($"{name} is required.")
             : value.Trim().ToLowerInvariant();
+
+    static ValueTask<FortuneDatabase> CreateSlonAsync(
+        string connectionString, int connectionCount, string? configuredMode)
+    {
+        var mode = string.IsNullOrWhiteSpace(configuredMode)
+            ? "raw"
+            : configuredMode.Trim().ToLowerInvariant();
+        Console.WriteLine($"Slon pool mode: {mode}.");
+        return mode switch
+        {
+            "raw" => RawSlonFortuneDatabase.CreateAsync(connectionString, connectionCount),
+            "connection" => ConnectionSlonFortuneDatabase.CreateAsync(connectionString, connectionCount),
+            _ => throw new ArgumentOutOfRangeException(
+                "SLON_POOL_MODE", configuredMode, "Expected 'raw' or 'connection'."),
+        };
+    }
 }
 
-internal sealed class SlonFortuneDatabase : FortuneDatabase
+internal sealed class RawSlonFortuneDatabase(RawSlonProtocolPool pool) : FortuneDatabase
 {
-    private readonly RawSlonProtocolPool _pool;
-
-    private SlonFortuneDatabase(RawSlonProtocolPool pool) => _pool = pool;
-
     public static async ValueTask<FortuneDatabase> CreateAsync(
-        string connectionString,
-        int connectionCount)
-    {
-        return new SlonFortuneDatabase(await RawSlonProtocolPool.CreateAsync(
+        string connectionString, int connectionCount)
+        => new RawSlonFortuneDatabase(await RawSlonProtocolPool.CreateAsync(
             connectionString, connectionCount).ConfigureAwait(false));
-    }
 
     public override async ValueTask<List<Fortune>> LoadAsync(
         CancellationToken cancellationToken)
     {
-        var fortunes = await _pool.LoadAsync(
+        var fortunes = await pool.LoadAsync(
             static (id, message) => new Fortune(id, message), cancellationToken).ConfigureAwait(false);
         return Complete(fortunes);
     }
 
-    public override ValueTask DisposeAsync() => _pool.DisposeAsync();
+    public override ValueTask DisposeAsync() => pool.DisposeAsync();
+}
+
+internal sealed class ConnectionSlonFortuneDatabase(FullSlonConnectionPool pool) : FortuneDatabase
+{
+    public static async ValueTask<FortuneDatabase> CreateAsync(
+        string connectionString, int connectionCount)
+        => new ConnectionSlonFortuneDatabase(await FullSlonConnectionPool.CreateAsync(
+            connectionString, connectionCount).ConfigureAwait(false));
+
+    public override async ValueTask<List<Fortune>> LoadAsync(CancellationToken cancellationToken)
+    {
+        var fortunes = await pool.LoadAsync(
+            static (id, message) => new Fortune(id, message), cancellationToken).ConfigureAwait(false);
+        return Complete(fortunes);
+    }
+
+    public override ValueTask DisposeAsync() => pool.DisposeAsync();
 }
 
 internal sealed class NpgsqlFortuneDatabase : FortuneDatabase

@@ -6,12 +6,13 @@
     <Nullable>enable</Nullable>
     <IsPackable>false</IsPackable>
     <DefineConstants>$(DefineConstants);DATABASE</DefineConstants>
-    <NoWarn>$(NoWarn);SLONPG001</NoWarn>
+    <NoWarn>$(NoWarn);SLONPG001;SLONPOOL001</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>
     <ProjectReference Include="../../Slon/Slon.csproj" />
     <Compile Include="../Shared/RawSlonProtocolPool.cs" Link="RawSlonProtocolPool.cs" />
+    <Compile Include="../Shared/FullSlonConnectionPool.cs" Link="FullSlonConnectionPool.cs" />
   </ItemGroup>
 
   <ItemGroup>
