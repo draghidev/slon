@@ -1313,6 +1313,11 @@ public sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
             if (pipelineTaskRecovery)
                 return ExecutePipelineTaskRecovery(_control, item, cancellationToken);
 
+#if NET11_0_OR_GREATER
+            // Runtime async: a synchronous completion allocates nothing and a suspension is a runtime
+            // continuation, so the pooled promise has nothing left to save.
+            return ExecuteCore(_control, item, cancellationToken);
+#else
             PromiseAsyncValueTaskMethodBuilder<PipelineItemResult>.Promise = _promise;
             try
             {
@@ -1322,9 +1327,12 @@ public sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
             {
                 PromiseAsyncValueTaskMethodBuilder<PipelineItemResult>.Promise = null;
             }
+#endif
 
+#if !NET11_0_OR_GREATER
             [RuntimeAsyncMethodGeneration(false)]
             [AsyncMethodBuilder(typeof(PromiseAsyncValueTaskMethodBuilder<>))]
+#endif
             static async ValueTask<PipelineItemResult> ExecuteCore(
                 Control control, PgClientFlow item, CancellationToken cancellationToken)
             {
