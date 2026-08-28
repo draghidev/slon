@@ -12,6 +12,25 @@ public static class CommandExtensions
     public static bool IsSimple(this in Command command) =>
         command.PreferSimple && command.WithSync && !command.DescribeOnly && !command.Descriptor.IsPrepared && command.Descriptor.ParameterTypes.Count is 0;
 
+    // Single-command entry for the reader-driven flow. A prepared command without parameters or
+    // result formats writes from the caller's storage as one reserved span, the same message
+    // sequence as WriteBind + CompletePreparedWrite + the appended Sync. Anything else composes the
+    // general list writer.
+    internal static ValueTask WriteCommandAsync(this in Command command, PgEncoder encoder, bool appendSync,
+        CancellationToken cancellationToken = default)
+    {
+        var descriptor = command.Descriptor;
+        if (!descriptor.IsPrepared || command.Parameters.Count is not 0
+            || descriptor.ParameterTypes.Count is not 0 || command.ResultFormats.Length is not 0)
+            return new CommandList(command).WriteCommandsAsync(encoder, appendSync, cancellationToken);
+
+        encoder.WritePreparedExecution(descriptor.CommandName,
+            describe: command.DescribeOnly || descriptor.PreparedRowDescription is null,
+            execute: !command.DescribeOnly,
+            syncCount: (command.WithSync ? 1 : 0) + (appendSync ? 1 : 0));
+        return encoder.FlushAsync(cancellationToken);
+    }
+
     // Sync/async pair at the command-list (full composition) level. No *Auto wrapper here.
     // Callers picking sync vs async make that choice once at this level rather than threading
     // a mode flag through every encoder helper underneath. Keeping the list loop in this state

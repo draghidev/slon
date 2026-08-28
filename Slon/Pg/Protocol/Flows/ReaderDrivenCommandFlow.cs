@@ -105,7 +105,7 @@ public sealed class ReaderDrivenCommandFlow : PgClientFlow, IValueTaskSource<boo
             _readFlowRfq = appendSync;
             // Caller cancellation never cancels wire I/O. The consumer observes the latched intent and
             // drains its command to RFQ instead.
-            writeTask = new CommandList(command).WriteCommandsAsync(context.GetEncoder(), appendSync, default);
+            writeTask = command.WriteCommandAsync(context.GetEncoder(), appendSync, default);
             // Observe synchronous faults here; pending writes remain the framework-owned trailing task.
             if (writeTask.IsCompleted)
                 writeTask.GetAwaiter().GetResult();
