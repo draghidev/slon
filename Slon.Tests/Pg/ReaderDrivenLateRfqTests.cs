@@ -59,6 +59,23 @@ public class ReaderDrivenLateRfqTests
         await PgTestPool.RunAsync(protocol, "select 1");
     }
 
+    [ConnectionCreatingTestMethod]
+    public async Task Collect_LateRfq_CompletesTheDrain()
+    {
+        var (protocol, transport) = await NewLateRfqProtocolAsync();
+        await using var _ = protocol;
+        var descriptor = await Prepare(protocol, "select 1", "late_rfq_collect");
+
+        var values = new List<int>();
+        await protocol.Queue(new ReaderDrivenCommandFlow(Command.Create(descriptor)))
+            .CollectAsync(values, static (state, row) => ((List<int>)state!).Add(row.GetValue<int>(0)))
+            .AsTask().WaitAsync(Patience);
+
+        CollectionAssert.AreEqual(new[] { 1 }, values);
+        Assert.IsGreaterThan(0, transport.SplitCount);
+        await PgTestPool.RunAsync(protocol, "select 1");
+    }
+
     // Forwards the inner transport's reads, holding back a trailing ReadyForQuery so it arrives on a
     // separate read that completes after the consumer already parked on it.
     sealed class LateRfqTransport : TransportConnection

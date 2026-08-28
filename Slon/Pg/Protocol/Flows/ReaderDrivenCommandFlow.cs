@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
+using System.Runtime.ExceptionServices;
 using System.Threading.Tasks.Sources;
 using Slon.Runtime.CompilerServices;
 
@@ -228,6 +229,99 @@ public sealed class ReaderDrivenCommandFlow : PgClientFlow, IValueTaskSource<boo
     {
         await WaitForCompletionAsync().ConfigureAwait(false);
         throw Volatile.Read(ref _coldState)?.TerminalException ?? ThrowHelper.ThrowInvalidOperation("The flow was disposed.");
+    }
+
+    /// Reads the whole response on the caller's frame, invoking the collector synchronously for each
+    /// row, and completes once the wire reached this command's ReadyForQuery. The row is the shared
+    /// protocol-static row: the collector must consume it before returning and must not retain it,
+    /// its reader, or any field view. A collector exception ends the callbacks; the command is still
+    /// drained to its boundary and the exception is then delivered here. A command error is
+    /// delivered as PgErrorException. Cancellation and close follow the enumerating consumer's rules.
+    /// The flow must not have been enumerated.
+    public ValueTask CollectAsync(object? state, Action<object?, Row> collector,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(collector);
+        if (cancellationToken.IsCancellationRequested)
+        {
+            RequestCancel(cancellationToken);
+            return ValueTask.FromException(new OperationCanceledException(cancellationToken));
+        }
+        if (Interlocked.CompareExchange(ref _phase, PhaseReading, PhaseInitial) != PhaseInitial)
+            return ValueTask.FromException(
+                ThrowHelper.ThrowInvalidOperation("Collection requires a flow that has not been read."));
+        return CollectCoreAsync(state, collector, cancellationToken);
+    }
+
+    // The single frame owns the decoder from activation to RFQ, so no idle state is ever published
+    // and no takeover can occur. Latches are observed at the terminal, as LastAsync observes them.
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
+    async ValueTask CollectCoreAsync(object? state, Action<object?, Row> collector, CancellationToken cancellationToken)
+    {
+        Exception? collectorFault;
+        PgError? commandError;
+        Exception? deliver;
+        try
+        {
+            await new ValueTask<bool>(this, _readySource.Version).ConfigureAwait(false);
+            _consumerDetached = false;
+            RegisterCancellation(cancellationToken);
+            CommandResult result;
+            if (!_options.Template.DescribeOnly
+                && _options.Template.Descriptor is { IsPrepared: true, PreparedRowDescription: not null })
+            {
+                var decoder = _decoder!;
+                if (_context.IsProtocolClosed)
+                    throw _context.FlowTerminationException;
+                decoder.UseReadTimeout(_options.Template.Timeout);
+                PgError? error;
+                if (!decoder.TryMoveNext())
+                {
+                    if (!await decoder.MoveNextAsync().ConfigureAwait(false))
+                        decoder.ThrowUnexpectedEof();
+                }
+                if (decoder.Current.EnsureExpectedOrError(PgTypes.BackendType.BindComplete) is { } bindError)
+                {
+                    error = bindError;
+                }
+                else
+                {
+                    if (!decoder.TryMoveNext())
+                    {
+                        if (!await decoder.MoveNextAsync().ConfigureAwait(false))
+                            decoder.ThrowUnexpectedEof();
+                    }
+                    decoder.Current.DebugEnsureExpected(
+                        PgTypes.BackendType.DataRow, PgTypes.BackendType.CommandComplete);
+                    error = null;
+                }
+                result = InitializeResult(error, null);
+            }
+            else
+            {
+                result = await ReadResultAsync().ConfigureAwait(false);
+            }
+            _current = result;
+
+            collectorFault = await result.CollectRowsAsync(state, collector).ConfigureAwait(false);
+            commandError = result.Error;
+            // Consumes whatever a faulted collector left, reads RFQ, resets the shared read state
+            // and completes the pipeline task.
+            await DrainCoreAsync(result).ConfigureAwait(false);
+            deliver = Volatile.Read(ref _coldState)?.TerminalException;
+        }
+        catch (Exception ex)
+        {
+            FaultFromOwner(ex);
+            throw;
+        }
+        _consumerObservedCompletion = true;
+        if (deliver is not null)
+            throw deliver;
+        if (collectorFault is not null)
+            ExceptionDispatchInfo.Throw(collectorFault);
+        if (commandError is { } pgError && !IsOwnCancellation(pgError))
+            PgErrorException.Throw(pgError);
     }
 
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]

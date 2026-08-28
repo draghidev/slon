@@ -318,6 +318,70 @@ public sealed class CommandResult
     CommandFlow.MoveNextStatus TryMoveNextMessage() => _messageEnumerator.TryMoveNext();
     ValueTask<bool> MoveNextMessageAsync() => _messageEnumerator.MoveNextAsync();
 
+    // Consumes this result's rows on the caller's frame, invoking the collector synchronously for
+    // each buffered row. Already-buffered rows cost no awaitable. The collector's first exception
+    // ends the callbacks and is returned; the remaining rows are left for the flow's drain. Reaches
+    // the command's terminal message and records it, as row enumeration does.
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
+    internal async ValueTask<Exception?> CollectRowsAsync(object? state, Action<object?, Row> collector)
+    {
+        Row? row = null;
+        while (true)
+        {
+            if (row is { HasColumnLease: true })
+                await row.RevokeColumnLeaseAsync().ConfigureAwait(false);
+
+            var status = TryMoveNextMessage();
+            if (status is CommandFlow.MoveNextStatus.RequiresInput)
+            {
+                if (!await MoveNextMessageAsync().ConfigureAwait(false))
+                    status = CommandFlow.MoveNextStatus.EndOfSequence;
+                else
+                    status = CommandFlow.MoveNextStatus.Moved;
+            }
+            if (status is CommandFlow.MoveNextStatus.EndOfSequence)
+            {
+                if (_requestedExecution && _commandCompleteMessage is null && _errorMessage is null)
+                    ThrowHelper.ThrowInvalidOperation("Underlying message enumerator completed before CommandComplete was returned.");
+                return null;
+            }
+
+            var current = GetCurrentMessage();
+            if (current.Header.Type is not PgTypes.BackendType.DataRow)
+            {
+                switch (current.Header.Type)
+                {
+                    case PgTypes.BackendType.EmptyQueryResponse:
+                    case PgTypes.BackendType.CommandComplete:
+                    case PgTypes.BackendType.ErrorResponse:
+                        CompleteCommand(current);
+                        return null;
+                    default:
+                        ThrowHelper.ThrowUnhandledCase(current.Header.Type);
+                        return null;
+                }
+            }
+
+            if (!current.Buffered)
+            {
+                await current.BufferBodyAsync(default).ConfigureAwait(false);
+                current = GetCurrentMessage();
+            }
+            row ??= GetRow();
+            row.InitializeRow(current);
+            try
+            {
+                collector(state, row);
+            }
+            catch (Exception exception)
+            {
+                if (row.HasColumnLease)
+                    await row.RevokeColumnLeaseAsync().ConfigureAwait(false);
+                return exception;
+            }
+        }
+    }
+
     public struct RowEnumerator : IEnumerator<Row>, IAsyncEnumerator<Row>
     {
         readonly CommandResult? _instance;
