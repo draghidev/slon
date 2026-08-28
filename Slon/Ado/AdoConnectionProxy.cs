@@ -130,4 +130,11 @@ sealed class AdoConnectionProxy
         }
     }
 
+    internal void AbandonExclusiveScope()
+    {
+        var scope = _exclusiveScope;
+        _exclusiveScope = null;
+        scope?.Abandon();
+    }
+
 }

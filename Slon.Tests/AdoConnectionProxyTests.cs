@@ -1,4 +1,5 @@
 using Slon.Pg;
+using Slon.Pg.Protocol;
 using Slon.Pg.Protocol.Flows;
 using Slon.Pooling;
 using Slon.Tests.Pg;
@@ -68,6 +69,28 @@ public class AdoConnectionProxyTests : ConnectionCreatingTest
         var pg = (await pool.GetUnqualifiedAsync(default)).Transfer();
         var proxy = WrapInProxy(pg);
         await RunAsyncOn(proxy, "select 1");
+    }
+
+    [TestMethod]
+    public async Task AbandonedQueuedExclusiveScope_RetiresBeforeSuccessor()
+    {
+        await using var dataSource = AdoTestPool.NewIsolatedDataSource(options => options with
+        {
+            PoolSize = 1,
+        });
+        var holder = await dataSource.GetProxyAsync(
+            TimeSpan.FromSeconds(5), CancellationToken.None, SlonConnectionOptions.None);
+        var abandoned = new AdoConnectionProxy(dataSource);
+        Assert.IsTrue(abandoned.TryStartExclusiveScope(
+            holder.PgConnection, async: true, FlowEnqueueOptions.None));
+
+        abandoned.AbandonExclusiveScope();
+        await holder.ReleaseExclusiveScopeAsync();
+
+        var successor = await dataSource.GetProxyAsync(
+            TimeSpan.FromSeconds(5), CancellationToken.None, SlonConnectionOptions.None);
+        await RunAsyncOn(successor, "select 1");
+        await successor.ReleaseExclusiveScopeAsync();
     }
 
     [TestMethod]

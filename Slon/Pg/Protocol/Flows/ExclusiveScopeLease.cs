@@ -45,6 +45,12 @@ sealed class ExclusiveScopeLease
         return _flow.CompleteScopeAsync(_tenure);
     }
 
+    internal void Abandon()
+    {
+        if (Interlocked.Exchange(ref _released, 1) is 0)
+            _flow.Abandon(_tenure);
+    }
+
     void EnsureActive()
     {
         if (Volatile.Read(ref _released) is not 0)

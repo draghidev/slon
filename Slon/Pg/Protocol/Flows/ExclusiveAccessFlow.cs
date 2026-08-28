@@ -123,6 +123,12 @@ sealed class ExclusiveAccessFlow : PgClientFlow
         cancellationToken.ThrowIfCancellationRequested();
     }
 
+    internal void Abandon(long tenure)
+    {
+        if (tenure == Volatile.Read(ref _tenure))
+            _consumerGone.TrySetResult();
+    }
+
     internal void WaitForHandoffSynchronously(long tenure)
     {
         EnsureTenure(tenure);

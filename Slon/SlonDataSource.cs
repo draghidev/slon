@@ -300,10 +300,18 @@ public sealed partial class SlonDataSource : DbDataSource
     {
         EnsureInitialized(timeout);
         var proxy = new AdoConnectionProxy(this);
-        _connectionPool.Get(static (candidate, state) => TryStartExclusiveScope(candidate, state),
-            (Proxy: proxy, Async: false, Options: options), timeout);
-        proxy.AcquireExclusiveScope();
-        return proxy;
+        try
+        {
+            _connectionPool.Get(static (candidate, state) => TryStartExclusiveScope(candidate, state),
+                (Proxy: proxy, Async: false, Options: options), timeout);
+            proxy.AcquireExclusiveScope();
+            return proxy;
+        }
+        catch
+        {
+            proxy.AbandonExclusiveScope();
+            throw;
+        }
     }
 
     internal async ValueTask<AdoConnectionProxy> GetProxyAsync(
@@ -311,10 +319,18 @@ public sealed partial class SlonDataSource : DbDataSource
     {
         await EnsureInitializedAsync(timeout, cancellationToken).ConfigureAwait(false);
         var proxy = new AdoConnectionProxy(this);
-        await _connectionPool.GetAsync(static (candidate, state) => TryStartExclusiveScope(candidate, state),
-            (Proxy: proxy, Async: true, Options: options), timeout, cancellationToken).ConfigureAwait(false);
-        await proxy.AcquireExclusiveScopeAsync(cancellationToken).ConfigureAwait(false);
-        return proxy;
+        try
+        {
+            await _connectionPool.GetAsync(static (candidate, state) => TryStartExclusiveScope(candidate, state),
+                (Proxy: proxy, Async: true, Options: options), timeout, cancellationToken).ConfigureAwait(false);
+            await proxy.AcquireExclusiveScopeAsync(cancellationToken).ConfigureAwait(false);
+            return proxy;
+        }
+        catch
+        {
+            proxy.AbandonExclusiveScope();
+            throw;
+        }
     }
 
     static bool TryStartExclusiveScope(ConnectionCandidate<PgConnection> candidate,
