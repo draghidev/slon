@@ -43,7 +43,7 @@ public sealed class CommandResult
         if (!ReferenceEquals(_flow, flow))
             _flow = flow;
         _index = index;
-        _descriptor = descriptor;
+        CommandDescriptor.WriteGranularly(ref _descriptor, in descriptor);
 
         // If the command wasn't redescribed, and the prepared description is valid use it instead.
         var rowDescription = requestedRowDescription;
@@ -343,7 +343,7 @@ public sealed class CommandResult
         var currentIsPending = false;
         while (true)
         {
-            var step = CollectBufferedRows(state, collector, currentIsPending, out var fault);
+            var step = CollectBufferedRows(state, collector, currentIsPending);
             currentIsPending = false;
             switch (step)
             {
@@ -352,6 +352,8 @@ public sealed class CommandResult
                 case CollectStep.Faulted:
                     if (_row.HasColumnLease)
                         await _row.RevokeColumnLeaseAsync().ConfigureAwait(false);
+                    var fault = _collectorFault;
+                    _collectorFault = null;
                     return fault;
                 case CollectStep.RequiresLeaseRevoke:
                     await _row.RevokeColumnLeaseAsync().ConfigureAwait(false);
@@ -376,10 +378,12 @@ public sealed class CommandResult
 
     // The synchronous half of collection. currentIsPending: the caller already moved to a message
     // (after a read or a body buffering) that this loop must process before moving again.
-    CollectStep CollectBufferedRows(object? state, Action<object?, Row> collector, bool currentIsPending,
-        out Exception? fault)
+    // The collector's exception lives on the result rather than in the async frame: an out or
+    // hoisted local would be a heap store on every synchronous pass.
+    Exception? _collectorFault;
+
+    CollectStep CollectBufferedRows(object? state, Action<object?, Row> collector, bool currentIsPending)
     {
-        fault = null;
         var row = _row;
         while (true)
         {
@@ -424,7 +428,7 @@ public sealed class CommandResult
             }
             catch (Exception exception)
             {
-                fault = exception;
+                _collectorFault = exception;
                 return CollectStep.Faulted;
             }
         }

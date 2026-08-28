@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using System.Collections;
 using System.Collections.Immutable;
 using System.Diagnostics;
@@ -15,6 +16,15 @@ public readonly struct ParameterTypeList : IEquatable<ParameterTypeList>
     readonly object _source;
     readonly ParameterWriter? _writer;
     readonly int _count;
+
+    internal static void WriteGranularly(ref ParameterTypeList destination, in ParameterTypeList value)
+    {
+        if (!ReferenceEquals(destination._source, value._source))
+            Unsafe.AsRef(in destination._source) = value._source;
+        if (!ReferenceEquals(destination._writer, value._writer))
+            Unsafe.AsRef(in destination._writer) = value._writer;
+        Unsafe.AsRef(in destination._count) = value._count;
+    }
 
     public ParameterTypeList(ImmutableArray<PgTypeId> typeIds)
     {

@@ -12,6 +12,12 @@ public readonly struct EncodedCString
 {
     readonly Core? _core;
 
+    internal static void WriteGranularly(ref EncodedCString destination, in EncodedCString value)
+    {
+        if (!ReferenceEquals(destination._core, value._core))
+            Unsafe.AsRef(in destination._core) = value._core;
+    }
+
     public EncodedCString(string value)
     {
         ArgumentNullException.ThrowIfNull(value);

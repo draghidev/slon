@@ -12,6 +12,16 @@ public readonly struct CommandDescriptor
     readonly EncodedCString _commandName;
     readonly ParameterTypeList _parameterTypes;
 
+    // Stores only the references that changed: a result is re-initialized with the same descriptor
+    // on every execution of a prepared command.
+    internal static void WriteGranularly(ref CommandDescriptor destination, in CommandDescriptor value)
+    {
+        if (!ReferenceEquals(destination._rowDescriptionOrCommandText, value._rowDescriptionOrCommandText))
+            Unsafe.AsRef(in destination._rowDescriptionOrCommandText) = value._rowDescriptionOrCommandText;
+        EncodedCString.WriteGranularly(ref Unsafe.AsRef(in destination._commandName), in value._commandName);
+        ParameterTypeList.WriteGranularly(ref Unsafe.AsRef(in destination._parameterTypes), in value._parameterTypes);
+    }
+
     CommandDescriptor(EncodedCString commandName, ParameterTypeList parameterTypes, RowDescription? rowDescription)
     {
         Debug.Assert(Unsafe.SizeOf<CommandDescriptor>() <= 40);

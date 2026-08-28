@@ -26,11 +26,11 @@ static class GranularWrites
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static void Write(ref ReadOnlySequence<byte> destination, in ReadOnlySequence<byte> value)
+    public static void Write<T>(ref ReadOnlySequence<T> destination, in ReadOnlySequence<T> value)
     {
-        Debug.Assert(Unsafe.SizeOf<ReadOnlySequence<byte>>() == Unsafe.SizeOf<SequenceLayout>());
-        ref var target = ref Unsafe.As<ReadOnlySequence<byte>, SequenceLayout>(ref destination);
-        ref readonly var source = ref Unsafe.As<ReadOnlySequence<byte>, SequenceLayout>(ref Unsafe.AsRef(in value));
+        Debug.Assert(Unsafe.SizeOf<ReadOnlySequence<T>>() == Unsafe.SizeOf<SequenceLayout>());
+        ref var target = ref Unsafe.As<ReadOnlySequence<T>, SequenceLayout>(ref destination);
+        ref readonly var source = ref Unsafe.As<ReadOnlySequence<T>, SequenceLayout>(ref Unsafe.AsRef(in value));
         if (!ReferenceEquals(target.StartObject, source.StartObject))
             target.StartObject = source.StartObject;
         if (!ReferenceEquals(target.EndObject, source.EndObject))

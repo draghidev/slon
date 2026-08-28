@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using Slon.Pipelines;
+using Slon.Runtime.InteropServices;
 using static Slon.Pg.Protocol.PgTypes;
 
 namespace Slon.Pg.Protocol;
@@ -187,14 +188,17 @@ struct BackendMessageBatch(ReadOnlySequence<byte> buffer)
             if (!SequenceMarshal.TryGetArray(_sequence, out var array) || array.Count <= offset)
             {
                 prev = new(_sequence.Slice(0, offset), offset);
-                _sequence = _sequence.Slice(offset);
+                var rest = _sequence.Slice(offset);
+                GranularWrites.Write(ref _sequence, in rest);
             }
             else
             {
                 Debug.Assert(offset <= int.MaxValue);
                 var arrayInstance = array.Array!;
                 prev = new(new(arrayInstance, array.Offset, (int)offset), offset);
-                _sequence = new(arrayInstance, array.Offset + (int)offset, array.Count - (int)offset);
+                // Same array, later offset: only the integers change.
+                var rest = new ReadOnlySequence<T>(arrayInstance, array.Offset + (int)offset, array.Count - (int)offset);
+                GranularWrites.Write(ref _sequence, in rest);
             }
 
             _length -= offset;
