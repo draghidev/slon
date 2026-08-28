@@ -1,3 +1,5 @@
+using System.Buffers.Binary;
+using System.Collections.Immutable;
 using Slon.Pg;
 using Slon.Pg.Protocol;
 using Slon.Pg.Protocol.Flows;
@@ -61,6 +63,58 @@ public class ReaderDrivenCommandFlowTests
 
         Assert.AreEqual(3, await CountRows(QueuePrepared(protocol, descriptor)));
         await PgTestPool.RunAsync(protocol, "select 1");
+    }
+
+    [ConnectionCreatingTestMethod]
+    public async Task SharedOptions_PipelinedFlowsCarryTheirOwnParameters()
+    {
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
+        var prepare = protocol.Queue(new CommandFlow(async: true,
+            Command.Create("select $1::int",
+                new ParameterTypeList(ImmutableArray.Create(Parameter.CreateNull(Oid.Unspecified))),
+                "rd_shared_options") with { DescribeOnly = true, DescribeForPreparation = true, WithSync = true }));
+        var prepared = prepare.GetAsyncEnumerator();
+        Assert.IsTrue(await prepared.MoveNextAsync());
+        var descriptor = prepared.Current.GetMetadata().ToPreparedDescriptor();
+        await prepared.DisposeAsync();
+        var options = new ReaderDrivenCommandOptions(Command.Create(descriptor));
+        var first = protocol.Queue(new ReaderDrivenCommandFlow(options, Int4Parameter(7)));
+        var second = protocol.Queue(new ReaderDrivenCommandFlow(options, Int4Parameter(11)));
+
+        Assert.AreEqual(7, await ReadSingleInt(first));
+        Assert.AreEqual(11, await ReadSingleInt(second));
+        await PgTestPool.RunAsync(protocol, "select 1");
+
+        static ParameterSource Int4Parameter(int value)
+        {
+            var bytes = new byte[sizeof(int)];
+            BinaryPrimitives.WriteInt32BigEndian(bytes, value);
+            return new(ImmutableArray.Create(Parameter.Create(bytes, (Oid)23u)));
+        }
+
+        static async Task<int> ReadSingleInt(ReaderDrivenCommandFlow flow)
+        {
+            var results = flow.GetAsyncEnumerator();
+            Assert.IsTrue(await results.MoveNextAsync());
+            var rows = results.Current.GetAsyncEnumerator();
+            Assert.IsTrue(await rows.MoveNextAsync());
+            var value = rows.Current.GetValue<int>(0);
+            Assert.IsFalse(await rows.MoveNextAsync());
+            await rows.DisposeAsync();
+            Assert.IsFalse(await results.MoveNextAsync());
+            await results.DisposeAsync();
+            return value;
+        }
+    }
+
+    [TestMethod]
+    public void SharedOptions_RejectParametersOnTheTemplate()
+    {
+        var template = Command.Create("select $1::int") with
+        {
+            Parameters = new ParameterSource(ImmutableArray.Create(Parameter.CreateNull(Oid.Unspecified)))
+        };
+        Assert.ThrowsExactly<ArgumentException>(() => new ReaderDrivenCommandOptions(template));
     }
 
     [ConnectionCreatingTestMethod]

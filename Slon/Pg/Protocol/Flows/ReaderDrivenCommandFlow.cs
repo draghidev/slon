@@ -21,8 +21,8 @@ public sealed class ReaderDrivenCommandFlow : PgClientFlow, IValueTaskSource<boo
     const int PhaseCompleted = 4;
     int _phase;
 
-    readonly CommandList _commands;
-    readonly TimeSpan? _pendingTimeout;
+    readonly ReaderDrivenCommandOptions _options;
+    readonly ParameterSource _parameters;
     Context _context;
     PgDecoder? _decoder;
     CommandResult? _current;
@@ -55,20 +55,24 @@ public sealed class ReaderDrivenCommandFlow : PgClientFlow, IValueTaskSource<boo
     }
 
     public ReaderDrivenCommandFlow(in Command command, TimeSpan? pendingTimeout = null)
+        : this(new ReaderDrivenCommandOptions(command with { Parameters = default }, pendingTimeout),
+            command.Parameters)
+    { }
+
+    /// Executes the shared template with this execution's parameters.
+    public ReaderDrivenCommandFlow(ReaderDrivenCommandOptions options, ParameterSource parameters = default)
         : base(supportsDeferredFlush: true)
     {
-        if (command.DescribeForPreparation || command.SuppressEnumeration)
-            ThrowHelper.ThrowArgumentException(nameof(command),
-                "Preparation and suppressed commands require the general command flow.");
-        _commands = new(command);
-        _pendingTimeout = pendingTimeout;
+        ArgumentNullException.ThrowIfNull(options);
+        _options = options;
+        _parameters = parameters;
         IsAsync = true;
         _readySource.CanCompleteConcurrently = true;
         _pipelineTaskSource.CanCompleteConcurrently = true;
     }
 
     protected override bool EnableActivationTimeout => true;
-    protected override TimeSpan? PendingTimeout => _pendingTimeout;
+    protected override TimeSpan? PendingTimeout => _options.PendingTimeout;
 
     internal override void BindCallerToken(CancellationToken cancellationToken)
         => GetOrCreateColdState().FlowToken = cancellationToken;
@@ -96,11 +100,12 @@ public sealed class ReaderDrivenCommandFlow : PgClientFlow, IValueTaskSource<boo
         ValueTask writeTask;
         try
         {
-            var appendSync = !_commands.ItemRef(0).WithSync;
+            var command = _options.CreateCommand(_parameters);
+            var appendSync = !command.WithSync;
             _readFlowRfq = appendSync;
             // Caller cancellation never cancels wire I/O. The consumer observes the latched intent and
             // drains its command to RFQ instead.
-            writeTask = _commands.WriteCommandsAsync(context.GetEncoder(), appendSync, default);
+            writeTask = new CommandList(command).WriteCommandsAsync(context.GetEncoder(), appendSync, default);
             // Observe synchronous faults here; pending writes remain the framework-owned trailing task.
             if (writeTask.IsCompleted)
                 writeTask.GetAwaiter().GetResult();
@@ -235,13 +240,13 @@ public sealed class ReaderDrivenCommandFlow : PgClientFlow, IValueTaskSource<boo
             _consumerDetached = false;
             RegisterCancellation(cancellationToken);
             CommandResult result;
-            if (!_commands.ItemRef(0).DescribeOnly
-                && _commands.ItemRef(0).Descriptor is { IsPrepared: true, PreparedRowDescription: not null })
+            if (!_options.Template.DescribeOnly
+                && _options.Template.Descriptor is { IsPrepared: true, PreparedRowDescription: not null })
             {
                 var decoder = _decoder!;
                 if (_context.IsProtocolClosed)
                     throw _context.FlowTerminationException;
-                decoder.UseReadTimeout(_commands.ItemRef(0).Timeout);
+                decoder.UseReadTimeout(_options.Template.Timeout);
                 PgError? error;
                 if (!decoder.TryMoveNext())
                 {
@@ -331,9 +336,9 @@ public sealed class ReaderDrivenCommandFlow : PgClientFlow, IValueTaskSource<boo
             throw context.FlowTerminationException;
         PgError? error;
         RowDescription? requestedRowDescription;
-        var describeOnly = _commands.ItemRef(0).DescribeOnly;
-        var hasPreparedDescription = _commands.ItemRef(0).Descriptor is { IsPrepared: true, PreparedRowDescription: not null };
-        decoder.UseReadTimeout(_commands.ItemRef(0).Timeout);
+        var describeOnly = _options.Template.DescribeOnly;
+        var hasPreparedDescription = _options.Template.Descriptor is { IsPrepared: true, PreparedRowDescription: not null };
+        decoder.UseReadTimeout(_options.Template.Timeout);
         if (hasPreparedDescription && !describeOnly)
         {
             // Prepared commands with a known description have the compact BindComplete ->
@@ -363,7 +368,7 @@ public sealed class ReaderDrivenCommandFlow : PgClientFlow, IValueTaskSource<boo
         }
         else
         {
-            (error, requestedRowDescription) = await _commands.ItemRef(0)
+            (error, requestedRowDescription) = await _options.Template
                 .ReadUntilExecuteAsync(decoder, context.GetProtocolStatic<CommandFlow.ReadState>().RowDescription)
                 .ConfigureAwait(false);
         }
@@ -376,8 +381,8 @@ public sealed class ReaderDrivenCommandFlow : PgClientFlow, IValueTaskSource<boo
         var context = _context;
         if (context.IsProtocolClosed)
             throw context.FlowTerminationException;
-        decoder.UseReadTimeout(_commands.ItemRef(0).Timeout);
-        var (error, requestedRowDescription) = _commands.ItemRef(0)
+        decoder.UseReadTimeout(_options.Template.Timeout);
+        var (error, requestedRowDescription) = _options.Template
             .ReadUntilExecute(decoder, context.GetProtocolStatic<CommandFlow.ReadState>().RowDescription);
         return InitializeResult(error, requestedRowDescription);
     }
@@ -385,7 +390,7 @@ public sealed class ReaderDrivenCommandFlow : PgClientFlow, IValueTaskSource<boo
     CommandResult InitializeResult(PgError? error, RowDescription? requestedRowDescription)
     {
         ref readonly var readState = ref _context.GetProtocolStatic<CommandFlow.ReadState>();
-        ref readonly var command = ref _commands.ItemRef(0);
+        ref readonly var command = ref _options.Template;
         readState.ResultMessageEnumerator.Initialize(command, _decoder!);
         var result = readState.CommandResult;
         var descriptor = command.Descriptor;
@@ -801,13 +806,11 @@ public sealed class ReaderDrivenCommandFlow : PgClientFlow, IValueTaskSource<boo
     protected override void OnReleasing(Exception? exception)
     {
         DisposeRegistrations();
-        _commands.Return();
     }
 
     protected override void OnDiscarded()
     {
         GetObserver(out var observerState)?.OnCompleting(this, null, observerState);
-        _commands.Return();
     }
 
     protected override void OnReset()
