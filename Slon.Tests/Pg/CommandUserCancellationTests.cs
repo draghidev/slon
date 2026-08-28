@@ -128,6 +128,39 @@ public class CommandUserCancellationTests : ConnectionCreatingTest
         await PgTestPool.RunAsync(protocol, "select 1");
     }
 
+    // Autonomous execution may enter the command read before the consumer supplies its per-read
+    // token. The late token must still arm backend cancellation for that active read.
+    [TestMethod]
+    public async Task UserCt_SuppliedAfterReadStarted_RequestsCancellation_ProtocolUsable()
+    {
+        await using var blocker = await PgAdvisoryLock.AcquireAsync();
+        var cancelRequested = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var protocol = await PgTestPool.NewIsolatedAsync(
+            o => o.CancelSender = (processId, secretKey, token) =>
+            {
+                cancelRequested.TrySetResult();
+                return new(CancelRequestState.NotSent);
+            });
+
+        var flow = new CommandFlow(async: true, blocker.WaitCommand);
+        Assert.IsTrue(protocol.TryQueue(flow));
+        await blocker.WaitUntilContendedAsync(protocol.FlowControl.BackendProcessId);
+
+        using var cts = new CancellationTokenSource();
+        var enumerator = flow.GetAsyncEnumerator();
+        var moveNext = enumerator.MoveNextAsync(cts.Token).AsTask();
+        cts.Cancel();
+
+        await cancelRequested.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await blocker.ReleaseAsync();
+        var exception = await Assert.ThrowsExactlyAsync<OperationCanceledException>(
+            async () => await moveNext.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.AreEqual(cts.Token, exception.CancellationToken);
+        await enumerator.DisposeAsync();
+
+        await PgTestPool.RunAsync(protocol, "select 1");
+    }
+
     [TestMethod]
     public async Task UserCt_ThenProtocolClose_DuringDrain_CompletesPendingMoveNext()
     {

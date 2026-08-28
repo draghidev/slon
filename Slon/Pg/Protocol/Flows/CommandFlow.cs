@@ -623,6 +623,12 @@ public partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
                     if (!publishedResult && IsAsync)
                     {
                         await _callerInteractionCore.WaitForCaller(this).ConfigureAwait(false);
+                        // The first consumer can arrive after the response prelude was already read
+                        // and its registrations were disposed. Its token was armed by MoveNextAsync;
+                        // the result has now won that race, so retire the late registration before
+                        // publishing the result.
+                        if (Volatile.Read(ref _cancellationState) is { } lateCancellation)
+                            await DisposeCancellationRegistrations(lateCancellation).ConfigureAwait(false);
                         EnterStoppingDrainIfNeeded(context);
                     }
 
@@ -883,15 +889,32 @@ public partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
         }
     }
 
+    void SetCallerCancellationToken(CancellationToken token)
+    {
+        var cancellation = GetOrCreateCancellationState();
+        lock (cancellation)
+        {
+            cancellation.CallerToken = token;
+            RegisterCancellationCallbacksLocked(cancellation);
+        }
+    }
+
     void RegisterCancellationCallbacks(CancellationState cancellation)
+    {
+        lock (cancellation)
+            RegisterCancellationCallbacksLocked(cancellation);
+    }
+
+    void RegisterCancellationCallbacksLocked(CancellationState cancellation)
     {
         if (cancellation.CallerToken.CanBeCanceled)
         {
             Debug.Assert(IsAsync);
-            cancellation.CallerRegistration = cancellation.CallerToken.UnsafeRegister(static (state, token)
-                => ((CommandFlow)state!).RequestCancelAndWake(token, CancellationScope.CurrentWindow), this);
+            if (cancellation.CallerRegistration == default)
+                cancellation.CallerRegistration = cancellation.CallerToken.UnsafeRegister(static (state, token)
+                    => ((CommandFlow)state!).RequestCancelAndWake(token, CancellationScope.CurrentWindow), this);
         }
-        if (cancellation.FlowToken.CanBeCanceled)
+        if (cancellation.FlowToken.CanBeCanceled && cancellation.FlowRegistration == default)
         {
             cancellation.FlowRegistration = cancellation.FlowToken.UnsafeRegister(static (state, token)
                 => ((CommandFlow)state!).RequestCancelAndWake(token, CancellationScope.RemainingFlow), this);
@@ -901,10 +924,17 @@ public partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
     async ValueTask DisposeCancellationRegistrations(CancellationState cancellation)
     {
-        if (cancellation.CallerToken.CanBeCanceled)
-            await cancellation.CallerRegistration.DisposeAsync().ConfigureAwait(false);
-        if (cancellation.FlowToken.CanBeCanceled)
-            await cancellation.FlowRegistration.DisposeAsync().ConfigureAwait(false);
+        CancellationTokenRegistration callerRegistration;
+        CancellationTokenRegistration flowRegistration;
+        lock (cancellation)
+        {
+            callerRegistration = cancellation.CallerRegistration;
+            cancellation.CallerRegistration = default;
+            flowRegistration = cancellation.FlowRegistration;
+            cancellation.FlowRegistration = default;
+        }
+        await callerRegistration.DisposeAsync().ConfigureAwait(false);
+        await flowRegistration.DisposeAsync().ConfigureAwait(false);
     }
 
     bool IsCancellationToken(CancellationToken token)

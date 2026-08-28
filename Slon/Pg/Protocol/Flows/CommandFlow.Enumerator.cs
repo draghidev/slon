@@ -258,7 +258,7 @@ partial class CommandFlow
                 // distinguish a pre-fired cancellation from a clean end.
                 if (cancellationToken.CanBeCanceled)
                 {
-                    flow.GetOrCreateCancellationState().CallerToken = cancellationToken;
+                    flow.SetCallerCancellationToken(cancellationToken);
                     flow._enumeratorMoveNextTaskSource.CanCompleteConcurrently = true;
                 }
 
