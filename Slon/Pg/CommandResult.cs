@@ -221,7 +221,9 @@ public sealed class CommandResult
         EnsureComplete();
     }
 
+#if !NET11_0_OR_GREATER
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
+#endif
     internal async ValueTask CompleteAsync()
     {
         if (IsComplete)
@@ -333,7 +335,9 @@ public sealed class CommandResult
     // column lease suspends this frame. The collector's first exception ends the callbacks and is
     // returned; the remaining rows are left for the flow's drain. Reaches the command's terminal
     // message and records it, as row enumeration does.
+#if !NET11_0_OR_GREATER
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
+#endif
     internal async ValueTask<Exception?> CollectRowsAsync(object? state, Action<object?, Row> collector)
     {
         var currentIsPending = false;
@@ -566,7 +570,9 @@ public sealed class CommandResult
         }
 
         [MethodImpl(MethodImplOptions.NoInlining)]
+#if !NET11_0_OR_GREATER
         [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
+#endif
         async ValueTask<bool> MoveNextAsyncCore(ValueTask<bool> task)
         {
             var instance = _instance!;
@@ -592,7 +598,9 @@ public sealed class CommandResult
         }
 
         [MethodImpl(MethodImplOptions.NoInlining)]
+#if !NET11_0_OR_GREATER
         [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
+#endif
         async ValueTask<bool> BufferRowAsync(ValueTask task, Row row)
         {
             await task.ConfigureAwait(false);

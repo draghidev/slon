@@ -214,7 +214,9 @@ public partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
     // makes the ownership rule structural: no enumerator is exposed on this path, so mixing
     // enumeration with internal consumption is unrepresentable. The declaration precedes any
     // consumer-side gate release, so the body observes it at first wake and never publishes.
+#if !NET11_0_OR_GREATER
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
+#endif
     internal async ValueTask<long> ConsumeNonQueryAsync(CancellationToken cancellationToken = default)
     {
         _consumeNonQuery = true;
@@ -282,7 +284,9 @@ public partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
         return new(ExecuteAutoCore(context));
     }
 
+#if !NET11_0_OR_GREATER
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
+#endif
     async ValueTask<FlowTasks> ExecuteAfterHandoff(Context context)
     {
         try
@@ -921,7 +925,9 @@ public partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
         }
     }
 
+#if !NET11_0_OR_GREATER
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
+#endif
     async ValueTask DisposeCancellationRegistrations(CancellationState cancellation)
     {
         CancellationTokenRegistration callerRegistration;

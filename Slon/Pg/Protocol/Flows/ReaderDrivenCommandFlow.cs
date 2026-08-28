@@ -255,7 +255,9 @@ public sealed class ReaderDrivenCommandFlow : PgClientFlow, IValueTaskSource<boo
 
     // The single frame owns the decoder from activation to RFQ, so no idle state is ever published
     // and no takeover can occur. Latches are observed at the terminal, as LastAsync observes them.
+#if !NET11_0_OR_GREATER
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
+#endif
     async ValueTask CollectCoreAsync(object? state, Action<object?, Row> collector, CancellationToken cancellationToken)
     {
         Exception? collectorFault;
@@ -324,7 +326,9 @@ public sealed class ReaderDrivenCommandFlow : PgClientFlow, IValueTaskSource<boo
             PgErrorException.Throw(pgError);
     }
 
+#if !NET11_0_OR_GREATER
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
+#endif
     async ValueTask<bool> FirstAsync(CancellationToken cancellationToken)
     {
         Exception? deliver;
@@ -398,7 +402,9 @@ public sealed class ReaderDrivenCommandFlow : PgClientFlow, IValueTaskSource<boo
         throw deliver ?? ThrowHelper.ThrowUnexpected("A latched flow completed without a terminal outcome.");
     }
 
+#if !NET11_0_OR_GREATER
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
+#endif
     async ValueTask<bool> LastAsync(CancellationToken cancellationToken)
     {
         Exception? deliver;

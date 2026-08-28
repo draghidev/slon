@@ -451,7 +451,9 @@ public sealed partial class SlonDataReader
         }
     }
 
+#if !NET11_0_OR_GREATER
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
+#endif
     async ValueTask DisposeEnumeratorAsync()
     {
         var (rowEnumerator, enumerator) = BeginEnumeratorDisposal();
@@ -572,7 +574,9 @@ public sealed partial class SlonDataReader
         }
     }
 
+#if !NET11_0_OR_GREATER
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
+#endif
     async ValueTask CloseAsyncCore(bool resetForReuse)
     {
         var ownsCleanup = false;

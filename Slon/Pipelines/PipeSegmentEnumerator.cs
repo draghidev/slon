@@ -149,7 +149,9 @@ sealed class PipeSegmentEnumerator<TSegmenter, TSegment>(PipeReader reader, TSeg
             ? new(CompleteCurrentSegmentRead(task.Result, cancellationToken))
             : Core(task, cancellationToken);
 
+#if !NET11_0_OR_GREATER
         [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
+#endif
         async ValueTask<CurrentSegmentBuffer> Core(ValueTask<ReadResult> task, CancellationToken cancellationToken)
             => CompleteCurrentSegmentRead(await task.ConfigureAwait(false), cancellationToken);
     }
@@ -162,7 +164,9 @@ sealed class PipeSegmentEnumerator<TSegmenter, TSegment>(PipeReader reader, TSeg
             ? new(CompleteCurrentSegmentRead(task.Result, cancellationToken))
             : Core(task, cancellationToken);
 
+#if !NET11_0_OR_GREATER
         [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
+#endif
         async ValueTask<CurrentSegmentBuffer> Core(ValueTask<ReadResult> task, CancellationToken cancellationToken)
             => CompleteCurrentSegmentRead(await task.ConfigureAwait(false), cancellationToken);
     }
@@ -385,7 +389,9 @@ sealed class PipeSegmentEnumerator<TSegmenter, TSegment>(PipeReader reader, TSeg
         }
 
 
+#if !NET11_0_OR_GREATER
         [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
+#endif
         async ValueTask<bool> Core(ValueTask<ReadResult> task, CancellationToken cancellationToken, bool consume = false, bool needMoreData = false)
         {
             while (true)

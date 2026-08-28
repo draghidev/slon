@@ -749,7 +749,9 @@ public sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<Bac
         return default;
     }
 
+#if !NET11_0_OR_GREATER
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
+#endif
     async ValueTask<BackendMessage> GetNextAsyncCore(ValueTask<bool> task)
     {
         if (await task.ConfigureAwait(false))

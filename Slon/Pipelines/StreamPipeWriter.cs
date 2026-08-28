@@ -175,7 +175,9 @@ abstract class StreamPipeWriter : PipeWriter, IOutputWriter
         EnsureFlushed(flushTask.Result);
         return default;
 
+#if !NET11_0_OR_GREATER
         [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
+#endif
         static async ValueTask Core(ValueTask<FlushResult> flushTask)
             => EnsureFlushed(await flushTask.ConfigureAwait(false));
 
