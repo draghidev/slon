@@ -357,11 +357,13 @@ public sealed class CommandResult
                     await _row.RevokeColumnLeaseAsync().ConfigureAwait(false);
                     break;
                 case CollectStep.RequiresInput:
-                    if (!await MoveNextMessageAsync().ConfigureAwait(false))
+                    // Park on the decoder directly: one frame suspends and resumes per wake.
+                    if (!await _messageEnumerator.ReadNextAsync().ConfigureAwait(false))
                     {
                         EnsureTerminalRecorded();
                         return null;
                     }
+                    _messageEnumerator.MarkMoved();
                     currentIsPending = true;
                     break;
                 case CollectStep.RequiresBody:

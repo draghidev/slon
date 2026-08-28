@@ -47,6 +47,10 @@ partial class CommandFlow
         public ValueTask<bool> MoveNextAsync() => _messageEnumerator.MoveNextAsync();
         public BackendMessage Current => _messageEnumerator.Current;
         internal MoveNextStatus TryMoveNext() => _messageEnumerator.TryMoveNext();
+        // Fused read for a consumer that owns the message loop: parks on the decoder itself instead
+        // of the MoveNextAsync/GetNextAsync frames. The caller records the move with MarkMoved.
+        internal ValueTask<bool> ReadNextAsync() => _messageEnumerator.ReadNextAsync();
+        internal void MarkMoved() => _messageEnumerator.MarkMoved();
 
         public void Dispose() => _messageEnumerator.Dispose();
         public ValueTask DisposeAsync() => _messageEnumerator.DisposeAsync();
@@ -152,6 +156,16 @@ partial class CommandFlow
                         throw;
                     }
                 }
+            }
+
+            public ValueTask<bool> ReadNextAsync() => _decoder.MoveNextAsync();
+
+            public void MarkMoved()
+            {
+                var message = _decoder.Current;
+                DebugEnsureExpected(message);
+                if (message.Header.Type is not PgTypes.BackendType.DataRow)
+                    _done = true;
             }
 
             public MoveNextStatus TryMoveNext()
