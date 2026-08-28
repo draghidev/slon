@@ -278,10 +278,17 @@ public sealed class Row : PgFieldReader
         _columnLease = lease;
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal void RevokeColumnLease()
     {
-        if (_columnLease is not { } lease)
-            return;
+        if (_columnLease is not null)
+            RevokeColumnLeaseCore();
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    void RevokeColumnLeaseCore()
+    {
+        var lease = _columnLease!;
         _columnLease = null;
         var ordinal = _leasedOrdinal;
         lease.Revoke();

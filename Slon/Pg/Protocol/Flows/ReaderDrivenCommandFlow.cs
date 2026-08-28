@@ -307,9 +307,28 @@ public sealed class ReaderDrivenCommandFlow : PgClientFlow, IValueTaskSource<boo
 
             collectorFault = await result.CollectRowsAsync(state, collector).ConfigureAwait(false);
             commandError = result.Error;
-            // Consumes whatever a faulted collector left, reads RFQ, resets the shared read state
-            // and completes the pipeline task.
-            await DrainCoreAsync(result).ConfigureAwait(false);
+            if (collectorFault is null)
+            {
+                // The loop consumed the terminal; exactly one ReadyForQuery follows it (the command's
+                // own Sync or the appended one). Read it here rather than through the enumerator's
+                // completion and the generic drain.
+                var decoder = _decoder!;
+                if (!decoder.TryMoveNext())
+                {
+                    if (!await decoder.MoveNextAsync().ConfigureAwait(false))
+                        decoder.ThrowUnexpectedEof();
+                }
+                if (decoder.Current.EnsureExpectedOrError(PgTypes.BackendType.ReadyForQuery) is { } rfqError)
+                    PgErrorException.Throw(rfqError);
+                await DisposeRegistrationsAsync().ConfigureAwait(false);
+                Finish(result);
+            }
+            else
+            {
+                // Consumes whatever the faulted collector left, reads RFQ, resets the shared read
+                // state and completes the pipeline task.
+                await DrainCoreAsync(result).ConfigureAwait(false);
+            }
             deliver = Volatile.Read(ref _coldState)?.TerminalException;
         }
         catch (Exception ex)
