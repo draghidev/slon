@@ -420,21 +420,31 @@ public sealed class ReaderDrivenCommandFlow : PgClientFlow, IValueTaskSource<boo
 
         static ValueTask CompleteDrain(ReaderDrivenCommandFlow flow, CommandResult result)
         {
+            if (!flow._readFlowRfq)
+                return FinishDrain(flow, result);
             var decoder = flow._decoder!;
-            if (flow._readFlowRfq)
+            if (!decoder.TryMoveNext())
             {
-                if (!decoder.TryMoveNext())
-                {
-                    var moveNext = decoder.MoveNextAsync();
-                    if (!moveNext.IsCompletedSuccessfully)
-                        return AwaitMoveNext(flow, result, moveNext);
-                    if (!moveNext.GetAwaiter().GetResult())
-                        decoder.ThrowUnexpectedEof();
-                }
-                if (decoder.Current.EnsureExpectedOrError(PgTypes.BackendType.ReadyForQuery) is { } rfqError)
-                    PgErrorException.Throw(rfqError);
+                var moveNext = decoder.MoveNextAsync();
+                if (!moveNext.IsCompletedSuccessfully)
+                    return AwaitRfq(flow, result, moveNext);
+                if (!moveNext.GetAwaiter().GetResult())
+                    decoder.ThrowUnexpectedEof();
             }
+            return CompleteRfq(flow, result);
+        }
 
+        // The read that positioned the RFQ is the only read; a further move-next would wait for a
+        // message the backend never sends.
+        static ValueTask CompleteRfq(ReaderDrivenCommandFlow flow, CommandResult result)
+        {
+            if (flow._decoder!.Current.EnsureExpectedOrError(PgTypes.BackendType.ReadyForQuery) is { } rfqError)
+                PgErrorException.Throw(rfqError);
+            return FinishDrain(flow, result);
+        }
+
+        static ValueTask FinishDrain(ReaderDrivenCommandFlow flow, CommandResult result)
+        {
             var registrations = flow.DisposeRegistrationsAsync();
             if (!registrations.IsCompletedSuccessfully)
                 return AwaitRegistrations(flow, result, registrations);
@@ -450,12 +460,12 @@ public sealed class ReaderDrivenCommandFlow : PgClientFlow, IValueTaskSource<boo
             await CompleteDrain(flow, result).ConfigureAwait(false);
         }
 
-        static async ValueTask AwaitMoveNext(
+        static async ValueTask AwaitRfq(
             ReaderDrivenCommandFlow flow, CommandResult result, ValueTask<bool> moveNext)
         {
             if (!await moveNext.ConfigureAwait(false))
                 flow._decoder!.ThrowUnexpectedEof();
-            await CompleteDrain(flow, result).ConfigureAwait(false);
+            await CompleteRfq(flow, result).ConfigureAwait(false);
         }
 
         static async ValueTask AwaitRegistrations(
