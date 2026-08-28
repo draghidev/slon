@@ -1313,6 +1313,28 @@ public sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
             if (pipelineTaskRecovery)
                 return ExecutePipelineTaskRecovery(_control, item, cancellationToken);
 
+            // Synchronous fast path: no sender settling, nothing this flow needs flushed first, and an
+            // execute that completes inline. The dispatch promise is only entered for a pending one.
+            if (_control.WaitForCancellationAttempt().IsCompletedSuccessfully
+                && (item.SupportsDeferredFlush || _control.UnflushedBytes == 0))
+            {
+                var execute = _control.Execute(item);
+                if (execute.IsCompletedSuccessfully)
+                {
+                    var tasks = execute.Result;
+                    return new(new PipelineItemResult(tasks.TrailingExecutionTask, tasks.PipelineTask));
+                }
+                PromiseAsyncValueTaskMethodBuilder<PipelineItemResult>.Promise = _promise;
+                try
+                {
+                    return AwaitExecute(execute);
+                }
+                finally
+                {
+                    PromiseAsyncValueTaskMethodBuilder<PipelineItemResult>.Promise = null;
+                }
+            }
+
 #if NET11_0_OR_GREATER
             // Runtime async: a synchronous completion allocates nothing and a suspension is a runtime
             // continuation, so the pooled promise has nothing left to save.
@@ -1343,6 +1365,16 @@ public sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
                     await control.FlushAsync(cancellationToken).ConfigureAwait(false);
 
                 var tasks = await control.Execute(item).ConfigureAwait(false);
+                return new PipelineItemResult(tasks.TrailingExecutionTask, tasks.PipelineTask);
+            }
+
+#if !NET11_0_OR_GREATER
+            [RuntimeAsyncMethodGeneration(false)]
+            [AsyncMethodBuilder(typeof(PromiseAsyncValueTaskMethodBuilder<>))]
+#endif
+            static async ValueTask<PipelineItemResult> AwaitExecute(ValueTask<FlowTasks> execute)
+            {
+                var tasks = await execute.ConfigureAwait(false);
                 return new PipelineItemResult(tasks.TrailingExecutionTask, tasks.PipelineTask);
             }
 
