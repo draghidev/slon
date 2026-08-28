@@ -354,25 +354,63 @@ public sealed class ReaderDrivenCommandFlow : PgClientFlow, IValueTaskSource<boo
 
     // Drains the current result to RFQ and completes the pipeline task. Runs on the frame that owns
     // the decoder. Throws to that frame on I/O failure.
-    async ValueTask DrainCoreAsync(CommandResult result)
+    ValueTask DrainCoreAsync(CommandResult result)
     {
-        var decoder = _decoder!;
         var enumerator = _context.GetProtocolStatic<CommandFlow.ReadState>().ResultMessageEnumerator;
         // Completes the command and, if rows remain, consumes them first. A WithSync command reads
         // its own RFQ here.
-        await enumerator.DisposeAsync().ConfigureAwait(false);
-        if (_readFlowRfq)
+        var dispose = enumerator.DisposeAsync();
+        if (!dispose.IsCompletedSuccessfully)
+            return AwaitDispose(this, result, dispose);
+        dispose.GetAwaiter().GetResult();
+        return CompleteDrain(this, result);
+
+        static ValueTask CompleteDrain(ReaderDrivenCommandFlow flow, CommandResult result)
         {
-            if (!decoder.TryMoveNext())
+            var decoder = flow._decoder!;
+            if (flow._readFlowRfq)
             {
-                if (!await decoder.MoveNextAsync().ConfigureAwait(false))
-                    decoder.ThrowUnexpectedEof();
+                if (!decoder.TryMoveNext())
+                {
+                    var moveNext = decoder.MoveNextAsync();
+                    if (!moveNext.IsCompletedSuccessfully)
+                        return AwaitMoveNext(flow, result, moveNext);
+                    if (!moveNext.GetAwaiter().GetResult())
+                        decoder.ThrowUnexpectedEof();
+                }
+                if (decoder.Current.EnsureExpectedOrError(PgTypes.BackendType.ReadyForQuery) is { } rfqError)
+                    PgErrorException.Throw(rfqError);
             }
-            if (decoder.Current.EnsureExpectedOrError(PgTypes.BackendType.ReadyForQuery) is { } rfqError)
-                PgErrorException.Throw(rfqError);
+
+            var registrations = flow.DisposeRegistrationsAsync();
+            if (!registrations.IsCompletedSuccessfully)
+                return AwaitRegistrations(flow, result, registrations);
+            registrations.GetAwaiter().GetResult();
+            flow.Finish(result);
+            return default;
         }
-        await DisposeRegistrationsAsync().ConfigureAwait(false);
-        Finish(result);
+
+        static async ValueTask AwaitDispose(
+            ReaderDrivenCommandFlow flow, CommandResult result, ValueTask dispose)
+        {
+            await dispose.ConfigureAwait(false);
+            await CompleteDrain(flow, result).ConfigureAwait(false);
+        }
+
+        static async ValueTask AwaitMoveNext(
+            ReaderDrivenCommandFlow flow, CommandResult result, ValueTask<bool> moveNext)
+        {
+            if (!await moveNext.ConfigureAwait(false))
+                flow._decoder!.ThrowUnexpectedEof();
+            await CompleteDrain(flow, result).ConfigureAwait(false);
+        }
+
+        static async ValueTask AwaitRegistrations(
+            ReaderDrivenCommandFlow flow, CommandResult result, ValueTask registrations)
+        {
+            await registrations.ConfigureAwait(false);
+            flow.Finish(result);
+        }
     }
 
     void DrainCore(CommandResult result)
