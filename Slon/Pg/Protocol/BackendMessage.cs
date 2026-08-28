@@ -5,6 +5,8 @@ using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using static Slon.Pg.Protocol.PgTypes;
 
+using Slon.Runtime.InteropServices;
+
 namespace Slon.Pg.Protocol;
 
 [DebuggerDisplay("{DebuggerDisplay,nq}")]
@@ -60,7 +62,7 @@ public readonly struct BackendMessage
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     static void WriteGranularly(ref ReadOnlySequence<byte> destination, in ReadOnlySequence<byte> value)
-        => destination = value;
+        => GranularWrites.Write(ref destination, in value);
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static void SetSequence(ref ReadOnlySequence<byte> destination, in ReadOnlySequence<byte> value)

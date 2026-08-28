@@ -8,6 +8,8 @@ using Slon.Pg.Protocol;
 using Slon.Pg.Types;
 using Slon.Runtime.CompilerServices;
 
+using Slon.Runtime.InteropServices;
+
 namespace Slon.Pg;
 
 [Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
@@ -564,7 +566,15 @@ public sealed class Row : PgFieldReader
     {
         if (_columnLease is not null)
             throw new InvalidOperationException("The previous column lease must be revoked before advancing the row.");
-        _bodyReader = row.Buffered ? null : row.OpenBodyReader();
+        if (row.Buffered)
+        {
+            if (_bodyReader is not null)
+                _bodyReader = null;
+        }
+        else
+        {
+            _bodyReader = row.OpenBodyReader();
+        }
         _column = 0;
         _columnOffset = sizeof(short);
         _lastBufferedOrdinal = -1;
@@ -590,7 +600,7 @@ public sealed class Row : PgFieldReader
     void CaptureBufferedBody(in BackendMessage message)
     {
         if (_bodyReader is null && message.TryGetBufferedFirstMemory(0, out var body))
-            _bufferedBody = body;
+            GranularWrites.Write(ref _bufferedBody, in body);
         else
             _bufferedBody = default;
     }
