@@ -761,6 +761,10 @@ public sealed class ReaderDrivenCommandFlow : PgClientFlow, IValueTaskSource<boo
     protected override void OnCancellationWindowCompleted(int completedWindow, int remainingWindowCount)
     { }
 
+    // Finish and FaultFromOwner reset the shared read objects before the pipeline task completes, and
+    // Current is null once the consumer observed the terminal, so nothing outlives the flow.
+    internal override bool ResetsSharedReadStateBeforeRelease => true;
+
     // Graceful stop. An unactivated flow releases its consumer, the closing wire owns its response.
     // An idle activated flow drains itself to RFQ so the pipeline can complete.
     protected override void OnStopping(Exception exception)

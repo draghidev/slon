@@ -349,7 +349,7 @@ public class CommandFlowContractTests
         return pid;
     }
 
-    static Command TornStreamedBind()
+    internal static Command TornStreamedBind()
     {
         var serializerOptions = new PgSerializerOptions(PgTypeCatalog.Default);
         var value = new SlonParameter<Stream>(new ThrowingReadStream(256 * 1024, 64 * 1024));

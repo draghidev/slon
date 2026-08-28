@@ -1844,8 +1844,9 @@ public sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
                     flow.GetExecutionControl(this).StallsPipeline);
 
             // Draghi clears the activated slot only at the exact idle edge and before CompleteItem.
-            // Release the shared read objects before the flow's terminal observer can reuse them.
-            if (idle)
+            // Release the shared read objects before the flow's terminal observer can reuse them,
+            // unless the flow already reset them and hands out nothing past its terminal.
+            if (idle && !flow.ResetsSharedReadStateBeforeRelease)
                 _commandFlowReadState = new();
         }
 

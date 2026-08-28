@@ -398,6 +398,10 @@ public abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSour
 
     protected virtual void OnHeartbeat(TimeSpan interval) {}
     protected virtual void OnAbort(Exception exception) {}
+    /// True when the flow resets the protocol-static read objects before its pipeline task completes
+    /// and hands out no result past its terminal. The idle edge then keeps those objects for the next
+    /// flow instead of replacing them to protect a handle retained past completion.
+    internal virtual bool ResetsSharedReadStateBeforeRelease => false;
     /// Terminates the flow from a result callback. Result-producing flows route the fault to their
     /// consumer and framework completion. Other flows never hand out results.
     internal virtual void Fail(Exception exception)
