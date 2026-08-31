@@ -36,6 +36,13 @@ public enum FlowEnqueueOptions : byte
     AllowMigration = 4
 }
 
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+public enum PgClientProtocolHeartbeatMode : byte
+{
+    Automatic,
+    External
+}
+
 interface IProtocolStatic<T>
 {
     ref readonly T Value { get; }
@@ -79,6 +86,7 @@ public sealed class PgClientProtocolOptions
     public Encoding DefaultClientEncoding { get; set; }
     public TimeSpan FlowActivationTimeout { get; set; }
     public TimeSpan HeartbeatInterval { get; set; } = Heartbeat.DefaultInterval;
+    public PgClientProtocolHeartbeatMode HeartbeatMode { get; set; }
     public TimeSpan ReadTimeout { get; set; } = PgClientOptions.DefaultReadTimeout;
     public TimeSpan WriteTimeout { get; set; } = TimeSpan.FromSeconds(10);
     // Allocation-free grace before starting a backend CancelRequest. Heartbeat supplies the clock.
@@ -313,7 +321,8 @@ public sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         _admissionAvailable = hosting.AdmissionAvailable;
         _loadObserver = hosting.LoadObserver;
 
-        if (!hosting.DrivesHeartbeat)
+        if (!hosting.DrivesHeartbeat &&
+            _options.HeartbeatMode is PgClientProtocolHeartbeatMode.Automatic)
         {
             _heartbeat = new(_options.HeartbeatInterval, _options.TimeProvider, _logger);
             _heartbeat.Register(period => Heartbeat(period));
@@ -1124,6 +1133,9 @@ public sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         PropagateFlowHeartbeat(period);
         return new();
     }
+
+    public ValueTask HeartbeatAsync(TimeSpan elapsed)
+        => Heartbeat(elapsed);
 
     void PropagateFlowHeartbeat(TimeSpan period)
     {
