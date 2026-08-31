@@ -94,6 +94,50 @@ internal sealed class FullSlonConnectionPool : IAsyncDisposable
         return values;
     }
 
+    public async ValueTask ConsumeRetainedAsync<T, TState>(
+        Func<int, ReadOnlyMemory<byte>, T> create,
+        TState state,
+        Func<TState, List<T>, ValueTask> consume,
+        CancellationToken cancellationToken)
+    {
+        if (_consumptionMode is not SlonConsumptionMode.Stream)
+            throw new InvalidOperationException(
+                "Retained field memory requires streaming consumption.");
+
+        var flow = new ReaderDrivenCommandFlow(_options);
+        await _pool.GetAsync(
+            static (candidate, item) => candidate.Connection.Protocol.TryQueue(
+                item,
+                candidate.IsIdleCandidate
+                    ? FlowEnqueueOptions.None
+                    : FlowEnqueueOptions.RequireExistingPipeline,
+                candidate.CancellationToken),
+            flow,
+            Timeout.InfiniteTimeSpan,
+            cancellationToken).ConfigureAwait(false);
+
+        var values = new List<T>();
+        var results = flow.GetAsyncEnumerator();
+        try
+        {
+            if (await results.MoveNextAsync().ConfigureAwait(false))
+            {
+                var rows = results.Current.GetAsyncEnumerator();
+                while (await rows.MoveNextAsync().ConfigureAwait(false))
+                {
+                    var reader = rows.Current.GetReader();
+                    values.Add(create(reader.Read<int>(), reader.ReadMemory()));
+                }
+                await rows.DisposeAsync().ConfigureAwait(false);
+            }
+            await consume(state, values).ConfigureAwait(false);
+        }
+        finally
+        {
+            await results.DisposeAsync().ConfigureAwait(false);
+        }
+    }
+
     public ValueTask DisposeAsync() => _pool.DisposeAsync();
 
     static async ValueTask<Command> PrepareAsync(PgClientProtocol protocol)

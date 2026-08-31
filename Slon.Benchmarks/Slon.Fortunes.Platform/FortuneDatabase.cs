@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Text;
 using Npgsql;
 using Slon.Fortunes;
 
@@ -7,11 +8,13 @@ namespace Slon.Fortunes.Platform;
 internal abstract class FortuneDatabase : IAsyncDisposable
 {
     internal const string Query = "SELECT id, message FROM fortune";
-    private const string AdditionalFortune = "Additional fortune added at request time.";
+    private static readonly ReadOnlyMemory<byte> AdditionalFortune =
+        "Additional fortune added at request time."u8.ToArray();
 
     public abstract ValueTask DisposeAsync();
 
-    public abstract ValueTask<List<Fortune>> LoadAsync(
+    public abstract ValueTask RenderAsync(
+        BenchmarkApplication application,
         CancellationToken cancellationToken);
 
     public static ValueTask<FortuneDatabase> CreateAsync(
@@ -109,13 +112,15 @@ internal sealed class RawSlonFortuneDatabase(RawSlonProtocolPool pool) : Fortune
         => new RawSlonFortuneDatabase(await RawSlonProtocolPool.CreateAsync(
             connectionString, connectionCount, consumptionMode).ConfigureAwait(false));
 
-    public override async ValueTask<List<Fortune>> LoadAsync(
+    public override ValueTask RenderAsync(
+        BenchmarkApplication application,
         CancellationToken cancellationToken)
-    {
-        var fortunes = await pool.LoadAsync(
-            static (id, message) => new Fortune(id, message), cancellationToken).ConfigureAwait(false);
-        return Complete(fortunes);
-    }
+        => pool.ConsumeRetainedAsync(
+            static (id, message) => new Fortune(id, message),
+            application,
+            static (application, fortunes) =>
+                application.RenderFortunesAsync(Complete(fortunes)),
+            cancellationToken);
 
     public override ValueTask DisposeAsync() => pool.DisposeAsync();
 }
@@ -127,12 +132,15 @@ internal sealed class ConnectionSlonFortuneDatabase(FullSlonConnectionPool pool)
         => new ConnectionSlonFortuneDatabase(await FullSlonConnectionPool.CreateAsync(
             connectionString, connectionCount, consumptionMode).ConfigureAwait(false));
 
-    public override async ValueTask<List<Fortune>> LoadAsync(CancellationToken cancellationToken)
-    {
-        var fortunes = await pool.LoadAsync(
-            static (id, message) => new Fortune(id, message), cancellationToken).ConfigureAwait(false);
-        return Complete(fortunes);
-    }
+    public override ValueTask RenderAsync(
+        BenchmarkApplication application,
+        CancellationToken cancellationToken)
+        => pool.ConsumeRetainedAsync(
+            static (id, message) => new Fortune(id, message),
+            application,
+            static (application, fortunes) =>
+                application.RenderFortunesAsync(Complete(fortunes)),
+            cancellationToken);
 
     public override ValueTask DisposeAsync() => pool.DisposeAsync();
 }
@@ -150,19 +158,21 @@ internal sealed class NpgsqlFortuneDatabase : FortuneDatabase
         _dataSource = new NpgsqlSlimDataSourceBuilder(builder.ConnectionString).Build();
     }
 
-    public override async ValueTask<List<Fortune>> LoadAsync(
+    public override async ValueTask RenderAsync(
+        BenchmarkApplication application,
         CancellationToken cancellationToken)
     {
         await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken);
         await using var command = new NpgsqlCommand(Query, connection);
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
-        List<Fortune> fortunes = [];
+        var fortunes = new List<Fortune>();
         while (await reader.ReadAsync(cancellationToken))
         {
-            fortunes.Add(new Fortune(reader.GetInt32(0), reader.GetString(1)));
+            fortunes.Add(new Fortune(
+                reader.GetInt32(0), Encoding.UTF8.GetBytes(reader.GetString(1))));
         }
 
-        return Complete(fortunes);
+        await application.RenderFortunesAsync(Complete(fortunes));
     }
 
     public override ValueTask DisposeAsync() => _dataSource.DisposeAsync();

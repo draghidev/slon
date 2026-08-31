@@ -96,6 +96,43 @@ internal sealed class RawSlonProtocolPool : IAsyncDisposable
         return values;
     }
 
+    public async ValueTask ConsumeRetainedAsync<T, TState>(
+        Func<int, ReadOnlyMemory<byte>, T> create,
+        TState state,
+        Func<TState, List<T>, ValueTask> consume,
+        CancellationToken cancellationToken)
+    {
+        if (_consumptionMode is not SlonConsumptionMode.Stream)
+            throw new InvalidOperationException(
+                "Retained field memory requires streaming consumption.");
+
+        var slot = GetSlot();
+        var flow = new ReaderDrivenCommandFlow(slot.Options);
+        if (!slot.Protocol.TryQueue(flow, cancellationToken: cancellationToken))
+            throw new InvalidOperationException("The selected PostgreSQL protocol is unavailable.");
+
+        var values = new List<T>();
+        var results = flow.GetAsyncEnumerator();
+        try
+        {
+            if (await results.MoveNextAsync().ConfigureAwait(false))
+            {
+                var rows = results.Current.GetAsyncEnumerator();
+                while (await rows.MoveNextAsync().ConfigureAwait(false))
+                {
+                    var reader = rows.Current.GetReader();
+                    values.Add(create(reader.Read<int>(), reader.ReadMemory()));
+                }
+                await rows.DisposeAsync().ConfigureAwait(false);
+            }
+            await consume(state, values).ConfigureAwait(false);
+        }
+        finally
+        {
+            await results.DisposeAsync().ConfigureAwait(false);
+        }
+    }
+
     Slot GetSlot()
         => _slots[(int)((uint)Interlocked.Increment(ref _nextSlot) % (uint)_slots.Length)];
 

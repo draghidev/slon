@@ -35,10 +35,12 @@ public sealed partial class BenchmarkApplication
     };
 
     private async Task RenderDatabaseAsync()
+        => await Database.RenderAsync(this, default);
+
+    internal ValueTask RenderFortunesAsync(List<Fortune> fortunes)
     {
-        var template = Templates.Fortunes.Create(
-            await Database.LoadAsync(ConnectionClosed));
-        await OutputFortunesAsync(Writer, template);
+        var template = Templates.Fortunes.Create(fortunes);
+        return OutputFortunesAsync(Writer, template);
     }
 
     private ValueTask OutputFortunesAsync(

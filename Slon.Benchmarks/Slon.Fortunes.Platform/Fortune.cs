@@ -2,7 +2,7 @@ namespace Slon.Fortunes.Platform;
 
 public readonly struct Fortune : IComparable<Fortune>
 {
-    public Fortune(int id, string message)
+    public Fortune(int id, ReadOnlyMemory<byte> message)
     {
         Id = id;
         Message = message;
@@ -10,8 +10,8 @@ public readonly struct Fortune : IComparable<Fortune>
 
     public int Id { get; }
 
-    public string Message { get; }
+    public ReadOnlyMemory<byte> Message { get; }
 
     public int CompareTo(Fortune other) =>
-        StringComparer.Ordinal.Compare(Message, other.Message);
+        Message.Span.SequenceCompareTo(other.Message.Span);
 }
