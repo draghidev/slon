@@ -104,6 +104,8 @@ public sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<Bac
     internal ProtocolReadPipe Pipe => _pipe;
     internal Encoding ClientEncoding => _control.ClientEncoding;
 
+    internal void EndResultBuffering() => _pipe.EndBatchRetention();
+
     // Builds a scope-bound shell over the shared pipe with the scope's abort token.
     internal static PgDecoder CreateScopeShell(PgDecoder baseShell, CancellationToken abortToken, TimeSpan defaultReadTimeout)
         => new(baseShell._pipe, abortToken, defaultReadTimeout, baseShell._readTimeoutArmed);

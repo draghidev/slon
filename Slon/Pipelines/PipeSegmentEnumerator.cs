@@ -20,6 +20,14 @@ interface IPipeSegmenter<TSegment>
     /// <param name="segment">Segment to return to the caller.</param>
     /// <returns>Whether the call was successful, requires more data, or invalid data was found, DestinationTooSmall is not supported.</returns>
     OperationStatus CreateSegment(in ReadOnlySequence<byte> buffer, out long segmentLength, out TSegment segment);
+
+    /// <summary>
+    /// Recreates the current logical segment over an extended read grant. Implementations may use
+    /// stronger buffering requirements than <see cref="CreateSegment" /> because previously
+    /// projected memory remains live until the extended segment is released.
+    /// </summary>
+    OperationStatus CreateExtendedSegment(in ReadOnlySequence<byte> buffer,
+        in TSegment remainingSegment, out long segmentLength, out TSegment segment);
 }
 
 readonly struct CurrentSegmentBuffer(ReadOnlySequence<byte> buffer, bool isComplete)
@@ -40,12 +48,15 @@ sealed class PipeSegmentEnumerator<TSegmenter, TSegment>(PipeReader reader, TSeg
     SequencePosition _currentSegmentStart;
     SequencePosition? _consumePosition;
     long _currentLength = -1;
+    int _extensionMinimumSize;
     byte _currentSegmentReadPending;
 
     public PipeReader PipeReader => reader;
 
     public ValueTask<ReadResult> ReadAsync(CancellationToken cancellationToken)
-        => reader.ReadAsync(cancellationToken);
+        => _currentSegmentReadPending == 3
+            ? reader.ReadAtLeastAsync(_extensionMinimumSize, cancellationToken)
+            : reader.ReadAsync(cancellationToken);
 
     public bool TryBeginDirectRead(CancellationToken cancellationToken, out ValueTask<int> task)
     {
@@ -70,6 +81,21 @@ sealed class PipeSegmentEnumerator<TSegmenter, TSegment>(PipeReader reader, TSeg
         return TryMoveNext(result, cancellationToken, out completed);
     }
 
+    public bool CompleteDirectSegmentExtension(int length, in TSegment remainingSegment,
+        CancellationToken cancellationToken, out ValueTask<int> next, out bool readFinished,
+        out bool completed)
+    {
+        if (!_directReader!.CompleteDirectRead(length, cancellationToken, out next, out var result))
+        {
+            readFinished = false;
+            completed = false;
+            return false;
+        }
+        readFinished = true;
+        return CompleteSegmentExtension(
+            result, remainingSegment, cancellationToken, out completed);
+    }
+
     public void AbortDirectRead() => _directReader!.AbortDirectRead();
 
     public bool TryMoveNext(ReadResult result, CancellationToken cancellationToken, out bool completed)
@@ -90,6 +116,7 @@ sealed class PipeSegmentEnumerator<TSegmenter, TSegment>(PipeReader reader, TSeg
         _examinedPosition = default;
         _currentSegmentStart = default;
         _currentLength = -1;
+        _extensionMinimumSize = 0;
         _currentSegmentReadPending = 0;
         return false;
     }
@@ -138,6 +165,111 @@ sealed class PipeSegmentEnumerator<TSegmenter, TSegment>(PipeReader reader, TSeg
 
         result = CompleteCurrentSegmentRead(readResult);
         return true;
+    }
+
+    // Regrants the current logical segment from its original start and asks the segmenter to append
+    // newly buffered data to it. No previously published memory is consumed while this operation is
+    // active. False means another physical read is required; completed distinguishes EOF.
+    public bool TryExtendSegment(in TSegment remainingSegment, out bool completed)
+    {
+        PrepareSegmentExtension();
+        if (!reader.TryRead(out var result))
+        {
+            completed = false;
+            return false;
+        }
+        return CompleteSegmentExtension(
+            result, remainingSegment, CancellationToken.None, out completed);
+    }
+
+    public bool CompleteSegmentExtension(ReadResult result, in TSegment remainingSegment,
+        CancellationToken cancellationToken, out bool completed)
+    {
+        if (_currentSegmentReadPending != 3)
+            ThrowHelper.ThrowInvalidOperation("No segment extension is pending.");
+
+        _currentSegmentReadPending = 0;
+        completed = false;
+        if (result.IsCanceled)
+            ThrowHelper.ThrowOperationCanceled(cancellationToken);
+
+        var previousLength = _currentLength;
+        var status = _segmenter.CreateExtendedSegment(
+            result.Buffer, remainingSegment, out var extendedLength, out var extended);
+        if (extendedLength > previousLength
+            && status is OperationStatus.Done or OperationStatus.NeedMoreData)
+        {
+            _current = extended;
+            _currentLength = extendedLength;
+            _currentSegmentStart = result.Buffer.Start;
+            _consumePosition = extendedLength <= result.Buffer.Length
+                ? result.Buffer.GetPosition(extendedLength)
+                : null;
+            _examinedPosition = _consumePosition ?? result.Buffer.End;
+            _extensionMinimumSize = 0;
+            return true;
+        }
+
+        if (result.IsCompleted)
+        {
+            completed = true;
+            return false;
+        }
+        if (status is OperationStatus.InvalidData)
+        {
+            reader.Complete(new Exception("Segmenter encountered invalid data."));
+            completed = true;
+            return false;
+        }
+        if (status is OperationStatus.DestinationTooSmall)
+            ThrowHelper.ThrowInvalidOperation();
+
+        // The new grant ended inside the next framed item. Keep the original segment unconsumed,
+        // publish how much total data the segmenter needs, and leave the next ReadAsync prepared.
+        _currentLength = previousLength;
+        _currentSegmentStart = result.Buffer.Start;
+        _examinedPosition = result.Buffer.End;
+        _consumePosition = result.Buffer.GetPosition(previousLength);
+        reader.AdvanceTo(result.Buffer.Start, result.Buffer.End);
+        _extensionMinimumSize = Math.Max(_segmenter.MinimumSize,
+            int.CreateSaturating(previousLength + 1));
+        _currentSegmentReadPending = 3;
+        return false;
+    }
+
+    public bool ExtendSegment(in TSegment remainingSegment, TimeSpan timeout = default)
+    {
+        if (reader is not StreamPipeReader syncReader)
+            throw new NotSupportedException("Underlying pipe reader does not support synchronous reads.");
+
+        while (true)
+        {
+            PrepareSegmentExtension();
+            var result = syncReader.ReadAtLeast(_extensionMinimumSize, timeout);
+            if (CompleteSegmentExtension(
+                    result, remainingSegment, CancellationToken.None, out var completed))
+                return true;
+            if (completed)
+                return false;
+        }
+    }
+
+    void PrepareSegmentExtension()
+    {
+        if (_currentSegmentReadPending != 0)
+        {
+            if (_currentSegmentReadPending != 3)
+                ThrowHelper.ThrowInvalidOperation(
+                    "The pending segment read uses a different continuation mode.");
+            return;
+        }
+        if (_currentLength <= 0 || _consumePosition is null)
+            ThrowHelper.ThrowInvalidOperation("The current segment cannot be extended.");
+
+        reader.AdvanceTo(_currentSegmentStart, _examinedPosition);
+        _extensionMinimumSize = int.CreateSaturating(
+            _currentLength + Math.Max(1, _segmenter.MinimumSize));
+        _currentSegmentReadPending = 3;
     }
 
     public ValueTask<CurrentSegmentBuffer> ContinueCurrentSegmentAsync(

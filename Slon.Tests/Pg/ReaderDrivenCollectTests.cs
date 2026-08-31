@@ -1,6 +1,7 @@
 using System.Buffers.Binary;
 using System.Collections.Immutable;
 using System.Runtime.CompilerServices;
+using System.Text;
 using Slon.Pg;
 using Slon.Pg.Protocol;
 using Slon.Pg.Protocol.Flows;
@@ -77,6 +78,71 @@ public class ReaderDrivenCollectTests
         var values = await CollectInts(QueuePrepared(protocol, descriptor));
 
         CollectionAssert.AreEqual(Enumerable.Range(1, rowCount).ToList(), values);
+        await PgTestPool.RunAsync(protocol, "select 1");
+    }
+
+    [ConnectionCreatingTestMethod]
+    public async Task ContiguousFieldMemory_RemainsValidAcrossExtendedBatches()
+    {
+        const int rowCount = 2000;
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
+        var descriptor = await Prepare(protocol,
+            $"select i, i::text || repeat('x', 96) from generate_series(1, {rowCount}) as i",
+            "retained_result_memory");
+        var results = QueuePrepared(protocol, descriptor).GetAsyncEnumerator();
+        var values = new List<(int Id, ReadOnlyMemory<byte> Message)>(rowCount);
+
+        try
+        {
+            Assert.IsTrue(await results.MoveNextAsync());
+            var rows = results.Current.GetAsyncEnumerator();
+            while (await rows.MoveNextAsync())
+            {
+                var reader = rows.Current.GetReader();
+                values.Add((reader.Read<int>(), reader.ReadMemory()));
+            }
+            await rows.DisposeAsync();
+
+            Assert.AreEqual(rowCount, values.Count);
+            foreach (var (id, message) in values)
+                Assert.AreEqual(id + new string('x', 96), Encoding.UTF8.GetString(message.Span));
+        }
+        finally
+        {
+            await results.DisposeAsync();
+        }
+
+        await PgTestPool.RunAsync(protocol, "select 1");
+    }
+
+    [ConnectionCreatingTestMethod]
+    public async Task ContiguousFieldMemory_BuffersStreamingRowsIntoTheRetainedBatch()
+    {
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
+        var descriptor = await Prepare(protocol,
+            "select i, i::text || repeat('x', 20000) from generate_series(1, 3) as i",
+            "retained_streaming_memory");
+        var results = QueuePrepared(protocol, descriptor).GetAsyncEnumerator();
+        var values = new List<ReadOnlyMemory<byte>>();
+
+        try
+        {
+            Assert.IsTrue(await results.MoveNextAsync());
+            var rows = results.Current.GetAsyncEnumerator();
+            while (await rows.MoveNextAsync())
+                values.Add(rows.Current.GetFieldMemory(1));
+            await rows.DisposeAsync();
+
+            Assert.AreEqual(3, values.Count);
+            for (var i = 0; i < values.Count; i++)
+                Assert.AreEqual((i + 1) + new string('x', 20000),
+                    Encoding.UTF8.GetString(values[i].Span));
+        }
+        finally
+        {
+            await results.DisposeAsync();
+        }
+
         await PgTestPool.RunAsync(protocol, "select 1");
     }
 

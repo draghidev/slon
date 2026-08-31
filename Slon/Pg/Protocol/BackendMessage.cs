@@ -92,6 +92,19 @@ public readonly struct BackendMessage
     public ReadOnlySequence<byte> GetSequence()
         => GetSequence(0);
 
+    internal void BeginCommandResultBuffering()
+    {
+        EnsureBodyWindowAvailable();
+        _context.BeginBatchRetention(_token);
+    }
+
+    internal ReadOnlyMemory<byte> GetContiguousMemory(in ReadOnlySequence<byte> source)
+    {
+        EnsureBodyWindowAvailable();
+        var messageOffset = _buffer.Slice(0, source.Start).Length;
+        return _context.GetContiguousMemory(_token, messageOffset, source);
+    }
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public bool TryGetFirstSpan(int offset, out ReadOnlySpan<byte> span)
     {

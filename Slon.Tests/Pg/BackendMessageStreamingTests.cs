@@ -1,6 +1,7 @@
 using System.Buffers;
 using System.Buffers.Binary;
 using System.IO.Pipelines;
+using System.Runtime.InteropServices;
 using Slon.Pipelines;
 using Slon.Pg.Protocol;
 using static Slon.Pg.Protocol.PgTypes;
@@ -12,6 +13,24 @@ namespace Slon.Tests.Pg;
 [TestClass]
 public class BackendMessageStreamingTests
 {
+    sealed class SequenceSegment : ReadOnlySequenceSegment<byte>
+    {
+        public SequenceSegment(ReadOnlyMemory<byte> memory) => Memory = memory;
+
+        public SequenceSegment Append(ReadOnlyMemory<byte> memory)
+        {
+            var next = new SequenceSegment(memory)
+            {
+                RunningIndex = RunningIndex + Memory.Length
+            };
+            Next = next;
+            return next;
+        }
+
+        public ReadOnlySequence<byte> To(SequenceSegment end)
+            => new(this, 0, end, end.Memory.Length);
+    }
+
     sealed class RejectRetiredSuppliedReadReader(PipeReader inner) : PipeReader
     {
         ReadResult _activeRead;
@@ -83,6 +102,10 @@ public class BackendMessageStreamingTests
             segment = len;
             return OperationStatus.Done;
         }
+
+        public OperationStatus CreateExtendedSegment(in ReadOnlySequence<byte> buffer,
+            in int remainingSegment, out long segmentLength, out int segment)
+            => CreateSegment(buffer, out segmentLength, out segment);
     }
 
     struct StreamingSegmenter : IPipeSegmenter<ReadOnlySequence<byte>>
@@ -104,6 +127,12 @@ public class BackendMessageStreamingTests
             segment = buffer.Slice(0, Math.Min(buffer.Length, len));
             return buffer.Length < len ? OperationStatus.NeedMoreData : OperationStatus.Done;
         }
+
+
+        public OperationStatus CreateExtendedSegment(in ReadOnlySequence<byte> buffer,
+            in ReadOnlySequence<byte> remainingSegment, out long segmentLength,
+            out ReadOnlySequence<byte> segment)
+            => CreateSegment(buffer, out segmentLength, out segment);
     }
 
     static byte[] LenPrefixed(int total)
@@ -129,6 +158,13 @@ public class BackendMessageStreamingTests
         var bytes = BackendMessageBytes(type, BackendHeader.ByteCount + body.Length);
         body.CopyTo(bytes.AsSpan(BackendHeader.ByteCount));
         return bytes;
+    }
+
+    static ReadOnlySequence<byte> Segmented(
+        ReadOnlyMemory<byte> first, ReadOnlyMemory<byte> second)
+    {
+        var start = new SequenceSegment(first);
+        return start.To(start.Append(second));
     }
 
     static PipeSegmentEnumerator<FixedSegmenter, int> BuildEnumerator(byte[] wire)
@@ -214,6 +250,60 @@ public class BackendMessageStreamingTests
 
         await pipe.Writer.CompleteAsync();
         await protocolPipe.DisposeAsync();
+    }
+
+    [TestMethod]
+    public async Task ExtendingCurrentBatch_ResumesFromTheSlicedRemainingBatch()
+    {
+        var pipe = new Pipe();
+        var protocolPipe = new ProtocolReadPipe(
+            new(pipe.Reader, new BackendMessageBatch.Segmenter(), ownsReader: true));
+        var firstBytes = BackendMessageBytes(BackendType.DataRow, new byte[] { 0, 0 });
+
+        await pipe.Writer.WriteAsync(firstBytes);
+        Assert.IsTrue(protocolPipe.TryMoveNextBatch(out _));
+        Assert.IsTrue(protocolPipe.TryMoveNext());
+        var first = protocolPipe.Current;
+        first.BeginCommandResultBuffering();
+        var firstBody = first.GetSequence();
+        Assert.IsFalse(protocolPipe.TryMoveNext());
+
+        await pipe.Writer.WriteAsync(BackendMessageBytes(BackendType.CommandComplete, 6));
+        Assert.IsTrue(protocolPipe.TryMoveNextBatch(out _));
+        CollectionAssert.AreEqual(firstBytes.AsSpan(BackendHeader.ByteCount).ToArray(),
+            firstBody.ToArray(), "extending must not retire the original row storage");
+
+        Assert.IsTrue(protocolPipe.TryMoveNext());
+        Assert.AreEqual(BackendType.CommandComplete, protocolPipe.Current.Header.Type,
+            "extension must resume after the already-consumed DataRow");
+
+        protocolPipe.EndBatchRetention();
+        await pipe.Writer.CompleteAsync();
+        await protocolPipe.DisposeAsync();
+    }
+
+    [TestMethod]
+    public void ContiguousMemory_StraddleIsProjectedOnceForTheBatch()
+    {
+        var bytes = BackendMessageBytes(BackendType.DataRow, new byte[] { 0, 1, 2, 3, 4, 5 });
+        var sequence = Segmented(bytes.AsMemory(0, 7), bytes.AsMemory(7));
+        var context = new BackendMessageContext();
+        context.SetBatch(new(sequence));
+        Assert.IsTrue(context.TryMoveNext());
+        var message = context.Current;
+        var field = message.GetSequence();
+        Assert.IsFalse(field.IsSingleSegment);
+
+        var first = message.GetContiguousMemory(field);
+        var second = message.GetContiguousMemory(field);
+        CollectionAssert.AreEqual(field.ToArray(), first.ToArray());
+        Assert.IsTrue(MemoryMarshal.TryGetArray(first, out var firstArray));
+        Assert.IsTrue(MemoryMarshal.TryGetArray(second, out var secondArray));
+        Assert.AreSame(firstArray.Array, secondArray.Array,
+            "the same logical range must reuse its ContiguousProjection");
+
+        context.EndBatchRetention();
+        context.RetireCurrentBatch();
     }
 
     [TestMethod]

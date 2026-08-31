@@ -316,6 +316,8 @@ partial class CommandFlow
 
             public void Reset()
             {
+                if (_decoder is not null)
+                    _decoder.EndResultBuffering();
                 _describeOnly = false;
                 _withSync = false;
                 _decoder = null!;

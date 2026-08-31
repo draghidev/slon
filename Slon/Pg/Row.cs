@@ -53,6 +53,26 @@ public sealed class Row : PgFieldReader
     public T GetValue<T>(int ordinal)
         => GetValueCore<T>(ordinal, textEncoding: null);
 
+    /// <summary>
+    /// Returns the field's raw PostgreSQL representation as contiguous memory.
+    /// </summary>
+    /// <remarks>
+    /// Requesting field memory retains its source batches and may buffer the remaining command
+    /// result in memory. The returned memory remains valid until the owning flow advances beyond or
+    /// disposes the current command result.
+    /// </remarks>
+    public ReadOnlyMemory<byte> GetFieldMemory(int ordinal)
+    {
+        RevokeColumnLease();
+        Message.BeginCommandResultBuffering();
+        EnsureBuffered();
+        if (TryGetFieldMemory(ordinal, out var field))
+            return field;
+
+        var sequence = GetFieldSequence(ordinal);
+        return Message.GetContiguousMemory(sequence);
+    }
+
     // Bootstrap consumers have no serializer but must still bind text decoding to one negotiated
     // encoding snapshot for the lifetime of their operation.
     internal T GetValue<T>(int ordinal, Encoding textEncoding)
@@ -561,6 +581,9 @@ public sealed class Row : PgFieldReader
             _remaining = _remaining.Slice(sizeof(int) + length);
             return BootstrapFieldDecoder.Read<T>(field);
         }
+
+        public ReadOnlyMemory<byte> ReadMemory()
+            => _row.GetFieldMemory(_ordinal++);
     }
 
     internal void Initialize(RowDescription rowDescription)

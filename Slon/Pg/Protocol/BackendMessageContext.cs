@@ -27,6 +27,16 @@ sealed class BackendMessageContext
     BackendHeader _peekedHeader;
     ReadOnlySequence<byte> _peekedBuffer;
     long _currentMessageOffset;
+    ContiguousProjection? _contiguousProjections;
+    bool _retainsBatch;
+
+    sealed class ContiguousProjection
+    {
+        public required byte[] Buffer { get; init; }
+        public required long Start { get; init; }
+        public required int Length { get; init; }
+        public ContiguousProjection? Next { get; init; }
+    }
 
     public BackendMessage Current
     {
@@ -65,13 +75,62 @@ sealed class BackendMessageContext
         Validate(token);
         if ((_messageState & MessageOffsetCaptured) == 0)
         {
-            // Fully buffered messages never need their batch-relative offset. Capture it only
-            // before a streaming operation can replace the segment used to derive it.
-            Debug.Assert(!_current.Buffered && !_hasPeeked);
             _currentMessageOffset = _remainingBatch.ConsumedLength - _current.BufferedLength;
             _messageState |= MessageOffsetCaptured;
         }
         return _currentMessageOffset;
+    }
+
+    public bool RetainsBatch => _retainsBatch;
+
+    public void BeginBatchRetention(short token)
+    {
+        Validate(token);
+        _retainsBatch = true;
+        _ = GetCurrentMessageOffset(token);
+    }
+
+    public ReadOnlyMemory<byte> GetContiguousMemory(short token, long messageOffset,
+        in ReadOnlySequence<byte> source)
+    {
+        BeginBatchRetention(token);
+        if (source.IsSingleSegment)
+            return source.First;
+        if (source.Length > int.MaxValue)
+            throw new ArgumentOutOfRangeException(nameof(source));
+
+        var start = checked(GetCurrentMessageOffset(token) + messageOffset);
+        var length = (int)source.Length;
+        for (var projection = _contiguousProjections;
+             projection is not null;
+             projection = projection.Next)
+        {
+            if (projection.Start == start && projection.Length == length)
+                return projection.Buffer.AsMemory(0, length);
+        }
+
+        var buffer = ArrayPool<byte>.Shared.Rent(length);
+        source.CopyTo(buffer);
+        _contiguousProjections = new()
+        {
+            Buffer = buffer,
+            Start = start,
+            Length = length,
+            Next = _contiguousProjections
+        };
+        return buffer.AsMemory(0, length);
+    }
+
+    public void EndBatchRetention()
+    {
+        _retainsBatch = false;
+        var projection = _contiguousProjections;
+        _contiguousProjections = null;
+        while (projection is not null)
+        {
+            ArrayPool<byte>.Shared.Return(projection.Buffer);
+            projection = projection.Next;
+        }
     }
 
     public void BindDecoder(PgDecoder decoder)
@@ -179,6 +238,8 @@ sealed class BackendMessageContext
     {
         var message = segment.Slice(_currentMessageOffset, _current.Header.MessageLength);
         SetBuffered(token, message);
+        var messageEnd = _currentMessageOffset + _current.Header.MessageLength;
+        _remainingBatch = new(segment.Slice(messageEnd), messageEnd);
     }
 
     void Validate(short token)
@@ -244,6 +305,11 @@ sealed class BackendMessageContext
             _messageState = 0;
         }
     }
+
+    public BackendMessageBatch RemainingBatch => _remainingBatch;
+
+    public void SetExtendedBatch(BackendMessageBatch batch)
+        => _remainingBatch = batch;
 
     public void RetireCurrentBatch()
     {

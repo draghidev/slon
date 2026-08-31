@@ -26,10 +26,41 @@ sealed class ProtocolReadPipe(PipeSegmentEnumerator<BackendMessageBatch.Segmente
 
     public bool TryMoveNextBatch(out bool completed)
     {
+        if (_messageContext.RetainsBatch)
+            return TryExtendCurrentBatch(out completed);
         _messageContext.RetireCurrentBatch();
         if (!messageBatchEnumerator.TryMoveNext(out completed))
             return false;
         CommitBatch();
+        return true;
+    }
+
+    bool TryExtendCurrentBatch(out bool completed)
+    {
+        var remaining = _messageContext.RemainingBatch;
+        if (!messageBatchEnumerator.TryExtendSegment(remaining, out completed))
+            return false;
+        _messageContext.SetExtendedBatch(messageBatchEnumerator.Current);
+        return true;
+    }
+
+    bool CompleteCurrentBatchExtension(ReadResult result,
+        CancellationToken cancellationToken, out bool completed)
+    {
+        var remaining = _messageContext.RemainingBatch;
+        if (!messageBatchEnumerator.CompleteSegmentExtension(
+                result, remaining, cancellationToken, out completed))
+            return false;
+        _messageContext.SetExtendedBatch(messageBatchEnumerator.Current);
+        return true;
+    }
+
+    bool ExtendCurrentBatch(TimeSpan timeout)
+    {
+        var remaining = _messageContext.RemainingBatch;
+        if (!messageBatchEnumerator.ExtendSegment(remaining, timeout))
+            return false;
+        _messageContext.SetExtendedBatch(messageBatchEnumerator.Current);
         return true;
     }
 
@@ -41,6 +72,15 @@ sealed class ProtocolReadPipe(PipeSegmentEnumerator<BackendMessageBatch.Segmente
 
     public bool CompleteDirectRead(int length, CancellationToken cancellationToken, out ValueTask<int> next, out bool readFinished, out bool completed)
     {
+        if (_messageContext.RetainsBatch)
+        {
+            var remaining = _messageContext.RemainingBatch;
+            var extended = messageBatchEnumerator.CompleteDirectSegmentExtension(length,
+                remaining, cancellationToken, out next, out readFinished, out completed);
+            if (extended)
+                _messageContext.SetExtendedBatch(messageBatchEnumerator.Current);
+            return extended;
+        }
         if (!messageBatchEnumerator.CompleteDirectRead(length, cancellationToken, out next, out readFinished, out completed))
             return false;
         CommitBatch();
@@ -51,6 +91,8 @@ sealed class ProtocolReadPipe(PipeSegmentEnumerator<BackendMessageBatch.Segmente
 
     public bool TryMoveNextBatch(ReadResult result, CancellationToken cancellationToken, out bool completed)
     {
+        if (_messageContext.RetainsBatch)
+            return CompleteCurrentBatchExtension(result, cancellationToken, out completed);
         _messageContext.RetireCurrentBatch();
         if (!messageBatchEnumerator.TryMoveNext(result, cancellationToken, out completed))
             return false;
@@ -80,27 +122,53 @@ sealed class ProtocolReadPipe(PipeSegmentEnumerator<BackendMessageBatch.Segmente
 
     public ValueTask<bool> MoveNextAsync(CancellationToken cancellationToken)
     {
+        if (_messageContext.RetainsBatch)
+            return ExtendCurrentBatchAsync(cancellationToken);
         _messageContext.RetireCurrentBatch();
         return messageBatchEnumerator.MoveNextAsync(cancellationToken);
     }
 
+    async ValueTask<bool> ExtendCurrentBatchAsync(CancellationToken cancellationToken)
+    {
+        while (true)
+        {
+            if (TryExtendCurrentBatch(out var completed))
+                return true;
+            if (completed)
+                return false;
+
+            var read = await messageBatchEnumerator.ReadAsync(cancellationToken).ConfigureAwait(false);
+            if (CompleteCurrentBatchExtension(
+                    read, cancellationToken, out completed))
+                return true;
+            if (completed)
+                return false;
+        }
+    }
+
     public bool MoveNext(TimeSpan timeout)
     {
+        if (_messageContext.RetainsBatch)
+            return ExtendCurrentBatch(timeout);
         _messageContext.RetireCurrentBatch();
         return messageBatchEnumerator.MoveNext(timeout);
     }
+
+    public void EndBatchRetention() => _messageContext.EndBatchRetention();
 
     // Publishes the just-read batch as the current batch the message context iterates.
     public void CommitBatch() => _messageContext.SetBatch(messageBatchEnumerator.Current);
 
     public void Dispose()
     {
+        _messageContext.EndBatchRetention();
         _messageContext.RetireCurrentBatch();
         messageBatchEnumerator.Dispose();
     }
 
     public ValueTask DisposeAsync()
     {
+        _messageContext.EndBatchRetention();
         _messageContext.RetireCurrentBatch();
         return messageBatchEnumerator.DisposeAsync();
     }

@@ -14,7 +14,7 @@ struct BackendMessageBatch(ReadOnlySequence<byte> buffer)
     FastReadOnlySequence<byte> _buffer = new(buffer);
     long _consumedLength;
 
-    BackendMessageBatch(ReadOnlySequence<byte> buffer, long consumedLength) : this(buffer)
+    internal BackendMessageBatch(ReadOnlySequence<byte> buffer, long consumedLength) : this(buffer)
         => _consumedLength = consumedLength;
 
     public readonly long ConsumedLength => _consumedLength;
@@ -48,8 +48,6 @@ struct BackendMessageBatch(ReadOnlySequence<byte> buffer)
     {
         if (!Header.TryParse(_buffer.FirstSpan, out var protoHeader) && !Header.TryParseMultiSegment(_buffer.Sequence, out protoHeader))
         {
-            // We use default(ROSeq) - which is fully supported - as ROSeq.Empty weirdly enough wraps an empty array.
-            _buffer = default;
             buffer = default;
             bufferLength = default;
             header = default;
@@ -92,7 +90,35 @@ struct BackendMessageBatch(ReadOnlySequence<byte> buffer)
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public OperationStatus CreateSegment(in ReadOnlySequence<byte> buffer, out long segmentLength, out BackendMessageBatch segment)
+        public OperationStatus CreateSegment(in ReadOnlySequence<byte> buffer, out long segmentLength,
+            out BackendMessageBatch segment)
+            => CreateSegment(buffer, fullyBufferDataRows: false, out segmentLength, out segment);
+
+        public OperationStatus CreateExtendedSegment(in ReadOnlySequence<byte> buffer,
+            in BackendMessageBatch remainingSegment, out long segmentLength,
+            out BackendMessageBatch segment)
+        {
+            // The remaining batch has been sliced in place while its messages were consumed. Its
+            // consumed length is the stable continuation point when a reader regrants the same
+            // bytes through a different physical sequence representation.
+            var prefixLength = remainingSegment._consumedLength;
+            if ((ulong)prefixLength > (ulong)buffer.Length)
+                throw new ArgumentOutOfRangeException(nameof(remainingSegment));
+            var status = CreateSegment(buffer.Slice(prefixLength), fullyBufferDataRows: true,
+                out var appendedLength, out segment);
+
+            segmentLength = prefixLength + appendedLength;
+            if (appendedLength == 0)
+                segment = remainingSegment;
+            else
+                segment._consumedLength = remainingSegment._consumedLength;
+
+            _minimumSize = int.CreateSaturating(prefixLength + _minimumSize);
+            return status;
+        }
+
+        OperationStatus CreateSegment(in ReadOnlySequence<byte> buffer, bool fullyBufferDataRows,
+            out long segmentLength, out BackendMessageBatch segment)
         {
             _minimumSize = Header.ByteCount;
             var reader = new SequenceReader<byte>(buffer);
@@ -109,7 +135,8 @@ struct BackendMessageBatch(ReadOnlySequence<byte> buffer)
 
                 if (reader.Remaining < header.MessageLength)
                 {
-                    var required = RequiredBufferedLength(backendType, header.MessageLength);
+                    var required = RequiredBufferedLength(
+                        backendType, header.MessageLength, fullyBufferDataRows);
                     if (reader.Remaining < required)
                     {
                         // MinimumSize is relative to the entire unconsumed pipe buffer, including messages
@@ -140,9 +167,11 @@ struct BackendMessageBatch(ReadOnlySequence<byte> buffer)
             return needMoreData ? OperationStatus.NeedMoreData : OperationStatus.Done;
         }
 
-        uint RequiredBufferedLength(BackendType backendType, uint messageLength) => backendType switch
+        uint RequiredBufferedLength(BackendType backendType, uint messageLength,
+            bool fullyBufferDataRows) => backendType switch
         {
-            BackendType.DataRow => Math.Min(messageLength, (uint)_dataRowStreamingThreshold),
+            BackendType.DataRow when !fullyBufferDataRows
+                => Math.Min(messageLength, (uint)_dataRowStreamingThreshold),
             // BackendType.RowDescription or
             // BackendType.CopyData or
             // BackendType.FunctionCallResponse or
