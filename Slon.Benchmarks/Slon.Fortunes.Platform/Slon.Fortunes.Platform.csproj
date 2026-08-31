@@ -11,8 +11,7 @@
 
   <ItemGroup>
     <ProjectReference Include="../../Slon/Slon.csproj" />
-    <Compile Include="../Shared/RawSlonProtocolPool.cs" Link="RawSlonProtocolPool.cs" />
-    <Compile Include="../Shared/FullSlonConnectionPool.cs" Link="FullSlonConnectionPool.cs" />
+    <Compile Include="../Shared/SlonConnectionPool.cs" />
   </ItemGroup>
 
   <ItemGroup>
