@@ -10,6 +10,22 @@ namespace Slon.Tests.Pg;
 [TestClass]
 public class HeartbeatTests
 {
+    [ConnectionCreatingTestMethod]
+    [DataRow(PgClientProtocolHeartbeatMode.Automatic, 1)]
+    [DataRow(PgClientProtocolHeartbeatMode.External, 0)]
+    public async Task ProtocolHeartbeatModeControlsTimerOwnership(
+        PgClientProtocolHeartbeatMode mode, int expectedTimerCount)
+    {
+        var time = new CountingTimeProvider();
+        await using var protocol = await PgTestPool.NewIsolatedAsync(options =>
+        {
+            options.TimeProvider = time;
+            options.HeartbeatMode = mode;
+        });
+
+        Assert.AreEqual(expectedTimerCount, time.TimerCount);
+    }
+
     [TestMethod]
     public async Task BackloggedFlow_ActivationTimeoutAdvancesBeforeDispatch()
     {
@@ -94,4 +110,16 @@ public class HeartbeatTests
     }
 
     readonly record struct Entry(LogLevel Level, Exception? Exception, string Message);
+
+    sealed class CountingTimeProvider : FakeTimeProvider
+    {
+        internal int TimerCount { get; private set; }
+
+        public override ITimer CreateTimer(TimerCallback callback, object? state,
+            TimeSpan dueTime, TimeSpan period)
+        {
+            TimerCount++;
+            return base.CreateTimer(callback, state, dueTime, period);
+        }
+    }
 }
