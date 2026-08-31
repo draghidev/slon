@@ -896,6 +896,8 @@ public sealed class ReaderDrivenCommandFlow : PgClientFlow, IValueTaskSource<boo
             cancellation.CallerRegistration.Dispose();
             cancellation.CallerRegistration = default;
         }
+        if (callerToken == cancellation.FlowToken)
+            return;
         if (callerToken.CanBeCanceled)
             cancellation.CallerRegistration = callerToken.UnsafeRegister(static (state, token)
                 => ((ReaderDrivenCommandFlow)state!).RequestCancel(token), this);

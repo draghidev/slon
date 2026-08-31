@@ -169,6 +169,24 @@ public class ReaderDrivenCollectTests
     }
 
     [ConnectionCreatingTestMethod]
+    public async Task SameQueueAndConsumerToken_CancelsAndKeepsWire()
+    {
+        await using var protocol = await NewCancelableProtocolAsync();
+        var descriptor = await Prepare(
+            protocol, "select pg_sleep(30)", "collect_shared_cancellation");
+        using var cancellation = new CancellationTokenSource();
+        var flow = protocol.Queue(
+            new ReaderDrivenCommandFlow(Command.Create(descriptor)),
+            cancellation.Token);
+
+        var pending = CollectInts(flow, cancellation.Token);
+        cancellation.CancelAfter(TimeSpan.FromMilliseconds(200));
+        await Assert.ThrowsExactlyAsync<OperationCanceledException>(() => pending);
+
+        await PgTestPool.RunAsync(protocol, "select 1");
+    }
+
+    [ConnectionCreatingTestMethod]
     public async Task Cancellation_AfterRows_DrainsThenDelivers()
     {
         await using var protocol = await NewCancelableProtocolAsync();
