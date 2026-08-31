@@ -3,5 +3,7 @@
   <Project Path="Slon/Slon.csproj" />
   <Project Path="Slon.Tests/Slon.Tests.csproj" />
   <Project Path="Slon.Benchmark/Slon.Benchmark.csproj" />
+  <Project Path="Slon.Benchmarks/Slon.Fortunes.Minimal/Slon.Fortunes.Minimal.csproj" />
+  <Project Path="Slon.Benchmarks/Slon.Fortunes.Platform/Slon.Fortunes.Platform.csproj" />
   <Project Path="Slon.ProductionWorkload/Slon.ProductionWorkload.csproj" />
 </Solution>
