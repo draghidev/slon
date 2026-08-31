@@ -21,6 +21,8 @@ internal sealed class FullSlonConnectionPool : IAsyncDisposable
         => (_pool, _options, _consumptionMode) =
             (pool, new ReaderDrivenCommandOptions(command), consumptionMode);
 
+    internal SlonConsumptionMode ConsumptionMode => _consumptionMode;
+
     internal static async ValueTask<FullSlonConnectionPool> CreateAsync(
         string connectionString,
         int connectionCount,
@@ -87,7 +89,7 @@ internal sealed class FullSlonConnectionPool : IAsyncDisposable
         }
         else
         {
-            await foreach (var result in flow)
+            await foreach (var result in flow.GetAsyncEnumerator(cancellationToken))
             await foreach (var row in result)
                 values.Add(create(row.GetValue<int>(0), row.GetValue<string>(1)));
         }
@@ -117,7 +119,7 @@ internal sealed class FullSlonConnectionPool : IAsyncDisposable
             cancellationToken).ConfigureAwait(false);
 
         var values = new List<T>();
-        var results = flow.GetAsyncEnumerator();
+        var results = flow.GetAsyncEnumerator(cancellationToken);
         try
         {
             if (await results.MoveNextAsync().ConfigureAwait(false))

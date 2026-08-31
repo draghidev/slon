@@ -115,12 +115,25 @@ internal sealed class RawSlonFortuneDatabase(RawSlonProtocolPool pool) : Fortune
     public override ValueTask RenderAsync(
         BenchmarkApplication application,
         CancellationToken cancellationToken)
-        => pool.ConsumeRetainedAsync(
-            static (id, message) => new Fortune(id, message),
-            application,
-            static (application, fortunes) =>
-                application.RenderFortunesAsync(Complete(fortunes)),
-            cancellationToken);
+        => pool.ConsumptionMode is SlonConsumptionMode.Stream
+            ? pool.ConsumeRetainedAsync(
+                static (id, message) => new Fortune(id, message),
+                application,
+                static (application, fortunes) =>
+                    application.RenderFortunesAsync(Complete(fortunes)),
+                cancellationToken)
+            : RenderCollectedAsync(pool, application, cancellationToken);
+
+    static async ValueTask RenderCollectedAsync(
+        RawSlonProtocolPool pool,
+        BenchmarkApplication application,
+        CancellationToken cancellationToken)
+    {
+        var fortunes = await pool.LoadAsync(
+            static (id, message) => new Fortune(id, Encoding.UTF8.GetBytes(message)),
+            cancellationToken).ConfigureAwait(false);
+        await application.RenderFortunesAsync(Complete(fortunes)).ConfigureAwait(false);
+    }
 
     public override ValueTask DisposeAsync() => pool.DisposeAsync();
 }
@@ -135,12 +148,25 @@ internal sealed class ConnectionSlonFortuneDatabase(FullSlonConnectionPool pool)
     public override ValueTask RenderAsync(
         BenchmarkApplication application,
         CancellationToken cancellationToken)
-        => pool.ConsumeRetainedAsync(
-            static (id, message) => new Fortune(id, message),
-            application,
-            static (application, fortunes) =>
-                application.RenderFortunesAsync(Complete(fortunes)),
-            cancellationToken);
+        => pool.ConsumptionMode is SlonConsumptionMode.Stream
+            ? pool.ConsumeRetainedAsync(
+                static (id, message) => new Fortune(id, message),
+                application,
+                static (application, fortunes) =>
+                    application.RenderFortunesAsync(Complete(fortunes)),
+                cancellationToken)
+            : RenderCollectedAsync(pool, application, cancellationToken);
+
+    static async ValueTask RenderCollectedAsync(
+        FullSlonConnectionPool pool,
+        BenchmarkApplication application,
+        CancellationToken cancellationToken)
+    {
+        var fortunes = await pool.LoadAsync(
+            static (id, message) => new Fortune(id, Encoding.UTF8.GetBytes(message)),
+            cancellationToken).ConfigureAwait(false);
+        await application.RenderFortunesAsync(Complete(fortunes)).ConfigureAwait(false);
+    }
 
     public override ValueTask DisposeAsync() => pool.DisposeAsync();
 }
