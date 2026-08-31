@@ -40,15 +40,14 @@ public sealed class ReaderDrivenCommandFlow : PgClientFlow, IValueTaskSource<boo
     // consumer whether or not one exists yet.
     Slon.Threading.Tasks.Sources.ManualResetValueTaskSourceCore<bool> _collectSource;
 
-    // Cancellation, close, and failure state is cold. A successful uncancelled operation carries one
-    // null reference instead of two registrations, three tokens, their latches, and two exceptions.
+    // The submission token occupies this slot until a consumer attaches, after which the consumer
+    // token replaces it, including with default. Cancellation delivery, close, and failures stay cold.
+    CancellationToken _flowToken;
+    CancellationTokenRegistration _flowRegistration;
     ColdState? _coldState;
 
     sealed class ColdState
     {
-        internal CancellationToken FlowToken;
-        internal CancellationTokenRegistration FlowRegistration;
-        internal CancellationTokenRegistration CallerRegistration;
         internal bool CancelRequested;
         internal CancellationToken DeliverToken;
         internal Exception? CloseException;
@@ -80,15 +79,14 @@ public sealed class ReaderDrivenCommandFlow : PgClientFlow, IValueTaskSource<boo
     protected override TimeSpan? PendingTimeout => _options.PendingTimeout;
 
     internal override void BindCallerToken(CancellationToken cancellationToken)
-        => GetOrCreateColdState().FlowToken = cancellationToken;
+        => _flowToken = cancellationToken;
     internal override CancellationToken MigrationCancellationToken
-        => Volatile.Read(ref _coldState)?.FlowToken ?? default;
+        => _flowToken;
 
     public Enumerator GetAsyncEnumerator(CancellationToken cancellationToken = default)
     {
-        if (cancellationToken.CanBeCanceled)
-            GetOrCreateColdState().FlowToken = cancellationToken;
-        return new(this);
+        _flowToken = cancellationToken;
+        return new(this, cancellationToken);
     }
 
     ColdState GetOrCreateColdState()
@@ -504,7 +502,7 @@ public sealed class ReaderDrivenCommandFlow : PgClientFlow, IValueTaskSource<boo
         Exception? deliver;
         try
         {
-            RegisterCallerToken(cancellationToken);
+            RegisterCancellation(cancellationToken);
             await DrainCoreAsync(_current!).ConfigureAwait(false);
             deliver = Volatile.Read(ref _coldState)?.TerminalException;
         }
@@ -879,72 +877,32 @@ public sealed class ReaderDrivenCommandFlow : PgClientFlow, IValueTaskSource<boo
 
     void RegisterCancellation(CancellationToken callerToken)
     {
-        var cancellation = Volatile.Read(ref _coldState);
-        if (cancellation is null && !callerToken.CanBeCanceled)
+        if (callerToken == _flowToken &&
+            (_flowRegistration != default || !callerToken.CanBeCanceled))
             return;
-        cancellation ??= GetOrCreateColdState();
-        if (cancellation.FlowToken.CanBeCanceled)
-            cancellation.FlowRegistration = cancellation.FlowToken.UnsafeRegister(static (state, token)
-                => ((ReaderDrivenCommandFlow)state!).RequestCancel(token), this);
-        RegisterCallerToken(cancellation, callerToken);
-    }
-
-    void RegisterCallerToken(ColdState cancellation, CancellationToken callerToken)
-    {
-        if (cancellation.CallerRegistration != default)
-        {
-            cancellation.CallerRegistration.Dispose();
-            cancellation.CallerRegistration = default;
-        }
-        if (callerToken == cancellation.FlowToken)
-            return;
+        var registration = _flowRegistration;
+        _flowRegistration = default;
+        registration.Dispose();
+        _flowToken = callerToken;
         if (callerToken.CanBeCanceled)
-            cancellation.CallerRegistration = callerToken.UnsafeRegister(static (state, token)
+            _flowRegistration = callerToken.UnsafeRegister(static (state, token)
                 => ((ReaderDrivenCommandFlow)state!).RequestCancel(token), this);
-    }
-
-    void RegisterCallerToken(CancellationToken callerToken)
-    {
-        var cancellation = Volatile.Read(ref _coldState);
-        if (cancellation is null)
-        {
-            if (!callerToken.CanBeCanceled)
-                return;
-            cancellation = GetOrCreateColdState();
-        }
-        RegisterCallerToken(cancellation, callerToken);
     }
 
     ValueTask DisposeRegistrationsAsync()
     {
-        var cancellation = Volatile.Read(ref _coldState);
-        if (cancellation is null ||
-            (cancellation.FlowRegistration == default && cancellation.CallerRegistration == default))
+        if (_flowRegistration == default)
             return default;
-        return Core(cancellation);
-
-        static async ValueTask Core(ColdState cancellation)
-        {
-            var flowRegistration = cancellation.FlowRegistration;
-            var callerRegistration = cancellation.CallerRegistration;
-            cancellation.FlowRegistration = default;
-            cancellation.CallerRegistration = default;
-            await flowRegistration.DisposeAsync().ConfigureAwait(false);
-            await callerRegistration.DisposeAsync().ConfigureAwait(false);
-        }
+        var flowRegistration = _flowRegistration;
+        _flowRegistration = default;
+        return flowRegistration.DisposeAsync();
     }
 
     void DisposeRegistrations()
     {
-        var cancellation = Volatile.Read(ref _coldState);
-        if (cancellation is null)
-            return;
-        var flowRegistration = cancellation.FlowRegistration;
-        var callerRegistration = cancellation.CallerRegistration;
-        cancellation.FlowRegistration = default;
-        cancellation.CallerRegistration = default;
+        var flowRegistration = _flowRegistration;
+        _flowRegistration = default;
         flowRegistration.Dispose();
-        callerRegistration.Dispose();
     }
 
     // Cancellation only latches intent and requests a backend cancel. The frame owning the decoder
@@ -1071,19 +1029,32 @@ public sealed class ReaderDrivenCommandFlow : PgClientFlow, IValueTaskSource<boo
             _pipelineTaskSource.OnCompleted(continuation, state, token, flags);
     }
 
-    public readonly struct Enumerator(ReaderDrivenCommandFlow flow) : IAsyncEnumerator<CommandResult>, IDisposable
+    public readonly struct Enumerator : IAsyncEnumerator<CommandResult>, IDisposable
     {
+        readonly ReaderDrivenCommandFlow? _flow;
+        readonly CancellationToken _cancellationToken;
+
+        public Enumerator(ReaderDrivenCommandFlow flow)
+            : this(flow, default)
+        { }
+
+        internal Enumerator(ReaderDrivenCommandFlow flow, CancellationToken cancellationToken)
+        {
+            _flow = flow;
+            _cancellationToken = cancellationToken;
+        }
+
         public Enumerator GetAsyncEnumerator() => this;
 
-        public ValueTask<bool> MoveNextAsync() => MoveNextAsync(default);
+        public ValueTask<bool> MoveNextAsync() => MoveNextAsync(_cancellationToken);
 
         public ValueTask<bool> MoveNextAsync(CancellationToken cancellationToken)
-            => flow is null ? new(false) : flow.MoveNextAsync(cancellationToken);
+            => _flow is null ? new(false) : _flow.MoveNextAsync(cancellationToken);
 
-        public CommandResult Current => flow?._current ?? default!;
+        public CommandResult Current => _flow?._current ?? default!;
 
-        public ValueTask DisposeAsync() => flow is null ? default : flow.DisposeAsync();
+        public ValueTask DisposeAsync() => _flow is null ? default : _flow.DisposeAsync();
 
-        public void Dispose() => flow?.Dispose();
+        public void Dispose() => _flow?.Dispose();
     }
 }

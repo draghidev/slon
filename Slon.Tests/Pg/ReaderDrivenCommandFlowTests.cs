@@ -332,7 +332,7 @@ public class ReaderDrivenCommandFlowTests
     }
 
     [ConnectionCreatingTestMethod]
-    public async Task FlowToken_CancelledBeforeActivation_ReplaysOnActivation()
+    public async Task ConsumerToken_CancelledBeforeActivation_ReplaysOnActivation()
     {
         await using var protocol = await NewCancelableProtocolAsync();
         var descriptor = await Prepare(protocol, "select generate_series(1, 1000)", "rd_flow_token");
@@ -341,12 +341,42 @@ public class ReaderDrivenCommandFlowTests
         var blocker = protocol.Queue(new CommandFlow(async: true, Command.Create("select pg_sleep(0.3)")))
             .GetAsyncEnumerator();
         Assert.IsTrue(await blocker.MoveNextAsync());
-        var results = QueuePrepared(protocol, descriptor, cts.Token).GetAsyncEnumerator();
+        var results = QueuePrepared(protocol, descriptor, cts.Token).GetAsyncEnumerator(cts.Token);
         cts.Cancel();
         Assert.IsFalse(await blocker.MoveNextAsync());
         await blocker.DisposeAsync();
 
         await Assert.ThrowsExactlyAsync<OperationCanceledException>(async () => await results.MoveNextAsync());
+        await results.DisposeAsync();
+
+        await PgTestPool.RunAsync(protocol, "select 1");
+    }
+
+    [ConnectionCreatingTestMethod]
+    public async Task ConsumerAttachment_EndsSubmissionTokenTenure()
+    {
+        await using var protocol = await NewCancelableProtocolAsync();
+        var descriptor = await Prepare(protocol, "select generate_series(1, 3)", "rd_token_handoff");
+        using var submissionCancellation = new CancellationTokenSource();
+        // Keep the flow behind a predecessor so cancellation happens before activation.
+        var blocker = protocol.Queue(new CommandFlow(async: true, Command.Create("select pg_sleep(0.3)")))
+            .GetAsyncEnumerator();
+        Assert.IsTrue(await blocker.MoveNextAsync());
+        var results = QueuePrepared(protocol, descriptor, submissionCancellation.Token)
+            .GetAsyncEnumerator();
+
+        submissionCancellation.Cancel();
+        Assert.IsFalse(await blocker.MoveNextAsync());
+        await blocker.DisposeAsync();
+
+        Assert.IsTrue(await results.MoveNextAsync());
+        var rows = results.Current.GetAsyncEnumerator();
+        var count = 0;
+        while (await rows.MoveNextAsync())
+            count++;
+        await rows.DisposeAsync();
+        Assert.AreEqual(3, count);
+        Assert.IsFalse(await results.MoveNextAsync());
         await results.DisposeAsync();
 
         await PgTestPool.RunAsync(protocol, "select 1");
