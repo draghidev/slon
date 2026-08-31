@@ -18,6 +18,8 @@ internal sealed class RawSlonProtocolPool : IAsyncDisposable
     RawSlonProtocolPool(Slot[] slots, SlonConsumptionMode consumptionMode)
         => (_slots, _consumptionMode) = (slots, consumptionMode);
 
+    internal SlonConsumptionMode ConsumptionMode => _consumptionMode;
+
     internal static async ValueTask<RawSlonProtocolPool> CreateAsync(
         string connectionString,
         int connectionCount,
@@ -89,7 +91,7 @@ internal sealed class RawSlonProtocolPool : IAsyncDisposable
         }
         else
         {
-            await foreach (var result in flow)
+            await foreach (var result in flow.GetAsyncEnumerator(cancellationToken))
             await foreach (var row in result)
                 values.Add(create(row.GetValue<int>(0), row.GetValue<string>(1)));
         }
@@ -112,7 +114,7 @@ internal sealed class RawSlonProtocolPool : IAsyncDisposable
             throw new InvalidOperationException("The selected PostgreSQL protocol is unavailable.");
 
         var values = new List<T>();
-        var results = flow.GetAsyncEnumerator();
+        var results = flow.GetAsyncEnumerator(cancellationToken);
         try
         {
             if (await results.MoveNextAsync().ConfigureAwait(false))
