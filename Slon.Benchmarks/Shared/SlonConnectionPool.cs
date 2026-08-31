@@ -10,24 +10,18 @@ using Slon.Transport;
 
 namespace Slon.Fortunes;
 
-internal sealed class FullSlonConnectionPool : IAsyncDisposable
+internal sealed class SlonConnectionPool : IAsyncDisposable
 {
     const string Query = "SELECT id, message FROM fortune";
     readonly ConnectionPool<ProtocolConnection> _pool;
     readonly ReaderDrivenCommandOptions _options;
-    readonly SlonConsumptionMode _consumptionMode;
 
-    FullSlonConnectionPool(ConnectionPool<ProtocolConnection> pool, Command command,
-        SlonConsumptionMode consumptionMode)
-        => (_pool, _options, _consumptionMode) =
-            (pool, new ReaderDrivenCommandOptions(command), consumptionMode);
+    SlonConnectionPool(ConnectionPool<ProtocolConnection> pool, Command command)
+        => (_pool, _options) = (pool, new ReaderDrivenCommandOptions(command));
 
-    internal SlonConsumptionMode ConsumptionMode => _consumptionMode;
-
-    internal static async ValueTask<FullSlonConnectionPool> CreateAsync(
+    internal static async ValueTask<SlonConnectionPool> CreateAsync(
         string connectionString,
-        int connectionCount,
-        SlonConsumptionMode consumptionMode)
+        int connectionCount)
     {
         var builder = new NpgsqlConnectionStringBuilder(connectionString);
         var clientOptions = new PgClientOptions
@@ -62,7 +56,7 @@ internal sealed class FullSlonConnectionPool : IAsyncDisposable
                 MaxConnections = connectionCount,
                 ConnectionIdleLifetime = Timeout.InfiniteTimeSpan,
             });
-        return new(pool, command, consumptionMode);
+        return new(pool, command);
     }
 
     public async ValueTask<List<T>> LoadAsync<T>(
@@ -81,21 +75,10 @@ internal sealed class FullSlonConnectionPool : IAsyncDisposable
             Timeout.InfiniteTimeSpan,
             cancellationToken).ConfigureAwait(false);
 
-        var values = new CollectList<T>(create);
-        if (_consumptionMode is SlonConsumptionMode.Collect)
-        {
-            await flow.CollectAsync(values, static (state, row) =>
-            {
-                var list = (CollectList<T>)state!;
-                list.Add(list.Create(row.GetValue<int>(0), row.GetValue<string>(1)));
-            }, cancellationToken).ConfigureAwait(false);
-        }
-        else
-        {
-            await foreach (var result in flow.GetAsyncEnumerator(cancellationToken))
-            await foreach (var row in result)
-                values.Add(create(row.GetValue<int>(0), row.GetValue<string>(1)));
-        }
+        var values = new List<T>();
+        await foreach (var result in flow.GetAsyncEnumerator(cancellationToken))
+        await foreach (var row in result)
+            values.Add(create(row.GetValue<int>(0), row.GetValue<string>(1)));
         return values;
     }
 
@@ -105,10 +88,6 @@ internal sealed class FullSlonConnectionPool : IAsyncDisposable
         Func<TState, List<T>, ValueTask> consume,
         CancellationToken cancellationToken)
     {
-        if (_consumptionMode is not SlonConsumptionMode.Stream)
-            throw new InvalidOperationException(
-                "Retained field memory requires streaming consumption.");
-
         var flow = new ReaderDrivenCommandFlow(_options);
         await _pool.GetAsync(
             static (candidate, item) => candidate.Connection.Protocol.TryQueue(
@@ -261,10 +240,5 @@ internal sealed class FullSlonConnectionPool : IAsyncDisposable
                 throw;
             }
         }
-    }
-
-    sealed class CollectList<T>(Func<int, string, T> create) : List<T>
-    {
-        internal Func<int, string, T> Create { get; } = create;
     }
 }

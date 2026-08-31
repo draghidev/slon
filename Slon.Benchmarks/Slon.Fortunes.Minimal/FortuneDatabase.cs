@@ -25,11 +25,8 @@ internal abstract class FortuneDatabase : IAsyncDisposable
 
         return (database, driver) switch
         {
-            ("postgresql", "slon") => CreateSlonAsync(
-                connectionString,
-                connectionCount,
-                configuration["SLON_POOL_MODE"],
-                configuration["SLON_CONSUMPTION_MODE"]),
+            ("postgresql", "slon") =>
+                SlonFortuneDatabase.CreateAsync(connectionString, connectionCount),
             ("postgresql", "npgsql") => ValueTask.FromResult<FortuneDatabase>(
                 new NpgsqlFortuneDatabase(connectionString, connectionCount)),
             _ => throw new InvalidOperationException("The database selection is invalid."),
@@ -80,60 +77,14 @@ internal abstract class FortuneDatabase : IAsyncDisposable
             : throw new InvalidOperationException($"{name} must be a positive integer.");
     }
 
-    static ValueTask<FortuneDatabase> CreateSlonAsync(
-        string connectionString, int connectionCount, string? configuredPoolMode,
-        string? configuredConsumptionMode)
-    {
-        var poolMode = string.IsNullOrWhiteSpace(configuredPoolMode)
-            ? "raw"
-            : configuredPoolMode.Trim().ToLowerInvariant();
-        var consumptionMode = ParseConsumptionMode(configuredConsumptionMode);
-        Console.WriteLine($"Slon pool mode: {poolMode}; consumption mode: {consumptionMode.ToString().ToLowerInvariant()}.");
-        return poolMode switch
-        {
-            "raw" => RawSlonFortuneDatabase.CreateAsync(connectionString, connectionCount, consumptionMode),
-            "connection" => ConnectionSlonFortuneDatabase.CreateAsync(connectionString, connectionCount, consumptionMode),
-            _ => throw new ArgumentOutOfRangeException(
-                "SLON_POOL_MODE", configuredPoolMode, "Expected 'raw' or 'connection'."),
-        };
-    }
-
-    static SlonConsumptionMode ParseConsumptionMode(string? configuredMode)
-        => string.IsNullOrWhiteSpace(configuredMode)
-            ? SlonConsumptionMode.Stream
-            : configuredMode.Trim().ToLowerInvariant() switch
-            {
-                "stream" => SlonConsumptionMode.Stream,
-                "collect" => SlonConsumptionMode.Collect,
-                _ => throw new ArgumentOutOfRangeException(
-                    "SLON_CONSUMPTION_MODE", configuredMode, "Expected 'stream' or 'collect'."),
-            };
 }
 
-internal sealed class RawSlonFortuneDatabase(RawSlonProtocolPool pool) : FortuneDatabase
+internal sealed class SlonFortuneDatabase(SlonConnectionPool pool) : FortuneDatabase
 {
     public static async ValueTask<FortuneDatabase> CreateAsync(
-        string connectionString, int connectionCount, SlonConsumptionMode consumptionMode)
-        => new RawSlonFortuneDatabase(await RawSlonProtocolPool.CreateAsync(
-            connectionString, connectionCount, consumptionMode).ConfigureAwait(false));
-
-    public override async ValueTask<List<Fortune>> LoadAsync(
-        CancellationToken cancellationToken)
-    {
-        var fortunes = await pool.LoadAsync(
-            static (id, message) => new Fortune(id, message), cancellationToken).ConfigureAwait(false);
-        return Complete(fortunes);
-    }
-
-    public override ValueTask DisposeAsync() => pool.DisposeAsync();
-}
-
-internal sealed class ConnectionSlonFortuneDatabase(FullSlonConnectionPool pool) : FortuneDatabase
-{
-    public static async ValueTask<FortuneDatabase> CreateAsync(
-        string connectionString, int connectionCount, SlonConsumptionMode consumptionMode)
-        => new ConnectionSlonFortuneDatabase(await FullSlonConnectionPool.CreateAsync(
-            connectionString, connectionCount, consumptionMode).ConfigureAwait(false));
+        string connectionString, int connectionCount)
+        => new SlonFortuneDatabase(await SlonConnectionPool.CreateAsync(
+            connectionString, connectionCount).ConfigureAwait(false));
 
     public override async ValueTask<List<Fortune>> LoadAsync(CancellationToken cancellationToken)
     {
