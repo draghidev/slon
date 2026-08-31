@@ -7,6 +7,12 @@ using RazorSlices;
 
 namespace Slon.Fortunes.Platform;
 
+internal enum FortuneTemplating
+{
+    Razor,
+    Raw
+}
+
 public sealed partial class BenchmarkApplication
 {
     private static readonly DefaultObjectPool<ChunkedPipeWriter> ChunkedWriterPool =
@@ -15,6 +21,7 @@ public sealed partial class BenchmarkApplication
     private RequestType _requestType;
 
     internal static FortuneDatabase Database { get; set; } = null!;
+    internal static FortuneTemplating Templating { get; set; }
 
     public void OnStartLine(
         HttpVersionAndMethod versionAndMethod,
@@ -36,6 +43,15 @@ public sealed partial class BenchmarkApplication
 
     internal ValueTask RenderFortunesAsync(List<Fortune> fortunes)
     {
+        if (Templating is FortuneTemplating.Raw)
+        {
+            var writer = StartResponse(Writer);
+            RawFortuneTemplating.Render(fortunes, writer, HtmlEncoder);
+            writer.Complete();
+            ReturnChunkedWriter(writer);
+            return ValueTask.CompletedTask;
+        }
+
         var template = Templates.Fortunes.Create(fortunes);
         return OutputFortunesAsync(Writer, template);
     }

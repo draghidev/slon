@@ -10,6 +10,13 @@ var configuration = new ConfigurationBuilder()
     .AddCommandLine(args)
     .Build();
 var url = new Uri(configuration["urls"] ?? "http://0.0.0.0:5000");
+BenchmarkApplication.Templating = configuration["TEMPLATING"]?.Trim().ToLowerInvariant() switch
+{
+    null or "" or "razor" => FortuneTemplating.Razor,
+    "raw" => FortuneTemplating.Raw,
+    var value => throw new ArgumentOutOfRangeException(
+        "TEMPLATING", value, "Expected 'razor' or 'raw'."),
+};
 
 await using var database = await FortuneDatabase.CreateAsync(
     configuration["DATABASE"],

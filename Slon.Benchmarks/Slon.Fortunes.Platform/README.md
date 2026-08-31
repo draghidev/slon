@@ -14,6 +14,7 @@ Set all of these environment variables before starting the app:
 | `DRIVER` | `slon` or `npgsql` |
 | `CONNECTION_STRING` | PostgreSQL connection string |
 | `DATABASE_CONNECTIONS` | Positive fixed pool size |
+| `TEMPLATING` | `razor` (default) or `raw` |
 
 Invalid, unsupported, or missing selections fail application startup with an explicit error.
 The Crank config defaults `branchOrCommit` to `main`; override it when benchmarking an
@@ -26,6 +27,9 @@ Slon uses its experimental lower layer through `ConnectionPool<T>` and creates a
 becomes schedulable. Streaming consumption retains UTF-8 field memory through rendering, avoiding
 per-row strings and byte arrays. Zero-byte reads are disabled to match Apex's ordinary BCL transport
 shape.
+
+`TEMPLATING=raw` writes the same encoded HTML directly into the response buffer. It isolates the
+driver and pool cost from RazorSlices overhead without changing query or row-consumption behavior.
 
 Npgsql uses a slim data source and a command bound to each leased connection. Every strategy
 appends and ordinally sorts the same logical model and renders through the same RazorSlices UTF-8
