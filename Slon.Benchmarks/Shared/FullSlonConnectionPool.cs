@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Net;
 using Npgsql;
 using Slon.Pg;
@@ -38,17 +39,19 @@ internal sealed class FullSlonConnectionPool : IAsyncDisposable
             Password = builder.Password,
             Ssl = new PostgreSqlSslOptions { Mode = PostgreSqlSslMode.Disable },
         };
+        var transportFactory = SocketStreamConnection.CreateFactory(
+            clientOptions.EndPoint,
+            new TransportConnectionOptions { UseZeroByteReads = false });
+        var bootstrapFactory = new PgClientProtocolFactory(clientOptions, transportFactory);
         var protocolFactory = new PgClientProtocolFactory(
             clientOptions,
-            SocketStreamConnection.CreateFactory(clientOptions.EndPoint, new TransportConnectionOptions
-            {
-                UseZeroByteReads = false,
-            }));
+            transportFactory,
+            static options => options.HeartbeatMode = PgClientProtocolHeartbeatMode.External);
 
         // Every pooled wire installs the same named statement. Obtain its immutable descriptor once;
         // later flows can be created before placement and use it on whichever wire the pool selects.
         Command command;
-        await using (var bootstrap = await protocolFactory.CreateAsync().ConfigureAwait(false))
+        await using (var bootstrap = await bootstrapFactory.CreateAsync().ConfigureAwait(false))
             command = await PrepareAsync(bootstrap).ConfigureAwait(false);
 
         var pool = new ConnectionPool<ProtocolConnection>(
@@ -169,17 +172,51 @@ internal sealed class FullSlonConnectionPool : IAsyncDisposable
     sealed class ProtocolConnection(PgClientProtocol protocol)
         : IPoolConnection<ProtocolConnection>
     {
+        IDisposable? _heartbeatRegistration;
+
         internal PgClientProtocol Protocol { get; } = protocol;
         public bool IsIdle => Protocol.Outstanding == 0;
         public bool IsSchedulable => Protocol.IsSchedulable;
         public Task Completion => Protocol.Completion;
-        public Task CompleteAsync(Exception? exception = null) => Protocol.CompleteAsync(exception);
+        public Task CompleteAsync(Exception? exception = null)
+        {
+            var completion = Protocol.CompleteAsync(exception);
+            if (completion.IsCompleted)
+            {
+                StopHeartbeat();
+                return completion;
+            }
+            return CompleteAndStopHeartbeat(completion, this);
+
+            static async Task CompleteAndStopHeartbeat(
+                Task completion, ProtocolConnection connection)
+            {
+                try
+                {
+                    await completion.ConfigureAwait(false);
+                }
+                finally
+                {
+                    connection.StopHeartbeat();
+                }
+            }
+        }
         public int CompareTo(ProtocolConnection? other)
             => other is null ? 1 : Protocol.Outstanding.CompareTo(other.Protocol.Outstanding);
 
         public void Start(ConnectionPool<ProtocolConnection>.Registration registration)
             => Protocol.SetAdmissionAvailableCallback(
                 () => registration.SignalAvailability(Protocol.Outstanding == 0));
+
+        internal void StartHeartbeat(ConnectionPoolContext<ProtocolConnection> poolContext)
+        {
+            Debug.Assert(_heartbeatRegistration is null);
+            _heartbeatRegistration = poolContext.OnHeartbeat(
+                static (connection, elapsed) => connection.Protocol.HeartbeatAsync(elapsed), this);
+        }
+
+        internal void StopHeartbeat()
+            => Interlocked.Exchange(ref _heartbeatRegistration, null)?.Dispose();
     }
 
     sealed class ProtocolConnectionFactory(PgClientProtocolFactory factory)
@@ -190,13 +227,16 @@ internal sealed class FullSlonConnectionPool : IAsyncDisposable
             TimeSpan timeout = default)
         {
             var protocol = factory.Create(timeout);
+            var connection = new ProtocolConnection(protocol);
+            connection.StartHeartbeat(poolContext);
             try
             {
                 _ = PrepareAsync(protocol).AsTask().GetAwaiter().GetResult();
-                return new(protocol);
+                return connection;
             }
             catch
             {
+                connection.StopHeartbeat();
                 protocol.Dispose();
                 throw;
             }
@@ -207,13 +247,16 @@ internal sealed class FullSlonConnectionPool : IAsyncDisposable
             CancellationToken cancellationToken = default)
         {
             var protocol = await factory.CreateAsync(cancellationToken).ConfigureAwait(false);
+            var connection = new ProtocolConnection(protocol);
+            connection.StartHeartbeat(poolContext);
             try
             {
                 _ = await PrepareAsync(protocol).ConfigureAwait(false);
-                return new(protocol);
+                return connection;
             }
             catch
             {
+                connection.StopHeartbeat();
                 await protocol.DisposeAsync().ConfigureAwait(false);
                 throw;
             }
