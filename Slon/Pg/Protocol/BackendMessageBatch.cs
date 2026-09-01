@@ -11,12 +11,17 @@ namespace Slon.Pg.Protocol;
 struct BackendMessageBatch(ReadOnlySequence<byte> buffer)
 {
     FastReadOnlySequence<byte> _buffer = new(buffer);
-    long _consumedLength;
+    long _initialLength = buffer.Length;
 
-    BackendMessageBatch(ReadOnlySequence<byte> buffer, long consumedLength) : this(buffer)
-        => _consumedLength = consumedLength;
+    public readonly long GetCurrentMessageOffset(long currentBufferedLength)
+        => _initialLength - _buffer.Length - currentBufferedLength;
 
-    public readonly long ConsumedLength => _consumedLength;
+    public readonly BackendMessageBatch Slice(long offset)
+    {
+        var result = new BackendMessageBatch(_buffer.Sequence.Slice(offset));
+        result._initialLength = _initialLength;
+        return result;
+    }
 
     public bool TryReadNextInPlace(out BackendHeader header, out ReadOnlySequence<byte> buffer, out uint bufferLength)
     {
@@ -31,7 +36,6 @@ struct BackendMessageBatch(ReadOnlySequence<byte> buffer)
         }
 
         var fastSeq = _buffer.SplitInPlace(Math.Min(_buffer.Length, protoHeader.MessageLength));
-        _consumedLength += fastSeq.Length;
         buffer = fastSeq.Sequence;
         Debug.Assert(fastSeq.Length <= uint.MaxValue);
         bufferLength = unchecked((uint)fastSeq.Length);
@@ -43,7 +47,7 @@ struct BackendMessageBatch(ReadOnlySequence<byte> buffer)
     {
         var thisCopy = this;
         var success = thisCopy.TryReadNextInPlace(out header, out buffer, out bufferLength);
-        remaining = success ? new(thisCopy._buffer.Sequence, thisCopy._consumedLength) : default;
+        remaining = success ? thisCopy : default;
         return success;
     }
 

@@ -80,10 +80,8 @@ sealed class BackendMessageContext
         Validate(token);
         if ((_messageState & MessageOffsetCaptured) == 0)
         {
-            // Fully buffered messages never need their batch-relative offset. Capture it only
-            // before a streaming operation can replace the segment used to derive it.
-            Debug.Assert(!_current.Buffered);
-            _currentMessageOffset = _remainingBatch.ConsumedLength - _current.BufferedLength;
+            _currentMessageOffset = _remainingBatch.GetCurrentMessageOffset(
+                _current.BufferedLength);
             _messageState |= MessageOffsetCaptured;
         }
         return _currentMessageOffset;
