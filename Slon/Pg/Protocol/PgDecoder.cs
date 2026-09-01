@@ -115,14 +115,14 @@ public sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<Bac
     internal void CompleteCurrentMessage()
         => _pipe.CompleteCurrentMessage();
 
-    void PrepareMoveNextBatch() => _pipe.PrepareMoveNextBatch();
+    void PrepareRead() => _pipe.PrepareRead();
 
-    bool CompleteMoveNextBatch(
+    bool CompleteRead(
         in ReadResult result, CancellationToken cancellationToken, out bool completed)
-        => _pipe.CompleteMoveNextBatch(
+        => _pipe.CompleteRead(
             result, cancellationToken, out completed);
 
-    bool MoveNextBatch(TimeSpan timeout)
+    bool ReadNext(TimeSpan timeout)
         => _pipe.MoveNext(timeout);
 
     bool TryBeginDirectRead(CancellationToken cancellationToken, out ValueTask<int> task)
@@ -146,7 +146,7 @@ public sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<Bac
             return false;
         }
         readFinished = true;
-        return CompleteMoveNextBatch(result, cancellationToken, out completed);
+        return CompleteRead(result, cancellationToken, out completed);
     }
 
     void AbortDirectRead() => _directReader!.AbortDirectRead();
@@ -441,7 +441,7 @@ public sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<Bac
                     return new(true);
             }
 
-            PrepareMoveNextBatch();
+            PrepareRead();
 
             var readToken = _cancellationTokenSource.Token;
             var frontierFlow = EnterCancellationReadFrontier();
@@ -483,7 +483,7 @@ public sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<Bac
                 if (!readTask.IsCompletedSuccessfully)
                     return MoveNextAsyncCore(readTask, null, null, cancellationToken, frontierFlow);
                 LeaveCancellationReadFrontier(frontierFlow);
-                if (CompleteMoveNextBatch(
+                if (CompleteRead(
                         readTask.Result, _cancellationTokenSource.Token,
                         out var readCompleted))
                     continue;
@@ -537,7 +537,7 @@ public sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<Bac
                             LeaveCancellationReadFrontier(frontierFlow!);
                             frontierFlow = null;
                             readTask = null;
-                            if (CompleteMoveNextBatch(
+                            if (CompleteRead(
                                     result, _cancellationTokenSource.Token,
                                     out var readCompleted))
                                 continue;
@@ -615,7 +615,7 @@ public sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<Bac
                     if (messageHandledTask.HasValue)
                         continue;
 
-                    PrepareMoveNextBatch();
+                    PrepareRead();
 
                     try
                     {
@@ -767,7 +767,7 @@ public sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<Bac
                 return true;
             }
 
-            PrepareMoveNextBatch();
+            PrepareRead();
             break;
         }
 

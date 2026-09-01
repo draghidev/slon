@@ -32,7 +32,7 @@ public class BackendMessageParsingTests
         BinaryPrimitives.WriteInt32BigEndian(bytes.AsSpan(1), length);
         body.CopyTo(bytes.AsSpan(BackendHeader.ByteCount));
         var context = new BackendMessageContext();
-        context.SetBatch(new BackendMessageBatch(new ReadOnlySequence<byte>(bytes)));
+        context.SetCursor(new BackendMessageCursor(new ReadOnlySequence<byte>(bytes)));
         Assert.IsTrue(context.TryMoveNext());
         return context.Current;
     }

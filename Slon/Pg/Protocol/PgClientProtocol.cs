@@ -86,7 +86,7 @@ public sealed class PgClientProtocolOptions
     public TimeSpan CancellationTimeout { get; set; } = TimeSpan.FromSeconds(10);
     public TimeSpan CancellationRetryInterval { get; set; } = TimeSpan.FromSeconds(1);
     internal PgSessionResetOptions SessionReset { get; set; } = new();
-    public int DataRowStreamingThreshold { get; set; } = BackendMessageBatch.DefaultDataRowStreamingThreshold;
+    public int DataRowStreamingThreshold { get; set; } = BackendMessageCursor.DefaultDataRowStreamingThreshold;
     public int MaxInFlightFlowsPerWire { get; set; }
     public ILoggerFactory LoggerFactory { get; set; } = NullLoggerFactory.Instance;
     // Datasource bootstrap supplies this. A standalone raw protocol can omit backend identity and

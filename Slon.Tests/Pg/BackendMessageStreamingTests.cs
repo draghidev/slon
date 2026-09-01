@@ -102,11 +102,11 @@ public class BackendMessageStreamingTests
         return start.To(start.Append(second));
     }
 
-    static async ValueTask<bool> MoveNextBatchAsync(ProtocolReadPipe pipe)
+    static async ValueTask<bool> ReadNextAsync(ProtocolReadPipe pipe)
     {
-        pipe.PrepareMoveNextBatch();
+        pipe.PrepareRead();
         var read = await pipe.ReadAsync(CancellationToken.None);
-        return pipe.CompleteMoveNextBatch(
+        return pipe.CompleteRead(
             read, CancellationToken.None, out _);
     }
 
@@ -150,7 +150,7 @@ public class BackendMessageStreamingTests
         Assert.IsFalse(context.TryGetCurrent(out _));
         Assert.ThrowsExactly<InvalidOperationException>(() => _ = context.Current);
 
-        context.SetBatch(new BackendMessageBatch(
+        context.SetCursor(new BackendMessageCursor(
             new ReadOnlySequence<byte>(BackendMessageBytes(BackendType.CommandComplete, 6))));
         Assert.IsTrue(context.TryMoveNext());
         Assert.IsTrue(context.TryGetCurrent(out var current));
@@ -160,39 +160,39 @@ public class BackendMessageStreamingTests
         Assert.IsTrue(context.TryGetCurrent(out current));
         Assert.AreEqual(BackendType.CommandComplete, current.Header.Type);
         Assert.AreEqual(BackendType.CommandComplete, accessor.Message.Header.Type);
-        context.RetireCurrentBatch();
+        context.RetireCursor();
         Assert.IsFalse(context.TryGetCurrent(out _));
         Assert.ThrowsExactly<InvalidOperationException>(() => _ = context.Current);
         Assert.ThrowsExactly<InvalidOperationException>(() => _ = accessor.Message);
     }
 
     [TestMethod]
-    public void BackendMessageBatch_AdvancesAcrossExactSegmentBoundary()
+    public void BackendMessageCursor_AdvancesAcrossExactSegmentBoundary()
     {
         var first = BackendMessageBytes(BackendType.CommandComplete, 6);
         var second = BackendMessageBytes(BackendType.ReadyForQuery, 6);
-        var batch = new BackendMessageBatch(Segmented(first, second));
+        var cursor = new BackendMessageCursor(Segmented(first, second));
 
-        Assert.IsTrue(batch.TryReadNextInPlace(out var header, out var message, out _));
+        Assert.IsTrue(cursor.TryReadNextInPlace(out var header, out var message, out _));
         Assert.AreEqual(BackendType.CommandComplete, header.Type);
         CollectionAssert.AreEqual(first, message.ToArray());
-        Assert.IsTrue(batch.TryReadNextInPlace(out header, out message, out _));
+        Assert.IsTrue(cursor.TryReadNextInPlace(out header, out message, out _));
         Assert.AreEqual(BackendType.ReadyForQuery, header.Type);
         CollectionAssert.AreEqual(second, message.ToArray());
-        Assert.IsFalse(batch.TryReadNextInPlace(out _, out _, out _));
+        Assert.IsFalse(cursor.TryReadNextInPlace(out _, out _, out _));
     }
 
     [TestMethod]
-    public async Task MovingToNextBatch_RetiresCurrentBeforeReturningItsStorage()
+    public async Task MovingToNextRead_RetiresCurrentBeforeReturningItsStorage()
     {
         var pipe = new Pipe();
         var reader = new RejectRetiredSuppliedReadReader(pipe.Reader);
         var protocolPipe = new ProtocolReadPipe(reader,
-            BackendMessageBatch.DefaultDataRowStreamingThreshold,
+            BackendMessageCursor.DefaultDataRowStreamingThreshold,
             ownsReader: true);
 
         await pipe.Writer.WriteAsync(BackendMessageBytes(BackendType.CommandComplete, 6));
-        Assert.IsTrue(await MoveNextBatchAsync(protocolPipe));
+        Assert.IsTrue(await ReadNextAsync(protocolPipe));
         Assert.IsTrue(protocolPipe.TryMoveNext());
         var accessor = protocolPipe.Current.GetAccessor();
         Assert.IsFalse(protocolPipe.TryMoveNext());
@@ -208,7 +208,7 @@ public class BackendMessageStreamingTests
         };
 
         await pipe.Writer.WriteAsync(BackendMessageBytes(BackendType.ReadyForQuery, 6));
-        Assert.IsTrue(await MoveNextBatchAsync(protocolPipe));
+        Assert.IsTrue(await ReadNextAsync(protocolPipe));
         Assert.IsTrue(observedAdvance);
         Assert.IsTrue(protocolPipe.TryMoveNext());
         Assert.AreEqual(BackendType.ReadyForQuery, protocolPipe.Current.Header.Type);
@@ -239,15 +239,15 @@ public class BackendMessageStreamingTests
                 {
                     case LifetimeAction.LoadCommandComplete:
                     case LifetimeAction.LoadReadyForQuery:
-                        // ProtocolReadPipe retires the prior batch before committing replacement
-                        // storage. Model that ownership boundary rather than calling SetBatch as a
+                        // ProtocolReadPipe retires the prior cursor before committing replacement
+                        // storage. Model that ownership boundary rather than calling SetCursor as a
                         // replacement operation it is not.
-                        context.RetireCurrentBatch();
+                        context.RetireCursor();
                         current = null;
                         loaded = action is LifetimeAction.LoadCommandComplete
                             ? BackendType.CommandComplete
                             : BackendType.ReadyForQuery;
-                        context.SetBatch(new(new ReadOnlySequence<byte>(
+                        context.SetCursor(new(new ReadOnlySequence<byte>(
                             BackendMessageBytes(loaded.Value, 6))));
                         break;
                     case LifetimeAction.MoveNext:
@@ -259,7 +259,7 @@ public class BackendMessageStreamingTests
                         }
                         break;
                     case LifetimeAction.Retire:
-                        context.RetireCurrentBatch();
+                        context.RetireCursor();
                         loaded = null;
                         current = null;
                         break;
@@ -298,7 +298,7 @@ public class BackendMessageStreamingTests
             new StreamPipeReaderOptions(bufferSize: 1024, useZeroByteReads: false),
             supportCancelPending: false);
         var readPipe = new ProtocolReadPipe(reader,
-            BackendMessageBatch.DefaultDataRowStreamingThreshold,
+            BackendMessageCursor.DefaultDataRowStreamingThreshold,
             ownsReader: true);
         var messageIndex = 0;
         while (await readPipe.MoveNextAsync(default))
@@ -338,13 +338,13 @@ public class BackendMessageStreamingTests
             new StreamPipeReaderOptions(bufferSize: 1024, useZeroByteReads: false),
             supportCancelPending: false);
         var readPipe = new ProtocolReadPipe(reader,
-            BackendMessageBatch.DefaultDataRowStreamingThreshold,
+            BackendMessageCursor.DefaultDataRowStreamingThreshold,
             ownsReader: true);
         var directReader = (StreamPipeReader)readPipe.PipeReader;
         var messageIndex = 0;
         while (true)
         {
-            readPipe.PrepareMoveNextBatch();
+            readPipe.PrepareRead();
             Assert.IsTrue(directReader.SupportsDirectRead);
             var read = directReader.BeginDirectRead(default);
             while (true)
@@ -354,10 +354,10 @@ public class BackendMessageStreamingTests
                 {
                     continue;
                 }
-                if (readPipe.CompleteMoveNextBatch(
+                if (readPipe.CompleteRead(
                         result, default, out var completed))
                 {
-                    ValidateBatch();
+                    ValidateMessages();
                     break;
                 }
                 if (completed)
@@ -370,7 +370,7 @@ public class BackendMessageStreamingTests
         Assert.AreEqual(repetitions * response.Length, messageIndex);
         await readPipe.DisposeAsync();
 
-        void ValidateBatch()
+        void ValidateMessages()
         {
             while (readPipe.TryMoveNext())
             {
@@ -409,7 +409,7 @@ public class BackendMessageStreamingTests
     {
         var pipe = new Pipe();
         var readPipe = new ProtocolReadPipe(pipe.Reader,
-            BackendMessageBatch.DefaultDataRowStreamingThreshold);
+            BackendMessageCursor.DefaultDataRowStreamingThreshold);
         await pipe.Writer.WriteAsync(BackendMessageBytes(BackendType.ReadyForQuery, 6));
 
         Assert.IsTrue(await readPipe.MoveNextAsync(CancellationToken.None));
@@ -438,7 +438,7 @@ public class BackendMessageStreamingTests
         decoder.Pipe.BindDecoder(decoder);
 
         await pipe.Writer.WriteAsync(wire.AsMemory(0, 8));
-        Assert.IsTrue(await MoveNextBatchAsync(decoder.Pipe));
+        Assert.IsTrue(await ReadNextAsync(decoder.Pipe));
         Assert.IsTrue(decoder.Pipe.TryMoveNext());
         var body = decoder.Pipe.Current.OpenBodyReader();
         Assert.AreEqual(3, body.Buffer.Length);
@@ -473,12 +473,12 @@ public class BackendMessageStreamingTests
             pauseWriterThreshold: 256 * 1024,
             resumeWriterThreshold: 128 * 1024));
         var decoder = new PgDecoder(pipe.Reader,
-            BackendMessageBatch.DefaultDataRowStreamingThreshold,
+            BackendMessageCursor.DefaultDataRowStreamingThreshold,
             CancellationToken.None, Timeout.InfiniteTimeSpan);
         decoder.Pipe.BindDecoder(decoder);
 
         var initialLength = bind.Length
-            + BackendMessageBatch.DefaultDataRowStreamingThreshold;
+            + BackendMessageCursor.DefaultDataRowStreamingThreshold;
         await pipe.Writer.WriteAsync(wire.AsMemory(0, initialLength));
         Assert.IsTrue(await decoder.Pipe.MoveNextAsync(default));
         Assert.IsTrue(decoder.Pipe.TryMoveNext());
@@ -509,44 +509,44 @@ public class BackendMessageStreamingTests
     }
 
     [TestMethod]
-    public void BackendBatch_WaitsForUsefulPartialDataRowPrefix()
+    public void BackendCursor_WaitsForUsefulPartialDataRowPrefix()
     {
         var rowLength = 128 * 1024;
         var wire = BackendMessageBytes(BackendType.DataRow, rowLength);
 
         var smallPrefix = new ReadOnlySequence<byte>(wire.AsMemory(0, 32));
-        var batch = new BackendMessageBatch(smallPrefix);
-        Assert.IsFalse(batch.TryReadNextInPlace(out _, out _, out _));
-        Assert.AreEqual(BackendMessageBatch.DefaultDataRowStreamingThreshold,
-            batch.RequiredBufferedLength);
+        var cursor = new BackendMessageCursor(smallPrefix);
+        Assert.IsFalse(cursor.TryReadNextInPlace(out _, out _, out _));
+        Assert.AreEqual(BackendMessageCursor.DefaultDataRowStreamingThreshold,
+            cursor.RequiredBufferedLength);
 
         var usefulPrefix = new ReadOnlySequence<byte>(
-            wire.AsMemory(0, BackendMessageBatch.DefaultDataRowStreamingThreshold));
-        batch = new(usefulPrefix);
-        Assert.IsTrue(batch.TryReadNextInPlace(out var rowHeader, out var partialRow, out _));
+            wire.AsMemory(0, BackendMessageCursor.DefaultDataRowStreamingThreshold));
+        cursor = new(usefulPrefix);
+        Assert.IsTrue(cursor.TryReadNextInPlace(out var rowHeader, out var partialRow, out _));
         Assert.AreEqual(BackendType.DataRow, rowHeader.Type);
-        Assert.AreEqual(BackendMessageBatch.DefaultDataRowStreamingThreshold, partialRow.Length);
+        Assert.AreEqual(BackendMessageCursor.DefaultDataRowStreamingThreshold, partialRow.Length);
         Assert.IsFalse(new BackendMessage(rowHeader, partialRow, new BackendMessageContext(), 0).Buffered);
     }
 
     [TestMethod]
-    public void BackendBatch_FramesUnknownMessageType()
+    public void BackendCursor_FramesUnknownMessageType()
     {
         var wire = BackendHeaderBytes((BackendType)(byte)'o', 4);
-        var batch = new BackendMessageBatch(new ReadOnlySequence<byte>(wire));
+        var cursor = new BackendMessageCursor(new ReadOnlySequence<byte>(wire));
 
-        Assert.IsTrue(batch.TryReadNextInPlace(out var header, out _, out _));
+        Assert.IsTrue(cursor.TryReadNextInPlace(out var header, out _, out _));
         Assert.AreEqual((BackendType)(byte)'o', header.Type);
     }
 
     [TestMethod]
-    public void BackendBatch_RejectsMessageBeyondPostgreSqlAllocationLimit()
+    public void BackendCursor_RejectsMessageBeyondPostgreSqlAllocationLimit()
     {
         var wire = BackendHeaderBytes(BackendType.DataRow, 0x3FFF_FFFF);
-        var batch = new BackendMessageBatch(new ReadOnlySequence<byte>(wire));
+        var cursor = new BackendMessageCursor(new ReadOnlySequence<byte>(wire));
 
         Assert.ThrowsExactly<PgFramingException>(() =>
-            batch.TryReadNextInPlace(out _, out _, out _));
+            cursor.TryReadNextInPlace(out _, out _, out _));
     }
 
     static byte[] BackendHeaderBytes(BackendType type, int length)

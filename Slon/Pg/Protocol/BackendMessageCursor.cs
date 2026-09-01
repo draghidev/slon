@@ -6,8 +6,8 @@ using static Slon.Pg.Protocol.PgTypes;
 
 namespace Slon.Pg.Protocol;
 
-// Note: both the batch and the segmenter are perf sensitive.
-struct BackendMessageBatch(ReadOnlySequence<byte> buffer)
+// The cursor is perf sensitive.
+struct BackendMessageCursor(ReadOnlySequence<byte> buffer)
 {
     public const int DefaultDataRowStreamingThreshold = 16 * 1024;
     const uint MaxMessageLength = 0x3FFF_FFFF;
@@ -17,11 +17,11 @@ struct BackendMessageBatch(ReadOnlySequence<byte> buffer)
     readonly int _dataRowStreamingThreshold = DefaultDataRowStreamingThreshold;
     long _requiredBufferedLength;
 
-    internal BackendMessageBatch(
+    internal BackendMessageCursor(
         ReadOnlySequence<byte> buffer, int dataRowStreamingThreshold) : this(buffer)
         => _dataRowStreamingThreshold = dataRowStreamingThreshold;
 
-    BackendMessageBatch(ReadOnlySequence<byte> buffer,
+    BackendMessageCursor(ReadOnlySequence<byte> buffer,
         int dataRowStreamingThreshold, long initialLength)
         : this(buffer, dataRowStreamingThreshold)
         => _initialLength = initialLength;
@@ -33,7 +33,7 @@ struct BackendMessageBatch(ReadOnlySequence<byte> buffer)
     public readonly long GetCurrentMessageOffset(long currentBufferedLength)
         => _initialLength - _buffer.Length - currentBufferedLength;
 
-    public readonly BackendMessageBatch Slice(long offset)
+    public readonly BackendMessageCursor Slice(long offset)
     {
         return new(_buffer.Sequence.Slice(offset),
             _dataRowStreamingThreshold, _initialLength);
@@ -74,7 +74,7 @@ struct BackendMessageBatch(ReadOnlySequence<byte> buffer)
         return true;
     }
 
-    public readonly bool TryReadNext(out BackendHeader header, out ReadOnlySequence<byte> buffer, out uint bufferLength, out BackendMessageBatch remaining)
+    public readonly bool TryReadNext(out BackendHeader header, out ReadOnlySequence<byte> buffer, out uint bufferLength, out BackendMessageCursor remaining)
     {
         var thisCopy = this;
         var success = thisCopy.TryReadNextInPlace(out header, out buffer, out bufferLength);

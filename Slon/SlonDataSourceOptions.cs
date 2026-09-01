@@ -112,7 +112,7 @@ public sealed record SlonDataSourceOptions
     /// <summary>
     /// DataRows larger than this may cross the decoder boundary before their complete body has arrived.
     /// </summary>
-    public int DataRowStreamingThreshold { get; init; } = BackendMessageBatch.DefaultDataRowStreamingThreshold;
+    public int DataRowStreamingThreshold { get; init; } = BackendMessageCursor.DefaultDataRowStreamingThreshold;
     /// <summary>Configures which connection state is reset when an exclusive scope is released.</summary>
     internal PgSessionResetOptions SessionReset { get; init; } = new();
     /// <summary>

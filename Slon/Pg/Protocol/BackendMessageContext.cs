@@ -9,8 +9,8 @@ namespace Slon.Pg.Protocol;
 sealed class BackendMessageContext
 {
     PgDecoder _decoder = null!;
-    BackendMessageBatch _remainingBatch;
-    bool _hasBatch;
+    BackendMessageCursor _cursor;
+    bool _hasCursor;
     BackendMessage _current;
     FallbackBuffer _currentFallbackBuffer;
     short _version;
@@ -116,7 +116,7 @@ sealed class BackendMessageContext
         Validate(token);
         if ((_messageState & MessageOffsetCaptured) == 0)
         {
-            _currentMessageOffset = _remainingBatch.GetCurrentMessageOffset(
+            _currentMessageOffset = _cursor.GetCurrentMessageOffset(
                 _current.BufferedLength);
             _messageState |= MessageOffsetCaptured;
         }
@@ -185,7 +185,7 @@ sealed class BackendMessageContext
             BackendMessage.Initialize(
                 ref _current, _current.Header, message, this, token, buffered: true);
             var messageEnd = _currentMessageOffset + messageLength;
-            _remainingBatch = new BackendMessageBatch(result.Buffer).Slice(messageEnd);
+            _cursor = new BackendMessageCursor(result.Buffer).Slice(messageEnd);
         }
         return new(body, result.IsComplete);
     }
@@ -274,12 +274,12 @@ sealed class BackendMessageContext
             _publicationState = PublicationState.Current;
             return true;
         }
-        if (!_remainingBatch.TryReadNextInPlace(out var header, out var buffer, out var bufferLength))
+        if (!_cursor.TryReadNextInPlace(out var header, out var buffer, out var bufferLength))
             return false;
         ResetMessageState();
         if (bufferLength < header.MessageLength)
             _decoder.SetCurrentMessageLength(
-                _remainingBatch.ConsumedLength - bufferLength
+                _cursor.ConsumedLength - bufferLength
                 + header.MessageLength);
         BackendMessage.Initialize(ref _current, header, buffer, this, ++_version,
             bufferLength >= header.MessageLength);
@@ -292,39 +292,39 @@ sealed class BackendMessageContext
         }
     }
 
-    public void RetireCurrentBatch()
+    public void RetireCursor()
     {
-        // Moving the batch enumerator may return or refill the memory backing every view held here.
+        // Advancing the read grant may return or refill the memory backing every view held here.
         // A failed message poll preserves Current, but crossing this ownership boundary cannot.
         var invalidateToken = _publicationState is not PublicationState.None;
         _current = default;
         _currentFallbackBuffer.Clear();
         _publicationState = PublicationState.None;
-        _remainingBatch = default;
-        _hasBatch = false;
+        _cursor = default;
+        _hasCursor = false;
         _currentMessageOffset = 0;
         _messageState = 0;
         if (invalidateToken)
             _version++;
     }
 
-    public bool TryGetBatchReadRequirement(
+    public bool TryGetReadRequirement(
         out SequencePosition consumed, out long requiredLength)
     {
-        if (!_hasBatch || _remainingBatch.RequiredBufferedLength <= 0)
+        if (!_hasCursor || _cursor.RequiredBufferedLength <= 0)
         {
             consumed = default;
             requiredLength = 0;
             return false;
         }
 
-        consumed = _remainingBatch.UnreadStart;
-        requiredLength = _remainingBatch.RequiredBufferedLength
-            - _remainingBatch.ConsumedLength;
+        consumed = _cursor.UnreadStart;
+        requiredLength = _cursor.RequiredBufferedLength
+            - _cursor.ConsumedLength;
         return true;
     }
 
-    // Reads the next message WITHOUT publishing it as Current. The remaining batch cursor
+    // Reads the next message WITHOUT publishing it as Current. The message cursor
     // really advances past the header, but the parsed (header, buffer) lands in the peek
     // slot and the follow-up TryMoveNext picks it up without re-parsing. The returned
     // BackendMessage is valid until the next TryMoveNext (which bumps the version token);
@@ -336,14 +336,14 @@ sealed class BackendMessageContext
             header = _current.Header;
             return true;
         }
-        if (!_remainingBatch.TryReadNextInPlace(
+        if (!_cursor.TryReadNextInPlace(
                 out header, out var buffer, out var bufferLength))
         {
             return false;
         }
         if (bufferLength < header.MessageLength)
             _decoder.SetCurrentMessageLength(
-                _remainingBatch.ConsumedLength - bufferLength
+                _cursor.ConsumedLength - bufferLength
                 + header.MessageLength);
         _messageState = 0;
         BackendMessage.Initialize(ref _current, header, buffer, this, ++_version,
@@ -362,13 +362,13 @@ sealed class BackendMessageContext
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public void SetBatch(BackendMessageBatch batch)
+    public void SetCursor(BackendMessageCursor cursor)
     {
         Debug.Assert(_publicationState is PublicationState.None,
-            "The prior batch must be retired before publishing replacement storage.");
+            "The prior cursor must be retired before publishing replacement storage.");
         _publicationState = PublicationState.None;
-        _remainingBatch = batch;
-        _hasBatch = true;
+        _cursor = cursor;
+        _hasCursor = true;
     }
 
 }

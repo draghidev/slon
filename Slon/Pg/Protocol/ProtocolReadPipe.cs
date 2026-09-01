@@ -10,7 +10,7 @@ namespace Slon.Pg.Protocol;
 sealed class ProtocolReadPipe(
     PipeReader reader, int dataRowStreamingThreshold, bool ownsReader = false)
 {
-    enum PendingRead : byte { None, Batch, Slide, Extend }
+    enum PendingRead : byte { None, Messages, Slide, Extend }
 
     readonly BackendMessageContext _messageContext = new();
     ReadOnlySequence<byte> _activeBuffer;
@@ -18,7 +18,7 @@ sealed class ProtocolReadPipe(
     SequencePosition _retainedStart;
     long _currentMessageOffset;
     long _currentMessageLength = -1;
-    long _pendingBatchOffset;
+    long _pendingCursorOffset;
     long _pendingSkipLength;
     int _minimumReadSize;
     PendingRead _pendingRead;
@@ -37,9 +37,9 @@ sealed class ProtocolReadPipe(
 
     public void BindDecoder(PgDecoder decoder) => _messageContext.BindDecoder(decoder);
 
-    public void PrepareMoveNextBatch()
+    public void PrepareRead()
     {
-        if (_pendingRead is PendingRead.Batch)
+        if (_pendingRead is PendingRead.Messages)
             return;
         if (_pendingRead is not PendingRead.None)
             ThrowHelper.ThrowInvalidOperation(
@@ -47,9 +47,9 @@ sealed class ProtocolReadPipe(
 
         if (!_hasActiveRead)
         {
-            _pendingBatchOffset = 0;
+            _pendingCursorOffset = 0;
             _minimumReadSize = BackendHeader.ByteCount;
-            _pendingRead = PendingRead.Batch;
+            _pendingRead = PendingRead.Messages;
             return;
         }
 
@@ -59,38 +59,38 @@ sealed class ProtocolReadPipe(
             return;
         }
 
-        if (!_messageContext.TryGetBatchReadRequirement(
+        if (!_messageContext.TryGetReadRequirement(
                 out var unread, out var requiredLength))
             ThrowHelper.ThrowInvalidOperation(
-                "The current backend-message batch has not been exhausted.");
+                "The current backend-message cursor has not been exhausted.");
 
-        _pendingBatchOffset = 0;
-        _messageContext.RetireCurrentBatch();
+        _pendingCursorOffset = 0;
+        _messageContext.RetireCursor();
         reader.AdvanceTo(unread, _examined);
         _hasActiveRead = false;
         _activeBuffer = default;
         _currentMessageLength = -1;
         _currentMessageOffset = 0;
         _minimumReadSize = int.CreateSaturating(requiredLength);
-        _pendingRead = PendingRead.Batch;
+        _pendingRead = PendingRead.Messages;
     }
 
     void PrepareAfterPartialMessage()
     {
         var current = _activeBuffer.Slice(_currentMessageOffset);
-        _messageContext.RetireCurrentBatch();
+        _messageContext.RetireCursor();
         if (current.Length >= _currentMessageLength)
         {
             var unread = current.GetPosition(_currentMessageLength);
             reader.AdvanceTo(unread, unread);
-            _pendingBatchOffset = 0;
+            _pendingCursorOffset = 0;
             _minimumReadSize = BackendHeader.ByteCount;
         }
         else
         {
             _pendingSkipLength = _currentMessageLength - current.Length;
             reader.AdvanceTo(_activeBuffer.End, _examined);
-            _pendingBatchOffset = _pendingSkipLength;
+            _pendingCursorOffset = _pendingSkipLength;
             _minimumReadSize = int.CreateSaturating(
                 _pendingSkipLength + BackendHeader.ByteCount);
         }
@@ -99,7 +99,7 @@ sealed class ProtocolReadPipe(
         _activeBuffer = default;
         _currentMessageLength = -1;
         _currentMessageOffset = 0;
-        _pendingRead = PendingRead.Batch;
+        _pendingRead = PendingRead.Messages;
     }
 
     public ValueTask<ReadResult> ReadAsync(CancellationToken cancellationToken)
@@ -107,12 +107,12 @@ sealed class ProtocolReadPipe(
             ? reader.ReadAtLeastAsync(_minimumReadSize, cancellationToken)
             : reader.ReadAsync(cancellationToken);
 
-    public bool CompleteMoveNextBatch(
+    public bool CompleteRead(
         in ReadResult result, CancellationToken cancellationToken,
         out bool completed)
     {
-        if (_pendingRead is not PendingRead.Batch)
-            ThrowHelper.ThrowInvalidOperation("No batch read is pending.");
+        if (_pendingRead is not PendingRead.Messages)
+            ThrowHelper.ThrowInvalidOperation("No protocol read is pending.");
         _pendingRead = PendingRead.None;
         _minimumReadSize = 0;
         if (result.IsCanceled)
@@ -120,7 +120,7 @@ sealed class ProtocolReadPipe(
         if (result.Buffer.IsEmpty && result.IsCompleted)
         {
             completed = true;
-            _messageContext.RetireCurrentBatch();
+            _messageContext.RetireCursor();
             return false;
         }
         if (result.Buffer.IsEmpty)
@@ -144,40 +144,40 @@ sealed class ProtocolReadPipe(
                 reader.AdvanceTo(result.Buffer.End, result.Buffer.End);
                 _hasActiveRead = false;
                 _activeBuffer = default;
-                _pendingBatchOffset = _pendingSkipLength;
+                _pendingCursorOffset = _pendingSkipLength;
                 _minimumReadSize = int.CreateSaturating(
                     _pendingSkipLength + BackendHeader.ByteCount);
-                _pendingRead = PendingRead.Batch;
+                _pendingRead = PendingRead.Messages;
                 completed = false;
                 return false;
             }
-            _pendingBatchOffset = _pendingSkipLength;
+            _pendingCursorOffset = _pendingSkipLength;
             _pendingSkipLength = 0;
         }
-        _currentMessageOffset = _pendingBatchOffset;
-        var batchBuffer = _pendingBatchOffset is 0
+        _currentMessageOffset = _pendingCursorOffset;
+        var cursorBuffer = _pendingCursorOffset is 0
             ? result.Buffer
-            : result.Buffer.Slice(_pendingBatchOffset);
-        if (batchBuffer.IsEmpty)
+            : result.Buffer.Slice(_pendingCursorOffset);
+        if (cursorBuffer.IsEmpty)
         {
             completed = result.IsCompleted;
             if (completed)
-                _messageContext.RetireCurrentBatch();
+                _messageContext.RetireCursor();
             if (!completed)
             {
                 reader.AdvanceTo(result.Buffer.End, result.Buffer.End);
                 _hasActiveRead = false;
                 _activeBuffer = default;
-                _pendingBatchOffset = 0;
+                _pendingCursorOffset = 0;
                 _minimumReadSize = BackendHeader.ByteCount;
-                _pendingRead = PendingRead.Batch;
+                _pendingRead = PendingRead.Messages;
             }
             return false;
         }
         _currentMessageLength = -1;
-        var batch = new BackendMessageBatch(
-            batchBuffer, dataRowStreamingThreshold);
-        _messageContext.SetBatch(batch);
+        var cursor = new BackendMessageCursor(
+            cursorBuffer, dataRowStreamingThreshold);
+        _messageContext.SetCursor(cursor);
         completed = false;
         return true;
     }
@@ -316,9 +316,9 @@ sealed class ProtocolReadPipe(
     {
         while (true)
         {
-            PrepareMoveNextBatch();
+            PrepareRead();
             var read = await ReadAsync(cancellationToken).ConfigureAwait(false);
-            if (CompleteMoveNextBatch(
+            if (CompleteRead(
                     read, cancellationToken, out var completed))
                 return true;
             if (completed)
@@ -333,11 +333,11 @@ sealed class ProtocolReadPipe(
                 "Underlying pipe reader does not support synchronous reads.");
         while (true)
         {
-            PrepareMoveNextBatch();
+            PrepareRead();
             var read = _minimumReadSize > 0
                 ? syncReader.ReadAtLeast(_minimumReadSize, timeout)
                 : syncReader.Read(timeout);
-            if (CompleteMoveNextBatch(
+            if (CompleteRead(
                     read, CancellationToken.None, out var completed))
                 return true;
             if (completed)
@@ -356,14 +356,14 @@ sealed class ProtocolReadPipe(
 
     public void Dispose()
     {
-        _messageContext.RetireCurrentBatch();
+        _messageContext.RetireCursor();
         if (ownsReader)
             reader.Complete();
     }
 
     public ValueTask DisposeAsync()
     {
-        _messageContext.RetireCurrentBatch();
+        _messageContext.RetireCursor();
         return ownsReader ? reader.CompleteAsync() : default;
     }
 }
