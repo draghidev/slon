@@ -191,7 +191,6 @@ public partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
     {
         IsAsync = async;
         _pendingTimeout = pendingTimeout;
-        _enumeratorMoveNextTaskSource.CanCompleteConcurrently = true;
     }
 
     public CommandFlow Initialize(bool async, params ReadOnlySpan<Command> commands)
@@ -205,8 +204,6 @@ public partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
         _commands = options.Commands;
         _pendingTimeout = options.PendingTimeout;
         options.Observer?.OnStarted(this, options.ObserverState);
-        // Arm before publication: teardown may complete the source concurrently even before enumeration.
-        _enumeratorMoveNextTaskSource.CanCompleteConcurrently = true;
         return this;
     }
 
@@ -266,9 +263,7 @@ public partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
 
     public Enumerator GetAsyncEnumerator(CancellationToken cancellationToken = default)
     {
-        // Body, teardown, and cancellation may complete the source concurrently. A missing per-call token
-        // must not replace the flow token captured at submission.
-        _enumeratorMoveNextTaskSource.CanCompleteConcurrently = true;
+        // A missing per-call token must not replace the flow token captured at submission.
         if (cancellationToken.CanBeCanceled)
             GetOrCreateCancellationState().FlowToken = cancellationToken;
         return new(this);
@@ -839,6 +834,7 @@ public partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
         void SetResult(CommandResult? next)
         {
             var completed = next is null;
+            var publishAsync = IsAsync;
             if (completed)
             {
                 _enumeratorCurrent = null;
@@ -861,17 +857,31 @@ public partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
             }
             if (completed)
             {
-                // Publish durable terminal state and complete the current generation atomically with
-                // respect to consumer rearming. Completion dispatches asynchronously, so it cannot reenter
-                // this lock or the pipeline frame that still owns the shared promise.
+                // Publish durable terminal state atomically with respect to consumer rearming. Async
+                // consumers complete from the protocol scheduler so they cannot reenter this lock or
+                // the pipeline frame that still owns the shared promise; sync consumers retain their
+                // caller-driven completion.
                 using (_rearmLock.EnterScope())
                 {
                     PublishEnumerationCompleted();
-                    CompleteEnumeration();
+                    if (!publishAsync)
+                        CompleteEnumeration();
                 }
+                if (publishAsync)
+                    context.SubmitDetached(static state => ((CommandFlow)state!)
+                        .CompleteEnumeration(runContinuationsAsynchronously: false), this);
                 return;
             }
-            _enumeratorMoveNextTaskSource.SetResult(true, runContinuationsAsynchronously: true);
+            if (publishAsync)
+            {
+                // Queue the publication itself so the body reaches its next caller gate before user code
+                // resumes. Routing through the protocol scheduler preserves that ordering without forcing
+                // every result continuation onto the ThreadPool.
+                context.SubmitDetached(static state => ((CommandFlow)state!)
+                    .TrySetEnumeratorResult(true, runContinuationsAsynchronously: false), this);
+            }
+            else
+                TrySetEnumeratorResult(true, runContinuationsAsynchronously: true);
         }
 
         async ValueTask ReadRfqAsync(PgDecoder decoder)
@@ -1086,7 +1096,7 @@ public partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
             return;
         // Teardown may race the consumer. The task source is the completion authority;
         // _enumeratorCompleted follows only when this call wins the current generation.
-        if (_enumeratorMoveNextTaskSource.TrySetException(ex, runContinuationsAsynchronously: true))
+        if (TrySetEnumeratorException(ex, runContinuationsAsynchronously: true))
             PublishEnumerationCompleted();
         // A faulted body will not publish another continuation.
         SignalPumpProgress();
@@ -1182,10 +1192,7 @@ public partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
         Debug.Assert(IsPending || IsCompleted);
         _commandIndex = -1;
         _executePipelinedCore.Reset();
-        _enumeratorMoveNextTaskSource.Reset();
-        // Disarm while idle in the pool (no teardown can target a non-live flow). Initialize re-arms it
-        // before the flow is queued, so a live flow is always in concurrent-completion mode.
-        _enumeratorMoveNextTaskSource.CanCompleteConcurrently = false;
+        ResetEnumeratorMoveNextSource();
         _enumeratorCurrent = default;
         _enumeratorCompleted = false;
         _isResultReady = false;

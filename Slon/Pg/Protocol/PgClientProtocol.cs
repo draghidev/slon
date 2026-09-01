@@ -1524,6 +1524,8 @@ public sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         public bool IsInlineDrive => _source.IsInlineDrive;
         public long UnflushedBytes => protocol.UnflushedBytes;
         public ValueTask FlushAsync(CancellationToken cancellationToken) => protocol.FlushAsync(cancellationToken);
+        internal void SubmitDetached(Action<object?> action, object? state, bool preferLocal = true)
+            => protocol._activationScheduler.SubmitDetached(action, state, preferLocal);
         PgClientFlow? _cancellationActivatedFlow;
         internal (PgClientFlow? Owner, int Window) CancellationActivation
         {

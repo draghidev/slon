@@ -167,6 +167,7 @@ public abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSour
     // pattern). At most one pending waiter per tenure; post-completion awaits resolve
     // synchronously.
     Slon.Threading.Tasks.Sources.ManualResetValueTaskSourceCore<PgClientFlow> _completionCore;
+    int _completionClaim;
     ManualResetEventSlim? _completionEvent;
     // 1 while a WaitForComplete token is live (set at capture, cleared after GetResult consumed the
     // core). Guards reuse: Reset bumps the core's version, so it must not run while this is set.
@@ -174,6 +175,7 @@ public abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSour
 
     // Activation state.
     Slon.Threading.Tasks.Sources.ManualResetValueTaskSourceCore<PgDecoder> _activationTaskSource;
+    int _activationClaim;
     CancellationTokenRegistration _activationCancellationTokenRegistration;
     TimeSpan _remainingActivationTimeout;
     bool _pendingTimeoutStarted;
@@ -268,8 +270,38 @@ public abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSour
     protected PgClientFlow(bool supportsDeferredFlush = false)
     {
         _supportsDeferredFlush = supportsDeferredFlush;
-        _activationTaskSource.CanCompleteConcurrently = true;
-        _completionCore.CanCompleteConcurrently = true;
+    }
+
+    bool TrySetActivationResult(PgDecoder decoder, bool runContinuationsAsynchronously)
+    {
+        if (Interlocked.CompareExchange(ref _activationClaim, 1, 0) != 0)
+            return false;
+        _activationTaskSource.SetResult(decoder, runContinuationsAsynchronously);
+        return true;
+    }
+
+    bool TrySetActivationException(Exception exception, bool runContinuationsAsynchronously)
+    {
+        if (Interlocked.CompareExchange(ref _activationClaim, 1, 0) != 0)
+            return false;
+        _activationTaskSource.SetException(exception, runContinuationsAsynchronously);
+        return true;
+    }
+
+    void ResetActivationSource()
+    {
+        _activationTaskSource.Reset();
+        Volatile.Write(ref _activationClaim, 0);
+    }
+
+    void CompleteFlow(Exception? exception)
+    {
+        if (Interlocked.CompareExchange(ref _completionClaim, 1, 0) != 0)
+            return;
+        if (exception is null)
+            _completionCore.SetResult(this, runContinuationsAsynchronously: true);
+        else
+            _completionCore.SetException(exception, runContinuationsAsynchronously: true);
     }
 
     protected void SetObserver(PgClientFlowObserver observer, object? state)
@@ -374,8 +406,9 @@ public abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSour
         // Version bump per tenure. Cross-tenure completer staleness rests on the done -> torn-down
         // -> retired layering (Complete precedes recycle), the same basis as the rest of this reset.
         _completionCore.Reset();
+        Volatile.Write(ref _completionClaim, 0);
         _completionEvent?.Reset();
-        _activationTaskSource.Reset();
+        ResetActivationSource();
         _rfqCount = 0;
         _cancellationWindow = 0;
         _lastMessageInducesRfq = false;
@@ -483,6 +516,9 @@ public abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSour
 
         internal ValueTask WaitForCancellationAttempt()
             => _executionControl.WaitForCancellationAttempt();
+
+        internal void SubmitDetached(Action<object?> action, object? state, bool preferLocal = true)
+            => _executionControl.SubmitDetached(action, state, preferLocal);
 
         internal void RequestBackendCancellation(PgClientFlow instigator, int window,
             BackendCancellationTiming timing, TaskCompletionSource? delivery, object episodeKey, int scope,
@@ -666,6 +702,9 @@ public abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSour
         public bool HasQueuedFlow => control.HasQueuedFlow;
         public bool IsInlineDrive => control.IsInlineDrive;
 
+        internal void SubmitDetached(Action<object?> action, object? state, bool preferLocal = true)
+            => control.SubmitDetached(action, state, preferLocal);
+
         // Small optimization to allow us to skip the final sync message if we can piggyback on the flow's final rfq.
         public bool LastMessageInducesRfq => flow._lastMessageInducesRfq;
 
@@ -848,7 +887,7 @@ public abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSour
         {
             flow._activationCancellationTokenRegistration.Dispose();
             // If none of the cancellations triggered, we have a problem, throw.
-            if (!flow._activationTaskSource.TrySetResult(decoder, runContinuationsAsynchronously: false)
+            if (!flow.TrySetActivationResult(decoder, runContinuationsAsynchronously: false)
                 && !(flow._remainingActivationTimeout <= TimeSpan.Zero)
                 && !control.AbortToken.IsCancellationRequested
                 && !flow._activationCancellationTokenRegistration.Token.IsCancellationRequested)
@@ -885,7 +924,7 @@ public abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSour
             if (control.AbortToken.IsCancellationRequested && !flow._completed)
             {
                 var ex = control.FlowTerminationException;
-                flow._activationTaskSource.TrySetException(ex, runContinuationsAsynchronously: true);
+                flow.TrySetActivationException(ex, runContinuationsAsynchronously: true);
                 flow.OnAbort(ex);
                 return true;
             }
@@ -906,7 +945,7 @@ public abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSour
             if (flow._remainingActivationTimeout != Timeout.InfiniteTimeSpan && flow._remainingActivationTimeout != TimeSpan.Zero
                 && flow._activationTaskSource.GetStatus(flow._activationTaskSource.Version) is ValueTaskSourceStatus.Pending
                 && (flow._remainingActivationTimeout -= interval) <= TimeSpan.Zero)
-                flow._activationTaskSource.TrySetException(new TimeoutException("Operation timed out waiting for activation."), runContinuationsAsynchronously: true);
+                flow.TrySetActivationException(new TimeoutException("Operation timed out waiting for activation."), runContinuationsAsynchronously: true);
         }
 
         /// Fail a never-started flow drained from the backlog at shutdown with the wire-death reason. The
@@ -948,7 +987,7 @@ public abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSour
             if (IsDecoderSettled)
             {
                 Debug.Assert(control.AbortToken.IsCancellationRequested);
-                flow._activationTaskSource.Reset();
+                flow.ResetActivationSource();
             }
             if (flow.HandoffEvent?.PlacementSource is not null)
                 flow.DetachPlacementSource(source.SourceState);
@@ -996,10 +1035,7 @@ public abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSour
             // Async continuation dispatch: completers run in retirement/teardown contexts where
             // inline caller continuations are a re-entrancy hazard, the contract the old TCS's
             // RunContinuationsAsynchronously carried, minus its unconditional thread-pool destination.
-            if (exception is not null)
-                flow._completionCore.TrySetException(exception, runContinuationsAsynchronously: true);
-            else
-                flow._completionCore.TrySetResult(flow, runContinuationsAsynchronously: true);
+            flow.CompleteFlow(exception);
             flow._completionEvent?.Set();
             // The completed observer runs from CompleteItem in the advancer/retirement work-item
             // context: a raw throw would crash that thread unobserved. Don't swallow either - a
@@ -1075,7 +1111,7 @@ public abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSour
                 ThrowHelper.ThrowInvalidOperation("Concurrent activation result awaits are not supported.");
             flow._activationCancellationTokenRegistration = cancellationToken.UnsafeRegister(
                 static (state, token) =>
-                    ((PgClientFlow)state!)._activationTaskSource.TrySetException(new OperationCanceledException(token), runContinuationsAsynchronously: true),
+                    ((PgClientFlow)state!).TrySetActivationException(new OperationCanceledException(token), runContinuationsAsynchronously: true),
                 flow);
         }
     }

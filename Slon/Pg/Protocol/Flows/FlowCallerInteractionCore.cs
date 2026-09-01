@@ -26,16 +26,17 @@ struct FlowCallerInteractionCore<TResult>
     // Inline completion transfers the body to a synchronous caller; asynchronous completion preserves
     // autonomous execution without running the body on the signaller's stack.
     Slon.Threading.Tasks.Sources.ManualResetValueTaskSourceCore<TResult> _gate;
-    public void Initialize()
-    {
-        _gate.CanCompleteConcurrently = true;
-    }
+    int _gateCompletionClaim;
+    public void Initialize() => _gateCompletionClaim = 0;
 
     public ValueTask<TResult> WaitForCaller(IValueTaskSource<TResult> source) => new(source, _gate.Version);
 
     // The IVTS facade forwards through this gate surface.
     public void ResumeBody(bool runContinuationsAsynchronously)
-        => _gate.TrySetResult(default!, runContinuationsAsynchronously);
+    {
+        if (Interlocked.CompareExchange(ref _gateCompletionClaim, 1, 0) == 0)
+            _gate.SetResult(default!, runContinuationsAsynchronously);
+    }
     public System.Threading.Tasks.Sources.ValueTaskSourceStatus GateStatus(short token) => _gate.GetStatus(token);
     public void OnGateCompleted(Action<object?> continuation, object? state, short token, ValueTaskSourceOnCompletedFlags flags)
         => _gate.OnCompleted(continuation, state, token, flags);
@@ -44,6 +45,7 @@ struct FlowCallerInteractionCore<TResult>
     {
         var result = _gate.GetResult(token);
         _gate.Reset();
+        Volatile.Write(ref _gateCompletionClaim, 0);
         return result;
     }
 
@@ -52,7 +54,8 @@ struct FlowCallerInteractionCore<TResult>
         // Latch first (monotone), then fault the gate, so a consumer observing the gate fault always
         // reads the latch set.
         var latched = SetCloseLatch(exception);
-        _gate.TrySetException(latched, runContinuationsAsynchronously: true);
+        if (Interlocked.CompareExchange(ref _gateCompletionClaim, 1, 0) == 0)
+            _gate.SetException(latched, runContinuationsAsynchronously: true);
         // The synchronous disposer may not have created its event yet. Publish a sticky progress
         // level so WaitForContinuation observes the close even when this Set would have been a no-op.
         SignalProgress();
@@ -187,6 +190,7 @@ struct FlowCallerInteractionCore<TResult>
         _wakeRequested = false;
         _closeException = null;
         _gate.Reset();
+        Volatile.Write(ref _gateCompletionClaim, 0);
     }
 
     public readonly struct CallerHandoffAwaitable(FieldRef<FlowCallerInteractionCore<TResult>> fieldRef)

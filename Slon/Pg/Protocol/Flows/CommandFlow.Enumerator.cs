@@ -6,6 +6,7 @@ namespace Slon.Pg.Protocol.Flows;
 partial class CommandFlow
 {
     Slon.Threading.Tasks.Sources.ManualResetValueTaskSourceCore<bool> _enumeratorMoveNextTaskSource;
+    int _enumeratorMoveNextCompletionClaim;
     // Serializes move-next rearming against body termination. Otherwise Reset can replace the generation
     // just before terminal completion and strand the consumer (see MoveNextRearm.tla). Never hold it while
     // dispatching the gate, which may run the body inline.
@@ -27,22 +28,44 @@ partial class CommandFlow
     void IValueTaskSource<bool>.OnCompleted(Action<object?> continuation, object? state, short token, ValueTaskSourceOnCompletedFlags flags)
         => _enumeratorMoveNextTaskSource.OnCompleted(continuation, state, token, flags);
 
+    bool TrySetEnumeratorResult(bool result, bool runContinuationsAsynchronously)
+    {
+        if (Interlocked.CompareExchange(ref _enumeratorMoveNextCompletionClaim, 1, 0) != 0)
+            return false;
+        _enumeratorMoveNextTaskSource.SetResult(result, runContinuationsAsynchronously);
+        return true;
+    }
+
+    bool TrySetEnumeratorException(Exception exception, bool runContinuationsAsynchronously)
+    {
+        if (Interlocked.CompareExchange(ref _enumeratorMoveNextCompletionClaim, 1, 0) != 0)
+            return false;
+        _enumeratorMoveNextTaskSource.SetException(exception, runContinuationsAsynchronously);
+        return true;
+    }
+
+    void ResetEnumeratorMoveNextSource()
+    {
+        _enumeratorMoveNextTaskSource.Reset();
+        Volatile.Write(ref _enumeratorMoveNextCompletionClaim, 0);
+    }
+
     // Consumer completion must dispatch asynchronously because it may run while the pipeline still owns
     // the current execution frame.
-    void CompleteEnumeration()
+    void CompleteEnumeration(bool runContinuationsAsynchronously = true)
     {
         // Drain errors outrank cancellation and clean completion. Preserve every error across a batch.
         if (_drainErrors is { Count: > 0 } errors)
         {
             Exception fault = errors.Count == 1 ? errors[0] : new AggregateException(errors);
-            _enumeratorMoveNextTaskSource.TrySetException(fault, runContinuationsAsynchronously: true);
+            TrySetEnumeratorException(fault, runContinuationsAsynchronously);
         }
         else if (Volatile.Read(ref _cancellationState) is { DeliverOce: true } cancellation
                  && !_consumerDisposed)
-            _enumeratorMoveNextTaskSource.TrySetException(
-                new OperationCanceledException(cancellation.DeliverToken), runContinuationsAsynchronously: true);
+            TrySetEnumeratorException(
+                new OperationCanceledException(cancellation.DeliverToken), runContinuationsAsynchronously);
         else
-            _enumeratorMoveNextTaskSource.TrySetResult(false, runContinuationsAsynchronously: true);
+            TrySetEnumeratorResult(false, runContinuationsAsynchronously);
         // _enumeratorCompleted was set by the caller (SetResult's completed branch) before this runs.
         SignalPumpProgress();
     }
@@ -95,7 +118,7 @@ partial class CommandFlow
         // terminal enumeration state when the close wins the generation; otherwise the consumer must
         // observe the result once, rearm, and self-deliver the latched close on its next move.
         _callerInteractionCore.SetCloseLatch(closeException);
-        if (_enumeratorMoveNextTaskSource.TrySetException(closeException, runContinuationsAsynchronously: true))
+        if (TrySetEnumeratorException(closeException, runContinuationsAsynchronously: true))
             PublishEnumerationCompleted();
         SignalPumpProgress();
     }
@@ -120,21 +143,21 @@ partial class CommandFlow
         if (_enumeratorMoveNextTaskSource.GetStatus(_enumeratorMoveNextTaskSource.Version) is not ValueTaskSourceStatus.Pending)
             return;
         if (_callerInteractionCore.CloseException is { } latched)
-            _enumeratorMoveNextTaskSource.TrySetException(latched, runContinuationsAsynchronously: true);
+            TrySetEnumeratorException(latched, runContinuationsAsynchronously: true);
         else
         {
             var cancellation = Volatile.Read(ref _cancellationState);
             var effectiveCancellationToken = EffectiveCancellationToken;
             if (cancellation is { } && Volatile.Read(ref cancellation.Requested)
                 || effectiveCancellationToken.IsCancellationRequested)
-                _enumeratorMoveNextTaskSource.TrySetException(
+                TrySetEnumeratorException(
                     new OperationCanceledException(effectiveCancellationToken.IsCancellationRequested
                         ? effectiveCancellationToken
                         : cancellation!.DeliverToken),
                     runContinuationsAsynchronously: true);
             // Rearming after a clean terminal still needs to complete the new generation.
             else if (IsEnumerationCompleted)
-                _enumeratorMoveNextTaskSource.TrySetResult(false, runContinuationsAsynchronously: true);
+                TrySetEnumeratorResult(false, runContinuationsAsynchronously: true);
         }
     }
 
@@ -183,7 +206,7 @@ partial class CommandFlow
                 // See MoveNextAsync: rearm only on a non-first call; the first-call source is fresh and the
                 // body's first delivery lands on it.
                 if (flow._consumerAdvanced)
-                    flow._enumeratorMoveNextTaskSource.Reset();
+                    flow.ResetEnumeratorMoveNextSource();
                 flow._consumerAdvanced = true;
             }
             // Close-latch self-deliver (sync): under close this call completes the generation it just
@@ -259,7 +282,6 @@ partial class CommandFlow
                 if (cancellationToken.CanBeCanceled)
                 {
                     flow.SetCallerCancellationToken(cancellationToken);
-                    flow._enumeratorMoveNextTaskSource.CanCompleteConcurrently = true;
                 }
 
                 // Terminal enumeration state may outlive its completed source generation. Complete the
@@ -281,7 +303,7 @@ partial class CommandFlow
                 // current generation for the body's one-shot terminal. Body-initiated drain retains a live
                 // consumer and therefore continues rearming.
                 if (flow._consumerAdvanced && !Volatile.Read(ref flow._consumerDisposed))
-                    flow._enumeratorMoveNextTaskSource.Reset();
+                    flow.ResetEnumeratorMoveNextSource();
                 flow._consumerAdvanced = true;
             }
             // Drive the body; teardown may already have faulted the gate.

@@ -37,18 +37,8 @@ struct ManualResetValueTaskSourceCore<TResult>
     TResult? _result;
     /// <summary>The current version of this value, used to help prevent misuse.</summary>
     short _version;
-    /// <summary>Whether the current operation has completed (this can mean it's still completing, which is why _continuation is also checked).</summary>
+    /// <summary>Whether the current operation has completed.</summary>
     bool _completed;
-    /// <summary>Whether concurrent completions are handled correctly.</summary>
-    bool _canCompleteConcurrently;
-
-    /// <summary>Gets or sets whether concurrent completions are handled correctly.</summary>
-    /// <remarks>Enabling this allows the use of TrySet methods and makes the Set methods thread safe.</remarks>
-    public bool CanCompleteConcurrently
-    {
-        get => _canCompleteConcurrently;
-        set => _canCompleteConcurrently = value;
-    }
 
     /// <summary>Resets to prepare for the next operation.</summary>
     public void Reset()
@@ -60,8 +50,7 @@ struct ManualResetValueTaskSourceCore<TResult>
         _capturedContext = null;
         _error = null;
         _result = default;
-        // Release, written last: a concurrent completer's CAS (acquire) observing false then sees
-        // the resets above. Without it a racing TrySet could complete a half-reset source.
+        // Release, written last so the next tenure observes all reset state.
         Volatile.Write(ref _completed, false);
     }
 
@@ -69,12 +58,10 @@ struct ManualResetValueTaskSourceCore<TResult>
     /// <param name="result">The result.</param>
     public void SetResult(TResult result)
     {
-        var canCompleteConcurrently = _canCompleteConcurrently;
-        if (_completed || (canCompleteConcurrently && Interlocked.CompareExchange(ref _completed, true, false) is not false))
+        if (_completed)
             ThrowInvalidOperationException();
-        if (!canCompleteConcurrently)
-            _completed = true;
         _result = result;
+        Volatile.Write(ref _completed, true);
         new ContinuationDispatcher(ref  _continuation, ref _continuationState, ref _capturedContext)
             .SignalCompletion(runContinuationsAsynchronously: false);
     }
@@ -84,12 +71,10 @@ struct ManualResetValueTaskSourceCore<TResult>
     /// <param name="runContinuationsAsynchronously">whether to force continuations to run asynchronously this call.</param>
     public void SetResult(TResult result, bool runContinuationsAsynchronously)
     {
-        var canCompleteConcurrently = _canCompleteConcurrently;
-        if (_completed || (canCompleteConcurrently && Interlocked.CompareExchange(ref _completed, true, false) is not false))
+        if (_completed)
             ThrowInvalidOperationException();
-        if (!canCompleteConcurrently)
-            _completed = true;
         _result = result;
+        Volatile.Write(ref _completed, true);
         new ContinuationDispatcher(ref _continuation, ref _continuationState, ref _capturedContext)
             .SignalCompletion(runContinuationsAsynchronously);
     }
@@ -98,12 +83,10 @@ struct ManualResetValueTaskSourceCore<TResult>
     /// <param name="error">The exception.</param>
     public void SetException(Exception error)
     {
-        var canCompleteConcurrently = _canCompleteConcurrently;
-        if (_completed || (canCompleteConcurrently && Interlocked.CompareExchange(ref _completed, true, false) is not false))
+        if (_completed)
             ThrowInvalidOperationException();
-        if (!canCompleteConcurrently)
-            _completed = true;
         _error = ExceptionDispatchInfo.Capture(error);
+        Volatile.Write(ref _completed, true);
         new ContinuationDispatcher(ref _continuation, ref _continuationState, ref _capturedContext)
             .SignalCompletion(false);
     }
@@ -113,72 +96,12 @@ struct ManualResetValueTaskSourceCore<TResult>
     /// <param name="runContinuationsAsynchronously">whether to force continuations to run asynchronously this call.</param>
     public void SetException(Exception error, bool runContinuationsAsynchronously)
     {
-        var canCompleteConcurrently = _canCompleteConcurrently;
-        if (_completed || (canCompleteConcurrently && Interlocked.CompareExchange(ref _completed, true, false) is not false))
+        if (_completed)
             ThrowInvalidOperationException();
-        if (!canCompleteConcurrently)
-            _completed = true;
         _error = ExceptionDispatchInfo.Capture(error);
+        Volatile.Write(ref _completed, true);
         new ContinuationDispatcher(ref _continuation, ref _continuationState, ref _capturedContext)
             .SignalCompletion(runContinuationsAsynchronously);
-    }
-
-    /// <summary>Completes with a successful result.</summary>
-    /// <param name="result">The result.</param>
-    public bool TrySetResult(TResult result)
-    {
-        if (!_canCompleteConcurrently)
-            ThrowInvalidOperationException();
-        if (_completed || Interlocked.CompareExchange(ref _completed, true, false) is not false)
-            return false;
-        _result = result;
-        new ContinuationDispatcher(ref  _continuation, ref _continuationState, ref _capturedContext)
-            .SignalCompletion(false);
-        return true;
-    }
-
-    /// <summary>Completes with a successful result.</summary>
-    /// <param name="result">The result.</param>
-    /// <param name="runContinuationsAsynchronously">whether to force continuations to run asynchronously this call.</param>
-    public bool TrySetResult(TResult result, bool runContinuationsAsynchronously)
-    {
-        if (!_canCompleteConcurrently)
-            ThrowInvalidOperationException();
-        if (_completed || Interlocked.CompareExchange(ref _completed, true, false) is not false)
-            return false;
-        _result = result;
-        new ContinuationDispatcher(ref _continuation, ref _continuationState, ref _capturedContext)
-            .SignalCompletion(runContinuationsAsynchronously);
-        return true;
-    }
-
-    /// <summary>Completes with an error.</summary>
-    /// <param name="error">The exception.</param>
-    public bool TrySetException(Exception error)
-    {
-        if (!_canCompleteConcurrently)
-            ThrowInvalidOperationException();
-        if (_completed || Interlocked.CompareExchange(ref _completed, true, false) is not false)
-            return false;
-        _error = ExceptionDispatchInfo.Capture(error);
-        new ContinuationDispatcher(ref _continuation, ref _continuationState, ref _capturedContext)
-            .SignalCompletion(false);
-        return true;
-    }
-
-    /// <summary>Completes with an error.</summary>
-    /// <param name="error">The exception.</param>
-    /// <param name="runContinuationsAsynchronously">whether to force continuations to run asynchronously this call.</param>
-    public bool TrySetException(Exception error, bool runContinuationsAsynchronously)
-    {
-        if (!_canCompleteConcurrently)
-            ThrowInvalidOperationException();
-        if (_completed || Interlocked.CompareExchange(ref _completed, true, false) is not false)
-            return false;
-        _error = ExceptionDispatchInfo.Capture(error);
-        new ContinuationDispatcher(ref _continuation, ref _continuationState, ref _capturedContext)
-            .SignalCompletion(runContinuationsAsynchronously);
-        return true;
     }
 
     /// <summary>Gets the operation version.</summary>
