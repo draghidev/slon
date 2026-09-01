@@ -56,7 +56,7 @@ sealed class BackendMessageBodyReader : IInputReader
     public bool TryRead()
     {
         EnsureAdvanced();
-        if (!_context.TryContinue(_token, _consumed, _consumedLength, out var result))
+        if (!_context.TrySlide(_token, _consumed, _consumedLength, out var result))
             return false;
         Publish(result);
         return true;
@@ -65,7 +65,8 @@ sealed class BackendMessageBodyReader : IInputReader
     public ValueTask ReadAsync(CancellationToken cancellationToken = default)
     {
         EnsureAdvanced();
-        var task = _context.ContinueAsync(_token, _consumed, _consumedLength, cancellationToken);
+        var task = _context.SlideAsync(
+            _token, _consumed, _consumedLength, cancellationToken);
         if (task.IsCompletedSuccessfully)
         {
             Publish(task.Result);
@@ -73,14 +74,14 @@ sealed class BackendMessageBodyReader : IInputReader
         }
         return Core(task);
 
-        async ValueTask Core(ValueTask<CurrentSegmentBuffer> task)
+        async ValueTask Core(ValueTask<CurrentMessageBuffer> task)
             => Publish(await task.ConfigureAwait(false));
     }
 
     public void Read()
     {
         EnsureAdvanced();
-        Publish(_context.Continue(_token, _consumed, _consumedLength));
+        Publish(_context.Slide(_token, _consumed, _consumedLength));
     }
 
     public bool TryExtend()
@@ -103,7 +104,7 @@ sealed class BackendMessageBodyReader : IInputReader
         }
         return Core(task);
 
-        async ValueTask Core(ValueTask<CurrentSegmentBuffer> task)
+        async ValueTask Core(ValueTask<CurrentMessageBuffer> task)
             => Publish(await task.ConfigureAwait(false), retained: true);
     }
 
@@ -191,7 +192,7 @@ sealed class BackendMessageBodyReader : IInputReader
             ThrowHelper.ThrowInvalidOperation("AdvanceTo must be called before reading more message data.");
     }
 
-    void Publish(CurrentSegmentBuffer result, bool retained = false)
+    void Publish(CurrentMessageBuffer result, bool retained = false)
     {
         _buffer = result.Buffer;
         IsComplete = result.IsComplete;

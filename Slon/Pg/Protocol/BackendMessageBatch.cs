@@ -9,25 +9,56 @@ namespace Slon.Pg.Protocol;
 // Note: both the batch and the segmenter are perf sensitive.
 struct BackendMessageBatch(ReadOnlySequence<byte> buffer)
 {
+    public const int DefaultDataRowStreamingThreshold = 16 * 1024;
+    const uint MaxMessageLength = 0x3FFF_FFFF;
+
     FastReadOnlySequence<byte> _buffer = new(buffer);
     long _initialLength = buffer.Length;
+    readonly int _dataRowStreamingThreshold = DefaultDataRowStreamingThreshold;
+    long _requiredBufferedLength;
+
+    internal BackendMessageBatch(
+        ReadOnlySequence<byte> buffer, int dataRowStreamingThreshold) : this(buffer)
+        => _dataRowStreamingThreshold = dataRowStreamingThreshold;
+
+    BackendMessageBatch(ReadOnlySequence<byte> buffer,
+        int dataRowStreamingThreshold, long initialLength)
+        : this(buffer, dataRowStreamingThreshold)
+        => _initialLength = initialLength;
+
+    public readonly long ConsumedLength => _initialLength - _buffer.Length;
+    public readonly long RequiredBufferedLength => _requiredBufferedLength;
+    public readonly SequencePosition UnreadStart => _buffer.Sequence.Start;
 
     public readonly long GetCurrentMessageOffset(long currentBufferedLength)
         => _initialLength - _buffer.Length - currentBufferedLength;
 
     public readonly BackendMessageBatch Slice(long offset)
     {
-        var result = new BackendMessageBatch(_buffer.Sequence.Slice(offset));
-        result._initialLength = _initialLength;
-        return result;
+        return new(_buffer.Sequence.Slice(offset),
+            _dataRowStreamingThreshold, _initialLength);
     }
 
     public bool TryReadNextInPlace(out BackendHeader header, out ReadOnlySequence<byte> buffer, out uint bufferLength)
     {
         if (!Header.TryParse(_buffer.FirstSpan, out var protoHeader) && !Header.TryParseMultiSegment(_buffer.Sequence, out protoHeader))
         {
-            // We use default(ROSeq) - which is fully supported - as ROSeq.Empty weirdly enough wraps an empty array.
-            _buffer = default;
+            _requiredBufferedLength = ConsumedLength + Header.ByteCount;
+            buffer = default;
+            bufferLength = default;
+            header = default;
+            return false;
+        }
+
+        var backendType = (BackendType)protoHeader.Tag;
+        if (protoHeader.MessageLength > MaxMessageLength)
+            throw new PgFramingException($"PostgreSQL backend message length {protoHeader.MessageLength} exceeds the maximum supported length.");
+        var required = backendType is BackendType.DataRow
+            ? Math.Min(protoHeader.MessageLength, (uint)_dataRowStreamingThreshold)
+            : protoHeader.MessageLength;
+        if (_buffer.Length < required)
+        {
+            _requiredBufferedLength = ConsumedLength + required;
             buffer = default;
             bufferLength = default;
             header = default;
@@ -35,6 +66,7 @@ struct BackendMessageBatch(ReadOnlySequence<byte> buffer)
         }
 
         var fastSeq = _buffer.SplitInPlace(Math.Min(_buffer.Length, protoHeader.MessageLength));
+        _requiredBufferedLength = 0;
         buffer = fastSeq.Sequence;
         Debug.Assert(fastSeq.Length <= uint.MaxValue);
         bufferLength = unchecked((uint)fastSeq.Length);
@@ -48,85 +80,6 @@ struct BackendMessageBatch(ReadOnlySequence<byte> buffer)
         var success = thisCopy.TryReadNextInPlace(out header, out buffer, out bufferLength);
         remaining = success ? thisCopy : default;
         return success;
-    }
-
-    // Segmenter parses messages and ensures relevant messages are fully buffered before being returned.
-    internal struct Segmenter : IPipeSegmenter<BackendMessageBatch>
-    {
-        public const int DefaultDataRowStreamingThreshold = 16 * 1024;
-        const uint MaxMessageLength = 0x3FFF_FFFF;
-
-        readonly int _dataRowStreamingThreshold;
-        int _minimumSize;
-        public int MinimumSize => _minimumSize;
-
-        public Segmenter() : this(DefaultDataRowStreamingThreshold) {}
-
-        public Segmenter(int dataRowStreamingThreshold)
-        {
-            ArgumentOutOfRangeException.ThrowIfNegative(dataRowStreamingThreshold);
-            _dataRowStreamingThreshold = dataRowStreamingThreshold;
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public OperationStatus CreateSegment(in ReadOnlySequence<byte> buffer, out long segmentLength, out BackendMessageBatch segment)
-        {
-            _minimumSize = Header.ByteCount;
-            var reader = new SequenceReader<byte>(buffer);
-            var messages = 0;
-            var needMoreData = false;
-            segmentLength = 0;
-
-            // Try span first before accessing the sequence.
-            while (Header.TryParse(reader.UnreadSpan, out var header) || Header.TryParseMultiSegment(reader.UnreadSequence, out header))
-            {
-                var backendType = (BackendType)header.Tag;
-                if (header.MessageLength > MaxMessageLength)
-                    throw new PgFramingException($"PostgreSQL backend message length {header.MessageLength} exceeds the maximum supported length.");
-
-                if (reader.Remaining < header.MessageLength)
-                {
-                    var required = RequiredBufferedLength(backendType, header.MessageLength);
-                    if (reader.Remaining < required)
-                    {
-                        // MinimumSize is relative to the entire unconsumed pipe buffer, including messages
-                        // already framed before this one.
-                        _minimumSize = int.CreateSaturating(segmentLength + required);
-                        needMoreData = true;
-                        break;
-                    }
-
-                    reader.Advance(reader.Remaining);
-                }
-                else
-                {
-                    reader.Advance(header.MessageLength);
-                }
-
-                messages++;
-                segmentLength += header.MessageLength;
-            }
-
-            if (messages is 0)
-            {
-                segment = default;
-                return OperationStatus.NeedMoreData;
-            }
-
-            segment = new(reader.Length == segmentLength ? buffer : buffer.Slice(0, reader.Position));
-            return needMoreData ? OperationStatus.NeedMoreData : OperationStatus.Done;
-        }
-
-        uint RequiredBufferedLength(BackendType backendType, uint messageLength) => backendType switch
-        {
-            BackendType.DataRow => Math.Min(messageLength, (uint)_dataRowStreamingThreshold),
-            // BackendType.RowDescription or
-            // BackendType.CopyData or
-            // BackendType.FunctionCallResponse or
-            // BackendType.NotificationResponse or
-            // BackendType.ParameterDescription => false,
-            _ => messageLength,
-        };
     }
 
     // Keeps the public position components scalar so consuming the first segment does not repeatedly
@@ -215,7 +168,9 @@ struct BackendMessageBatch(ReadOnlySequence<byte> buffer)
             if (offset == _length)
             {
                 var exhausted = this;
-                this = default;
+                _startObject = _endObject;
+                _startIndex = _endIndex;
+                _length = 0;
                 return exhausted;
             }
             if (offset == firstLength

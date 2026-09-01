@@ -143,7 +143,7 @@ public class RacingDisposeInMemoryTests
         for (var i = 0; i < dataRowIndex; i++)
             transport.ReleaseSegment(messages[i]);
         transport.ReleaseSegment(messages[dataRowIndex]
-            .AsSpan(0, BackendMessageBatch.Segmenter.DefaultDataRowStreamingThreshold).ToArray());
+            .AsSpan(0, BackendMessageBatch.DefaultDataRowStreamingThreshold).ToArray());
 
         Assert.IsTrue(await resultPending);
         var rows = flowEnumerator.Current.GetAsyncEnumerator(CommandResult.RowBuffering.Streaming);

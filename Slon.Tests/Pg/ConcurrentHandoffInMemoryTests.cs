@@ -250,8 +250,8 @@ public class ConcurrentHandoffInMemoryTests
         public EchoServerTransport(byte[] handshake, byte[] response)
         {
             _response = response;
-            // Slon's PipeSegmentEnumerator requires its OWN StreamPipeReader for the sync path
-            // (not the BCL PipeReader.Create). Wrap the in-memory pipe as a stream, same as the socket transport.
+            // Slon's synchronous protocol path requires a StreamPipeReader (not the BCL
+            // PipeReader.Create). Wrap the in-memory pipe as a stream, like the socket transport.
             _clientReader = new Slon.Pipelines.DefaultStreamPipeReader(
                 _toClient.Reader.AsStream(),
                 new StreamPipeReaderOptions(bufferSize: 8192, useZeroByteReads: false),

@@ -227,6 +227,7 @@ abstract class StreamPipeReader : PipeReader
     // or AbortDirectRead. The protocol must interrupt and join that tenure before completing the
     // reader and returning its destination buffer.
     internal bool SupportsDirectRead => PendingReadTokenSource is null;
+    const int BufferedDirectRead = -1;
 
     internal void EnsureCanUpgradeStream()
     {
@@ -247,7 +248,9 @@ abstract class StreamPipeReader : PipeReader
 
         try
         {
-            if (Segments.BufferedBytes is 0 && UseZeroByteReads)
+            if (Segments.BufferedBytes is not 0 && !ExaminedEverything)
+                return new(BufferedDirectRead);
+            if (UseZeroByteReads)
             {
                 _directReadAwaitingData = true;
                 return Stream.ReadAsync(Memory<byte>.Empty, cancellationToken);
@@ -276,12 +279,13 @@ abstract class StreamPipeReader : PipeReader
             length = next.Result;
         }
 
-        if (length is not 0)
+        if (length > 0)
         {
             ExaminedEverything = false;
             Segments.Grow(length);
         }
-        result = new ReadResult(Segments.GetReadOnlySequence(), isCanceled: false, isCompleted: length is 0);
+        result = new ReadResult(Segments.GetReadOnlySequence(), isCanceled: false,
+            isCompleted: length is 0);
         next = default;
         EndStartedRead();
         return true;

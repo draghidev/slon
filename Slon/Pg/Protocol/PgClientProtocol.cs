@@ -86,7 +86,7 @@ public sealed class PgClientProtocolOptions
     public TimeSpan CancellationTimeout { get; set; } = TimeSpan.FromSeconds(10);
     public TimeSpan CancellationRetryInterval { get; set; } = TimeSpan.FromSeconds(1);
     internal PgSessionResetOptions SessionReset { get; set; } = new();
-    public int DataRowStreamingThreshold { get; set; } = BackendMessageBatch.Segmenter.DefaultDataRowStreamingThreshold;
+    public int DataRowStreamingThreshold { get; set; } = BackendMessageBatch.DefaultDataRowStreamingThreshold;
     public int MaxInFlightFlowsPerWire { get; set; }
     public ILoggerFactory LoggerFactory { get; set; } = NullLoggerFactory.Instance;
     // Datasource bootstrap supplies this. A standalone raw protocol can omit backend identity and
@@ -177,7 +177,6 @@ public sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
     TransportConnection _connection = null!;
     IOutputWriter _pipeWriter = null!;
     ProtocolDataWriter _protocolDataWriter = null!;
-    PipeSegmentEnumerator<BackendMessageBatch.Segmenter, BackendMessageBatch> _pipeSegmentEnumerator = null!;
     PgDecoder _pgDecoder = null!;
 
     LoadObserver? _loadObserver;
@@ -307,9 +306,9 @@ public sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         _pipeWriter = connection.Writer as IOutputWriter ?? new PipeOutputWriter(connection.Writer);
         _protocolDataWriter = new(_pipeWriter, PgClientOptions.PreStartupEncoding,
             connection.WaitUntilWritable, AbortToken, FlowControl, _options.WriteTimeout);
-        _pipeSegmentEnumerator = new(connection.Reader,
-            new(_options.DataRowStreamingThreshold), ownsReader: true);
-        _pgDecoder = new(_pipeSegmentEnumerator, AbortToken, _options.ReadTimeout, _options.ReadTimeoutArmed);
+        _pgDecoder = new(connection.Reader, _options.DataRowStreamingThreshold,
+            AbortToken, _options.ReadTimeout, _options.ReadTimeoutArmed,
+            ownsReader: true);
         _admissionAvailable = hosting.AdmissionAvailable;
         _loadObserver = hosting.LoadObserver;
 

@@ -437,8 +437,8 @@ public class StoppingTokenInMemoryTests
             return tcs.Task;
         }
 
-        // The protocol's transport read (PipeSegmentEnumerator) funnels through ReadAsync, including
-        // via the base ReadAtLeastAsync default; signaling here covers both. AdvanceTo is delegated
+        // The protocol transport funnels through ReadAsync, including via the base
+        // ReadAtLeastAsync default; signaling here covers both. AdvanceTo is delegated
         // verbatim (no teeing), so the base default's position tracking stays correct.
         public override ValueTask<ReadResult> ReadAsync(CancellationToken cancellationToken = default)
         {

@@ -10,6 +10,7 @@ sealed class BackendMessageContext
 {
     PgDecoder _decoder = null!;
     BackendMessageBatch _remainingBatch;
+    bool _hasBatch;
     BackendMessage _current;
     FallbackBuffer _currentFallbackBuffer;
     short _version;
@@ -128,27 +129,27 @@ sealed class BackendMessageContext
             _decoder = decoder;
     }
 
-    public bool TryContinue(short token, SequencePosition consumed, long consumedLength,
-        out CurrentSegmentBuffer result)
+    public bool TrySlide(short token, SequencePosition consumed, long consumedLength,
+        out CurrentMessageBuffer result)
     {
         MarkBodyWindowAdvanced(token);
-        return _decoder.TryContinueCurrentMessage(consumed, consumedLength, out result);
+        return _decoder.TrySlideCurrentMessage(consumed, consumedLength, out result);
     }
 
-    public ValueTask<CurrentSegmentBuffer> ContinueAsync(short token, SequencePosition consumed,
+    public ValueTask<CurrentMessageBuffer> SlideAsync(short token, SequencePosition consumed,
         long consumedLength, CancellationToken cancellationToken)
     {
         MarkBodyWindowAdvanced(token);
-        return _decoder.ContinueCurrentMessageAsync(consumed, consumedLength, cancellationToken);
+        return _decoder.SlideCurrentMessageAsync(consumed, consumedLength, cancellationToken);
     }
 
-    public CurrentSegmentBuffer Continue(short token, SequencePosition consumed, long consumedLength)
+    public CurrentMessageBuffer Slide(short token, SequencePosition consumed, long consumedLength)
     {
         MarkBodyWindowAdvanced(token);
-        return _decoder.ContinueCurrentMessage(consumed, consumedLength);
+        return _decoder.SlideCurrentMessage(consumed, consumedLength);
     }
 
-    public bool TryExtend(short token, out CurrentSegmentBuffer result)
+    public bool TryExtend(short token, out CurrentMessageBuffer result)
     {
         EnsureBodyWindowAvailable(token);
         if (!_decoder.TryExtendCurrentMessage(out result))
@@ -157,19 +158,19 @@ sealed class BackendMessageContext
         return true;
     }
 
-    public async ValueTask<CurrentSegmentBuffer> ExtendAsync(short token, CancellationToken cancellationToken)
+    public async ValueTask<CurrentMessageBuffer> ExtendAsync(short token, CancellationToken cancellationToken)
     {
         EnsureBodyWindowAvailable(token);
         return GetBodyBuffer(token, await _decoder.ExtendCurrentMessageAsync(cancellationToken).ConfigureAwait(false));
     }
 
-    public CurrentSegmentBuffer Extend(short token)
+    public CurrentMessageBuffer Extend(short token)
     {
         EnsureBodyWindowAvailable(token);
         return GetBodyBuffer(token, _decoder.ExtendCurrentMessage());
     }
 
-    CurrentSegmentBuffer GetBodyBuffer(short token, CurrentSegmentBuffer result)
+    CurrentMessageBuffer GetBodyBuffer(short token, CurrentMessageBuffer result)
     {
         Validate(token);
         var bodyOffset = _currentMessageOffset + BackendHeader.ByteCount;
@@ -177,7 +178,15 @@ sealed class BackendMessageContext
         var bufferedLength = Math.Min(bodyLength, result.Buffer.Length - bodyOffset);
         var body = result.Buffer.Slice(bodyOffset, bufferedLength);
         if (result.IsComplete)
-            SetCurrentFromSegment(token, result.Buffer);
+        {
+            _decoder.CompleteCurrentMessage();
+            var messageLength = _current.Header.MessageLength;
+            var message = result.Buffer.Slice(_currentMessageOffset, messageLength);
+            BackendMessage.Initialize(
+                ref _current, _current.Header, message, this, token, buffered: true);
+            var messageEnd = _currentMessageOffset + messageLength;
+            _remainingBatch = new BackendMessageBatch(result.Buffer).Slice(messageEnd);
+        }
         return new(body, result.IsComplete);
     }
 
@@ -196,16 +205,10 @@ sealed class BackendMessageContext
             _ = GetCurrentMessageOffset(token);
     }
 
-    public void SetBuffered(short token, ReadOnlySequence<byte> buffer)
-    {
-        Validate(token);
-        BackendMessage.Initialize(ref _current, _current.Header, buffer, this, token, buffered: true);
-    }
-
     public void BufferCurrentMessage(short token)
     {
         EnsureBodyWindowAvailable(token);
-        CurrentSegmentBuffer result;
+        CurrentMessageBuffer result;
         do result = Extend(token);
         while (!result.IsComplete);
     }
@@ -217,16 +220,10 @@ sealed class BackendMessageContext
 
         async ValueTask Core(short token, CancellationToken cancellationToken)
         {
-            CurrentSegmentBuffer result;
+            CurrentMessageBuffer result;
             do result = await ExtendAsync(token, cancellationToken).ConfigureAwait(false);
             while (!result.IsComplete);
         }
-    }
-
-    void SetCurrentFromSegment(short token, ReadOnlySequence<byte> segment)
-    {
-        var message = segment.Slice(_currentMessageOffset, _current.Header.MessageLength);
-        SetBuffered(token, message);
     }
 
     void Validate(short token)
@@ -280,6 +277,10 @@ sealed class BackendMessageContext
         if (!_remainingBatch.TryReadNextInPlace(out var header, out var buffer, out var bufferLength))
             return false;
         ResetMessageState();
+        if (bufferLength < header.MessageLength)
+            _decoder.SetCurrentMessageLength(
+                _remainingBatch.ConsumedLength - bufferLength
+                + header.MessageLength);
         BackendMessage.Initialize(ref _current, header, buffer, this, ++_version,
             bufferLength >= header.MessageLength);
         _publicationState = PublicationState.Current;
@@ -300,10 +301,27 @@ sealed class BackendMessageContext
         _currentFallbackBuffer.Clear();
         _publicationState = PublicationState.None;
         _remainingBatch = default;
+        _hasBatch = false;
         _currentMessageOffset = 0;
         _messageState = 0;
         if (invalidateToken)
             _version++;
+    }
+
+    public bool TryGetBatchReadRequirement(
+        out SequencePosition consumed, out long requiredLength)
+    {
+        if (!_hasBatch || _remainingBatch.RequiredBufferedLength <= 0)
+        {
+            consumed = default;
+            requiredLength = 0;
+            return false;
+        }
+
+        consumed = _remainingBatch.UnreadStart;
+        requiredLength = _remainingBatch.RequiredBufferedLength
+            - _remainingBatch.ConsumedLength;
+        return true;
     }
 
     // Reads the next message WITHOUT publishing it as Current. The remaining batch cursor
@@ -323,6 +341,10 @@ sealed class BackendMessageContext
         {
             return false;
         }
+        if (bufferLength < header.MessageLength)
+            _decoder.SetCurrentMessageLength(
+                _remainingBatch.ConsumedLength - bufferLength
+                + header.MessageLength);
         _messageState = 0;
         BackendMessage.Initialize(ref _current, header, buffer, this, ++_version,
             bufferLength >= header.MessageLength);
@@ -346,6 +368,7 @@ sealed class BackendMessageContext
             "The prior batch must be retired before publishing replacement storage.");
         _publicationState = PublicationState.None;
         _remainingBatch = batch;
+        _hasBatch = true;
     }
 
 }

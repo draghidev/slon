@@ -12,6 +12,24 @@ namespace Slon.Tests.Pg;
 [TestClass]
 public class BackendMessageStreamingTests
 {
+    sealed class SequenceSegment : ReadOnlySequenceSegment<byte>
+    {
+        public SequenceSegment(ReadOnlyMemory<byte> memory) => Memory = memory;
+
+        public SequenceSegment Append(ReadOnlyMemory<byte> memory)
+        {
+            var next = new SequenceSegment(memory)
+            {
+                RunningIndex = RunningIndex + Memory.Length
+            };
+            Next = next;
+            return next;
+        }
+
+        public ReadOnlySequence<byte> To(SequenceSegment end)
+            => new(this, 0, end, end.Memory.Length);
+    }
+
     sealed class RejectRetiredSuppliedReadReader(PipeReader inner) : PipeReader
     {
         ReadResult _activeRead;
@@ -62,60 +80,6 @@ public class BackendMessageStreamingTests
         Retire,
     }
 
-    // Treats the first 4 big-endian bytes as the total segment length. Fully buffered => Done (so the
-    // enumerator takes the deferred-consume branch, exactly the state the defect needs).
-    struct FixedSegmenter : IPipeSegmenter<int>
-    {
-        public int MinimumSize => 4;
-
-        public OperationStatus CreateSegment(in ReadOnlySequence<byte> buffer, out long segmentLength, out int segment)
-        {
-            segment = 0;
-            var reader = new SequenceReader<byte>(buffer);
-            if (!reader.TryReadBigEndian(out int len))
-            {
-                segmentLength = 0;
-                return OperationStatus.NeedMoreData;
-            }
-            segmentLength = len;
-            if (buffer.Length < len)
-                return OperationStatus.NeedMoreData;
-            segment = len;
-            return OperationStatus.Done;
-        }
-    }
-
-    struct StreamingSegmenter : IPipeSegmenter<ReadOnlySequence<byte>>
-    {
-        public int MinimumSize => 4;
-
-        public OperationStatus CreateSegment(in ReadOnlySequence<byte> buffer, out long segmentLength,
-            out ReadOnlySequence<byte> segment)
-        {
-            var reader = new SequenceReader<byte>(buffer);
-            if (!reader.TryReadBigEndian(out int len))
-            {
-                segmentLength = 0;
-                segment = default;
-                return OperationStatus.NeedMoreData;
-            }
-
-            segmentLength = len;
-            segment = buffer.Slice(0, Math.Min(buffer.Length, len));
-            return buffer.Length < len ? OperationStatus.NeedMoreData : OperationStatus.Done;
-        }
-    }
-
-    static byte[] LenPrefixed(int total)
-    {
-        var bytes = new byte[total];
-        bytes[0] = (byte)(total >> 24);
-        bytes[1] = (byte)(total >> 16);
-        bytes[2] = (byte)(total >> 8);
-        bytes[3] = (byte)total;
-        return bytes;
-    }
-
     static byte[] BackendMessageBytes(BackendType type, int totalLength)
     {
         var bytes = new byte[totalLength];
@@ -131,15 +95,19 @@ public class BackendMessageStreamingTests
         return bytes;
     }
 
-    static PipeSegmentEnumerator<FixedSegmenter, int> BuildEnumerator(byte[] wire)
+    static ReadOnlySequence<byte> Segmented(
+        ReadOnlyMemory<byte> first, ReadOnlyMemory<byte> second)
     {
-        // A MemoryStream returns the wire bytes then 0 (EOF) on every subsequent read, so re-drives
-        // after completion re-hit the same terminal state the recovery drain does against a closed peer.
-        var reader = new DefaultStreamPipeReader(
-            new MemoryStream(wire, writable: false),
-            new StreamPipeReaderOptions(bufferSize: 8192, useZeroByteReads: false),
-            supportCancelPending: false);
-        return new(reader, new FixedSegmenter(), ownsReader: true);
+        var start = new SequenceSegment(first);
+        return start.To(start.Append(second));
+    }
+
+    static async ValueTask<bool> MoveNextBatchAsync(ProtocolReadPipe pipe)
+    {
+        pipe.PrepareMoveNextBatch();
+        var read = await pipe.ReadAsync(CancellationToken.None);
+        return pipe.CompleteMoveNextBatch(
+            read, CancellationToken.None, out _);
     }
 
     [TestMethod]
@@ -219,13 +187,15 @@ public class BackendMessageStreamingTests
     {
         var pipe = new Pipe();
         var reader = new RejectRetiredSuppliedReadReader(pipe.Reader);
-        var protocolPipe = new ProtocolReadPipe(
-            new(reader, new BackendMessageBatch.Segmenter(), ownsReader: true));
+        var protocolPipe = new ProtocolReadPipe(reader,
+            BackendMessageBatch.DefaultDataRowStreamingThreshold,
+            ownsReader: true);
 
         await pipe.Writer.WriteAsync(BackendMessageBytes(BackendType.CommandComplete, 6));
-        Assert.IsTrue(protocolPipe.TryMoveNextBatch(out _));
+        Assert.IsTrue(await MoveNextBatchAsync(protocolPipe));
         Assert.IsTrue(protocolPipe.TryMoveNext());
         var accessor = protocolPipe.Current.GetAccessor();
+        Assert.IsFalse(protocolPipe.TryMoveNext());
 
         var observedAdvance = false;
         reader.BeforeAdvance = () =>
@@ -238,7 +208,7 @@ public class BackendMessageStreamingTests
         };
 
         await pipe.Writer.WriteAsync(BackendMessageBytes(BackendType.ReadyForQuery, 6));
-        Assert.IsTrue(protocolPipe.TryMoveNextBatch(out _));
+        Assert.IsTrue(await MoveNextBatchAsync(protocolPipe));
         Assert.IsTrue(observedAdvance);
         Assert.IsTrue(protocolPipe.TryMoveNext());
         Assert.AreEqual(BackendType.ReadyForQuery, protocolPipe.Current.Header.Type);
@@ -307,113 +277,6 @@ public class BackendMessageStreamingTests
     }
 
     [TestMethod]
-    public async Task ReDriveAfterEof_Async_ReturnsFalseWithoutCorruption()
-    {
-        var e = BuildEnumerator(LenPrefixed(24));
-
-        Assert.IsTrue(await e.MoveNextAsync(), "first segment should be produced");
-        Assert.AreEqual(24, e.Current);
-        Assert.IsFalse(await e.MoveNextAsync(), "second call consumes the segment and reaches EOF");
-
-        // The recovery drain keeps pulling after completion; before the fix each of these re-applied the
-        // stale deferred advance and threw ArgumentOutOfRangeException('length') from the ReadResult build.
-        for (var i = 0; i < 6; i++)
-            Assert.IsFalse(await e.MoveNextAsync(), $"re-drive #{i} past completion must stay false");
-
-        await e.DisposeAsync();
-    }
-
-    [TestMethod]
-    public async Task CompletedRead_WithFinalBufferedSegment_StillPublishesIt()
-    {
-        var pipe = new Pipe();
-        var e = new PipeSegmentEnumerator<FixedSegmenter, int>(pipe.Reader, new FixedSegmenter());
-        await pipe.Writer.WriteAsync(LenPrefixed(24));
-        await pipe.Writer.CompleteAsync();
-
-        Assert.IsTrue(await e.MoveNextAsync());
-        Assert.AreEqual(24, e.Current);
-        Assert.IsFalse(await e.MoveNextAsync());
-        await e.DisposeAsync();
-    }
-
-    [TestMethod]
-    public async Task CompletedRead_WithTruncatedFinalSegment_Throws()
-    {
-        var pipe = new Pipe();
-        var e = new PipeSegmentEnumerator<FixedSegmenter, int>(pipe.Reader, new FixedSegmenter());
-        await pipe.Writer.WriteAsync(LenPrefixed(24).AsMemory(0, 12));
-        await pipe.Writer.CompleteAsync();
-
-        Assert.IsTrue(await e.MoveNextAsync(), "the useful prefix is published before its missing tail is discovered");
-        await Assert.ThrowsExactlyAsync<EndOfStreamException>(async () => await e.MoveNextAsync());
-        await e.DisposeAsync();
-    }
-
-    [TestMethod]
-    public async Task CompletedRead_AfterPendingContinuation_Throws()
-    {
-        var pipe = new Pipe();
-        var e = new PipeSegmentEnumerator<StreamingSegmenter, ReadOnlySequence<byte>>(
-            pipe.Reader, new StreamingSegmenter());
-        await pipe.Writer.WriteAsync(LenPrefixed(24).AsMemory(0, 12));
-
-        Assert.IsTrue(await e.MoveNextAsync());
-        Assert.IsFalse(e.TryContinueCurrentSegment(e.Current.End, e.Current.Length, out _));
-        await pipe.Writer.CompleteAsync();
-
-        await Assert.ThrowsExactlyAsync<EndOfStreamException>(async () => await e.MoveNextAsync());
-        await e.DisposeAsync();
-    }
-
-    [TestMethod]
-    public async Task CompletionAtEveryByteInsideSegment_Throws()
-    {
-        const int segmentLength = 32;
-        var wire = LenPrefixed(segmentLength);
-
-        for (var cut = 1; cut < segmentLength; cut++)
-        {
-            var pipe = new Pipe();
-            var e = new PipeSegmentEnumerator<FixedSegmenter, int>(pipe.Reader, new FixedSegmenter());
-            await pipe.Writer.WriteAsync(wire.AsMemory(0, cut));
-            await pipe.Writer.CompleteAsync();
-
-            await Assert.ThrowsExactlyAsync<EndOfStreamException>(async () =>
-            {
-                while (await e.MoveNextAsync()) { }
-            }, $"completion at byte {cut} must not become clean EOF");
-            await e.DisposeAsync();
-        }
-    }
-
-    [TestMethod]
-    public async Task CompletionAtEveryByteInsideSuccessor_ThrowsAfterPredecessor()
-    {
-        const int firstLength = 12;
-        const int secondLength = 32;
-        var wire = new byte[firstLength + secondLength];
-        LenPrefixed(firstLength).CopyTo(wire, 0);
-        LenPrefixed(secondLength).CopyTo(wire, firstLength);
-
-        for (var successorBytes = 1; successorBytes < secondLength; successorBytes++)
-        {
-            var pipe = new Pipe();
-            var e = new PipeSegmentEnumerator<FixedSegmenter, int>(pipe.Reader, new FixedSegmenter());
-            await pipe.Writer.WriteAsync(wire.AsMemory(0, firstLength + successorBytes));
-            await pipe.Writer.CompleteAsync();
-
-            Assert.IsTrue(await e.MoveNextAsync(), $"predecessor missing at successor byte {successorBytes}");
-            Assert.AreEqual(firstLength, e.Current);
-            await Assert.ThrowsExactlyAsync<EndOfStreamException>(async () =>
-            {
-                while (await e.MoveNextAsync()) { }
-            }, $"completion at successor byte {successorBytes} must not become clean EOF");
-            await e.DisposeAsync();
-        }
-    }
-
-    [TestMethod]
     public async Task RepeatedQueryFrames_WithSmallRecycledBuffers_NeverEnterMessageBodies()
     {
         var repetitions = StressEnv.Iterations(512, 100_000);
@@ -434,22 +297,23 @@ public class BackendMessageStreamingTests
             new MemoryStream(wire, writable: false),
             new StreamPipeReaderOptions(bufferSize: 1024, useZeroByteReads: false),
             supportCancelPending: false);
-        var e = new PipeSegmentEnumerator<BackendMessageBatch.Segmenter, BackendMessageBatch>(
-            reader, new BackendMessageBatch.Segmenter(), ownsReader: true);
+        var readPipe = new ProtocolReadPipe(reader,
+            BackendMessageBatch.DefaultDataRowStreamingThreshold,
+            ownsReader: true);
         var messageIndex = 0;
-        while (await e.MoveNextAsync())
+        while (await readPipe.MoveNextAsync(default))
         {
-            var batch = e.Current;
-            while (batch.TryReadNextInPlace(out var header, out _, out _))
+            while (readPipe.TryMoveNext())
             {
-                Assert.AreEqual(response[messageIndex % response.Length][0], (byte)header.Type,
+                Assert.AreEqual(response[messageIndex % response.Length][0],
+                    (byte)readPipe.Current.Header.Type,
                     $"message {messageIndex}");
                 messageIndex++;
             }
         }
 
         Assert.AreEqual(repetitions * response.Length, messageIndex);
-        await e.DisposeAsync();
+        await readPipe.DisposeAsync();
     }
 
     [TestMethod]
@@ -473,44 +337,45 @@ public class BackendMessageStreamingTests
             new MemoryStream(wire, writable: false),
             new StreamPipeReaderOptions(bufferSize: 1024, useZeroByteReads: false),
             supportCancelPending: false);
-        var e = new PipeSegmentEnumerator<BackendMessageBatch.Segmenter, BackendMessageBatch>(
-            reader, new BackendMessageBatch.Segmenter(), ownsReader: true);
+        var readPipe = new ProtocolReadPipe(reader,
+            BackendMessageBatch.DefaultDataRowStreamingThreshold,
+            ownsReader: true);
+        var directReader = (StreamPipeReader)readPipe.PipeReader;
         var messageIndex = 0;
         while (true)
         {
-            if (e.TryMoveNext(out var completed))
-            {
-                ValidateBatch(e.Current);
-                continue;
-            }
-            if (completed)
-                break;
-
-            Assert.IsTrue(e.TryBeginDirectRead(default, out var read));
+            readPipe.PrepareMoveNextBatch();
+            Assert.IsTrue(directReader.SupportsDirectRead);
+            var read = directReader.BeginDirectRead(default);
             while (true)
             {
                 var length = await read;
-                if (e.CompleteDirectRead(length, default, out read, out var readFinished, out completed))
+                if (!directReader.CompleteDirectRead(length, default, out read, out var result))
                 {
-                    ValidateBatch(e.Current);
+                    continue;
+                }
+                if (readPipe.CompleteMoveNextBatch(
+                        result, default, out var completed))
+                {
+                    ValidateBatch();
                     break;
                 }
-                if (!readFinished)
-                    continue;
-                Assert.IsTrue(completed);
-                goto done;
+                if (completed)
+                    goto done;
+                break;
             }
         }
 
         done:
         Assert.AreEqual(repetitions * response.Length, messageIndex);
-        await e.DisposeAsync();
+        await readPipe.DisposeAsync();
 
-        void ValidateBatch(BackendMessageBatch batch)
+        void ValidateBatch()
         {
-            while (batch.TryReadNextInPlace(out var header, out _, out _))
+            while (readPipe.TryMoveNext())
             {
-                Assert.AreEqual(response[messageIndex % response.Length][0], (byte)header.Type,
+                Assert.AreEqual(response[messageIndex % response.Length][0],
+                    (byte)readPipe.Current.Header.Type,
                     $"message {messageIndex}");
                 messageIndex++;
             }
@@ -543,214 +408,21 @@ public class BackendMessageStreamingTests
     public async Task Eof_InvalidatesPublishedBackendMessage()
     {
         var pipe = new Pipe();
-        var batches = new PipeSegmentEnumerator<BackendMessageBatch.Segmenter, BackendMessageBatch>(
-            pipe.Reader, new BackendMessageBatch.Segmenter());
-        var readPipe = new ProtocolReadPipe(batches);
+        var readPipe = new ProtocolReadPipe(pipe.Reader,
+            BackendMessageBatch.DefaultDataRowStreamingThreshold);
         await pipe.Writer.WriteAsync(BackendMessageBytes(BackendType.ReadyForQuery, 6));
 
         Assert.IsTrue(await readPipe.MoveNextAsync(CancellationToken.None));
-        readPipe.CommitBatch();
         Assert.IsTrue(readPipe.TryMoveNext());
         var accessor = readPipe.Current.GetAccessor();
+        Assert.IsFalse(readPipe.TryMoveNext());
 
         await pipe.Writer.CompleteAsync();
         Assert.IsFalse(await readPipe.MoveNextAsync(CancellationToken.None));
         Assert.IsFalse(readPipe.TryGetCurrent(out _));
         Assert.ThrowsExactly<InvalidOperationException>(() => _ = readPipe.Current);
         Assert.ThrowsExactly<InvalidOperationException>(() => _ = accessor.Message);
-        await batches.DisposeAsync();
-    }
-
-    [TestMethod]
-    public void ReDriveAfterEof_Sync_ReturnsFalseWithoutCorruption()
-    {
-        var e = BuildEnumerator(LenPrefixed(24));
-
-        Assert.IsTrue(e.MoveNext(), "first segment should be produced");
-        Assert.AreEqual(24, e.Current);
-        Assert.IsFalse(e.MoveNext(), "second call consumes the segment and reaches EOF");
-
-        for (var i = 0; i < 6; i++)
-            Assert.IsFalse(e.MoveNext(), $"re-drive #{i} past completion must stay false");
-
-        e.Dispose();
-    }
-
-    [TestMethod]
-    public async Task TryMoveNext_PollsFragmentedSegmentWithoutSuspending()
-    {
-        var pipe = new Pipe();
-        var e = new PipeSegmentEnumerator<FixedSegmenter, int>(pipe.Reader, new FixedSegmenter());
-
-        Assert.IsFalse(e.TryMoveNext(out var completed));
-        Assert.IsFalse(completed);
-
-        var wire = LenPrefixed(24);
-        await pipe.Writer.WriteAsync(wire.AsMemory(0, 2));
-        Assert.IsFalse(e.TryMoveNext(out completed), "a partial header must request another read");
-        Assert.IsFalse(completed);
-
-        await pipe.Writer.WriteAsync(wire.AsMemory(2));
-        Assert.IsTrue(e.TryMoveNext(out completed));
-        Assert.IsFalse(completed);
-        Assert.AreEqual(24, e.Current);
-
-        await pipe.Writer.CompleteAsync();
-        Assert.IsFalse(e.TryMoveNext(out completed));
-        Assert.IsTrue(completed);
-        await e.DisposeAsync();
-    }
-
-    [TestMethod]
-    public async Task DirectRead_PreservesFramingAndTerminalState()
-    {
-        var e = BuildEnumerator(LenPrefixed(24));
-
-        Assert.IsTrue(e.TryBeginDirectRead(default, out var read));
-        var length = await read;
-        Assert.IsTrue(e.CompleteDirectRead(length, default, out _, out var readFinished, out var completed));
-        Assert.IsTrue(readFinished);
-        Assert.IsFalse(completed);
-        Assert.AreEqual(24, e.Current);
-
-        Assert.IsFalse(e.TryMoveNext(out completed));
-        Assert.IsFalse(completed);
-        Assert.IsTrue(e.TryBeginDirectRead(default, out read));
-        length = await read;
-        Assert.IsFalse(e.CompleteDirectRead(length, default, out _, out readFinished, out completed));
-        Assert.IsTrue(readFinished);
-        Assert.IsTrue(completed);
-
-        await e.DisposeAsync();
-    }
-
-    [TestMethod]
-    public async Task ContinueCurrentSegment_StreamsWithoutCrossingNextSegment()
-    {
-        var pipe = new Pipe();
-        var e = new PipeSegmentEnumerator<StreamingSegmenter, ReadOnlySequence<byte>>(
-            pipe.Reader, new StreamingSegmenter());
-        var first = LenPrefixed(12);
-        var second = LenPrefixed(8);
-
-        await pipe.Writer.WriteAsync(first.AsMemory(0, 6));
-        Assert.IsTrue(e.TryMoveNext(out _));
-        Assert.AreEqual(6, e.Current.Length);
-
-        Assert.IsFalse(e.TryContinueCurrentSegment(e.Current.End, e.Current.Length, out _));
-
-        var tail = new byte[first.Length - 6 + second.Length];
-        first.AsSpan(6).CopyTo(tail);
-        second.CopyTo(tail.AsSpan(first.Length - 6));
-        await pipe.Writer.WriteAsync(tail);
-
-        Assert.IsTrue(e.TryContinueCurrentSegment(e.Current.End, e.Current.Length, out var continuation));
-        Assert.IsTrue(continuation.IsComplete);
-        Assert.AreEqual(6, continuation.Buffer.Length);
-
-        Assert.IsTrue(e.TryMoveNext(out _));
-        Assert.AreEqual(8, e.Current.Length);
-
-        await pipe.Writer.CompleteAsync();
-        Assert.IsFalse(await e.MoveNextAsync());
-        await e.DisposeAsync();
-    }
-
-    [TestMethod]
-    public async Task MoveNextAsync_SkipsUnconsumedPartialSegmentBeforeReadingNext()
-    {
-        var pipe = new Pipe();
-        var e = new PipeSegmentEnumerator<StreamingSegmenter, ReadOnlySequence<byte>>(
-            pipe.Reader, new StreamingSegmenter());
-        var first = LenPrefixed(12);
-        var second = LenPrefixed(8);
-
-        await pipe.Writer.WriteAsync(first.AsMemory(0, 6));
-        Assert.IsTrue(await e.MoveNextAsync());
-        Assert.AreEqual(6, e.Current.Length);
-
-        byte[] remaining = [.. first.AsSpan(6), .. second];
-        await pipe.Writer.WriteAsync(remaining);
-        Assert.IsTrue(await e.MoveNextAsync());
-        Assert.AreEqual(second.Length, e.Current.Length);
-
-        await pipe.Writer.CompleteAsync();
-        Assert.IsFalse(await e.MoveNextAsync());
-        await e.DisposeAsync();
-    }
-
-    [TestMethod]
-    public async Task TryMoveNext_SkipsUnconsumedPartialSegmentBeforePollingNext()
-    {
-        var pipe = new Pipe();
-        var e = new PipeSegmentEnumerator<StreamingSegmenter, ReadOnlySequence<byte>>(
-            pipe.Reader, new StreamingSegmenter());
-        var first = LenPrefixed(12);
-        var second = LenPrefixed(8);
-
-        await pipe.Writer.WriteAsync(first.AsMemory(0, 6));
-        Assert.IsTrue(e.TryMoveNext(out _));
-        Assert.AreEqual(6, e.Current.Length);
-
-        byte[] remaining = [.. first.AsSpan(6), .. second];
-        await pipe.Writer.WriteAsync(remaining);
-        Assert.IsTrue(e.TryMoveNext(out _));
-        Assert.AreEqual(second.Length, e.Current.Length);
-
-        await pipe.Writer.CompleteAsync();
-        Assert.IsFalse(e.TryMoveNext(out var completed));
-        Assert.IsTrue(completed);
-        await e.DisposeAsync();
-    }
-
-    [TestMethod]
-    public async Task ContinueCurrentSegmentAsync_PreservesPartialProgress()
-    {
-        var pipe = new Pipe();
-        var e = new PipeSegmentEnumerator<StreamingSegmenter, ReadOnlySequence<byte>>(
-            pipe.Reader, new StreamingSegmenter());
-        var wire = LenPrefixed(12);
-
-        await pipe.Writer.WriteAsync(wire.AsMemory(0, 6));
-        Assert.IsTrue(e.TryMoveNext(out _));
-
-        var pending = e.ContinueCurrentSegmentAsync(e.Current.End, e.Current.Length);
-        Assert.IsFalse(pending.IsCompleted);
-        await pipe.Writer.WriteAsync(wire.AsMemory(6, 3));
-        var middle = await pending;
-        Assert.IsFalse(middle.IsComplete);
-        Assert.AreEqual(3, middle.Buffer.Length);
-
-        pending = e.ContinueCurrentSegmentAsync(middle.Buffer.End, middle.Buffer.Length);
-        await pipe.Writer.WriteAsync(wire.AsMemory(9));
-        var final = await pending;
-        Assert.IsTrue(final.IsComplete);
-        Assert.AreEqual(3, final.Buffer.Length);
-
-        await pipe.Writer.CompleteAsync();
-        Assert.IsFalse(await e.MoveNextAsync());
-        await e.DisposeAsync();
-    }
-
-    [TestMethod]
-    public async Task ExtendCurrentSegmentAsync_RetainsUntilTheCompleteSegment()
-    {
-        var wire = LenPrefixed(128 * 1024);
-        var reader = new DefaultStreamPipeReader(
-            new MemoryStream(wire, writable: false),
-            new StreamPipeReaderOptions(bufferSize: 8192, useZeroByteReads: false),
-            supportCancelPending: false);
-        var e = new PipeSegmentEnumerator<StreamingSegmenter, ReadOnlySequence<byte>>(
-            reader, new StreamingSegmenter(), ownsReader: true);
-
-        Assert.IsTrue(await e.MoveNextAsync());
-        CurrentSegmentBuffer current;
-        do current = await e.ExtendCurrentSegmentAsync();
-        while (!current.IsComplete);
-
-        Assert.AreEqual(wire.Length, current.Buffer.Length);
-        Assert.IsFalse(await e.MoveNextAsync());
-        await e.DisposeAsync();
+        await readPipe.DisposeAsync();
     }
 
     [TestMethod]
@@ -761,13 +433,12 @@ public class BackendMessageStreamingTests
         for (var i = BackendHeader.ByteCount; i < wire.Length; i++)
             wire[i] = (byte)i;
 
-        var segments = new PipeSegmentEnumerator<BackendMessageBatch.Segmenter, BackendMessageBatch>(
-            pipe.Reader, new BackendMessageBatch.Segmenter(8));
-        var decoder = new PgDecoder(segments, CancellationToken.None, Timeout.InfiniteTimeSpan);
+        var decoder = new PgDecoder(
+            pipe.Reader, 8, CancellationToken.None, Timeout.InfiniteTimeSpan);
         decoder.Pipe.BindDecoder(decoder);
 
         await pipe.Writer.WriteAsync(wire.AsMemory(0, 8));
-        Assert.IsTrue(decoder.Pipe.TryMoveNextBatch(out _));
+        Assert.IsTrue(await MoveNextBatchAsync(decoder.Pipe));
         Assert.IsTrue(decoder.Pipe.TryMoveNext());
         var body = decoder.Pipe.Current.OpenBodyReader();
         Assert.AreEqual(3, body.Buffer.Length);
@@ -789,7 +460,7 @@ public class BackendMessageStreamingTests
     }
 
     [TestMethod]
-    public async Task BackendSegmenter_ExtendedRowAdvancesToTrailingMessage()
+    public async Task BackendReadPipe_ExtendedRowAdvancesToTrailingMessage()
     {
         var bind = BackendMessageBytes(BackendType.BindComplete, BackendHeader.ByteCount);
         var row = BackendMessageBytes(BackendType.DataRow, 128 * 1024);
@@ -798,102 +469,33 @@ public class BackendMessageStreamingTests
         bind.CopyTo(wire, 0);
         row.CopyTo(wire, bind.Length);
         complete.CopyTo(wire, bind.Length + row.Length);
-        var reader = new DefaultStreamPipeReader(
-            new MemoryStream(wire, writable: false),
-            new StreamPipeReaderOptions(bufferSize: 64 * 1024, useZeroByteReads: false),
-            supportCancelPending: false);
-        var e = new PipeSegmentEnumerator<BackendMessageBatch.Segmenter, BackendMessageBatch>(
-            reader, new BackendMessageBatch.Segmenter(), ownsReader: true);
+        var pipe = new Pipe(new PipeOptions(
+            pauseWriterThreshold: 256 * 1024,
+            resumeWriterThreshold: 128 * 1024));
+        var decoder = new PgDecoder(pipe.Reader,
+            BackendMessageBatch.DefaultDataRowStreamingThreshold,
+            CancellationToken.None, Timeout.InfiniteTimeSpan);
+        decoder.Pipe.BindDecoder(decoder);
 
-        Assert.IsTrue(await e.MoveNextAsync());
-        CurrentSegmentBuffer current;
-        do current = await e.ExtendCurrentSegmentAsync();
-        while (!current.IsComplete);
+        var initialLength = bind.Length
+            + BackendMessageBatch.DefaultDataRowStreamingThreshold;
+        await pipe.Writer.WriteAsync(wire.AsMemory(0, initialLength));
+        Assert.IsTrue(await decoder.Pipe.MoveNextAsync(default));
+        Assert.IsTrue(decoder.Pipe.TryMoveNext());
+        Assert.AreEqual(BackendType.BindComplete, decoder.Pipe.Current.Header.Type);
+        Assert.IsTrue(decoder.Pipe.TryMoveNext());
+        Assert.AreEqual(BackendType.DataRow, decoder.Pipe.Current.Header.Type);
+        var body = decoder.Pipe.Current.OpenBodyReader();
+        await pipe.Writer.WriteAsync(wire.AsMemory(initialLength));
+        while (!body.IsComplete)
+            Assert.IsTrue(body.TryExtend());
 
-        Assert.IsTrue(await e.MoveNextAsync());
-        Assert.IsTrue(e.Current.TryReadNextInPlace(out var header, out _, out _));
-        Assert.AreEqual(BackendType.CommandComplete, header.Type);
-        await e.DisposeAsync();
-    }
-
-    [TestMethod]
-    public async Task ContinueCurrentSegment_SlidesPastOnlyTheConsumedPrefix()
-    {
-        var pipe = new Pipe();
-        var e = new PipeSegmentEnumerator<StreamingSegmenter, ReadOnlySequence<byte>>(
-            pipe.Reader, new StreamingSegmenter());
-        var wire = LenPrefixed(12);
-        for (var i = 4; i < wire.Length; i++)
-            wire[i] = (byte)i;
-
-        await pipe.Writer.WriteAsync(wire.AsMemory(0, 8));
-        Assert.IsTrue(e.TryMoveNext(out _));
-        var consumed = e.Current.GetPosition(6);
-        Assert.IsFalse(e.TryContinueCurrentSegment(consumed, 6, out _));
-
-        await pipe.Writer.WriteAsync(wire.AsMemory(8, 2));
-        Assert.IsTrue(e.TryContinueCurrentSegment(consumed, 6, out var middle));
-        Assert.IsFalse(middle.IsComplete);
-        CollectionAssert.AreEqual(wire.AsSpan(6, 4).ToArray(), middle.Buffer.ToArray());
-
-        await pipe.Writer.WriteAsync(wire.AsMemory(10));
-        var final = await e.ContinueCurrentSegmentAsync(middle.Buffer.End, middle.Buffer.Length);
-        Assert.IsTrue(final.IsComplete);
-        CollectionAssert.AreEqual(wire.AsSpan(10).ToArray(), final.Buffer.ToArray());
-
+        Assert.IsFalse(decoder.Pipe.TryMoveNext());
+        Assert.IsTrue(await decoder.Pipe.MoveNextAsync(default));
+        Assert.IsTrue(decoder.Pipe.TryMoveNext());
+        Assert.AreEqual(BackendType.CommandComplete, decoder.Pipe.Current.Header.Type);
         await pipe.Writer.CompleteAsync();
-        Assert.IsFalse(await e.MoveNextAsync());
-        await e.DisposeAsync();
-    }
-
-    [TestMethod]
-    public async Task MoveNext_CanDrainAfterAContinuationPollParks()
-    {
-        var pipe = new Pipe();
-        var e = new PipeSegmentEnumerator<StreamingSegmenter, ReadOnlySequence<byte>>(
-            pipe.Reader, new StreamingSegmenter());
-        var first = LenPrefixed(12);
-        var second = LenPrefixed(8);
-
-        await pipe.Writer.WriteAsync(first.AsMemory(0, 6));
-        Assert.IsTrue(e.TryMoveNext(out _));
-        Assert.IsFalse(e.TryContinueCurrentSegment(e.Current.End, e.Current.Length, out _));
-
-        await pipe.Writer.WriteAsync(first.AsMemory(6));
-        await pipe.Writer.WriteAsync(second);
-        Assert.IsTrue(await e.MoveNextAsync(), "normal iteration must take over the pending continuation read");
-        Assert.AreEqual(second.Length, e.Current.Length);
-
-        await pipe.Writer.CompleteAsync();
-        Assert.IsFalse(await e.MoveNextAsync());
-        await e.DisposeAsync();
-    }
-
-    [TestMethod]
-    public async Task SuppliedRead_IsInspectedBeforeItsConsumedPrefixIsRetired()
-    {
-        var pipe = new Pipe();
-        var reader = new RejectRetiredSuppliedReadReader(pipe.Reader);
-        var e = new PipeSegmentEnumerator<StreamingSegmenter, ReadOnlySequence<byte>>(
-            reader, new StreamingSegmenter());
-        var first = LenPrefixed(12);
-        var second = LenPrefixed(8);
-
-        await pipe.Writer.WriteAsync(first.AsMemory(0, 6));
-        Assert.IsTrue(e.TryMoveNext(out _));
-        Assert.IsFalse(e.TryMoveNext(out _), "the poll should advance once and park for the tail");
-
-        await pipe.Writer.WriteAsync(first.AsMemory(6));
-        await pipe.Writer.WriteAsync(second);
-        var supplied = await e.ReadAsync(CancellationToken.None);
-        reader.RejectAdvanceAtActiveStart();
-
-        Assert.IsTrue(e.TryMoveNext(supplied, CancellationToken.None, out _));
-        Assert.AreEqual(second.Length, e.Current.Length);
-
-        await pipe.Writer.CompleteAsync();
-        Assert.IsFalse(await e.MoveNextAsync());
-        await e.DisposeAsync();
+        await ((IAsyncDisposable)decoder).DisposeAsync();
     }
 
     [TestMethod]
@@ -907,50 +509,44 @@ public class BackendMessageStreamingTests
     }
 
     [TestMethod]
-    public void BackendSegmenter_WaitsForUsefulPartialDataRowPrefix()
+    public void BackendBatch_WaitsForUsefulPartialDataRowPrefix()
     {
         var rowLength = 128 * 1024;
         var wire = BackendMessageBytes(BackendType.DataRow, rowLength);
-        var segmenter = new BackendMessageBatch.Segmenter();
 
         var smallPrefix = new ReadOnlySequence<byte>(wire.AsMemory(0, 32));
-        Assert.AreEqual(OperationStatus.NeedMoreData,
-            segmenter.CreateSegment(smallPrefix, out var length, out _));
-        Assert.AreEqual(0, length);
-        Assert.AreEqual(BackendMessageBatch.Segmenter.DefaultDataRowStreamingThreshold, segmenter.MinimumSize);
+        var batch = new BackendMessageBatch(smallPrefix);
+        Assert.IsFalse(batch.TryReadNextInPlace(out _, out _, out _));
+        Assert.AreEqual(BackendMessageBatch.DefaultDataRowStreamingThreshold,
+            batch.RequiredBufferedLength);
 
         var usefulPrefix = new ReadOnlySequence<byte>(
-            wire.AsMemory(0, BackendMessageBatch.Segmenter.DefaultDataRowStreamingThreshold));
-        Assert.AreEqual(OperationStatus.Done,
-            segmenter.CreateSegment(usefulPrefix, out length, out var batch));
-        Assert.AreEqual(rowLength, length);
+            wire.AsMemory(0, BackendMessageBatch.DefaultDataRowStreamingThreshold));
+        batch = new(usefulPrefix);
         Assert.IsTrue(batch.TryReadNextInPlace(out var rowHeader, out var partialRow, out _));
         Assert.AreEqual(BackendType.DataRow, rowHeader.Type);
-        Assert.AreEqual(BackendMessageBatch.Segmenter.DefaultDataRowStreamingThreshold, partialRow.Length);
+        Assert.AreEqual(BackendMessageBatch.DefaultDataRowStreamingThreshold, partialRow.Length);
         Assert.IsFalse(new BackendMessage(rowHeader, partialRow, new BackendMessageContext(), 0).Buffered);
     }
 
     [TestMethod]
-    public void BackendSegmenter_FramesUnknownMessageType()
+    public void BackendBatch_FramesUnknownMessageType()
     {
         var wire = BackendHeaderBytes((BackendType)(byte)'o', 4);
-        var segmenter = new BackendMessageBatch.Segmenter();
+        var batch = new BackendMessageBatch(new ReadOnlySequence<byte>(wire));
 
-        Assert.AreEqual(OperationStatus.Done,
-            segmenter.CreateSegment(new ReadOnlySequence<byte>(wire), out var length, out var batch));
-        Assert.AreEqual(wire.Length, length);
         Assert.IsTrue(batch.TryReadNextInPlace(out var header, out _, out _));
         Assert.AreEqual((BackendType)(byte)'o', header.Type);
     }
 
     [TestMethod]
-    public void BackendSegmenter_RejectsMessageBeyondPostgreSqlAllocationLimit()
+    public void BackendBatch_RejectsMessageBeyondPostgreSqlAllocationLimit()
     {
         var wire = BackendHeaderBytes(BackendType.DataRow, 0x3FFF_FFFF);
-        var segmenter = new BackendMessageBatch.Segmenter();
+        var batch = new BackendMessageBatch(new ReadOnlySequence<byte>(wire));
 
         Assert.ThrowsExactly<PgFramingException>(() =>
-            segmenter.CreateSegment(new ReadOnlySequence<byte>(wire), out _, out _));
+            batch.TryReadNextInPlace(out _, out _, out _));
     }
 
     static byte[] BackendHeaderBytes(BackendType type, int length)
