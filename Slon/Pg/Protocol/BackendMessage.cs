@@ -159,6 +159,24 @@ public readonly struct BackendMessage
     public ReadOnlySequence<byte> GetSequence()
         => GetSequence(0);
 
+    internal ReadOnlyMemory<byte> GetContiguousMemory(
+        ReadOnlyMemory<byte> source)
+    {
+        EnsureBodyWindowAvailable();
+        return IsIndependent
+            ? source
+            : Context.GetContiguousMemory(Token, source);
+    }
+
+    internal ReadOnlyMemory<byte> GetContiguousMemory(
+        in ReadOnlySequence<byte> source)
+    {
+        EnsureBodyWindowAvailable();
+        if (IsIndependent)
+            return source.IsSingleSegment ? source.First : source.ToArray();
+        return Context.GetContiguousMemory(Token, source);
+    }
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public bool TryGetFirstSpan(int offset, out ReadOnlySpan<byte> span)
     {

@@ -33,6 +33,7 @@ public sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<Bac
     long _remainingTimeoutTicks;
     int _cancellationReadFrontierWindow = -1;
     PgClientFlow? _cancellationReadFrontierFlow;
+    PgClientFlow? _resultSetBufferingOwner;
 
     PgClientFlow.ExecutionControl CurrentExecutionControl
     {
@@ -115,15 +116,63 @@ public sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<Bac
     internal void CompleteCurrentMessage()
         => _pipe.CompleteCurrentMessage();
 
-    void PrepareRead() => _pipe.PrepareRead();
+    internal bool ResultSetBuffering
+    {
+        get => _resultSetBufferingOwner is not null;
+        set
+        {
+            if (value)
+            {
+                var owner = CurrentExecutionControl.Flow;
+                if (!ReferenceEquals(_resultSetBufferingOwner, owner))
+                    _resultSetBufferingOwner = owner;
+                _pipe.EnableResultSetRetention();
+            }
+            else
+            {
+                if (_resultSetBufferingOwner is null)
+                    return;
+                _resultSetBufferingOwner = null;
+                _pipe.EndResultSetRetention();
+            }
+        }
+    }
+
+    internal void EndResultSetBuffering(PgClientFlow owner)
+    {
+        if (!ReferenceEquals(_resultSetBufferingOwner, owner))
+            return;
+        _resultSetBufferingOwner = null;
+        _pipe.EndResultSetRetention();
+    }
+
+    void ValidateResultSetBufferingOwner()
+    {
+        var owner = _resultSetBufferingOwner;
+        if (owner is not null
+            && !ReferenceEquals(CurrentExecutionControl.Flow, owner))
+            EndResultSetBuffering(owner);
+    }
+
+    void PrepareRead()
+    {
+        ValidateResultSetBufferingOwner();
+        _pipe.PrepareRead();
+    }
 
     bool CompleteRead(
         in ReadResult result, CancellationToken cancellationToken, out bool completed)
-        => _pipe.CompleteRead(
+    {
+        ValidateResultSetBufferingOwner();
+        return _pipe.CompleteRead(
             result, cancellationToken, out completed);
+    }
 
     bool ReadNext(TimeSpan timeout)
-        => _pipe.MoveNext(timeout);
+    {
+        ValidateResultSetBufferingOwner();
+        return _pipe.MoveNext(timeout);
+    }
 
     bool TryBeginDirectRead(CancellationToken cancellationToken, out ValueTask<int> task)
     {

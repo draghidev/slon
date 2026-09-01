@@ -1,6 +1,7 @@
 using System.Buffers;
 using System.Buffers.Binary;
 using System.IO.Pipelines;
+using System.Runtime.InteropServices;
 using Slon.Pipelines;
 using Slon.Pg.Protocol;
 using static Slon.Pg.Protocol.PgTypes;
@@ -180,6 +181,29 @@ public class BackendMessageStreamingTests
         Assert.AreEqual(BackendType.ReadyForQuery, header.Type);
         CollectionAssert.AreEqual(second, message.ToArray());
         Assert.IsFalse(cursor.TryReadNextInPlace(out _, out _, out _));
+    }
+
+    [TestMethod]
+    public void ContiguousMemory_StraddleIsProjectedOncePerResultTenure()
+    {
+        var bytes = BackendMessageBytes(
+            BackendType.DataRow, new byte[] { 0, 1, 2, 3, 4, 5 });
+        var context = new BackendMessageContext();
+        context.SetCursor(new(Segmented(
+            bytes.AsMemory(0, 7), bytes.AsMemory(7))));
+        Assert.IsTrue(context.TryMoveNext());
+        var field = context.Current.GetSequence();
+        Assert.IsFalse(field.IsSingleSegment);
+
+        var first = context.Current.GetContiguousMemory(field);
+        var second = context.Current.GetContiguousMemory(field);
+        CollectionAssert.AreEqual(field.ToArray(), first.ToArray());
+        Assert.IsTrue(MemoryMarshal.TryGetArray(first, out var firstArray));
+        Assert.IsTrue(MemoryMarshal.TryGetArray(second, out var secondArray));
+        Assert.AreSame(firstArray.Array, secondArray.Array);
+
+        context.ReleaseContiguousProjections();
+        context.RetireCursor();
     }
 
     [TestMethod]

@@ -101,6 +101,21 @@ public sealed class CommandResult
         return new(this, buffering);
     }
 
+    /// <summary>
+    /// Retains the memory backing this result set while its rows are enumerated.
+    /// </summary>
+    /// <remarks>
+    /// Retention may cause subsequent rows to be buffered. Memory returned by
+    /// <see cref="Row.BorrowFieldMemory" /> remains valid until this command result is released.
+    /// </remarks>
+    public void EnableResultSetBuffering()
+    {
+        if (_firstRowEnumerated)
+            ThrowHelper.ThrowInvalidOperation(
+                "Result-set buffering must be enabled before row enumeration begins.");
+        _messageEnumerator.EnableResultSetBuffering();
+    }
+
     public bool TryGetCommandComplete([NotNullWhen(true)]out CommandCompleteMessage? value)
     {
         // For commands without rows we enumerate once ourselves.

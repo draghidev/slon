@@ -24,6 +24,7 @@ sealed class BackendMessageContext
     enum PublicationState : byte { None, Current, Peeked }
     PublicationState _publicationState;
     long _currentMessageOffset;
+    ContiguousProjection? _contiguousProjections;
     struct FallbackBuffer
     {
         ReadOnlySequenceSegment<byte>? _start;
@@ -57,6 +58,14 @@ sealed class BackendMessageContext
 
         public readonly ReadOnlySequence<byte> Sequence
             => new(_start!, _startIndex, _end!, _endIndex);
+    }
+
+    sealed class ContiguousProjection
+    {
+        public required byte[] Buffer { get; init; }
+        public required SequencePosition Start { get; init; }
+        public required int Length { get; init; }
+        public ContiguousProjection? Next { get; init; }
     }
 
 
@@ -121,6 +130,55 @@ sealed class BackendMessageContext
             _messageState |= MessageOffsetCaptured;
         }
         return _currentMessageOffset;
+    }
+
+    public ReadOnlyMemory<byte> GetContiguousMemory(
+        short token, ReadOnlyMemory<byte> source)
+    {
+        Validate(token);
+        return source;
+    }
+
+    public ReadOnlyMemory<byte> GetContiguousMemory(
+        short token, in ReadOnlySequence<byte> source)
+    {
+        Validate(token);
+        if (source.IsSingleSegment)
+            return source.First;
+        if (source.Length > int.MaxValue)
+            throw new ArgumentOutOfRangeException(nameof(source));
+
+        var length = (int)source.Length;
+        for (var projection = _contiguousProjections;
+             projection is not null;
+             projection = projection.Next)
+        {
+            if (projection.Start.Equals(source.Start)
+                && projection.Length == length)
+                return projection.Buffer.AsMemory(0, length);
+        }
+
+        var buffer = ArrayPool<byte>.Shared.Rent(length);
+        source.CopyTo(buffer);
+        _contiguousProjections = new()
+        {
+            Buffer = buffer,
+            Start = source.Start,
+            Length = length,
+            Next = _contiguousProjections
+        };
+        return buffer.AsMemory(0, length);
+    }
+
+    public void ReleaseContiguousProjections()
+    {
+        var projection = _contiguousProjections;
+        _contiguousProjections = null;
+        while (projection is not null)
+        {
+            ArrayPool<byte>.Shared.Return(projection.Buffer);
+            projection = projection.Next;
+        }
     }
 
     public void BindDecoder(PgDecoder decoder)
@@ -292,8 +350,10 @@ sealed class BackendMessageContext
         }
     }
 
-    public void RetireCursor()
+    public void RetireCursor(bool retainProjections = false)
     {
+        if (!retainProjections)
+            ReleaseContiguousProjections();
         // Advancing the read grant may return or refill the memory backing every view held here.
         // A failed message poll preserves Current, but crossing this ownership boundary cannot.
         var invalidateToken = _publicationState is not PublicationState.None;
@@ -321,6 +381,17 @@ sealed class BackendMessageContext
         consumed = _cursor.UnreadStart;
         requiredLength = _cursor.RequiredBufferedLength
             - _cursor.ConsumedLength;
+        return true;
+    }
+
+    public bool TryGetCursorUnread(out SequencePosition unread)
+    {
+        if (!_hasCursor)
+        {
+            unread = default;
+            return false;
+        }
+        unread = _cursor.UnreadStart;
         return true;
     }
 

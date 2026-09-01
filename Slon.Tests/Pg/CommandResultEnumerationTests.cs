@@ -1,3 +1,4 @@
+using System.Text;
 using Slon.Pg;
 using Slon.Pg.Protocol;
 using Slon.Pg.Protocol.Flows;
@@ -7,6 +8,111 @@ namespace Slon.Tests.Pg;
 [TestClass]
 public class CommandResultEnumerationTests
 {
+    [ConnectionCreatingTestMethod]
+    public async Task ResultSetBuffering_CannotBeginAfterRowEnumeration()
+    {
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
+        var flow = protocol.Queue(new CommandFlow(
+            async: true, Command.Create("select generate_series(1, 2)")));
+        var results = flow.GetAsyncEnumerator();
+
+        Assert.IsTrue(await results.MoveNextAsync());
+        var result = results.Current;
+        var rows = result.GetAsyncEnumerator();
+        Assert.IsTrue(await rows.MoveNextAsync());
+        Assert.ThrowsExactly<InvalidOperationException>(
+            result.EnableResultSetBuffering);
+
+        await rows.DisposeAsync();
+        await results.DisposeAsync();
+    }
+
+    [ConnectionCreatingTestMethod]
+    public async Task ContiguousFieldMemory_RemainsValidAcrossExtendedBatches()
+    {
+        const int rowCount = 2000;
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
+        var flow = protocol.Queue(new CommandFlow(async: true, Command.Create(
+            $"select i, i::text || repeat('x', 96) from generate_series(1, {rowCount}) as i")));
+        var results = flow.GetAsyncEnumerator();
+        var values = new List<(int Id, ReadOnlyMemory<byte> Message)>(rowCount);
+
+        try
+        {
+            Assert.IsTrue(await results.MoveNextAsync());
+            results.Current.EnableResultSetBuffering();
+            var rows = results.Current.GetAsyncEnumerator();
+            while (await rows.MoveNextAsync())
+            {
+                var reader = rows.Current.GetReader();
+                values.Add((reader.Read<int>(), reader.ReadBorrowedMemory()));
+            }
+            await rows.DisposeAsync();
+
+            Assert.AreEqual(rowCount, values.Count);
+            foreach (var (id, message) in values)
+                Assert.AreEqual(id + new string('x', 96),
+                    Encoding.UTF8.GetString(message.Span));
+        }
+        finally
+        {
+            await results.DisposeAsync();
+        }
+
+        await PgTestPool.RunAsync(protocol, "select 1");
+    }
+
+    [ConnectionCreatingTestMethod]
+    public async Task ContiguousFieldMemory_BuffersStreamingRowsIntoTheRetainedBatch()
+    {
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
+        var flow = protocol.Queue(new CommandFlow(async: true, Command.Create(
+            "select i, i::text || repeat('x', 20000) from generate_series(1, 3) as i")));
+        var results = flow.GetAsyncEnumerator();
+        var values = new List<ReadOnlyMemory<byte>>();
+
+        try
+        {
+            Assert.IsTrue(await results.MoveNextAsync());
+            results.Current.EnableResultSetBuffering();
+            var rows = results.Current.GetAsyncEnumerator();
+            while (await rows.MoveNextAsync())
+                values.Add(rows.Current.BorrowFieldMemory(1));
+            await rows.DisposeAsync();
+
+            Assert.AreEqual(3, values.Count);
+            for (var i = 0; i < values.Count; i++)
+                Assert.AreEqual((i + 1) + new string('x', 20000),
+                    Encoding.UTF8.GetString(values[i].Span));
+        }
+        finally
+        {
+            await results.DisposeAsync();
+        }
+
+        await PgTestPool.RunAsync(protocol, "select 1");
+    }
+
+    [ConnectionCreatingTestMethod]
+    public async Task ResultSetBuffering_AbandonmentReleasesTheReadGrant()
+    {
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
+        var flow = protocol.Queue(new CommandFlow(async: true, Command.Create(
+            "select i, i::text || repeat('x', 96) from generate_series(1, 2000) as i")));
+        var results = flow.GetAsyncEnumerator();
+
+        Assert.IsTrue(await results.MoveNextAsync());
+        results.Current.EnableResultSetBuffering();
+        var rows = results.Current.GetAsyncEnumerator();
+        Assert.IsTrue(await rows.MoveNextAsync());
+        var borrowed = rows.Current.BorrowFieldMemory(1);
+        Assert.IsFalse(borrowed.IsEmpty);
+
+        await rows.DisposeAsync();
+        await results.DisposeAsync();
+        await PgTestPool.RunAsync(protocol, "select 1");
+    }
+
     [ConnectionCreatingTestMethod]
     public async Task DescribeOnlyErrorSurfacesWhenInspectingTheResult()
     {

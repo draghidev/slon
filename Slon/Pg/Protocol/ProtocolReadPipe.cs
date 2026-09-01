@@ -23,6 +23,7 @@ sealed class ProtocolReadPipe(
     int _minimumReadSize;
     PendingRead _pendingRead;
     bool _hasActiveRead;
+    bool _retainsResultSet;
 
     public PipeReader PipeReader => reader;
     public BackendMessage Current => _messageContext.Current;
@@ -45,6 +46,8 @@ sealed class ProtocolReadPipe(
             ThrowHelper.ThrowInvalidOperation(
                 "The current message still has a pending read.");
 
+        var retainsResultSet = _retainsResultSet;
+
         if (!_hasActiveRead)
         {
             _pendingCursorOffset = 0;
@@ -55,7 +58,7 @@ sealed class ProtocolReadPipe(
 
         if (_currentMessageLength > 0)
         {
-            PrepareAfterPartialMessage();
+            PrepareAfterPartialMessage(retainsResultSet);
             return;
         }
 
@@ -64,9 +67,13 @@ sealed class ProtocolReadPipe(
             ThrowHelper.ThrowInvalidOperation(
                 "The current backend-message cursor has not been exhausted.");
 
-        _pendingCursorOffset = 0;
-        _messageContext.RetireCursor();
-        reader.AdvanceTo(unread, _examined);
+        _pendingCursorOffset = retainsResultSet
+            ? _activeBuffer.Slice(0, unread).Length
+            : 0;
+        _messageContext.RetireCursor(
+            retainProjections: retainsResultSet);
+        reader.AdvanceTo(
+            retainsResultSet ? _retainedStart : unread, _examined);
         _hasActiveRead = false;
         _activeBuffer = default;
         _currentMessageLength = -1;
@@ -75,11 +82,23 @@ sealed class ProtocolReadPipe(
         _pendingRead = PendingRead.Messages;
     }
 
-    void PrepareAfterPartialMessage()
+    void PrepareAfterPartialMessage(bool retainsResultSet)
     {
         var current = _activeBuffer.Slice(_currentMessageOffset);
-        _messageContext.RetireCursor();
-        if (current.Length >= _currentMessageLength)
+        _messageContext.RetireCursor(
+            retainProjections: retainsResultSet);
+        if (retainsResultSet)
+        {
+            _pendingCursorOffset = checked(
+                _currentMessageOffset + _currentMessageLength);
+            var examined = current.Length >= _currentMessageLength
+                ? current.GetPosition(_currentMessageLength)
+                : _examined;
+            reader.AdvanceTo(_retainedStart, examined);
+            _minimumReadSize = int.CreateSaturating(
+                _pendingCursorOffset + BackendHeader.ByteCount);
+        }
+        else if (current.Length >= _currentMessageLength)
         {
             var unread = current.GetPosition(_currentMessageLength);
             reader.AdvanceTo(unread, unread);
@@ -161,15 +180,21 @@ sealed class ProtocolReadPipe(
         if (cursorBuffer.IsEmpty)
         {
             completed = result.IsCompleted;
-            if (completed)
+            if (completed && !_retainsResultSet)
                 _messageContext.RetireCursor();
             if (!completed)
             {
-                reader.AdvanceTo(result.Buffer.End, result.Buffer.End);
+                reader.AdvanceTo(
+                    _retainsResultSet ? _retainedStart : result.Buffer.End,
+                    result.Buffer.End);
                 _hasActiveRead = false;
                 _activeBuffer = default;
-                _pendingCursorOffset = 0;
-                _minimumReadSize = BackendHeader.ByteCount;
+                if (!_retainsResultSet)
+                    _pendingCursorOffset = 0;
+                _minimumReadSize = _retainsResultSet
+                    ? int.CreateSaturating(
+                        _pendingCursorOffset + BackendHeader.ByteCount)
+                    : BackendHeader.ByteCount;
                 _pendingRead = PendingRead.Messages;
             }
             return false;
@@ -260,12 +285,21 @@ sealed class ProtocolReadPipe(
             throw new ArgumentOutOfRangeException(nameof(consumedLength));
 
         reader.AdvanceTo(
-            mode is PendingRead.Slide ? consumed : _retainedStart,
+            mode is PendingRead.Slide && !_retainsResultSet
+                ? consumed
+                : _retainedStart,
             _examined);
         if (mode is PendingRead.Slide)
         {
-            _retainedStart = consumed;
-            _currentMessageOffset = 0;
+            if (_retainsResultSet)
+            {
+                _currentMessageOffset = _activeBuffer.Slice(0, consumed).Length;
+            }
+            else
+            {
+                _retainedStart = consumed;
+                _currentMessageOffset = 0;
+            }
             _currentMessageLength -= consumedLength;
         }
         _hasActiveRead = false;
@@ -353,6 +387,34 @@ sealed class ProtocolReadPipe(
 
     public void CompleteCurrentMessage()
         => _currentMessageLength = -1;
+
+    public void EnableResultSetRetention()
+    {
+        if (!_hasActiveRead || _pendingRead is not PendingRead.None)
+            ThrowHelper.ThrowInvalidOperation(
+                "Result-set retention requires an active backend message.");
+        _ = _messageContext.Current;
+        _retainsResultSet = true;
+    }
+
+    public void EndResultSetRetention()
+    {
+        _retainsResultSet = false;
+        if (!_hasActiveRead || _pendingRead is not PendingRead.None
+            || _currentMessageLength > 0
+            || !_messageContext.TryGetCursorUnread(out var unread))
+        {
+            _messageContext.ReleaseContiguousProjections();
+            return;
+        }
+
+        _messageContext.RetireCursor();
+        reader.AdvanceTo(unread, _examined);
+        _hasActiveRead = false;
+        _activeBuffer = default;
+        _currentMessageOffset = 0;
+        _pendingCursorOffset = 0;
+    }
 
     public void Dispose()
     {

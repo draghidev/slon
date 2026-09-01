@@ -51,6 +51,32 @@ public sealed class Row : PgFieldReader
     public T GetValue<T>(int ordinal)
         => GetValueCore<T>(ordinal, textEncoding: null);
 
+    /// <summary>
+    /// Borrows the field's raw PostgreSQL representation as contiguous memory.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The returned memory is a view over storage owned by the command result. Its lifetime is not
+    /// enforced: after the row enumerator advances or is disposed, accessing it may observe storage
+    /// that has been reused for unrelated data rather than throw.
+    /// </para>
+    /// <para>
+    /// Calling <see cref="CommandResult.EnableResultSetBuffering" /> before row enumeration extends
+    /// the borrow until that command result is released. Copy the memory when it must outlive the
+    /// applicable boundary.
+    /// </para>
+    /// </remarks>
+    public ReadOnlyMemory<byte> BorrowFieldMemory(int ordinal)
+    {
+        RevokeColumnLease();
+        EnsureBuffered();
+        if (TryGetFieldMemory(ordinal, out var field))
+            return Message.GetContiguousMemory(field);
+
+        var sequence = GetFieldSequence(ordinal);
+        return Message.GetContiguousMemory(sequence);
+    }
+
     // Bootstrap consumers have no serializer but must still bind text decoding to one negotiated
     // encoding snapshot for the lifetime of their operation.
     internal T GetValue<T>(int ordinal, Encoding textEncoding)
@@ -552,6 +578,16 @@ public sealed class Row : PgFieldReader
             _remaining = _remaining.Slice(sizeof(int) + length);
             return BootstrapFieldDecoder.Read<T>(field);
         }
+
+        /// <summary>
+        /// Borrows the next field's raw PostgreSQL representation as contiguous memory.
+        /// </summary>
+        /// <remarks>
+        /// The returned memory has the same unenforced lifetime as
+        /// <see cref="Row.BorrowFieldMemory" />.
+        /// </remarks>
+        public ReadOnlyMemory<byte> ReadBorrowedMemory()
+            => _row.BorrowFieldMemory(_ordinal++);
     }
 
     internal void Initialize(RowDescription rowDescription)
