@@ -18,7 +18,6 @@ sealed class ProtocolReadPipe(PipeSegmentEnumerator<BackendMessageBatch.Segmente
     public bool TryGetCurrent(out BackendMessage message) => _messageContext.TryGetCurrent(out message);
 
     public bool TryMoveNext() => _messageContext.TryMoveNext();
-    public bool TryPeekNextType(out PgTypes.BackendType type) => _messageContext.TryPeekNextType(out type);
     public bool TryPeekNext(out BackendHeader header) => _messageContext.TryPeekNext(out header);
     public BackendMessage Peeked => _messageContext.Peeked;
 

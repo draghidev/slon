@@ -689,8 +689,9 @@ public sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<Bac
     {
         while (true)
         {
-            while (_pipe.TryPeekNextType(out var type))
+            while (_pipe.TryPeekNext(out var header))
             {
+                var type = header.Type;
                 // Only auto-handled messages need the transactional peek slot: their handler may need
                 // I/O and decline the synchronous path. Ordinary messages can publish directly.
                 if (type is not (PgTypes.BackendType.ReadyForQuery
@@ -703,8 +704,6 @@ public sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<Bac
                     return true;
                 }
 
-                if (!_pipe.TryPeekNext(out _))
-                    break;
                 var handled = false;
                 if (type is PgTypes.BackendType.ReadyForQuery)
                     RestoreDefaultReadTimeout();

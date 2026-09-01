@@ -278,17 +278,6 @@ sealed class BackendMessageContext
     // slot and the follow-up TryMoveNext picks it up without re-parsing. The returned
     // BackendMessage is valid until the next TryMoveNext (which bumps the version token);
     // use it immediately, don't store it.
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public bool TryPeekNextType(out PgTypes.BackendType type)
-    {
-        if (_publicationState is PublicationState.Peeked)
-        {
-            type = _current.Header.Type;
-            return true;
-        }
-        return _remainingBatch.TryPeekType(out type);
-    }
-
     public bool TryPeekNext(out BackendHeader header)
     {
         if (_publicationState is PublicationState.Peeked)
@@ -296,14 +285,14 @@ sealed class BackendMessageContext
             header = _current.Header;
             return true;
         }
-        if (!_remainingBatch.TryReadNextInPlace(out header, out var buffer, out _))
+        if (!_remainingBatch.TryReadNextInPlace(
+                out header, out var buffer, out var bufferLength))
         {
             return false;
         }
-        _version++;
         _messageState = 0;
-        _currentFallbackBuffer = default;
-        BackendMessage.InitializeIndependent(ref _current, header, buffer);
+        BackendMessage.Initialize(ref _current, header, buffer, this, ++_version,
+            bufferLength >= header.MessageLength);
         _publicationState = PublicationState.Peeked;
         return true;
     }
