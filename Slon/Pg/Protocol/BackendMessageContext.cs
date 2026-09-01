@@ -20,12 +20,8 @@ sealed class BackendMessageContext
     const byte MessageOffsetCaptured = 1 << 4;
     byte _messageState;
 
-    // Peek slot: TryPeekNext advances the real batch cursor into here, so the header parse
-    // happens at peek time and a follow-up TryMoveNext can publish without re-parsing. _hasPeeked
-    // alone owns validity; leaving the inactive buffer populated avoids a redundant clear and lets
-    // the next peek usually reuse the same backing objects without write barriers.
-    bool _hasPeeked;
-    BackendMessage _peeked;
+    enum PublicationState : byte { None, Current, Peeked }
+    PublicationState _publicationState;
     long _currentMessageOffset;
 
     public BackendMessage Current
@@ -34,7 +30,7 @@ sealed class BackendMessageContext
         get
         {
             var current = _current;
-            if (current.IsDefault)
+            if (_publicationState is not PublicationState.Current)
                 ThrowHelper.ThrowInvalidOperation("The decoder has no current backend message.");
             return current;
         }
@@ -43,19 +39,23 @@ sealed class BackendMessageContext
     public bool CurrentIsError
     {
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        get => _current.Header.Type is PgTypes.BackendType.ErrorResponse;
+        get
+        {
+            Debug.Assert(_publicationState is PublicationState.Current);
+            return _current.Header.Type is PgTypes.BackendType.ErrorResponse;
+        }
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public bool TryGetCurrent(out BackendMessage current)
     {
         current = _current;
-        return !current.IsDefault;
+        return _publicationState is PublicationState.Current;
     }
 
     public BackendMessage GetCurrent(short token)
     {
-        if (_version != token)
+        if (_publicationState is not PublicationState.Current || _version != token)
             ThrowHelper.ThrowInvalidOperation("Backend message has been invalidated by moving to the next message.");
         return _current;
     }
@@ -82,7 +82,7 @@ sealed class BackendMessageContext
         {
             // Fully buffered messages never need their batch-relative offset. Capture it only
             // before a streaming operation can replace the segment used to derive it.
-            Debug.Assert(!_current.Buffered && !_hasPeeked);
+            Debug.Assert(!_current.Buffered);
             _currentMessageOffset = _remainingBatch.ConsumedLength - _current.BufferedLength;
             _messageState |= MessageOffsetCaptured;
         }
@@ -198,7 +198,7 @@ sealed class BackendMessageContext
 
     void Validate(short token)
     {
-        if (_version != token)
+        if (_publicationState is PublicationState.Peeked || _version != token)
             ThrowHelper.ThrowInvalidOperation("Backend message has been invalidated by moving to the next message.");
     }
 
@@ -239,12 +239,9 @@ sealed class BackendMessageContext
 
     public bool TryMoveNext()
     {
-        if (_hasPeeked)
+        if (_publicationState is PublicationState.Peeked)
         {
-            _hasPeeked = false;
-            ResetMessageState();
-            _version++;
-            BackendMessage.Copy(ref _current, in _peeked);
+            _publicationState = PublicationState.Current;
             return true;
         }
         if (!_remainingBatch.TryReadNextInPlace(out var header, out var buffer, out var bufferLength))
@@ -252,6 +249,7 @@ sealed class BackendMessageContext
         ResetMessageState();
         BackendMessage.Initialize(ref _current, header, buffer, this, ++_version,
             bufferLength >= header.MessageLength);
+        _publicationState = PublicationState.Current;
         return true;
 
         void ResetMessageState()
@@ -264,10 +262,10 @@ sealed class BackendMessageContext
     {
         // Moving the batch enumerator may return or refill the memory backing every view held here.
         // A failed message poll preserves Current, but crossing this ownership boundary cannot.
-        var invalidateToken = !_current.IsDefault || _hasPeeked;
+        var invalidateToken = _publicationState is not PublicationState.None;
         _current = default;
         _currentFallbackBuffer = default;
-        _hasPeeked = false;
+        _publicationState = PublicationState.None;
         _remainingBatch = default;
         _currentMessageOffset = 0;
         _messageState = 0;
@@ -283,9 +281,9 @@ sealed class BackendMessageContext
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public bool TryPeekNextType(out PgTypes.BackendType type)
     {
-        if (_hasPeeked)
+        if (_publicationState is PublicationState.Peeked)
         {
-            type = _peeked.Header.Type;
+            type = _current.Header.Type;
             return true;
         }
         return _remainingBatch.TryPeekType(out type);
@@ -293,17 +291,20 @@ sealed class BackendMessageContext
 
     public bool TryPeekNext(out BackendHeader header)
     {
-        if (_hasPeeked)
+        if (_publicationState is PublicationState.Peeked)
         {
-            header = _peeked.Header;
+            header = _current.Header;
             return true;
         }
         if (!_remainingBatch.TryReadNextInPlace(out header, out var buffer, out _))
         {
             return false;
         }
-        BackendMessage.InitializeIndependent(ref _peeked, header, buffer);
-        _hasPeeked = true;
+        _version++;
+        _messageState = 0;
+        _currentFallbackBuffer = default;
+        BackendMessage.InitializeIndependent(ref _current, header, buffer);
+        _publicationState = PublicationState.Peeked;
         return true;
     }
 
@@ -311,19 +312,17 @@ sealed class BackendMessageContext
     {
         get
         {
-            Debug.Assert(_hasPeeked);
-            return _peeked;
+            Debug.Assert(_publicationState is PublicationState.Peeked);
+            return _current;
         }
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void SetBatch(BackendMessageBatch batch)
     {
-        Debug.Assert(_current.IsDefault && !_hasPeeked,
+        Debug.Assert(_publicationState is PublicationState.None,
             "The prior batch must be retired before publishing replacement storage.");
-        // Keep release behavior defensive. The inactive buffer may stay populated because
-        // _hasPeeked owns validity and the next peek overwrites it.
-        _hasPeeked = false;
+        _publicationState = PublicationState.None;
         _remainingBatch = batch;
     }
 
