@@ -199,6 +199,22 @@ public class BackendMessageStreamingTests
     }
 
     [TestMethod]
+    public void BackendMessageBatch_AdvancesAcrossExactSegmentBoundary()
+    {
+        var first = BackendMessageBytes(BackendType.CommandComplete, 6);
+        var second = BackendMessageBytes(BackendType.ReadyForQuery, 6);
+        var batch = new BackendMessageBatch(Segmented(first, second));
+
+        Assert.IsTrue(batch.TryReadNextInPlace(out var header, out var message, out _));
+        Assert.AreEqual(BackendType.CommandComplete, header.Type);
+        CollectionAssert.AreEqual(first, message.ToArray());
+        Assert.IsTrue(batch.TryReadNextInPlace(out header, out message, out _));
+        Assert.AreEqual(BackendType.ReadyForQuery, header.Type);
+        CollectionAssert.AreEqual(second, message.ToArray());
+        Assert.IsFalse(batch.TryReadNextInPlace(out _, out _, out _));
+    }
+
+    [TestMethod]
     public async Task MovingToNextBatch_RetiresCurrentBeforeReturningItsStorage()
     {
         var pipe = new Pipe();

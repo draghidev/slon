@@ -1,7 +1,6 @@
 using System.Buffers;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
-using System.Runtime.InteropServices;
 using Slon.Pipelines;
 using static Slon.Pg.Protocol.PgTypes;
 
@@ -130,69 +129,122 @@ struct BackendMessageBatch(ReadOnlySequence<byte> buffer)
         };
     }
 
-    // TODO faster firstspan and splitting should be able to be upstreamed.
-    // Optimizes for faster splitting and length checks.
+    // Keeps the public position components scalar so consuming the first segment does not repeatedly
+    // reconstruct and rediscover the backing of a ReadOnlySequence. Materialize one only at API seams.
     struct FastReadOnlySequence<T>
     {
-        ReadOnlySequence<T> _sequence;
+        object? _startObject;
+        object? _endObject;
+        int _startIndex;
+        int _endIndex;
         long _length;
 
-        FastReadOnlySequence(ReadOnlySequence<T> sequence, long length)
+        FastReadOnlySequence(object? startObject, int startIndex,
+            object? endObject, int endIndex, long length)
         {
             Debug.Assert(Unsafe.SizeOf<FastReadOnlySequence<T>>() is 32);
-            _sequence = sequence;
+            _startObject = startObject;
+            _endObject = endObject;
+            _startIndex = startIndex;
+            _endIndex = endIndex;
             _length = length;
         }
 
         public FastReadOnlySequence(ReadOnlySequence<T> sequence)
         {
             Debug.Assert(Unsafe.SizeOf<FastReadOnlySequence<T>>() is 32);
-            _sequence = sequence;
+            _startObject = sequence.Start.GetObject();
+            _endObject = sequence.End.GetObject();
+            _startIndex = sequence.Start.GetInteger() & int.MaxValue;
+            _endIndex = sequence.End.GetInteger() & int.MaxValue;
             _length = sequence.Length;
         }
 
-        public ReadOnlySequence<T> Sequence => _sequence;
+        public ReadOnlySequence<T> Sequence
+        {
+            get
+            {
+                if (_startObject is null)
+                    return default;
+                if (_startObject is T[] array)
+                {
+                    Debug.Assert(ReferenceEquals(_startObject, _endObject));
+                    return new(array, _startIndex, _endIndex - _startIndex);
+                }
+                if (_startObject is MemoryManager<T> manager)
+                {
+                    Debug.Assert(ReferenceEquals(_startObject, _endObject));
+                    return new(manager.Memory.Slice(
+                        _startIndex, _endIndex - _startIndex));
+                }
+                return new((ReadOnlySequenceSegment<T>)_startObject!, _startIndex,
+                    (ReadOnlySequenceSegment<T>)_endObject!, _endIndex);
+            }
+        }
         public long Length => _length;
 
-        public ReadOnlySpan<T> FirstSpan => GetFirstSpan(out _);
+        public ReadOnlySpan<T> FirstSpan
+        {
+            get
+            {
+                if (_startObject is null)
+                    return default;
+                var memory = FirstMemory;
+                var end = ReferenceEquals(_startObject, _endObject)
+                    ? _endIndex
+                    : memory.Length;
+                return memory.Span.Slice(_startIndex, end - _startIndex);
+            }
+        }
+
+        ReadOnlyMemory<T> FirstMemory => _startObject switch
+        {
+            T[] array => array,
+            MemoryManager<T> manager => manager.Memory,
+            ReadOnlySequenceSegment<T> segment => segment.Memory,
+            _ => throw new UnreachableException()
+        };
 
         // Returns the sequence before the index, stores the sequence after it in place.
         public FastReadOnlySequence<T> SplitInPlace(long offset)
         {
-            FastReadOnlySequence<T> prev;
-
-            // If it's out-of-range of the first, has to resolve another segment, or is not backed by
-            // one array, let Slice handle it.
-            if (!SequenceMarshal.TryGetArray(_sequence, out var array) || array.Count <= offset)
+            var firstEnd = ReferenceEquals(_startObject, _endObject)
+                ? _endIndex
+                : FirstMemory.Length;
+            var firstLength = firstEnd - _startIndex;
+            if (offset == _length)
             {
-                prev = new(_sequence.Slice(0, offset), offset);
-                _sequence = _sequence.Slice(offset);
+                var exhausted = this;
+                this = default;
+                return exhausted;
             }
-            else
+            if (offset == firstLength
+                && _startObject is ReadOnlySequenceSegment<T> segment
+                && segment.Next is { } next)
             {
-                Debug.Assert(offset <= int.MaxValue);
-                var arrayInstance = array.Array!;
-                prev = new(new(arrayInstance, array.Offset, (int)offset), offset);
-                _sequence = new(arrayInstance, array.Offset + (int)offset, array.Count - (int)offset);
+                var boundaryPrefix = new FastReadOnlySequence<T>(
+                    segment, _startIndex, segment, firstEnd, offset);
+                _startObject = next;
+                _startIndex = 0;
+                _length -= offset;
+                return boundaryPrefix;
             }
-
-            _length -= offset;
-            return prev;
-        }
-
-        // TODO arrays should not go down the slow path for First and FirstSpan, the SequenceReader variant doesn't either.
-        // Inline to remove the write barriers.
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        ReadOnlySpan<T> GetFirstSpan(out ArraySegment<T> array)
-        {
-            if (SequenceMarshal.TryGetArray(_sequence, out array))
+            if ((ulong)offset < (uint)firstLength)
             {
-                Debug.Assert(_sequence.IsSingleSegment);
-                return array.AsSpan();
+                var splitIndex = _startIndex + (int)offset;
+                var prev = new FastReadOnlySequence<T>(
+                    _startObject, _startIndex, _startObject, splitIndex, offset);
+                _startIndex = splitIndex;
+                _length -= offset;
+                return prev;
             }
 
-            array = default;
-            return _sequence.FirstSpan;
+            var sequence = Sequence;
+            var prefix = sequence.Slice(0, offset);
+            var remaining = sequence.Slice(offset);
+            var result = new FastReadOnlySequence<T>(prefix);
+            this = new(remaining);
+            return result;
         }
 
     }
