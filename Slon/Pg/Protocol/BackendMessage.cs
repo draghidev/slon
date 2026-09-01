@@ -13,27 +13,53 @@ public readonly struct BackendMessage
 {
     string DebuggerDisplay => $"Type = {Header.Type}, Length = {Header.MessageLength}";
 
-    readonly ReadOnlySequence<byte> _buffer;
-    readonly BackendMessageContext _context;
+    readonly object? _firstObject;
+    readonly object? _contextOrEndObject;
 
-    // Packed to avoid another 8 bytes.
-    readonly bool _buffered;
-    readonly BackendType _type;
-    readonly short _token;
+    // Buffered, peeked, type, and token fit in one word so the message remains 32 bytes.
+    readonly uint _state;
     readonly int _length;
+    readonly int _startIndex;
+    readonly int _endIndexOrBufferedLength;
 
-    BackendMessage(BackendHeader header, ReadOnlySequence<byte> buffer, BackendMessageContext context, short token, bool buffered)
+    BackendMessage(BackendHeader header, ReadOnlySequence<byte> buffer,
+        BackendMessageContext? context, short token, bool buffered,
+        bool peeked = false, bool independent = false)
     {
-        _buffer = buffer;
-        _context = context;
-        _buffered = buffered;
-        _type = header.Type;
-        _token = token;
+        _firstObject = buffer.Start.GetObject();
+        _contextOrEndObject = independent ? buffer.End.GetObject() : context;
+        _startIndex = buffer.Start.GetInteger() & int.MaxValue;
+        _endIndexOrBufferedLength = independent
+            ? buffer.End.GetInteger() & int.MaxValue
+            : checked((int)buffer.Length);
+        _state = (buffered ? 1u : 0)
+            | (peeked ? 2u : 0)
+            | (independent ? 4u : 0)
+            | ((uint)(byte)header.Type << 3)
+            | ((uint)(ushort)token << 11);
         _length = header.Length;
+        if (context is not null && !peeked)
+            context.SetCurrentFallbackBuffer(in buffer,
+                _firstObject is ReadOnlySequenceSegment<byte>);
     }
 
     internal BackendMessage(BackendHeader header, ReadOnlySequence<byte> buffer, BackendMessageContext context, short token)
         : this(header, buffer, context, token, buffer.Length >= header.MessageLength) {}
+
+    internal static BackendMessage CreatePeeked(BackendHeader header,
+        ReadOnlySequence<byte> buffer, BackendMessageContext context, short token)
+        => new(header, buffer, context, token,
+            buffer.Length >= header.MessageLength, peeked: true);
+
+    internal static BackendMessage CreateIndependent(
+        BackendHeader header, ReadOnlySequence<byte> buffer)
+    {
+        if (buffer.Length < header.MessageLength)
+            ThrowHelper.ThrowInvalidOperation(
+                "An independent backend message must be fully buffered.");
+        return new(header, buffer, context: null, token: 0,
+            buffered: true, independent: true);
+    }
 
     internal static void Initialize(ref BackendMessage destination, BackendHeader header, ReadOnlySequence<byte> buffer,
         BackendMessageContext context, short token, bool buffered)
@@ -47,44 +73,83 @@ public readonly struct BackendMessage
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     static void WriteGranularly(ref BackendMessage destination, in BackendMessage value, bool destinationIsZero = false)
     {
-        if ((destinationIsZero && value._context is not null) || !ReferenceEquals(destination._context, value._context))
-            Unsafe.AsRef(in destination._context) = value._context!;
+        if ((destinationIsZero && value._contextOrEndObject is not null)
+            || !ReferenceEquals(destination._contextOrEndObject, value._contextOrEndObject))
+            Unsafe.AsRef(in destination._contextOrEndObject) = value._contextOrEndObject;
+        if (!ReferenceEquals(destination._firstObject, value._firstObject))
+            Unsafe.AsRef(in destination._firstObject) = value._firstObject;
 
-        WriteGranularly(ref Unsafe.AsRef(in destination._buffer), in value._buffer);
-
-        Unsafe.AsRef(in destination._buffered) = value._buffered;
-        Unsafe.AsRef(in destination._type) = value._type;
-        Unsafe.AsRef(in destination._token) = value._token;
+        Unsafe.AsRef(in destination._state) = value._state;
         Unsafe.AsRef(in destination._length) = value._length;
+        Unsafe.AsRef(in destination._startIndex) = value._startIndex;
+        Unsafe.AsRef(in destination._endIndexOrBufferedLength) = value._endIndexOrBufferedLength;
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    static void WriteGranularly(ref ReadOnlySequence<byte> destination, in ReadOnlySequence<byte> value)
-        => destination = value;
+    BackendType Type => (BackendType)((_state >> 3) & byte.MaxValue);
+    short Token => (short)(_state >> 11);
+    bool IsPeeked => (_state & 2) != 0;
+    bool IsIndependent => (_state & 4) != 0;
+    internal bool IsDefault => Type == default;
+    BackendMessageContext Context
+        => _contextOrEndObject as BackendMessageContext
+            ?? throw new InvalidOperationException(
+                "The independent backend message has no decoder context.");
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    internal static void SetSequence(ref ReadOnlySequence<byte> destination, in ReadOnlySequence<byte> value)
-        => WriteGranularly(ref destination, in value);
+    ReadOnlySequence<byte> GetBuffer()
+    {
+        if (!IsIndependent)
+        {
+            if (_firstObject is byte[] array)
+                return new(array, _startIndex, _endIndexOrBufferedLength);
+            if (_firstObject is MemoryManager<byte> manager)
+                return new(manager.Memory.Slice(_startIndex, _endIndexOrBufferedLength));
+            return Context.GetFallbackBuffer(Token, IsPeeked);
+        }
 
-    BackendType Type => _type;
-    internal bool IsDefault => _type == default;
+        if (_firstObject is byte[] independentArray
+            && ReferenceEquals(_firstObject, _contextOrEndObject))
+            return new(independentArray, _startIndex,
+                _endIndexOrBufferedLength - _startIndex);
+        if (_firstObject is MemoryManager<byte> independentManager
+            && ReferenceEquals(_firstObject, _contextOrEndObject))
+            return new(independentManager.Memory.Slice(
+                _startIndex, _endIndexOrBufferedLength - _startIndex));
+        return new((ReadOnlySequenceSegment<byte>)_firstObject!, _startIndex,
+            (ReadOnlySequenceSegment<byte>)_contextOrEndObject!,
+            _endIndexOrBufferedLength);
+    }
 
     public BackendHeader Header
     {
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        get => BackendHeader.CreateUnchecked(_type, _length);
+        get => BackendHeader.CreateUnchecked(Type, _length);
     }
 
     public ReadOnlySequence<byte> GetSequence(SequencePosition start)
     {
         EnsureBodyWindowAvailable();
-        return _buffer.Slice(start);
+        return GetBuffer().Slice(start);
     }
 
     public ReadOnlySequence<byte> GetSequence(long offset)
     {
         EnsureBodyWindowAvailable();
-        return _buffer.Slice(BackendHeader.ByteCount + offset);
+        ArgumentOutOfRangeException.ThrowIfNegative(offset);
+        var start = checked(BackendHeader.ByteCount + offset);
+        var length = BufferedLength - start;
+        if (length < 0 || length > int.MaxValue)
+            throw new ArgumentOutOfRangeException(nameof(offset));
+
+        if (!IsIndependent || ReferenceEquals(_firstObject, _contextOrEndObject))
+        {
+            if (_firstObject is byte[] array)
+                return new(array, checked(_startIndex + (int)start), (int)length);
+            if (_firstObject is MemoryManager<byte> manager)
+                return new(manager.Memory.Slice(
+                    checked(_startIndex + (int)start), (int)length));
+        }
+        return GetBuffer().Slice(start);
     }
 
     public ReadOnlySequence<byte> GetSequence()
@@ -101,17 +166,7 @@ public readonly struct BackendMessage
     internal bool TryGetFirstSpanUnchecked(int offset, out ReadOnlySpan<byte> span)
     {
         offset += BackendHeader.ByteCount;
-        ref var buffer = ref Unsafe.AsRef(in _buffer);
-        ReadOnlySpan<byte> firstSpan;
-        if (SequenceMarshal.TryGetArray(buffer, out var array))
-        {
-            Debug.Assert(buffer.IsSingleSegment);
-            firstSpan = array.AsSpan();
-        }
-        else
-        {
-            firstSpan = buffer.FirstSpan;
-        }
+        var firstSpan = GetFirstMemory().Span;
         if ((uint)offset <= (uint)firstSpan.Length)
         {
             span = firstSpan.Slice(offset);
@@ -125,19 +180,9 @@ public readonly struct BackendMessage
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal bool TryGetBufferedFirstMemory(int offset, out ReadOnlyMemory<byte> memory)
     {
-        Debug.Assert(_buffered);
+        Debug.Assert(Buffered);
         offset += BackendHeader.ByteCount;
-        ref var buffer = ref Unsafe.AsRef(in _buffer);
-        ReadOnlyMemory<byte> firstMemory;
-        if (SequenceMarshal.TryGetArray(buffer, out var array))
-        {
-            Debug.Assert(buffer.IsSingleSegment);
-            firstMemory = array.AsMemory();
-        }
-        else
-        {
-            firstMemory = buffer.First;
-        }
+        var firstMemory = GetFirstMemory();
         if ((uint)offset <= (uint)firstMemory.Length)
         {
             memory = firstMemory.Slice(offset);
@@ -148,13 +193,28 @@ public readonly struct BackendMessage
         return false;
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    ReadOnlyMemory<byte> GetFirstMemory()
+    {
+        var length = IsIndependent
+            ? _endIndexOrBufferedLength - _startIndex
+            : _endIndexOrBufferedLength;
+        return _firstObject switch
+        {
+            byte[] array => array.AsMemory(_startIndex, length),
+            MemoryManager<byte> manager => manager.Memory.Slice(_startIndex, length),
+            ReadOnlySequenceSegment<byte> segment => segment.Memory.Slice(_startIndex),
+            _ => GetBuffer().First
+        };
+    }
+
     public SequenceReader<byte> BodyReader => new(GetSequence());
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     void EnsureBodyWindowAvailable()
     {
-        if (!_buffered)
-            _context.EnsureBodyWindowAvailable(_token);
+        if (!Buffered)
+            Context.EnsureBodyWindowAvailable(Token);
     }
 
     public (PgError? Error, BackendType Type) EnsureExpectedOrError(params ReadOnlySpan<BackendType> expected)
@@ -181,19 +241,19 @@ public readonly struct BackendMessage
                 $"Unexpected backend message: {actual}, expected: {string.Join(" or ", expected.ToArray())}.");
     }
 
-    public Accessor GetAccessor() => new(_context, _token);
+    public Accessor GetAccessor() => new(Context, Token);
 
     internal BackendMessageBodyReader OpenBodyReader()
-        => new(_context, _token, GetSequence(), Buffered);
+        => new(Context, Token, GetSequence(), Buffered);
 
     internal void BufferBody()
     {
         if (!Buffered)
-            _context.BufferCurrentMessage(_token);
+            Context.BufferCurrentMessage(Token);
     }
 
     internal ValueTask BufferBodyAsync(CancellationToken cancellationToken)
-        => Buffered ? default : _context.BufferCurrentMessageAsync(_token, cancellationToken);
+        => Buffered ? default : Context.BufferCurrentMessageAsync(Token, cancellationToken);
 
     public readonly struct Accessor
     {
@@ -325,23 +385,26 @@ public readonly struct BackendMessage
     }
 
     internal void MarkPriorCancellationExposure()
-        => _context.MarkPriorCancellationExposure(_token);
+        => Context.MarkPriorCancellationExposure(Token);
 
     internal bool HasPriorCancellationExposure
-        => _context.HasPriorCancellationExposure(_token);
+        => Context.HasPriorCancellationExposure(Token);
 
     internal void MarkBackendTermination()
-        => _context.MarkBackendTermination(_token);
+        => Context.MarkBackendTermination(Token);
 
     internal bool IsBackendTermination
-        => _context.IsBackendTermination(_token);
+        => Context.IsBackendTermination(Token);
 
     internal bool TryObserveError()
-        => _context.TryObserveError(_token);
+        => Context.TryObserveError(Token);
 
     // We have no buffer for header only messages.
-    public bool Buffered => _buffered;
-    internal long BufferedLength => _buffer.Length;
+    public bool Buffered => (_state & 1) != 0;
+    internal long BufferedLength
+        => IsDefault ? 0
+            : IsIndependent ? Header.MessageLength
+            : _endIndexOrBufferedLength;
 }
 
 [Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]

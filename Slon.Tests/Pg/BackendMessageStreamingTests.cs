@@ -160,6 +160,21 @@ public class BackendMessageStreamingTests
     }
 
     [TestMethod]
+    public void IndependentBackendMessage_ReconstructsAChainedBuffer()
+    {
+        var bytes = BackendMessageBytes(BackendType.DataRow, [1, 2, 3, 4, 5, 6]);
+        var sequence = Segmented(bytes.AsMemory(0, 7), bytes.AsMemory(7));
+        var message = BackendMessage.CreateIndependent(
+            new BackendHeader(BackendType.DataRow, bytes.Length - 1), sequence);
+
+        CollectionAssert.AreEqual(bytes.AsSpan(BackendHeader.ByteCount).ToArray(),
+            message.GetSequence().ToArray());
+        Assert.IsTrue(message.TryGetFirstSpan(0, out var first));
+        CollectionAssert.AreEqual(bytes.AsSpan(BackendHeader.ByteCount, 2).ToArray(),
+            first.ToArray());
+    }
+
+    [TestMethod]
     public void BackendMessageContext_CurrentThrowsOutsidePublicationWindow()
     {
         var context = new BackendMessageContext();

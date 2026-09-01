@@ -11,6 +11,7 @@ sealed class BackendMessageContext
     PgDecoder _decoder = null!;
     BackendMessageBatch _remainingBatch;
     BackendMessage _current;
+    ReadOnlySequence<byte> _currentFallbackBuffer;
     short _version;
     const byte PriorCancellationExposure = 1 << 0;
     const byte BackendTermination = 1 << 1;
@@ -58,6 +59,29 @@ sealed class BackendMessageContext
         if (_version != token)
             ThrowHelper.ThrowInvalidOperation("Backend message has been invalidated by moving to the next message.");
         return _current;
+    }
+
+    internal void SetCurrentFallbackBuffer(
+        in ReadOnlySequence<byte> buffer, bool required)
+    {
+        if (required)
+            _currentFallbackBuffer = buffer;
+        else if (!_currentFallbackBuffer.IsEmpty)
+            _currentFallbackBuffer = default;
+    }
+
+    internal ReadOnlySequence<byte> GetFallbackBuffer(short token, bool peeked)
+    {
+        if (peeked)
+        {
+            if (!_hasPeeked || _version != token)
+                ThrowHelper.ThrowInvalidOperation(
+                    "Backend message has been invalidated by moving to the next message.");
+            return _peekedBuffer;
+        }
+
+        Validate(token);
+        return _currentFallbackBuffer;
     }
 
     public long GetCurrentMessageOffset(short token)
@@ -251,6 +275,7 @@ sealed class BackendMessageContext
         // A failed message poll preserves Current, but crossing this ownership boundary cannot.
         var invalidateToken = !_current.IsDefault || _hasPeeked;
         _current = default;
+        _currentFallbackBuffer = default;
         _hasPeeked = false;
         _peekedHeader = default;
         _peekedBuffer = default;
@@ -289,7 +314,7 @@ sealed class BackendMessageContext
             header = default;
             return false;
         }
-        BackendMessage.SetSequence(ref _peekedBuffer, in buffer);
+        _peekedBuffer = buffer;
         _hasPeeked = true;
         header = _peekedHeader;
         return true;
@@ -300,7 +325,8 @@ sealed class BackendMessageContext
         get
         {
             Debug.Assert(_hasPeeked);
-            return new(_peekedHeader, _peekedBuffer, this, _version);
+            return BackendMessage.CreatePeeked(
+                _peekedHeader, _peekedBuffer, this, _version);
         }
     }
 
