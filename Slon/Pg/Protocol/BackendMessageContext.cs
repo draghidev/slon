@@ -11,7 +11,7 @@ sealed class BackendMessageContext
     PgDecoder _decoder = null!;
     BackendMessageBatch _remainingBatch;
     BackendMessage _current;
-    ReadOnlySequence<byte> _currentFallbackBuffer;
+    FallbackBuffer _currentFallbackBuffer;
     short _version;
     const byte PriorCancellationExposure = 1 << 0;
     const byte BackendTermination = 1 << 1;
@@ -23,6 +23,41 @@ sealed class BackendMessageContext
     enum PublicationState : byte { None, Current, Peeked }
     PublicationState _publicationState;
     long _currentMessageOffset;
+    struct FallbackBuffer
+    {
+        ReadOnlySequenceSegment<byte>? _start;
+        ReadOnlySequenceSegment<byte>? _end;
+        int _startIndex;
+        int _endIndex;
+
+        public readonly bool IsEmpty => _start is null;
+
+        public void Set(in ReadOnlySequence<byte> buffer)
+        {
+            var start = (ReadOnlySequenceSegment<byte>)buffer.Start.GetObject()!;
+            var end = (ReadOnlySequenceSegment<byte>)buffer.End.GetObject()!;
+            if (!ReferenceEquals(_start, start))
+                _start = start;
+            if (!ReferenceEquals(_end, end))
+                _end = end;
+            _startIndex = buffer.Start.GetInteger() & int.MaxValue;
+            _endIndex = buffer.End.GetInteger() & int.MaxValue;
+        }
+
+        public void Clear()
+        {
+            if (_start is not null)
+                _start = null;
+            if (_end is not null)
+                _end = null;
+            _startIndex = 0;
+            _endIndex = 0;
+        }
+
+        public readonly ReadOnlySequence<byte> Sequence
+            => new(_start!, _startIndex, _end!, _endIndex);
+    }
+
 
     public BackendMessage Current
     {
@@ -64,15 +99,15 @@ sealed class BackendMessageContext
         in ReadOnlySequence<byte> buffer, bool required)
     {
         if (required)
-            _currentFallbackBuffer = buffer;
+            _currentFallbackBuffer.Set(in buffer);
         else if (!_currentFallbackBuffer.IsEmpty)
-            _currentFallbackBuffer = default;
+            _currentFallbackBuffer.Clear();
     }
 
     internal ReadOnlySequence<byte> GetFallbackBuffer(short token)
     {
         Validate(token);
-        return _currentFallbackBuffer;
+        return _currentFallbackBuffer.Sequence;
     }
 
     public long GetCurrentMessageOffset(short token)
@@ -262,7 +297,7 @@ sealed class BackendMessageContext
         // A failed message poll preserves Current, but crossing this ownership boundary cannot.
         var invalidateToken = _publicationState is not PublicationState.None;
         _current = default;
-        _currentFallbackBuffer = default;
+        _currentFallbackBuffer.Clear();
         _publicationState = PublicationState.None;
         _remainingBatch = default;
         _currentMessageOffset = 0;
