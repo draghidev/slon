@@ -24,7 +24,7 @@ public readonly struct BackendMessage
 
     BackendMessage(BackendHeader header, ReadOnlySequence<byte> buffer,
         BackendMessageContext? context, short token, bool buffered,
-        bool peeked = false, bool independent = false)
+        bool independent = false)
     {
         _firstObject = buffer.Start.GetObject();
         _contextOrEndObject = independent ? buffer.End.GetObject() : context;
@@ -33,23 +33,17 @@ public readonly struct BackendMessage
             ? buffer.End.GetInteger() & int.MaxValue
             : checked((int)buffer.Length);
         _state = (buffered ? 1u : 0)
-            | (peeked ? 2u : 0)
-            | (independent ? 4u : 0)
-            | ((uint)(byte)header.Type << 3)
-            | ((uint)(ushort)token << 11);
+            | (independent ? 2u : 0)
+            | ((uint)(byte)header.Type << 2)
+            | ((uint)(ushort)token << 10);
         _length = header.Length;
-        if (context is not null && !peeked)
+        if (context is not null)
             context.SetCurrentFallbackBuffer(in buffer,
                 _firstObject is ReadOnlySequenceSegment<byte>);
     }
 
     internal BackendMessage(BackendHeader header, ReadOnlySequence<byte> buffer, BackendMessageContext context, short token)
         : this(header, buffer, context, token, buffer.Length >= header.MessageLength) {}
-
-    internal static BackendMessage CreatePeeked(BackendHeader header,
-        ReadOnlySequence<byte> buffer, BackendMessageContext context, short token)
-        => new(header, buffer, context, token,
-            buffer.Length >= header.MessageLength, peeked: true);
 
     internal static BackendMessage CreateIndependent(
         BackendHeader header, ReadOnlySequence<byte> buffer)
@@ -60,6 +54,17 @@ public readonly struct BackendMessage
         return new(header, buffer, context: null, token: 0,
             buffered: true, independent: true);
     }
+
+    internal static void InitializeIndependent(ref BackendMessage destination,
+        BackendHeader header, ReadOnlySequence<byte> buffer)
+    {
+        var value = CreateIndependent(header, buffer);
+        WriteGranularly(ref destination, in value);
+    }
+
+    internal static void Copy(
+        ref BackendMessage destination, in BackendMessage value)
+        => WriteGranularly(ref destination, in value);
 
     internal static void Initialize(ref BackendMessage destination, BackendHeader header, ReadOnlySequence<byte> buffer,
         BackendMessageContext context, short token, bool buffered)
@@ -85,10 +90,9 @@ public readonly struct BackendMessage
         Unsafe.AsRef(in destination._endIndexOrBufferedLength) = value._endIndexOrBufferedLength;
     }
 
-    BackendType Type => (BackendType)((_state >> 3) & byte.MaxValue);
-    short Token => (short)(_state >> 11);
-    bool IsPeeked => (_state & 2) != 0;
-    bool IsIndependent => (_state & 4) != 0;
+    BackendType Type => (BackendType)((_state >> 2) & byte.MaxValue);
+    short Token => (short)(_state >> 10);
+    bool IsIndependent => (_state & 2) != 0;
     internal bool IsDefault => Type == default;
     BackendMessageContext Context
         => _contextOrEndObject as BackendMessageContext
@@ -104,7 +108,7 @@ public readonly struct BackendMessage
                 return new(array, _startIndex, _endIndexOrBufferedLength);
             if (_firstObject is MemoryManager<byte> manager)
                 return new(manager.Memory.Slice(_startIndex, _endIndexOrBufferedLength));
-            return Context.GetFallbackBuffer(Token, IsPeeked);
+            return Context.GetFallbackBuffer(Token);
         }
 
         if (_firstObject is byte[] independentArray

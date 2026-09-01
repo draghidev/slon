@@ -25,8 +25,7 @@ sealed class BackendMessageContext
     // alone owns validity; leaving the inactive buffer populated avoids a redundant clear and lets
     // the next peek usually reuse the same backing objects without write barriers.
     bool _hasPeeked;
-    BackendHeader _peekedHeader;
-    ReadOnlySequence<byte> _peekedBuffer;
+    BackendMessage _peeked;
     long _currentMessageOffset;
 
     public BackendMessage Current
@@ -70,16 +69,8 @@ sealed class BackendMessageContext
             _currentFallbackBuffer = default;
     }
 
-    internal ReadOnlySequence<byte> GetFallbackBuffer(short token, bool peeked)
+    internal ReadOnlySequence<byte> GetFallbackBuffer(short token)
     {
-        if (peeked)
-        {
-            if (!_hasPeeked || _version != token)
-                ThrowHelper.ThrowInvalidOperation(
-                    "Backend message has been invalidated by moving to the next message.");
-            return _peekedBuffer;
-        }
-
         Validate(token);
         return _currentFallbackBuffer;
     }
@@ -252,8 +243,8 @@ sealed class BackendMessageContext
         {
             _hasPeeked = false;
             ResetMessageState();
-            BackendMessage.Initialize(ref _current, _peekedHeader, _peekedBuffer, this, ++_version,
-                _peekedBuffer.Length >= _peekedHeader.MessageLength);
+            _version++;
+            BackendMessage.Copy(ref _current, in _peeked);
             return true;
         }
         if (!_remainingBatch.TryReadNextInPlace(out var header, out var buffer, out var bufferLength))
@@ -277,8 +268,6 @@ sealed class BackendMessageContext
         _current = default;
         _currentFallbackBuffer = default;
         _hasPeeked = false;
-        _peekedHeader = default;
-        _peekedBuffer = default;
         _remainingBatch = default;
         _currentMessageOffset = 0;
         _messageState = 0;
@@ -296,7 +285,7 @@ sealed class BackendMessageContext
     {
         if (_hasPeeked)
         {
-            type = _peekedHeader.Type;
+            type = _peeked.Header.Type;
             return true;
         }
         return _remainingBatch.TryPeekType(out type);
@@ -306,17 +295,15 @@ sealed class BackendMessageContext
     {
         if (_hasPeeked)
         {
-            header = _peekedHeader;
+            header = _peeked.Header;
             return true;
         }
-        if (!_remainingBatch.TryReadNextInPlace(out _peekedHeader, out var buffer, out _))
+        if (!_remainingBatch.TryReadNextInPlace(out header, out var buffer, out _))
         {
-            header = default;
             return false;
         }
-        _peekedBuffer = buffer;
+        BackendMessage.InitializeIndependent(ref _peeked, header, buffer);
         _hasPeeked = true;
-        header = _peekedHeader;
         return true;
     }
 
@@ -325,8 +312,7 @@ sealed class BackendMessageContext
         get
         {
             Debug.Assert(_hasPeeked);
-            return BackendMessage.CreatePeeked(
-                _peekedHeader, _peekedBuffer, this, _version);
+            return _peeked;
         }
     }
 
