@@ -27,7 +27,15 @@ sealed class ProtocolReadPipe(
 
     public PipeReader PipeReader => reader;
     public BackendMessage Current => _messageContext.Current;
+    public BackendMessage.Accessor CurrentAccessor => _messageContext.CurrentAccessor;
     public bool CurrentIsError => _messageContext.CurrentIsError;
+    public PgTypes.BackendType CurrentType => _messageContext.CurrentType;
+    public bool CurrentBuffered => _messageContext.CurrentBuffered;
+    public ReadOnlyMemory<byte> CurrentBufferedBody => _messageContext.CurrentBufferedBody;
+    public bool TryGetCurrentBufferedArray(
+        [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out byte[]? array,
+        out int start, out int length)
+        => _messageContext.TryGetCurrentBufferedArray(out array, out start, out length);
     public bool TryGetCurrent(out BackendMessage message)
         => _messageContext.TryGetCurrent(out message);
 

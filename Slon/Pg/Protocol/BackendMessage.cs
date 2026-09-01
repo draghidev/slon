@@ -216,6 +216,30 @@ public readonly struct BackendMessage
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal bool TryGetBufferedFirstArray(int offset,
+        [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out byte[]? array,
+        out int start, out int length)
+    {
+        Debug.Assert(Buffered);
+        offset += BackendHeader.ByteCount;
+        var firstLength = IsIndependent
+            ? _endIndexOrBufferedLength - _startIndex
+            : _endIndexOrBufferedLength;
+        if (_firstObject is byte[] firstArray && (uint)offset <= (uint)firstLength)
+        {
+            array = firstArray;
+            start = _startIndex + offset;
+            length = firstLength - offset;
+            return true;
+        }
+
+        array = null;
+        start = 0;
+        length = 0;
+        return false;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     ReadOnlyMemory<byte> GetFirstMemory()
     {
         var length = IsIndependent
@@ -263,7 +287,7 @@ public readonly struct BackendMessage
                 $"Unexpected backend message: {actual}, expected: {string.Join(" or ", expected.ToArray())}.");
     }
 
-    public Accessor GetAccessor() => new(Context, Token);
+    public Accessor GetAccessor() => new(Context, Token, Type, Buffered);
 
     internal BackendMessageBodyReader OpenBodyReader()
         => new(Context, Token, GetSequence(), Buffered);
@@ -281,14 +305,29 @@ public readonly struct BackendMessage
     {
         readonly BackendMessageContext _context;
         readonly short _token;
+        readonly PgTypes.BackendType _type;
+        readonly bool _buffered;
 
-        internal Accessor(BackendMessageContext context, short token)
+        internal Accessor(BackendMessageContext context, short token,
+            PgTypes.BackendType type, bool buffered)
         {
             _context = context;
             _token = token;
+            _type = type;
+            _buffered = buffered;
         }
 
         public BackendMessage Message => _context.GetCurrent(_token);
+
+        internal PgTypes.BackendType Type => _type;
+        internal bool Buffered => _buffered;
+        internal BackendMessageBodyReader OpenBodyReader()
+            => _context.OpenCurrentBodyReader(_token);
+        internal bool TryGetBufferedFirstMemory(int offset, out ReadOnlyMemory<byte> memory)
+            => _context.TryGetCurrentBufferedFirstMemory(_token, offset, out memory);
+        internal void BufferBody() => _context.BufferCurrentMessage(_token);
+        internal ValueTask BufferBodyAsync(CancellationToken cancellationToken)
+            => _context.BufferCurrentMessageAsync(_token, cancellationToken);
 
         // The JIT should have a phase for picking granular writes (and write barriers) over full struct assignments.
         // This translation is entirely mechanical (even though these implementations need to deviate for external types).
@@ -298,6 +337,8 @@ public readonly struct BackendMessage
                 Unsafe.AsRef(in destination._context) = value._context!;
 
             Unsafe.AsRef(in destination._token) = value._token;
+            Unsafe.AsRef(in destination._type) = value._type;
+            Unsafe.AsRef(in destination._buffered) = value._buffered;
         }
     }
 

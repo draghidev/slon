@@ -2,6 +2,7 @@ using System.Buffers;
 using System.Buffers.Binary;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using System.Text;
 using Slon.Buffers;
 using Slon.Pg.Protocol;
@@ -19,7 +20,10 @@ public sealed class Row : PgFieldReader
     RowDescription _rowDescription = null!;
     BackendMessageBodyReader? _bodyReader;
     IColumnLease? _columnLease;
+    byte[]? _bufferedArray;
     ReadOnlyMemory<byte> _bufferedBody;
+    int _bufferedOffset;
+    int _bufferedLength;
     int _leasedOrdinal;
     int _lastBufferedOrdinal = -1;
     int _lastBufferedOffset;
@@ -29,6 +33,10 @@ public sealed class Row : PgFieldReader
     int _columnOffset;
 
     BackendMessage Message => _messageAccessor.Message;
+    ReadOnlyMemory<byte> BufferedBody
+        => _bufferedArray is { } array
+            ? array.AsMemory(_bufferedOffset, _bufferedLength)
+            : _bufferedBody;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     SequenceReader<byte> GetColumnReader(int ordinal, out int columnIndex, out int columnOffset)
@@ -445,18 +453,19 @@ public sealed class Row : PgFieldReader
     {
         if (ordinal == _lastBufferedOrdinal)
         {
-            field = _bufferedBody.Slice(_lastBufferedOffset, _lastBufferedLength);
+            field = BufferedBody.Slice(_lastBufferedOffset, _lastBufferedLength);
             return true;
         }
 
         var columnIndex = _column <= ordinal ? _column : 0;
         var columnOffset = _column <= ordinal ? _columnOffset : sizeof(short);
-        if ((uint)columnOffset > (uint)_bufferedBody.Length)
+        var bufferedBody = BufferedBody;
+        if ((uint)columnOffset > (uint)bufferedBody.Length)
         {
             field = default;
             return false;
         }
-        var remainingMemory = _bufferedBody.Slice(columnOffset);
+        var remainingMemory = bufferedBody.Slice(columnOffset);
         var remaining = remainingMemory.Span;
 
         while (columnIndex++ < ordinal)
@@ -596,15 +605,21 @@ public sealed class Row : PgFieldReader
             _rowDescription = rowDescription;
     }
 
-    internal void InitializeRow(in BackendMessage row)
+    internal void InitializeRow(in BackendMessage.Accessor row)
     {
         if (_columnLease is not null)
             throw new InvalidOperationException("The previous column lease must be revoked before advancing the row.");
-        _bodyReader = row.Buffered ? null : row.OpenBodyReader();
+        if (row.Buffered)
+        {
+            if (_bodyReader is not null)
+                _bodyReader = null;
+        }
+        else
+            _bodyReader = row.OpenBodyReader();
         _column = 0;
         _columnOffset = sizeof(short);
         _lastBufferedOrdinal = -1;
-        BackendMessage.Accessor.WriteGranularly(ref _messageAccessor, row.GetAccessor());
+        BackendMessage.Accessor.WriteGranularly(ref _messageAccessor, row);
         CaptureBufferedBody(row);
     }
 
@@ -618,17 +633,37 @@ public sealed class Row : PgFieldReader
     }
 
     void CaptureBufferedBody()
-    {
-        var message = Message;
-        CaptureBufferedBody(message);
-    }
+        => CaptureBufferedBody(_messageAccessor);
 
-    void CaptureBufferedBody(in BackendMessage message)
+    void CaptureBufferedBody(in BackendMessage.Accessor message)
     {
         if (_bodyReader is null && message.TryGetBufferedFirstMemory(0, out var body))
-            _bufferedBody = body;
+        {
+            if (MemoryMarshal.TryGetArray(body, out var segment))
+            {
+                if (!ReferenceEquals(_bufferedArray, segment.Array))
+                    _bufferedArray = segment.Array;
+                _bufferedOffset = segment.Offset;
+                _bufferedLength = segment.Count;
+                if (!_bufferedBody.IsEmpty)
+                    _bufferedBody = default;
+            }
+            else
+            {
+                if (_bufferedArray is not null)
+                    _bufferedArray = null;
+                _bufferedBody = body;
+            }
+        }
         else
-            _bufferedBody = default;
+        {
+            if (_bufferedArray is not null)
+                _bufferedArray = null;
+            if (!_bufferedBody.IsEmpty)
+                _bufferedBody = default;
+            _bufferedOffset = 0;
+            _bufferedLength = 0;
+        }
     }
 
     // Returns false when the seek was exhausted, true if positioned correctly, and throws if the seek is invalid.

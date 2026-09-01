@@ -46,7 +46,13 @@ partial class CommandFlow
         public bool MoveNext() => _messageEnumerator.MoveNext();
         public ValueTask<bool> MoveNextAsync() => _messageEnumerator.MoveNextAsync();
         public BackendMessage Current => _messageEnumerator.Current;
+        internal BackendMessage.Accessor CurrentAccessor => _messageEnumerator.CurrentAccessor;
         internal MoveNextStatus TryMoveNext() => _messageEnumerator.TryMoveNext();
+        internal ValueTask<BackendMessage> CollectRowsAsync<TState>(
+            TState state, Action<TState, CommandResult.RowView> collector,
+            CancellationToken cancellationToken)
+            => _messageEnumerator.CollectRowsAsync(state, collector, cancellationToken);
+        internal void ThrowCollectorException() => _messageEnumerator.ThrowCollectorException();
 
         public void Dispose() => _messageEnumerator.Dispose();
         public ValueTask DisposeAsync() => _messageEnumerator.DisposeAsync();
@@ -78,6 +84,7 @@ partial class CommandFlow
             bool _first;
             bool _done;
             ExceptionDispatchInfo? _exceptionDispatchInfo;
+            ExceptionDispatchInfo? _collectorException;
             (PgError, TransactionStatus)? _completeError;
 
             // An Execute response consists of DataRow messages followed by one terminal message.
@@ -157,6 +164,137 @@ partial class CommandFlow
                 }
             }
 
+            enum CollectRowsStatus : byte
+            {
+                RequiresInput,
+                RequiresBuffer,
+                Complete
+            }
+
+            public ValueTask<BackendMessage> CollectRowsAsync<TState>(
+                TState state, Action<TState, CommandResult.RowView> collector,
+                CancellationToken cancellationToken)
+            {
+                try
+                {
+                    var status = CollectAvailableRows(
+                        state, collector, currentReady: false, out var pending, out var terminal);
+                    return status is CollectRowsStatus.Complete
+                        ? new(terminal)
+                        : Core(this, state, collector, status, pending, cancellationToken);
+                }
+                catch (Exception ex)
+                {
+                    _exceptionDispatchInfo = ExceptionDispatchInfo.Capture(ex);
+                    return ValueTask.FromException<BackendMessage>(ex);
+                }
+
+                static async ValueTask<BackendMessage> Core(
+                    MessageEnumerator enumerator,
+                    TState state, Action<TState, CommandResult.RowView> collector,
+                    CollectRowsStatus status, BackendMessage.Accessor pending,
+                    CancellationToken cancellationToken)
+                {
+                    try
+                    {
+                        while (true)
+                        {
+                            if (status is CollectRowsStatus.RequiresInput)
+                            {
+                                cancellationToken.ThrowIfCancellationRequested();
+                                _ = await enumerator._decoder.GetNextAsync().ConfigureAwait(false);
+                            }
+                            else
+                            {
+                                await pending.BufferBodyAsync(cancellationToken).ConfigureAwait(false);
+                            }
+
+                            status = enumerator.CollectAvailableRows(
+                                state, collector, currentReady: true, out pending, out var terminal);
+                            if (status is CollectRowsStatus.Complete)
+                                return terminal;
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        enumerator._exceptionDispatchInfo = ExceptionDispatchInfo.Capture(ex);
+                        throw;
+                    }
+                }
+            }
+
+            CollectRowsStatus CollectAvailableRows<TState>(
+                TState state, Action<TState, CommandResult.RowView> collector,
+                bool currentReady,
+                out BackendMessage.Accessor pending,
+                out BackendMessage terminal)
+            {
+                while (true)
+                {
+                    if (!currentReady)
+                    {
+                        if (_first)
+                        {
+                            _first = false;
+                            currentReady = true;
+                        }
+                        else
+                        {
+                            _exceptionDispatchInfo?.Throw();
+                            if (_done)
+                                ThrowHelper.ThrowInvalidOperation(
+                                    "Underlying message enumerator completed before a terminal message was returned.");
+                            if (!_decoder.TryMoveNext())
+                            {
+                                pending = default;
+                                terminal = default;
+                                return CollectRowsStatus.RequiresInput;
+                            }
+                            currentReady = true;
+                        }
+                    }
+
+                    DebugEnsureExpected(_decoder.Current);
+                    if (_decoder.CurrentType is not PgTypes.BackendType.DataRow)
+                    {
+                        _done = true;
+                        pending = default;
+                        terminal = _decoder.Current;
+                        return CollectRowsStatus.Complete;
+                    }
+                    if (!_decoder.CurrentBuffered)
+                    {
+                        pending = _decoder.CurrentAccessor;
+                        terminal = default;
+                        return CollectRowsStatus.RequiresBuffer;
+                    }
+
+                    if (_collectorException is null)
+                    {
+                        try
+                        {
+                            var row = _decoder.TryGetCurrentBufferedArray(
+                                out var array, out var offset, out var length)
+                                ? new CommandResult.RowView(array, offset, length)
+                                : new CommandResult.RowView(_decoder.CurrentBufferedBody);
+                            collector(state, row);
+                        }
+                        catch (Exception ex)
+                        {
+                            _collectorException = ExceptionDispatchInfo.Capture(ex);
+                        }
+                    }
+                    currentReady = false;
+                }
+            }
+
+            public void ThrowCollectorException()
+            {
+                var exception = _collectorException;
+                _collectorException = null;
+                exception?.Throw();
+            }
+
             public MoveNextStatus TryMoveNext()
             {
                 if (_first)
@@ -180,12 +318,13 @@ partial class CommandFlow
 
                 return MoveNextStatus.RequiresInput;
             }
-
             public BackendMessage Current
             {
                 [MethodImpl(MethodImplOptions.AggressiveInlining)]
                 get => _decoder.Current;
             }
+
+            internal BackendMessage.Accessor CurrentAccessor => _decoder.CurrentAccessor;
 
             public void Dispose()
             {
@@ -294,6 +433,8 @@ partial class CommandFlow
                     _decoder = decoder;
 
                 _exceptionDispatchInfo = null;
+                if (_collectorException is not null)
+                    _collectorException = null;
                 _disposed = false;
                 _completeError = null;
 
@@ -310,6 +451,8 @@ partial class CommandFlow
                 _withSync = false;
                 _decoder = null!;
                 _exceptionDispatchInfo = null;
+                if (_collectorException is not null)
+                    _collectorException = null;
                 _completeError = null;
                 _disposed = true;
                 _first = false;

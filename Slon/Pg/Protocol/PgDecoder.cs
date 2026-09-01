@@ -725,6 +725,25 @@ public sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<Bac
         get => _pipe.Current;
     }
 
+    internal BackendMessage.Accessor CurrentAccessor
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        get => _pipe.CurrentAccessor;
+    }
+
+    internal ReadOnlyMemory<byte> CurrentBufferedBody
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        get => _pipe.CurrentBufferedBody;
+    }
+
+    internal PgTypes.BackendType CurrentType => _pipe.CurrentType;
+    internal bool CurrentBuffered => _pipe.CurrentBuffered;
+    internal bool TryGetCurrentBufferedArray(
+        [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out byte[]? array,
+        out int start, out int length)
+        => _pipe.TryGetCurrentBufferedArray(out array, out start, out length);
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public bool TryGetCurrent(out BackendMessage message)
     {

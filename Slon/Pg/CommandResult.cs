@@ -1,9 +1,11 @@
+using System.Buffers.Binary;
 using System.Collections;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
 using Slon.Pg.Protocol;
 using Slon.Pg.Protocol.Flows;
+using Slon.Pg.Types;
 
 namespace Slon.Pg;
 
@@ -256,6 +258,89 @@ public sealed class CommandResult
         EnsureComplete();
     }
 
+    internal readonly struct RowView
+    {
+        readonly byte[]? _array;
+        readonly ReadOnlyMemory<byte> _memory;
+        readonly int _offset;
+        readonly int _length;
+
+        internal RowView(ReadOnlyMemory<byte> memory)
+            => (_array, _memory, _offset, _length) = (null, memory, 0, 0);
+
+        internal RowView(byte[] array, int offset, int length)
+            => (_array, _memory, _offset, _length) = (array, default, offset, length);
+
+        public T GetValue<T>(int ordinal)
+            => BootstrapFieldDecoder.Read<T>(GetFieldSpan(ordinal));
+
+        public int GetInt32(int ordinal)
+        {
+            if (ordinal == 0)
+            {
+                var row = _array is { } array
+                    ? array.AsSpan(_offset, _length)
+                    : _memory.Span;
+                const int valueOffset = sizeof(short) + sizeof(int);
+                if (row.Length >= valueOffset + sizeof(int)
+                    && BinaryPrimitives.ReadInt32BigEndian(row[sizeof(short)..]) == sizeof(int))
+                    return BinaryPrimitives.ReadInt32BigEndian(row[valueOffset..]);
+                ThrowHelper.ThrowInvalidOperation("The first DataRow field is not a non-null Int32.");
+            }
+            return BinaryPrimitives.ReadInt32BigEndian(GetFieldSpan(ordinal));
+        }
+
+        ReadOnlySpan<byte> GetFieldSpan(int ordinal)
+        {
+            ArgumentOutOfRangeException.ThrowIfNegative(ordinal);
+            var fields = _array is { } array
+                ? array.AsSpan(_offset, _length)
+                : _memory.Span;
+            if (fields.Length >= sizeof(short))
+            {
+                var remaining = fields[sizeof(short)..];
+                for (var index = 0; ; index++)
+                {
+                    if (remaining.Length < sizeof(int))
+                        ThrowHelper.ThrowInvalidOperation("The DataRow field length is truncated.");
+                    var length = BinaryPrimitives.ReadInt32BigEndian(remaining);
+                    remaining = remaining[sizeof(int)..];
+                    if (length < 0)
+                    {
+                        if (index == ordinal)
+                            ThrowHelper.ThrowInvalidOperation("The requested field is null.");
+                        continue;
+                    }
+                    if ((uint)length > (uint)remaining.Length)
+                        ThrowHelper.ThrowInvalidOperation("The DataRow field is truncated.");
+                    if (index == ordinal)
+                        return remaining[..length];
+                    remaining = remaining[length..];
+                }
+            }
+
+            ThrowHelper.ThrowInvalidOperation("The DataRow field count is truncated.");
+            return default;
+        }
+    }
+
+    internal async ValueTask CollectRowsAsync<TState>(
+        TState state, Action<TState, RowView> collector,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(collector);
+        cancellationToken.ThrowIfCancellationRequested();
+        if (_firstRowEnumerated)
+            ThrowHelper.ThrowInvalidOperation(
+                "Rows have already been consumed from this command result.");
+        _firstRowEnumerated = true;
+        var terminal = await _messageEnumerator
+            .CollectRowsAsync(state, collector, cancellationToken)
+            .ConfigureAwait(false);
+        CompleteTerminal(terminal);
+        _messageEnumerator.ThrowCollectorException();
+    }
+
     void EnsureComplete()
     {
         if (_requestedExecution && !IsComplete)
@@ -329,6 +414,7 @@ public sealed class CommandResult
     }
 
     BackendMessage GetCurrentMessage() => _messageEnumerator.Current;
+    BackendMessage.Accessor GetCurrentMessageAccessor() => _messageEnumerator.CurrentAccessor;
     bool MoveNextMessage() => _messageEnumerator.MoveNext();
     CommandFlow.MoveNextStatus TryMoveNextMessage() => _messageEnumerator.TryMoveNext();
     ValueTask<bool> MoveNextMessageAsync() => _messageEnumerator.MoveNextAsync();
@@ -342,17 +428,17 @@ public sealed class CommandResult
         internal RowEnumerator(CommandResult instance, RowBuffering buffering)
             => (_instance, _buffering) = (instance, buffering);
 
-        BackendMessage PrepareRow(BackendMessage message)
+        BackendMessage.Accessor PrepareRow(BackendMessage.Accessor message)
         {
             if (_buffering is RowBuffering.Buffered && !message.Buffered)
             {
                 message.BufferBody();
-                message = _instance!.GetCurrentMessage();
+                message = _instance!.GetCurrentMessageAccessor();
             }
             return message;
         }
 
-        bool PublishRow(in BackendMessage message)
+        bool PublishRow(in BackendMessage.Accessor message)
         {
             (_row ??= _instance!.GetRow()).InitializeRow(message);
             return true;
@@ -377,8 +463,8 @@ public sealed class CommandResult
             // https://www.postgresql.org/docs/current/protocol-flow.html#PROTOCOL-FLOW-EXT-QUERY
             // "Therefore, an Execute phase is always terminated by the appearance of exactly one of these messages:
             // CommandComplete, EmptyQueryResponse (if the portal was created from an empty query string), ErrorResponse, or PortalSuspended"
-            var current = instance.GetCurrentMessage();
-            if (current.Header.Type is PgTypes.BackendType.DataRow)
+            var current = instance.GetCurrentMessageAccessor();
+            if (current.Type is PgTypes.BackendType.DataRow)
                 return PublishRow(PrepareRow(current));
 
             return HandleUncommon(current);
@@ -408,21 +494,14 @@ public sealed class CommandResult
                 return MoveNextAfterRevokeAsync(leasedRow);
 
             var status = instance.TryMoveNextMessage();
-            if (status is CommandFlow.MoveNextStatus.RequiresInput)
-                return MoveNextAsyncCore(instance.MoveNextMessageAsync());
-
-            if (status is CommandFlow.MoveNextStatus.EndOfSequence)
-            {
-                if (instance._requestedExecution && instance._commandCompleteMessage is null && instance._errorMessage is null)
-                    ThrowHelper.ThrowInvalidOperation("Underlying message enumerator completed before CommandComplete was returned.");
-                return new(false);
-            }
+            if (status is not CommandFlow.MoveNextStatus.Moved)
+                return HandleNonMoved(instance, status);
 
             // https://www.postgresql.org/docs/current/protocol-flow.html#PROTOCOL-FLOW-EXT-QUERY
             // "Therefore, an Execute phase is always terminated by the appearance of exactly one of these messages:
             // CommandComplete, EmptyQueryResponse (if the portal was created from an empty query string), ErrorResponse, or PortalSuspended"
-            var current = instance.GetCurrentMessage();
-            if (current.Header.Type is PgTypes.BackendType.DataRow)
+            var current = instance.GetCurrentMessageAccessor();
+            if (current.Type is PgTypes.BackendType.DataRow)
             {
                 if (_buffering is RowBuffering.Buffered && !current.Buffered)
                     return BufferCurrentRow(in current);
@@ -433,13 +512,24 @@ public sealed class CommandResult
         }
 
         [MethodImpl(MethodImplOptions.NoInlining)]
-        ValueTask<bool> BufferCurrentRow(in BackendMessage current)
+        ValueTask<bool> HandleNonMoved(CommandResult instance, CommandFlow.MoveNextStatus status)
+        {
+            if (status is CommandFlow.MoveNextStatus.RequiresInput)
+                return MoveNextAsyncCore(instance.MoveNextMessageAsync());
+
+            if (instance._requestedExecution && instance._commandCompleteMessage is null && instance._errorMessage is null)
+                ThrowHelper.ThrowInvalidOperation("Underlying message enumerator completed before CommandComplete was returned.");
+            return new(false);
+        }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        ValueTask<bool> BufferCurrentRow(in BackendMessage.Accessor current)
         {
             var instance = _instance!;
             var bufferTask = current.BufferBodyAsync(default);
             if (!bufferTask.IsCompletedSuccessfully)
                 return BufferRowAsync(bufferTask, _row ??= instance.GetRow());
-            return new(PublishRow(instance.GetCurrentMessage()));
+            return new(PublishRow(instance.GetCurrentMessageAccessor()));
         }
 
         [MethodImpl(MethodImplOptions.NoInlining)]
@@ -450,16 +540,16 @@ public sealed class CommandResult
         }
 
         [MethodImpl(MethodImplOptions.NoInlining)]
-        bool HandleUncommon(in BackendMessage current)
+        bool HandleUncommon(in BackendMessage.Accessor current)
         {
             var instance = _instance!;
-            var type = current.Header.Type;
+            var type = current.Type;
             switch (type)
             {
                 case PgTypes.BackendType.EmptyQueryResponse:
                 case PgTypes.BackendType.CommandComplete:
                 case PgTypes.BackendType.ErrorResponse:
-                    instance.CompleteCommand(current);
+                    instance.CompleteCommand(current.Message);
                     return false;
                 case PgTypes.BackendType.PortalSuspended when !instance._simpleProtocol:
                 default:
@@ -483,12 +573,15 @@ public sealed class CommandResult
             // https://www.postgresql.org/docs/current/protocol-flow.html#PROTOCOL-FLOW-EXT-QUERY
             // "Therefore, an Execute phase is always terminated by the appearance of exactly one of these messages:
             // CommandComplete, EmptyQueryResponse (if the portal was created from an empty query string), ErrorResponse, or PortalSuspended"
-            var current = instance.GetCurrentMessage();
-            if (current.Header.Type is PgTypes.BackendType.DataRow)
+            var current = instance.GetCurrentMessageAccessor();
+            if (current.Type is PgTypes.BackendType.DataRow)
             {
                 if (_buffering is RowBuffering.Buffered && !current.Buffered)
+                {
                     await current.BufferBodyAsync(default).ConfigureAwait(false);
-                return PublishRow(instance.GetCurrentMessage());
+                    current = instance.GetCurrentMessageAccessor();
+                }
+                return PublishRow(current);
             }
 
             return HandleUncommon(current);
@@ -499,7 +592,7 @@ public sealed class CommandResult
         async ValueTask<bool> BufferRowAsync(ValueTask task, Row row)
         {
             await task.ConfigureAwait(false);
-            row.InitializeRow(_instance!.GetCurrentMessage());
+            row.InitializeRow(_instance!.GetCurrentMessageAccessor());
             return true;
         }
 

@@ -81,6 +81,17 @@ sealed class BackendMessageContext
         }
     }
 
+    public BackendMessage.Accessor CurrentAccessor
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        get
+        {
+            if (_publicationState is not PublicationState.Current)
+                ThrowHelper.ThrowInvalidOperation("The decoder has no current backend message.");
+            return new(this, _version, _current.Header.Type, _current.Buffered);
+        }
+    }
+
     public bool CurrentIsError
     {
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -89,6 +100,47 @@ sealed class BackendMessageContext
             Debug.Assert(_publicationState is PublicationState.Current);
             return _current.Header.Type is PgTypes.BackendType.ErrorResponse;
         }
+    }
+
+    public PgTypes.BackendType CurrentType
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        get
+        {
+            Debug.Assert(_publicationState is PublicationState.Current);
+            return _current.Header.Type;
+        }
+    }
+
+    public bool CurrentBuffered
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        get
+        {
+            Debug.Assert(_publicationState is PublicationState.Current);
+            return _current.Buffered;
+        }
+    }
+
+    public ReadOnlyMemory<byte> CurrentBufferedBody
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        get
+        {
+            Debug.Assert(_publicationState is PublicationState.Current);
+            if (!_current.TryGetBufferedFirstMemory(0, out var body))
+                ThrowHelper.ThrowInvalidOperation("The current backend message is not buffered contiguously.");
+            return body;
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public bool TryGetCurrentBufferedArray(
+        [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out byte[]? array,
+        out int start, out int length)
+    {
+        Debug.Assert(_publicationState is PublicationState.Current);
+        return _current.TryGetBufferedFirstArray(0, out array, out start, out length);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -103,6 +155,21 @@ sealed class BackendMessageContext
         if (_publicationState is not PublicationState.Current || _version != token)
             ThrowHelper.ThrowInvalidOperation("Backend message has been invalidated by moving to the next message.");
         return _current;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal BackendMessageBodyReader OpenCurrentBodyReader(short token)
+    {
+        Validate(token);
+        return _current.OpenBodyReader();
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal bool TryGetCurrentBufferedFirstMemory(short token, int offset,
+        out ReadOnlyMemory<byte> memory)
+    {
+        Validate(token);
+        return _current.TryGetBufferedFirstMemory(offset, out memory);
     }
 
     internal void SetCurrentFallbackBuffer(
