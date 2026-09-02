@@ -229,58 +229,65 @@ partial class CommandFlow
                 out BackendMessage.Accessor pending,
                 out BackendMessage terminal)
             {
-                while (true)
+                var decoder = _decoder;
+                if (!currentReady)
                 {
-                    if (!currentReady)
+                    if (_first)
                     {
-                        if (_first)
+                        _first = false;
+                    }
+                    else
+                    {
+                        _exceptionDispatchInfo?.Throw();
+                        if (_done)
+                            ThrowHelper.ThrowInvalidOperation(
+                                "Underlying message enumerator completed before a terminal message was returned.");
+                        if (!decoder.TryMoveNext())
                         {
-                            _first = false;
-                            currentReady = true;
-                        }
-                        else
-                        {
-                            _exceptionDispatchInfo?.Throw();
-                            if (_done)
-                                ThrowHelper.ThrowInvalidOperation(
-                                    "Underlying message enumerator completed before a terminal message was returned.");
-                            if (!_decoder.TryMoveNext())
-                            {
-                                pending = default;
-                                terminal = default;
-                                return CollectRowsStatus.RequiresInput;
-                            }
-                            currentReady = true;
+                            pending = default;
+                            terminal = default;
+                            return CollectRowsStatus.RequiresInput;
                         }
                     }
+                }
 
-                    DebugEnsureExpected(_decoder.Current);
-                    if (_decoder.CurrentType is not PgTypes.BackendType.DataRow)
+                var collect = _collectorException is null;
+                while (true)
+                {
+                    DebugEnsureExpected(decoder.Current);
+                    if (decoder.CurrentType is not PgTypes.BackendType.DataRow)
                     {
                         _done = true;
                         pending = default;
-                        terminal = _decoder.Current;
+                        terminal = decoder.Current;
                         return CollectRowsStatus.Complete;
                     }
-                    if (!_decoder.CurrentBuffered)
+                    if (!decoder.CurrentBuffered)
                     {
-                        pending = _decoder.CurrentAccessor;
+                        pending = decoder.CurrentAccessor;
                         terminal = default;
                         return CollectRowsStatus.RequiresBuffer;
                     }
 
-                    if (_collectorException is null)
+                    if (collect)
                     {
                         try
                         {
-                            collector(state, new CommandResult.RowView(_decoder.CurrentBufferedBody));
+                            collector(state, new CommandResult.RowView(decoder.CurrentBufferedBody));
                         }
                         catch (Exception ex)
                         {
                             _collectorException = ExceptionDispatchInfo.Capture(ex);
+                            collect = false;
                         }
                     }
-                    currentReady = false;
+
+                    if (!decoder.TryMoveNext())
+                    {
+                        pending = default;
+                        terminal = default;
+                        return CollectRowsStatus.RequiresInput;
+                    }
                 }
             }
 
