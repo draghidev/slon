@@ -15,14 +15,8 @@ readonly struct ReadyForQueryMessage
         message.EnsureExpected(PgTypes.BackendType.ReadyForQuery);
         message.EnsureBuffered();
 
-        byte status;
-        if (message.TryGetFirstSpan(0, out var body) && !body.IsEmpty)
+        if (!message.TryGetFirstByte(0, out var status))
         {
-            status = body[0];
-        }
-        else
-        {
-            status = 0;
             message.BodyReader.TryCopyTo(new Span<byte>(ref status));
         }
         var transactionStatus = (TransactionStatus)status;
