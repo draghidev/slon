@@ -238,12 +238,18 @@ public sealed class CommandResult
         EnsureComplete();
     }
 
-    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
-    internal async ValueTask CompleteAsync()
+    internal ValueTask CompleteAsync()
     {
         if (IsComplete)
-            return;
+            return default;
 
+        return CompleteAsyncCore();
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
+    async ValueTask CompleteAsyncCore()
+    {
         await _row.RevokeColumnLeaseAsync().ConfigureAwait(false);
         while (await MoveNextMessageAsync().ConfigureAwait(false))
         {
