@@ -485,7 +485,6 @@ public abstract class PgClientFlow : IValueTaskSource<FlowActivation>, IValueTas
     /// No overridable hook may run after that signal: a completion waiter can immediately Reset and
     /// enqueue the same object for its next tenure.
     protected virtual void OnReleasing(Exception? exception) {}
-    protected virtual void OnCancellationWindowCompleted(int completedWindow, int remainingWindowCount) {}
     protected virtual void OnDiscarded() {}
     protected virtual void OnReset() {}
 
@@ -838,7 +837,6 @@ public abstract class PgClientFlow : IValueTaskSource<FlowActivation>, IValueTas
                     flow._rfqCount -= 1;
                     var completedWindow = flow._cancellationWindow++;
                     control.OnFlowRfq(flow, backendMessage, completedWindow, flow._rfqCount);
-                    flow.OnCancellationWindowCompleted(completedWindow, flow._rfqCount);
                     handled = false;
                     return true;
                 case PgTypes.BackendType.NoticeResponse:
@@ -866,7 +864,6 @@ public abstract class PgClientFlow : IValueTaskSource<FlowActivation>, IValueTas
                     flow._rfqCount -= 1;
                     var completedWindow = flow._cancellationWindow++;
                     control.OnFlowRfq(flow, backendMessage, completedWindow, flow._rfqCount);
-                    flow.OnCancellationWindowCompleted(completedWindow, flow._rfqCount);
                     goto default;
                 case PgTypes.BackendType.NoticeResponse:
                     // We sink all notices (this includes RAISE notices) and expect those to end up on the flow for user retrieval/logging.

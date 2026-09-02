@@ -1144,9 +1144,6 @@ public partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
         }
     }
 
-    protected override void OnCancellationWindowCompleted(int completedWindow, int remainingWindowCount)
-    { }
-
     bool IsOwnCancellation(PgError error)
     {
         if (Volatile.Read(ref _cancellationState) is not { } cancellation
