@@ -485,7 +485,7 @@ public sealed partial class SlonConnection
         _proxy.Enqueue(flow);
         return AwaitCompletion(completion);
 
-        static async ValueTask AwaitCompletion(ValueTask<PgClientFlow> completion)
+        static async ValueTask AwaitCompletion(ValueTask<FlowCompletion> completion)
             => _ = await completion.ConfigureAwait(false);
     }
 

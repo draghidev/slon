@@ -482,7 +482,7 @@ public sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         connection.Reader.Complete(reason);
     }
 
-    async ValueTask StartAsync(StartupFlow flow, ValueTask<PgClientFlow> flowCompletion, CancellationToken cancellationToken = default)
+    async ValueTask StartAsync(StartupFlow flow, ValueTask<FlowCompletion> flowCompletion, CancellationToken cancellationToken = default)
     {
         _source = PgClientFlowSource.Create(
             this, FlowControl, _executionScheduler, _options.MaxInFlightFlowsPerWire);

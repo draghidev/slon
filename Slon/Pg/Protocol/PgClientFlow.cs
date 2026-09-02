@@ -16,6 +16,8 @@ public abstract class PgClientFlowObserver
 // them from the migratable source backlog, while standalone low-level flows remain initialized.
 abstract class PgClientFlowBindingContext;
 
+readonly struct FlowCompletion;
+
 sealed class FlowHandoffEvent : ManualResetEventSlim
 {
     PgClientFlowSource.State? _placementSource;
@@ -74,7 +76,7 @@ sealed class FlowHandoffEvent : ManualResetEventSlim
 }
 
 [Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
-public abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<PgClientFlow>, IThreadPoolWorkItem
+public abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<FlowCompletion>, IThreadPoolWorkItem
 {
     PgClientProtocol.Control? _pendingActivationControl;
     FlowEnqueueOptions _enqueueOptions;
@@ -166,7 +168,7 @@ public abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSour
     // the flow types; the flow-as-result is the free disambiguator (the old Slon.Protocols
     // pattern). At most one pending waiter per tenure; post-completion awaits resolve
     // synchronously.
-    Slon.Threading.Tasks.Sources.ManualResetValueTaskSourceCore<PgClientFlow> _completionCore;
+    Slon.Threading.Tasks.Sources.ManualResetValueTaskSourceCore<FlowCompletion> _completionCore;
     int _completionClaim;
     ManualResetEventSlim? _completionEvent;
     // 1 while a WaitForComplete token is live (set at capture, cleared after GetResult consumed the
@@ -299,7 +301,7 @@ public abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSour
         if (Interlocked.CompareExchange(ref _completionClaim, 1, 0) != 0)
             return;
         if (exception is null)
-            _completionCore.SetResult(this, runContinuationsAsynchronously: true);
+            _completionCore.SetResult(default, runContinuationsAsynchronously: true);
         else
             _completionCore.SetException(exception, runContinuationsAsynchronously: true);
     }
@@ -340,7 +342,7 @@ public abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSour
     // synchronously). The token is checked on entry only: the park itself is not cancelable, the
     // signal fires on every exit path (terminal, fault delivery, teardown), including the
     // cancel-delivered terminal.
-    internal ValueTask<PgClientFlow> WaitForComplete(CancellationToken cancellationToken = default)
+    internal ValueTask<FlowCompletion> WaitForComplete(CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
         // Publish waiter-pending before the token capture: a reuse path that observes the flag
@@ -358,7 +360,7 @@ public abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSour
     // Synchronous consumers must not block on an async continuation whose dispatch requires another
     // scheduler turn. The event is allocated only for that uncommon path and is signaled after the
     // completion core has published its result.
-    internal PgClientFlow WaitForCompleteSynchronously(CancellationToken cancellationToken = default)
+    internal void WaitForCompleteSynchronously(CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
         Volatile.Write(ref _completionWaiterPending, 1);
@@ -374,7 +376,7 @@ public abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSour
 
         if (_completionCore.GetStatus(token) is ValueTaskSourceStatus.Pending)
             completionEvent.Wait();
-        return ((IValueTaskSource<PgClientFlow>)this).GetResult(token);
+        _ = ((IValueTaskSource<FlowCompletion>)this).GetResult(token);
     }
 
     /// True while a completion waiter holds an unconsumed token on this tenure's signal. Reuse
@@ -463,7 +465,7 @@ public abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSour
     // bare flow ref. Keeps the handoff primitive off PgClientFlow's internal API, like _rfqCount.
     private protected virtual FlowHandoffEvent? HandoffEvent => null;
 
-    PgClientFlow IValueTaskSource<PgClientFlow>.GetResult(short token)
+    FlowCompletion IValueTaskSource<FlowCompletion>.GetResult(short token)
     {
         // Consume-then-clear: the release store orders the core consumption before the flag clear,
         // so a reuse path's acquire read of "not pending" proves the token's lifetime ended. Fault
@@ -477,8 +479,8 @@ public abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSour
             Volatile.Write(ref _completionWaiterPending, 0);
         }
     }
-    ValueTaskSourceStatus IValueTaskSource<PgClientFlow>.GetStatus(short token) => _completionCore.GetStatus(token);
-    void IValueTaskSource<PgClientFlow>.OnCompleted(Action<object?> continuation, object? state, short token, ValueTaskSourceOnCompletedFlags flags)
+    ValueTaskSourceStatus IValueTaskSource<FlowCompletion>.GetStatus(short token) => _completionCore.GetStatus(token);
+    void IValueTaskSource<FlowCompletion>.OnCompleted(Action<object?> continuation, object? state, short token, ValueTaskSourceOnCompletedFlags flags)
         => _completionCore.OnCompleted(continuation, state, token, flags);
 
     PgDecoder IValueTaskSource<PgDecoder>.GetResult(short token) => _activationTaskSource.GetResult(token);
