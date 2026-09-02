@@ -240,15 +240,25 @@ sealed class BackendMessageContext
         return buffer.AsMemory(0, length);
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void ReleaseContiguousProjections()
     {
         var projection = _contiguousProjections;
+        if (projection is null)
+            return;
+        ReleaseContiguousProjectionsCore(projection);
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    void ReleaseContiguousProjectionsCore(ContiguousProjection projection)
+    {
         _contiguousProjections = null;
-        while (projection is not null)
+        do
         {
             ArrayPool<byte>.Shared.Return(projection.Buffer);
-            projection = projection.Next;
+            projection = projection.Next!;
         }
+        while (projection is not null);
     }
 
     public void BindDecoder(PgDecoder decoder)
