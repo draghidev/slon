@@ -116,7 +116,7 @@ struct ManualResetValueTaskSourceCore<TResult>
             ThrowInvalidOperationException();
         }
         return
-            _continuation is null || !_completed ? ValueTaskSourceStatus.Pending :
+            _continuation is null || !Volatile.Read(ref _completed) ? ValueTaskSourceStatus.Pending :
             _error is null ? ValueTaskSourceStatus.Succeeded :
             _error.SourceException is OperationCanceledException ? ValueTaskSourceStatus.Canceled :
             ValueTaskSourceStatus.Faulted;
