@@ -487,18 +487,18 @@ sealed class BackendMessageContext
     }
 
     public bool TryGetReadRequirement(
-        out SequencePosition consumed, out long requiredLength)
+        out long consumedLength, out long requiredLength)
     {
         if (!_hasCursor || _cursor.RequiredBufferedLength <= 0)
         {
-            consumed = default;
+            consumedLength = 0;
             requiredLength = 0;
             return false;
         }
 
-        consumed = _cursor.UnreadStart;
+        consumedLength = _cursor.ConsumedLength;
         requiredLength = _cursor.RequiredBufferedLength
-            - _cursor.ConsumedLength;
+            - consumedLength;
         return true;
     }
 

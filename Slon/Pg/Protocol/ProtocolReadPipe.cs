@@ -68,12 +68,14 @@ sealed class ProtocolReadPipe(
         }
 
         if (!_messageContext.TryGetReadRequirement(
-                out var unread, out var requiredLength))
+                out var cursorConsumedLength, out var requiredLength))
             ThrowHelper.ThrowInvalidOperation(
                 "The current backend-message cursor has not been exhausted.");
 
+        var unreadOffset = checked(_pendingCursorOffset + cursorConsumedLength);
+        var unread = _activeBuffer.GetPosition(unreadOffset);
         _pendingCursorOffset = retainsResultSet
-            ? _activeBuffer.Slice(0, unread).Length
+            ? unreadOffset
             : 0;
         _messageContext.RetireCursor(
             retainProjections: retainsResultSet);
