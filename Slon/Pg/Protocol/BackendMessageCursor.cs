@@ -1,5 +1,6 @@
 using System.Buffers;
 using System.Diagnostics;
+using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
 using Slon.Pipelines;
 using static Slon.Pg.Protocol.PgTypes;
@@ -52,7 +53,7 @@ struct BackendMessageCursor(ReadOnlySequence<byte> buffer)
 
         var backendType = (BackendType)protoHeader.Tag;
         if (protoHeader.MessageLength > MaxMessageLength)
-            throw new PgFramingException($"PostgreSQL backend message length {protoHeader.MessageLength} exceeds the maximum supported length.");
+            ThrowMessageTooLong(protoHeader.MessageLength);
         var required = backendType is BackendType.DataRow
             ? Math.Min(protoHeader.MessageLength, (uint)_dataRowStreamingThreshold)
             : protoHeader.MessageLength;
@@ -73,6 +74,12 @@ struct BackendMessageCursor(ReadOnlySequence<byte> buffer)
         header = BackendHeader.FromHeader(protoHeader);
         return true;
     }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    [DoesNotReturn]
+    static void ThrowMessageTooLong(uint messageLength)
+        => throw new PgFramingException(
+            $"PostgreSQL backend message length {messageLength} exceeds the maximum supported length.");
 
     public readonly bool TryReadNext(out BackendHeader header, out ReadOnlySequence<byte> buffer, out uint bufferLength, out BackendMessageCursor remaining)
     {
@@ -195,6 +202,12 @@ struct BackendMessageCursor(ReadOnlySequence<byte> buffer)
                 return prev;
             }
 
+            return SplitSlow(offset);
+        }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        FastReadOnlySequence<T> SplitSlow(long offset)
+        {
             var sequence = Sequence;
             var prefix = sequence.Slice(0, offset);
             var remaining = sequence.Slice(offset);

@@ -801,43 +801,51 @@ public sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<Bac
 
     bool TryMoveNextCore()
     {
+        if (!_pipe.TryPeekNext(out var header))
+        {
+            PrepareRead();
+            return false;
+        }
+
+        var type = header.Type;
+        // Only auto-handled messages need the transactional peek slot: their handler may need
+        // I/O and decline the synchronous path. Ordinary messages can publish directly.
+        if (PgClientFlow.ExecutionControl.ShouldHandle(type))
+            return TryMoveNextAutoHandled(type);
+
+        _pipe.PublishPeeked();
+        if (type is PgTypes.BackendType.ErrorResponse)
+            ObserveMessage(_pipe.Current);
+        return true;
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    bool TryMoveNextAutoHandled(PgTypes.BackendType type)
+    {
         while (true)
         {
-            while (_pipe.TryPeekNext(out var header))
-            {
-                var type = header.Type;
-                // Only auto-handled messages need the transactional peek slot: their handler may need
-                // I/O and decline the synchronous path. Ordinary messages can publish directly.
-                if (type is not (PgTypes.BackendType.ReadyForQuery
-                    or PgTypes.BackendType.NoticeResponse
-                    or PgTypes.BackendType.NotificationResponse
-                    or PgTypes.BackendType.ParameterStatus))
-                {
-                    _pipe.PublishPeeked();
-                    if (type is PgTypes.BackendType.ErrorResponse)
-                        ObserveMessage(_pipe.Current);
-                    return true;
-                }
+            var handled = false;
+            if (type is PgTypes.BackendType.ReadyForQuery)
+                RestoreDefaultReadTimeout();
+            if (!CurrentExecutionControl.TryHandleMessage(_pipe.Peeked, out handled))
+                return false;
 
-                var handled = false;
-                if (type is PgTypes.BackendType.ReadyForQuery)
-                    RestoreDefaultReadTimeout();
-                if (!CurrentExecutionControl.TryHandleMessage(_pipe.Peeked, out handled))
-                {
-                    goto unavailable;
-                }
-                _pipe.PublishPeeked();
-                if (handled)
-                    continue;
+            _pipe.PublishPeeked();
+            if (!handled)
+            {
+                if (type is PgTypes.BackendType.ErrorResponse)
+                    ObserveMessage(_pipe.Current);
                 return true;
             }
 
-            PrepareRead();
-            break;
-        }
+            if (!_pipe.TryPeekNext(out var header))
+            {
+                PrepareRead();
+                return false;
+            }
 
-        unavailable:
-        return false;
+            type = header.Type;
+        }
     }
 
     // Auto-switch read, mirroring the encoder's FlushAuto: a sync flow takes the BLOCKING read path

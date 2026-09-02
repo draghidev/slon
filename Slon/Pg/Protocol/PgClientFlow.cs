@@ -755,6 +755,13 @@ public abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSour
             }
         }
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static bool ShouldHandle(PgTypes.BackendType type)
+            => type is PgTypes.BackendType.ReadyForQuery
+                or PgTypes.BackendType.NoticeResponse
+                or PgTypes.BackendType.NotificationResponse
+                or PgTypes.BackendType.ParameterStatus;
+
         /// Try-shape sync attempt: returns true if the message was processed without I/O. handled is
         /// true if the protocol layer consumed it (caller skips and pulls the next), false if it
         /// should be surfaced to the flow. Returns false only when a handler genuinely needs async
@@ -763,11 +770,7 @@ public abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSour
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public bool TryHandleMessage(in BackendMessage backendMessage, out bool handled)
         {
-            if (backendMessage.Header.Type
-                is PgTypes.BackendType.ReadyForQuery
-                or PgTypes.BackendType.NoticeResponse
-                or PgTypes.BackendType.NotificationResponse
-                or PgTypes.BackendType.ParameterStatus)
+            if (ShouldHandle(backendMessage.Header.Type))
             {
                 return TryHandleMessageCore(backendMessage, out handled);
             }
@@ -781,11 +784,7 @@ public abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSour
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public ValueTask<bool> HandleMessageAuto(in BackendMessage backendMessage)
         {
-            return backendMessage.Header.Type
-                is PgTypes.BackendType.ReadyForQuery
-                or PgTypes.BackendType.NoticeResponse
-                or PgTypes.BackendType.NotificationResponse
-                or PgTypes.BackendType.ParameterStatus
+            return ShouldHandle(backendMessage.Header.Type)
                 ? HandleMessageAutoCore(backendMessage) : new(false);
         }
 
