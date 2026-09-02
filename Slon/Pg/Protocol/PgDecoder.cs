@@ -507,7 +507,7 @@ public sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<Bac
                         while (true)
                         {
                             if (!directReadTask.IsCompletedSuccessfully)
-                                return MoveNextDirectAsync(directReadTask, cancellationToken, frontierFlow);
+                                return AwaitDirectRead(directReadTask, cancellationToken, frontierFlow);
                             if (CompleteDirectRead(directReadTask.Result, readToken,
                                     out directReadTask, out var readFinished,
                                     out var directReadCompleted))
@@ -561,15 +561,20 @@ public sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<Bac
 
 
         [MethodImpl(MethodImplOptions.NoInlining)]
-        async ValueTask<bool> MoveNextDirectAsync(
+        ValueTask<bool> AwaitDirectRead(
             ValueTask<int> directReadTask,
             CancellationToken cancellationToken,
             PgClientFlow frontierFlow)
+            => cancellationToken.CanBeCanceled
+                ? MoveNextDirectWithCancellationAsync(directReadTask, cancellationToken, frontierFlow)
+                : MoveNextDirectAsync(directReadTask, frontierFlow);
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        async ValueTask<bool> MoveNextDirectAsync(
+            ValueTask<int> directReadTask,
+            PgClientFlow frontierFlow)
         {
             var timeoutSet = false;
-            var registration = cancellationToken.UnsafeRegister(
-                static (state, _) => ((CancellationTokenSource)state!).Cancel(),
-                _cancellationTokenSource);
             try
             {
                 while (true)
@@ -612,7 +617,7 @@ public sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<Bac
                             frontierFlow = null!;
                         }
                         if (_cancellationTokenSource.IsCancellationRequested)
-                            throw TranslateReadCancellation(ex, cancellationToken);
+                            throw TranslateReadCancellation(ex, default);
                         if (ex is EndOfStreamException eof)
                             throw TranslateEof(eof);
                         throw;
@@ -637,16 +642,38 @@ public sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<Bac
                     if (!TryBeginDirectRead(token, out directReadTask))
                         return await MoveNextAsyncCore(
                             _pipe.ReadAsync(token), null, null,
-                            cancellationToken, frontierFlow).ConfigureAwait(false);
+                            default, frontierFlow).ConfigureAwait(false);
                 }
             }
             finally
             {
                 if (frontierFlow is not null)
                     LeaveCancellationReadFrontier(frontierFlow);
-                registration.Dispose();
                 if (timeoutSet)
                     SetRemainingTimeout(Timeout.InfiniteTimeSpan);
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        async ValueTask<bool> MoveNextDirectWithCancellationAsync(
+            ValueTask<int> directReadTask,
+            CancellationToken cancellationToken,
+            PgClientFlow frontierFlow)
+        {
+            var registration = cancellationToken.UnsafeRegister(
+                static (state, _) => ((CancellationTokenSource)state!).Cancel(),
+                _cancellationTokenSource);
+            try
+            {
+                return await MoveNextDirectAsync(directReadTask, frontierFlow).ConfigureAwait(false);
+            }
+            catch (Exception) when (cancellationToken.IsCancellationRequested)
+            {
+                throw new OperationCanceledException(cancellationToken);
+            }
+            finally
+            {
+                registration.Dispose();
             }
         }
 
