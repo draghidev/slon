@@ -385,21 +385,24 @@ public sealed class CommandResult
                 break;
         }
 
-        InvokeCompletionAction();
+        if (_completionAction is not null)
+            InvokeCompletionAction();
     }
 
+    [MethodImpl(MethodImplOptions.NoInlining)]
     void InvokeCompletionAction()
     {
-        if (_completionAction is { } action)
+        var action = _completionAction!;
+        var state = _completionActionState;
+        _completionAction = null;
+        _completionActionState = null;
+        try
         {
-            var state = _completionActionState;
-            _completionAction = null;
-            _completionActionState = null;
-            try { action(this, state); }
-            catch (Exception ex)
-            {
-                _flow.Fail(ex);
-            }
+            action(this, state);
+        }
+        catch (Exception ex)
+        {
+            _flow.Fail(ex);
         }
     }
 
