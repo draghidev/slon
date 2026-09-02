@@ -128,13 +128,22 @@ sealed class BackendMessageContext
         get
         {
             Debug.Assert(_publicationState is PublicationState.Current);
-            if (_current.TryGetBufferedFirstMemory(0, out var body)
+            if (_current.TryGetBufferedArrayMemory(0, out var body)
                 && body.Length == _current.Header.BodyLength)
                 return body;
-
-            var sequence = _current.GetSequence();
-            return _current.GetContiguousMemory(sequence);
+            return GetCurrentBufferedBodySlow();
         }
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    ReadOnlyMemory<byte> GetCurrentBufferedBodySlow()
+    {
+        if (_current.TryGetBufferedFirstMemory(0, out var body)
+            && body.Length == _current.Header.BodyLength)
+            return body;
+
+        var sequence = _current.GetSequence();
+        return _current.GetContiguousMemory(sequence);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]

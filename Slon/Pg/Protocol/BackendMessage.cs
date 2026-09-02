@@ -225,6 +225,24 @@ public readonly struct BackendMessage
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal bool TryGetBufferedArrayMemory(int offset, out ReadOnlyMemory<byte> memory)
+    {
+        Debug.Assert(Buffered);
+        offset += BackendHeader.ByteCount;
+        var firstLength = IsIndependent
+            ? _endIndexOrBufferedLength - _startIndex
+            : _endIndexOrBufferedLength;
+        if (_firstObject is byte[] array && (uint)offset <= (uint)firstLength)
+        {
+            memory = array.AsMemory(_startIndex + offset, firstLength - offset);
+            return true;
+        }
+
+        memory = default;
+        return false;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     ReadOnlyMemory<byte> GetFirstMemory()
     {
         var length = IsIndependent
