@@ -962,10 +962,11 @@ public sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<Bac
     {
         while (true)
         {
+            Debug.Assert(PgClientFlow.ExecutionControl.ShouldHandle(type));
             var handled = false;
             if (type is PgTypes.BackendType.ReadyForQuery)
                 RestoreDefaultReadTimeout();
-            if (!CurrentExecutionControl.TryHandleMessage(_pipe.Peeked, out handled))
+            if (!CurrentExecutionControl.TryHandleKnownMessage(_pipe.Peeked, out handled))
                 return false;
 
             _pipe.PublishPeeked();
@@ -983,6 +984,13 @@ public sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<Bac
             }
 
             type = header.Type;
+            if (!PgClientFlow.ExecutionControl.ShouldHandle(type))
+            {
+                _pipe.PublishPeeked();
+                if (type is PgTypes.BackendType.ErrorResponse)
+                    ObserveMessage(_pipe.Current);
+                return true;
+            }
         }
     }
 

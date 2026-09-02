@@ -774,7 +774,7 @@ public abstract class PgClientFlow : IValueTaskSource<FlowActivation>, IValueTas
         {
             if (ShouldHandle(backendMessage.Header.Type))
             {
-                return TryHandleMessageCore(backendMessage, out handled);
+                return TryHandleKnownMessage(backendMessage, out handled);
             }
             handled = false;
             return true;
@@ -791,7 +791,7 @@ public abstract class PgClientFlow : IValueTaskSource<FlowActivation>, IValueTas
         }
 
         [MethodImpl(MethodImplOptions.NoInlining)]
-        bool TryHandleMessageCore(BackendMessage backendMessage, out bool handled)
+        internal bool TryHandleKnownMessage(BackendMessage backendMessage, out bool handled)
         {
             switch (backendMessage.Header.Type)
             {
