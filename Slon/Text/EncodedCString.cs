@@ -35,6 +35,12 @@ public readonly struct EncodedCString
 
     public static implicit operator EncodedCString(string value) => new(value);
 
+    internal static void Assign(ref EncodedCString destination, in EncodedCString value)
+    {
+        if (!ReferenceEquals(destination._core, value._core))
+            Unsafe.AsRef(in destination._core) = value._core;
+    }
+
     // Used for long lived strings that may have to be re-encoded (but usually wont), thread-safe.
     [DebuggerDisplay("{_value,nq}")]
     sealed class Core(string value)

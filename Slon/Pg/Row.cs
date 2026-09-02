@@ -619,7 +619,7 @@ public sealed class Row : PgFieldReader
         _column = 0;
         _columnOffset = sizeof(short);
         _lastBufferedOrdinal = -1;
-        BackendMessage.Accessor.WriteGranularly(ref _messageAccessor, row);
+        BackendMessage.Accessor.Assign(ref _messageAccessor, row);
         CaptureBufferedBody(row);
     }
 

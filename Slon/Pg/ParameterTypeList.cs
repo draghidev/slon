@@ -2,6 +2,7 @@ using System.Collections;
 using System.Collections.Immutable;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using Slon.Pg.Types;
 
@@ -167,4 +168,13 @@ public readonly struct ParameterTypeList : IEquatable<ParameterTypeList>
     public override int GetHashCode() => HashCode.Combine(_source, _writer, _count);
     public static bool operator ==(ParameterTypeList left, ParameterTypeList right) => left.Equals(right);
     public static bool operator !=(ParameterTypeList left, ParameterTypeList right) => !left.Equals(right);
+
+    internal static void Assign(ref ParameterTypeList destination, in ParameterTypeList value)
+    {
+        if (!ReferenceEquals(destination._source, value._source))
+            Unsafe.AsRef(in destination._source) = value._source;
+        if (!ReferenceEquals(destination._writer, value._writer))
+            Unsafe.AsRef(in destination._writer) = value._writer;
+        Unsafe.AsRef(in destination._count) = value._count;
+    }
 }

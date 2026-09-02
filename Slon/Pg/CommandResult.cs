@@ -45,7 +45,7 @@ public sealed class CommandResult
         if (!ReferenceEquals(_flow, flow))
             _flow = flow;
         _index = index;
-        _descriptor = descriptor;
+        CommandDescriptor.Assign(ref _descriptor, in descriptor);
 
         // If the command wasn't redescribed, and the prepared description is valid use it instead.
         var rowDescription = requestedRowDescription;

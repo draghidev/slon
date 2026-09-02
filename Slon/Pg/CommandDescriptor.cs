@@ -76,4 +76,13 @@ public readonly struct CommandDescriptor
 
     public static CommandDescriptor Create(string commandText, ParameterTypeList parameterTypes = default, EncodedCString commandName = default)
         => new(commandText, parameterTypes, commandName);
+
+    // Fieldwise equivalent of assignment, avoiding stores for reference components already present.
+    internal static void Assign(ref CommandDescriptor destination, in CommandDescriptor value)
+    {
+        if (!ReferenceEquals(destination._rowDescriptionOrCommandText, value._rowDescriptionOrCommandText))
+            Unsafe.AsRef(in destination._rowDescriptionOrCommandText) = value._rowDescriptionOrCommandText;
+        EncodedCString.Assign(ref Unsafe.AsRef(in destination._commandName), in value._commandName);
+        ParameterTypeList.Assign(ref Unsafe.AsRef(in destination._parameterTypes), in value._parameterTypes);
+    }
 }

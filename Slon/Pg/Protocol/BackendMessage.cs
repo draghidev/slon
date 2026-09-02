@@ -59,18 +59,14 @@ public readonly struct BackendMessage
         BackendHeader header, ReadOnlySequence<byte> buffer)
     {
         var value = CreateIndependent(header, buffer);
-        WriteGranularly(ref destination, in value);
+        Assign(ref destination, in value);
     }
-
-    internal static void Copy(
-        ref BackendMessage destination, in BackendMessage value)
-        => WriteGranularly(ref destination, in value);
 
     internal static void Initialize(ref BackendMessage destination, BackendHeader header, ReadOnlySequence<byte> buffer,
         BackendMessageContext context, short token, bool buffered)
     {
         var value = new BackendMessage(header, buffer, context, token, buffered);
-        WriteGranularly(ref destination, in value, destinationIsZero: false);
+        Assign(ref destination, in value, destinationIsZero: false);
     }
 
     internal static void Initialize(ref BackendMessage destination, BackendHeader header,
@@ -95,7 +91,7 @@ public readonly struct BackendMessage
     // The JIT should have a phase for picking granular writes (and write barriers) over full struct assignments.
     // This translation is entirely mechanical (even though these implementations need to deviate for external types).
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    static void WriteGranularly(ref BackendMessage destination, in BackendMessage value, bool destinationIsZero = false)
+    static void Assign(ref BackendMessage destination, in BackendMessage value, bool destinationIsZero = false)
     {
         if ((destinationIsZero && value._contextOrEndObject is not null)
             || !ReferenceEquals(destination._contextOrEndObject, value._contextOrEndObject))
@@ -379,7 +375,7 @@ public readonly struct BackendMessage
 
         // The JIT should have a phase for picking granular writes (and write barriers) over full struct assignments.
         // This translation is entirely mechanical (even though these implementations need to deviate for external types).
-        internal static void WriteGranularly(ref Accessor destination, in Accessor value, bool destinationIsZero = false)
+        internal static void Assign(ref Accessor destination, in Accessor value, bool destinationIsZero = false)
         {
             if ((destinationIsZero && value._context is not null) || !ReferenceEquals(destination._context, value._context))
                 Unsafe.AsRef(in destination._context) = value._context!;
