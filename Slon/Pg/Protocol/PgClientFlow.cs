@@ -169,7 +169,6 @@ public abstract class PgClientFlow : IValueTaskSource<FlowActivation>, IValueTas
     // pattern). At most one pending waiter per tenure; post-completion awaits resolve
     // synchronously.
     Slon.Threading.Tasks.Sources.ManualResetValueTaskSourceCore<FlowCompletion> _completionCore;
-    int _completionClaim;
     ManualResetEventSlim? _completionEvent;
     // 1 while a WaitForComplete token is live (set at capture, cleared after GetResult consumed the
     // core). Guards reuse: Reset bumps the core's version, so it must not run while this is set.
@@ -298,8 +297,10 @@ public abstract class PgClientFlow : IValueTaskSource<FlowActivation>, IValueTas
 
     void CompleteFlow(Exception? exception)
     {
-        if (Interlocked.CompareExchange(ref _completionClaim, 1, 0) != 0)
-            return;
+        // Completion has one structural owner: either pipeline retirement, or the source drain for
+        // an item which was never dispatched. Substitution transfers failed-item completion to the
+        // policy; it does not add a competing completer.
+        Debug.Assert(_completionCore.GetStatus(_completionCore.Version) is ValueTaskSourceStatus.Pending);
         if (exception is null)
             _completionCore.SetResult(default, runContinuationsAsynchronously: true);
         else
@@ -408,7 +409,6 @@ public abstract class PgClientFlow : IValueTaskSource<FlowActivation>, IValueTas
         // Version bump per tenure. Cross-tenure completer staleness rests on the done -> torn-down
         // -> retired layering (Complete precedes recycle), the same basis as the rest of this reset.
         _completionCore.Reset();
-        Volatile.Write(ref _completionClaim, 0);
         _completionEvent?.Reset();
         ResetActivationSource();
         _rfqCount = 0;
