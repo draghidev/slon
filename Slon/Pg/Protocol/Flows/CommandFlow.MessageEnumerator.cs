@@ -229,6 +229,31 @@ partial class CommandFlow
                 out BackendMessage.Accessor pending,
                 out BackendMessage terminal)
             {
+                var status = CollectAvailableRowsCore(state, collector, currentReady);
+                if (status is CollectRowsStatus.RequiresInput)
+                {
+                    pending = default;
+                    terminal = default;
+                }
+                else if (status is CollectRowsStatus.RequiresBuffer)
+                {
+                    pending = _decoder.CurrentAccessor;
+                    terminal = default;
+                }
+                else
+                {
+                    _done = true;
+                    pending = default;
+                    terminal = _decoder.Current;
+                }
+                return status;
+            }
+
+            [MethodImpl(MethodImplOptions.NoInlining)]
+            CollectRowsStatus CollectAvailableRowsCore<TState>(
+                TState state, Action<TState, CommandResult.RowView> collector,
+                bool currentReady)
+            {
                 var decoder = _decoder;
                 var collect = _collectorException is null;
                 if (currentReady)
@@ -246,27 +271,14 @@ partial class CommandFlow
 
                 MoveNext:
                 if (!decoder.TryMoveNext())
-                {
-                    pending = default;
-                    terminal = default;
                     return CollectRowsStatus.RequiresInput;
-                }
 
                 ProcessCurrent:
                 DebugEnsureExpected(decoder.Current);
                 if (decoder.CurrentType is not PgTypes.BackendType.DataRow)
-                {
-                    _done = true;
-                    pending = default;
-                    terminal = decoder.Current;
                     return CollectRowsStatus.Complete;
-                }
                 if (!decoder.CurrentBuffered)
-                {
-                    pending = decoder.CurrentAccessor;
-                    terminal = default;
                     return CollectRowsStatus.RequiresBuffer;
-                }
 
                 if (collect)
                 {
