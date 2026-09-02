@@ -23,7 +23,6 @@ public sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<Bac
     readonly CancellationToken _abortToken;
     readonly TimeSpan _defaultReadTimeout;
     readonly Action? _readTimeoutArmed;
-    readonly Action<TimeSpan> _onHeartbeatAction;
     CancellationTokenSource _cancellationTokenSource;
     TimeSpan _readTimeout;
 
@@ -94,7 +93,6 @@ public sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<Bac
         _readTimeout = defaultReadTimeout;
         _readTimeoutArmed = readTimeoutArmed;
         _cancellationTokenSource = CancellationTokenSource.CreateLinkedTokenSource(abortToken);
-        _onHeartbeatAction = OnHeartbeat;
         SetRemainingTimeout(Timeout.InfiniteTimeSpan);
     }
 
@@ -223,8 +221,6 @@ public sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<Bac
         if (!ReferenceEquals(_control, control))
             _control = control;
         _pipe.BindDecoder(this);
-        // TODO we want a heartbeat setup directly through the protocol on construction.
-        CurrentExecutionControl.RegisterDecoderOnHeartbeat(_onHeartbeatAction);
     }
 
     /// <summary>
@@ -373,7 +369,7 @@ public sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<Bac
         }
     }
 
-    void OnHeartbeat(TimeSpan elapsed)
+    internal void OnHeartbeat(TimeSpan elapsed)
     {
         var ticks = Interlocked.Exchange(ref _remainingTimeoutTicks, ClaimedTimeoutTicks);
         if (ticks == ClaimedTimeoutTicks)

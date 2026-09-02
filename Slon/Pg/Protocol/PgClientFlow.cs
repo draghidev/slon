@@ -143,7 +143,6 @@ public abstract class PgClientFlow : IValueTaskSource<FlowActivation>, IValueTas
 
     readonly bool _supportsDeferredFlush;
     internal bool SupportsDeferredFlush => _supportsDeferredFlush;
-    Action<TimeSpan>? _decoderOnHeartbeatAction; // TODO should we have this here?
     int _rfqCount;
     int _cancellationWindow;
     internal int CancellationWindow => Volatile.Read(ref _cancellationWindow);
@@ -904,11 +903,6 @@ public abstract class PgClientFlow : IValueTaskSource<FlowActivation>, IValueTas
                 ThrowHelper.ThrowInvalidOperation("Flow was already activated unexpectedly.");
         }
 
-        public void RegisterDecoderOnHeartbeat(Action<TimeSpan> action)
-        {
-            flow._decoderOnHeartbeatAction = action;
-        }
-
         public void OnHeartbeat(TimeSpan interval)
         {
             if (PropagateTermination())
@@ -916,7 +910,9 @@ public abstract class PgClientFlow : IValueTaskSource<FlowActivation>, IValueTas
 
             OnActivationHeartbeat(interval);
 
-            flow._decoderOnHeartbeatAction?.Invoke(interval);
+            if (flow._activationTaskSource.GetStatus(flow._activationTaskSource.Version)
+                is ValueTaskSourceStatus.Succeeded)
+                control.Decoder.OnHeartbeat(interval);
             flow.OnHeartbeat(interval);
         }
 
