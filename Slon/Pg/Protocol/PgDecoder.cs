@@ -570,6 +570,7 @@ public sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<Bac
                 : MoveNextDirectAsync(directReadTask, frontierFlow);
 
         [MethodImpl(MethodImplOptions.NoInlining)]
+        [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
         async ValueTask<bool> MoveNextDirectAsync(
             ValueTask<int> directReadTask,
             PgClientFlow frontierFlow)
