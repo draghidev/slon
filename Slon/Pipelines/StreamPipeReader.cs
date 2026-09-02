@@ -12,12 +12,14 @@ interface IStreamOwner : IDisposable, IAsyncDisposable { }
 
 abstract class StreamPipeReader : PipeReader
 {
+#if !NET11_0_OR_GREATER
     readonly ValueTaskSourcePromise<ReadResult> _readAsyncCorePromise = new();
+    bool _directReadAwaitingData;
+#endif
     readonly IStreamOwner? _streamOwner;
     int _isReadActive;
     int _readerCompleted;
     int _readerDisposed;
-    bool _directReadAwaitingData;
 
     // Null in direct-read mode (CancelPendingRead unsupported): the caller's token threads straight to
     // the underlying stream read, so neither this source nor a per-read registration is allocated.
@@ -223,17 +225,18 @@ abstract class StreamPipeReader : PipeReader
         return TryReadCore(out result);
     }
 
-    // Direct reads retain reader tenure until their continuation returns through CompleteDirectRead
-    // or AbortDirectRead. The protocol must interrupt and join that tenure before completing the
-    // reader and returning its destination buffer.
-    internal bool SupportsDirectRead => PendingReadTokenSource is null;
-    const int BufferedDirectRead = -1;
-
     internal void EnsureCanUpgradeStream()
     {
         if (IsReaderCompleted || Volatile.Read(ref _isReadActive) is not 0 || Segments.BufferedBytes is not 0)
             throw new InvalidOperationException("The reader must be open, idle, and empty before its stream can be upgraded.");
     }
+
+#if !NET11_0_OR_GREATER
+    // Direct reads retain reader tenure until their continuation returns through CompleteDirectRead
+    // or AbortDirectRead. The protocol must interrupt and join that tenure before completing the
+    // reader and returning its destination buffer.
+    internal bool SupportsDirectRead => PendingReadTokenSource is null;
+    const int BufferedDirectRead = -1;
 
     // Direct leaf handoff. The caller awaits the stream's ValueTask<int> directly, then returns
     // the byte count through CompleteDirectRead. This keeps buffer ownership and PipeReader read tenure
@@ -300,12 +303,12 @@ abstract class StreamPipeReader : PipeReader
         if (Volatile.Read(ref _isReadActive) is not 0)
             EndStartedRead();
     }
-
     ValueTask<int> StartDataRead(CancellationToken cancellationToken)
     {
         var buffer = Segments.Reserve(0, enforceHint: false);
         return Stream.ReadAsync(buffer, cancellationToken);
     }
+#endif
 
     protected ReadResult ReadCore(int minimumSize, TimeSpan timeout)
     {
@@ -378,6 +381,11 @@ abstract class StreamPipeReader : PipeReader
 
     }
 
+#if NET11_0_OR_GREATER
+    protected async ValueTask<ReadResult> ReadAsyncCore(int minimumSize, CancellationToken cancellationToken)
+    {
+        var tokenSource = PendingReadTokenSource;
+#else
     protected ValueTask<ReadResult> ReadAsyncCore(int minimumSize, CancellationToken cancellationToken)
     {
         PromiseAsyncValueTaskMethodBuilder<ReadResult>.Promise = _readAsyncCorePromise;
@@ -395,6 +403,7 @@ abstract class StreamPipeReader : PipeReader
         async ValueTask<ReadResult> ReadAsyncCore(int minimumSize,
             AutoResetCancellationTokenSource? tokenSource, CancellationToken cancellationToken)
         {
+#endif
             // Cancellation token was already checked before getting here.
             if (!TryStartRead())
                 ThrowAlreadyReading();
@@ -453,7 +462,9 @@ abstract class StreamPipeReader : PipeReader
                 }
             }
         }
+#if !NET11_0_OR_GREATER
     }
+#endif
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     int GetReadSizeHint(int minimumSize)

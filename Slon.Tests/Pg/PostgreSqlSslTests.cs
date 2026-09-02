@@ -175,7 +175,7 @@ public class PostgreSqlSslTests
             await CreateFactory(listener, PostgreSqlSslNegotiation.Direct,
                 PostgreSqlSslMode.VerifyFull).CreateAsync());
         try { await server; }
-        catch (IOException) { }
+        catch (Exception ex) when (ex is IOException or AuthenticationException) { }
     }
 
     [TestMethod]
@@ -190,7 +190,7 @@ public class PostgreSqlSslTests
             await CreateFactory(listener, PostgreSqlSslNegotiation.Direct,
                 PostgreSqlSslMode.VerifyCA).CreateAsync());
         try { await server; }
-        catch (IOException) { }
+        catch (Exception ex) when (ex is IOException or AuthenticationException) { }
     }
 
     [TestMethod]

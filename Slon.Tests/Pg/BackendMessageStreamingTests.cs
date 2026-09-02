@@ -340,6 +340,7 @@ public class BackendMessageStreamingTests
         await readPipe.DisposeAsync();
     }
 
+#if !NET11_0_OR_GREATER
     [TestMethod]
     public async Task RepeatedQueryFrames_ThroughDirectReads_NeverEnterMessageBodies()
     {
@@ -405,6 +406,7 @@ public class BackendMessageStreamingTests
             }
         }
     }
+#endif
 
     static byte[][] QueryResponseBytes()
     {
