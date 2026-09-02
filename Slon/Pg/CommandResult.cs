@@ -415,7 +415,7 @@ public sealed class CommandResult
     BackendMessage GetCurrentMessage() => _messageEnumerator.Current;
     BackendMessage.Accessor GetCurrentMessageAccessor() => _messageEnumerator.CurrentAccessor;
     bool MoveNextMessage() => _messageEnumerator.MoveNext();
-    CommandFlow.MoveNextStatus TryMoveNextMessage() => _messageEnumerator.TryMoveNext();
+    CommandFlow.MoveNextStatus TryMoveNextMessage() => _messageEnumerator.TryMoveNextRow();
     ValueTask<bool> MoveNextMessageAsync() => _messageEnumerator.MoveNextAsync();
 
     public struct RowEnumerator : IEnumerator<Row>, IAsyncEnumerator<Row>
@@ -548,6 +548,7 @@ public sealed class CommandResult
                 case PgTypes.BackendType.EmptyQueryResponse:
                 case PgTypes.BackendType.CommandComplete:
                 case PgTypes.BackendType.ErrorResponse:
+                    instance._messageEnumerator.MarkCurrentTerminal();
                     instance.CompleteCommand(current.Message);
                     return false;
                 case PgTypes.BackendType.PortalSuspended when !instance._simpleProtocol:

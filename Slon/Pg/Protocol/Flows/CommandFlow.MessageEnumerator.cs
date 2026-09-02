@@ -48,6 +48,9 @@ partial class CommandFlow
         public BackendMessage Current => _messageEnumerator.Current;
         internal BackendMessage.Accessor CurrentAccessor => _messageEnumerator.CurrentAccessor;
         internal MoveNextStatus TryMoveNext() => _messageEnumerator.TryMoveNext();
+        // RowEnumerator classifies the publication itself, avoiding a second Current copy here.
+        internal MoveNextStatus TryMoveNextRow() => _messageEnumerator.TryMoveNextRow();
+        internal void MarkCurrentTerminal() => _messageEnumerator.MarkCurrentTerminal();
         internal ValueTask<BackendMessage> CollectRowsAsync<TState>(
             TState state, Action<TState, CommandResult.RowView> collector,
             CancellationToken cancellationToken)
@@ -325,6 +328,25 @@ partial class CommandFlow
 
                 return MoveNextStatus.RequiresInput;
             }
+
+            public MoveNextStatus TryMoveNextRow()
+            {
+                if (_first)
+                {
+                    _first = false;
+                    return MoveNextStatus.Moved;
+                }
+
+                _exceptionDispatchInfo?.Throw();
+                if (_done)
+                    return MoveNextStatus.EndOfSequence;
+
+                return _decoder.TryMoveNext()
+                    ? MoveNextStatus.Moved
+                    : MoveNextStatus.RequiresInput;
+            }
+
+            public void MarkCurrentTerminal() => _done = true;
             public BackendMessage Current
             {
                 [MethodImpl(MethodImplOptions.AggressiveInlining)]
