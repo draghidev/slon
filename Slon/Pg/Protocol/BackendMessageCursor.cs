@@ -56,7 +56,9 @@ struct BackendMessageCursor(ReadOnlySequence<byte> buffer)
     internal bool TryReadNextBuffer(out BackendHeader header,
         out FastReadOnlySequence<byte> buffer, out uint bufferLength)
     {
-        if (!Header.TryParse(_buffer.FirstSpan, out var protoHeader) && !Header.TryParseMultiSegment(_buffer.Sequence, out protoHeader))
+        if (!Header.TryParse(_buffer.FirstSpan, out var protoHeader)
+            && (_buffer.Length < Header.ByteCount
+                || !Header.TryParseMultiSegment(_buffer.Sequence, out protoHeader)))
         {
             _requiredBufferedLength = ConsumedLength + Header.ByteCount;
             buffer = default;
