@@ -159,6 +159,7 @@ struct BackendMessageCursor(ReadOnlySequence<byte> buffer)
         };
 
         // Returns the sequence before the index, stores the sequence after it in place.
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public FastReadOnlySequence<T> SplitInPlace(long offset)
         {
             var firstEnd = ReferenceEquals(_startObject, _endObject)

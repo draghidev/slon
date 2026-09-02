@@ -38,6 +38,7 @@ sealed class ProtocolReadPipe(
     public bool TryMoveNext() => _messageContext.TryMoveNext();
     public bool TryPeekNext(out BackendHeader header)
         => _messageContext.TryPeekNext(out header);
+    public void PublishPeeked() => _messageContext.PublishPeeked();
     public BackendMessage Peeked => _messageContext.Peeked;
 
     public void BindDecoder(PgDecoder decoder) => _messageContext.BindDecoder(decoder);

@@ -813,8 +813,9 @@ public sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<Bac
                     or PgTypes.BackendType.NotificationResponse
                     or PgTypes.BackendType.ParameterStatus))
                 {
-                    var moved = TryMoveNext(_pipe);
-                    Debug.Assert(moved);
+                    _pipe.PublishPeeked();
+                    if (type is PgTypes.BackendType.ErrorResponse)
+                        ObserveMessage(_pipe.Current);
                     return true;
                 }
 
@@ -825,7 +826,7 @@ public sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<Bac
                 {
                     goto unavailable;
                 }
-                TryMoveNext(_pipe);
+                _pipe.PublishPeeked();
                 if (handled)
                     continue;
                 return true;

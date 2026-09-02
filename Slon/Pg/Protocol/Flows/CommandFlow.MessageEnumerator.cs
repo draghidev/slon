@@ -230,65 +230,57 @@ partial class CommandFlow
                 out BackendMessage terminal)
             {
                 var decoder = _decoder;
-                if (!currentReady)
-                {
-                    if (_first)
-                    {
-                        _first = false;
-                    }
-                    else
-                    {
-                        _exceptionDispatchInfo?.Throw();
-                        if (_done)
-                            ThrowHelper.ThrowInvalidOperation(
-                                "Underlying message enumerator completed before a terminal message was returned.");
-                        if (!decoder.TryMoveNext())
-                        {
-                            pending = default;
-                            terminal = default;
-                            return CollectRowsStatus.RequiresInput;
-                        }
-                    }
-                }
-
                 var collect = _collectorException is null;
-                while (true)
+                if (currentReady)
+                    goto ProcessCurrent;
+                if (_first)
                 {
-                    DebugEnsureExpected(decoder.Current);
-                    if (decoder.CurrentType is not PgTypes.BackendType.DataRow)
-                    {
-                        _done = true;
-                        pending = default;
-                        terminal = decoder.Current;
-                        return CollectRowsStatus.Complete;
-                    }
-                    if (!decoder.CurrentBuffered)
-                    {
-                        pending = decoder.CurrentAccessor;
-                        terminal = default;
-                        return CollectRowsStatus.RequiresBuffer;
-                    }
+                    _first = false;
+                    goto ProcessCurrent;
+                }
 
-                    if (collect)
-                    {
-                        try
-                        {
-                            collector(state, new CommandResult.RowView(decoder.CurrentBufferedBody));
-                        }
-                        catch (Exception ex)
-                        {
-                            _collectorException = ExceptionDispatchInfo.Capture(ex);
-                            collect = false;
-                        }
-                    }
+                _exceptionDispatchInfo?.Throw();
+                if (_done)
+                    ThrowHelper.ThrowInvalidOperation(
+                        "Underlying message enumerator completed before a terminal message was returned.");
 
-                    if (!decoder.TryMoveNext())
+                MoveNext:
+                if (!decoder.TryMoveNext())
+                {
+                    pending = default;
+                    terminal = default;
+                    return CollectRowsStatus.RequiresInput;
+                }
+
+                ProcessCurrent:
+                DebugEnsureExpected(decoder.Current);
+                if (decoder.CurrentType is not PgTypes.BackendType.DataRow)
+                {
+                    _done = true;
+                    pending = default;
+                    terminal = decoder.Current;
+                    return CollectRowsStatus.Complete;
+                }
+                if (!decoder.CurrentBuffered)
+                {
+                    pending = decoder.CurrentAccessor;
+                    terminal = default;
+                    return CollectRowsStatus.RequiresBuffer;
+                }
+
+                if (collect)
+                {
+                    try
                     {
-                        pending = default;
-                        terminal = default;
-                        return CollectRowsStatus.RequiresInput;
+                        collector(state, new CommandResult.RowView(decoder.CurrentBufferedBody));
+                    }
+                    catch (Exception ex)
+                    {
+                        _collectorException = ExceptionDispatchInfo.Capture(ex);
+                        collect = false;
                     }
                 }
+                goto MoveNext;
             }
 
             public void ThrowCollectorException()

@@ -399,7 +399,7 @@ sealed class BackendMessageContext
     {
         if (_publicationState is PublicationState.Peeked)
         {
-            _publicationState = PublicationState.Current;
+            PublishPeeked();
             return true;
         }
         if (!_cursor.TryReadNextInPlace(out var header, out var buffer, out var bufferLength))
@@ -418,6 +418,13 @@ sealed class BackendMessageContext
         {
             _messageState = 0;
         }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void PublishPeeked()
+    {
+        Debug.Assert(_publicationState is PublicationState.Peeked);
+        _publicationState = PublicationState.Current;
     }
 
     public void RetireCursor(bool retainProjections = false)
