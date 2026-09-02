@@ -1612,7 +1612,7 @@ public sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
             _writer = writer;
         }
 
-        PgDecoder Decoder => _decoder ?? protocol._pgDecoder;
+        internal PgDecoder Decoder => _decoder ?? protocol._pgDecoder;
 
         public PgClientFlow? ExecutingFlow => _slots.Executing;
         public PgClientFlow? ActivatedFlow => _slots.Activated;
@@ -1825,7 +1825,7 @@ public sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         // off the executor via the TP dispatch. Safe to lag the flow's retirement: TrySetResult no-ops
         // on a flow the abort already faulted.
         internal void Activate(PgClientFlow flow)
-            => flow.GetExecutionControl(this).Activate(Decoder);
+            => flow.GetExecutionControl(this).Activate();
 
         // Self-evict route for the flow layer's release-callback seam (see ExecutionControl.Release).
         internal void FailProtocol(Exception? reason) => protocol.FailProtocol(reason);

@@ -17,6 +17,7 @@ public abstract class PgClientFlowObserver
 abstract class PgClientFlowBindingContext;
 
 readonly struct FlowCompletion;
+readonly struct FlowActivation;
 
 sealed class FlowHandoffEvent : ManualResetEventSlim
 {
@@ -76,7 +77,7 @@ sealed class FlowHandoffEvent : ManualResetEventSlim
 }
 
 [Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
-public abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSource<FlowCompletion>, IThreadPoolWorkItem
+public abstract class PgClientFlow : IValueTaskSource<FlowActivation>, IValueTaskSource<FlowCompletion>, IThreadPoolWorkItem
 {
     PgClientProtocol.Control? _pendingActivationControl;
     FlowEnqueueOptions _enqueueOptions;
@@ -176,7 +177,7 @@ public abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSour
     int _completionWaiterPending;
 
     // Activation state.
-    Slon.Threading.Tasks.Sources.ManualResetValueTaskSourceCore<PgDecoder> _activationTaskSource;
+    Slon.Threading.Tasks.Sources.ManualResetValueTaskSourceCore<FlowActivation> _activationTaskSource;
     int _activationClaim;
     CancellationTokenRegistration _activationCancellationTokenRegistration;
     TimeSpan _remainingActivationTimeout;
@@ -274,11 +275,11 @@ public abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSour
         _supportsDeferredFlush = supportsDeferredFlush;
     }
 
-    bool TrySetActivationResult(PgDecoder decoder, bool runContinuationsAsynchronously)
+    bool TrySetActivationResult(bool runContinuationsAsynchronously)
     {
         if (Interlocked.CompareExchange(ref _activationClaim, 1, 0) != 0)
             return false;
-        _activationTaskSource.SetResult(decoder, runContinuationsAsynchronously);
+        _activationTaskSource.SetResult(default, runContinuationsAsynchronously);
         return true;
     }
 
@@ -483,9 +484,9 @@ public abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSour
     void IValueTaskSource<FlowCompletion>.OnCompleted(Action<object?> continuation, object? state, short token, ValueTaskSourceOnCompletedFlags flags)
         => _completionCore.OnCompleted(continuation, state, token, flags);
 
-    PgDecoder IValueTaskSource<PgDecoder>.GetResult(short token) => _activationTaskSource.GetResult(token);
-    ValueTaskSourceStatus IValueTaskSource<PgDecoder>.GetStatus(short token) => _activationTaskSource.GetStatus(token);
-    void IValueTaskSource<PgDecoder>.OnCompleted(Action<object?> continuation, object? state, short token, ValueTaskSourceOnCompletedFlags flags)
+    FlowActivation IValueTaskSource<FlowActivation>.GetResult(short token) => _activationTaskSource.GetResult(token);
+    ValueTaskSourceStatus IValueTaskSource<FlowActivation>.GetStatus(short token) => _activationTaskSource.GetStatus(token);
+    void IValueTaskSource<FlowActivation>.OnCompleted(Action<object?> continuation, object? state, short token, ValueTaskSourceOnCompletedFlags flags)
         => _activationTaskSource.OnCompleted(continuation, state, token, flags);
 
 
@@ -892,11 +893,11 @@ public abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSour
         [MethodImpl(MethodImplOptions.NoInlining)]
         ValueTask<FlowTasks> ExecuteSynchronously() => flow.ExecuteAuto(new(this));
 
-        public void Activate(PgDecoder decoder)
+        public void Activate()
         {
             flow._activationCancellationTokenRegistration.Dispose();
             // If none of the cancellations triggered, we have a problem, throw.
-            if (!flow.TrySetActivationResult(decoder, runContinuationsAsynchronously: false)
+            if (!flow.TrySetActivationResult(runContinuationsAsynchronously: false)
                 && !(flow._remainingActivationTimeout <= TimeSpan.Zero)
                 && !control.AbortToken.IsCancellationRequested
                 && !flow._activationCancellationTokenRegistration.Token.IsCancellationRequested)
@@ -1096,17 +1097,21 @@ public abstract class PgClientFlow : IValueTaskSource<PgDecoder>, IValueTaskSour
         public bool IsDecoderSettled
             => flow._activationTaskSource.GetStatus(flow._activationTaskSource.Version) is not ValueTaskSourceStatus.Pending;
         public PgDecoder GetDecoderResult()
-            => flow._activationTaskSource.GetResult(flow._activationTaskSource.Version);
+        {
+            _ = flow._activationTaskSource.GetResult(flow._activationTaskSource.Version);
+            return control.Decoder;
+        }
         public void OnDecoder(Action<object?> continuation, object? state, ValueTaskSourceOnCompletedFlags flags)
             => flow._activationTaskSource.OnCompleted(continuation, state, flow._activationTaskSource.Version, flags);
 
         // Bridge to Task for callers that need to block (sync flow body using
         // .GetAwaiter().GetResult()) or to compose with Task-based combinators. MVTSC has no
         // blocking GetResult of its own, so this is the only safe sync-wait path.
-        public Task<PgDecoder> GetDecoderTask(CancellationToken cancellationToken)
+        public async Task<PgDecoder> GetDecoderTask(CancellationToken cancellationToken)
         {
             RegisterActivationCancellation(cancellationToken);
-            return new ValueTask<PgDecoder>(flow, flow._activationTaskSource.Version).AsTask();
+            await new ValueTask<FlowActivation>(flow, flow._activationTaskSource.Version).ConfigureAwait(false);
+            return control.Decoder;
         }
 
         // Registers caller cancellation against the activation source so a flow can unwind
