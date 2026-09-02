@@ -504,7 +504,7 @@ public sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<Bac
                         while (true)
                         {
                             if (!directReadTask.IsCompletedSuccessfully)
-                                return MoveNextAsyncCore(null, directReadTask, null, cancellationToken, frontierFlow);
+                                return MoveNextDirectAsync(directReadTask, cancellationToken, frontierFlow);
                             if (CompleteDirectRead(directReadTask.Result, readToken,
                                     out directReadTask, out var readFinished,
                                     out var directReadCompleted))
@@ -556,6 +556,96 @@ public sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<Bac
             }
         }
 
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        async ValueTask<bool> MoveNextDirectAsync(
+            ValueTask<int> directReadTask,
+            CancellationToken cancellationToken,
+            PgClientFlow frontierFlow)
+        {
+            var timeoutSet = false;
+            var registration = cancellationToken.UnsafeRegister(
+                static (state, _) => ((CancellationTokenSource)state!).Cancel(),
+                _cancellationTokenSource);
+            try
+            {
+                while (true)
+                {
+                    try
+                    {
+                        if (!timeoutSet)
+                        {
+                            ArmReadTimeout();
+                            timeoutSet = true;
+                        }
+                        var length = await directReadTask.ConfigureAwait(false);
+                        if (CompleteDirectRead(length,
+                                _cancellationTokenSource.Token,
+                                out var nextDirectRead, out var readFinished,
+                                out var readCompleted))
+                        {
+                            LeaveCancellationReadFrontier(frontierFlow);
+                            frontierFlow = null!;
+                        }
+                        else if (!readFinished)
+                        {
+                            directReadTask = nextDirectRead;
+                            continue;
+                        }
+                        else
+                        {
+                            LeaveCancellationReadFrontier(frontierFlow);
+                            frontierFlow = null!;
+                            if (readCompleted)
+                                return ReadCompleted();
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        AbortDirectRead();
+                        if (frontierFlow is not null)
+                        {
+                            LeaveCancellationReadFrontier(frontierFlow);
+                            frontierFlow = null!;
+                        }
+                        if (_cancellationTokenSource.IsCancellationRequested)
+                            throw TranslateReadCancellation(ex, cancellationToken);
+                        if (ex is EndOfStreamException eof)
+                            throw TranslateEof(eof);
+                        throw;
+                    }
+
+                    while (TryMoveNext(_pipe))
+                    {
+                        var handleTask = CurrentExecutionControl.HandleMessageAuto(_pipe.Current);
+                        if (!handleTask.IsCompletedSuccessfully)
+                        {
+                            if (!await handleTask.ConfigureAwait(false))
+                                return true;
+                            continue;
+                        }
+                        if (!handleTask.Result)
+                            return true;
+                    }
+
+                    PrepareRead();
+                    var token = _cancellationTokenSource.Token;
+                    frontierFlow = EnterCancellationReadFrontier();
+                    if (!TryBeginDirectRead(token, out directReadTask))
+                        return await MoveNextAsyncCore(
+                            _pipe.ReadAsync(token), null, null,
+                            cancellationToken, frontierFlow).ConfigureAwait(false);
+                }
+            }
+            finally
+            {
+                if (frontierFlow is not null)
+                    LeaveCancellationReadFrontier(frontierFlow);
+                registration.Dispose();
+                if (timeoutSet)
+                    SetRemainingTimeout(Timeout.InfiniteTimeSpan);
+            }
+        }
 
         [MethodImpl(MethodImplOptions.NoInlining)]
         async ValueTask<bool> MoveNextAsyncCore(ValueTask<ReadResult>? readTask, ValueTask<int>? directReadTask, ValueTask<bool>? messageHandledTask, CancellationToken cancellationToken, PgClientFlow? frontierFlow = null)
