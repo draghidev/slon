@@ -43,6 +43,19 @@ struct BackendMessageCursor(ReadOnlySequence<byte> buffer)
     [MethodImpl(MethodImplOptions.NoInlining)]
     public bool TryReadNextInPlace(out BackendHeader header, out ReadOnlySequence<byte> buffer, out uint bufferLength)
     {
+        if (!TryReadNextBuffer(out header, out var fastBuffer, out bufferLength))
+        {
+            buffer = default;
+            return false;
+        }
+        buffer = fastBuffer.Sequence;
+        return true;
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    internal bool TryReadNextBuffer(out BackendHeader header,
+        out FastReadOnlySequence<byte> buffer, out uint bufferLength)
+    {
         if (!Header.TryParse(_buffer.FirstSpan, out var protoHeader) && !Header.TryParseMultiSegment(_buffer.Sequence, out protoHeader))
         {
             _requiredBufferedLength = ConsumedLength + Header.ByteCount;
@@ -67,11 +80,10 @@ struct BackendMessageCursor(ReadOnlySequence<byte> buffer)
             return false;
         }
 
-        var fastSeq = _buffer.SplitInPlace(Math.Min(_buffer.Length, protoHeader.MessageLength));
+        buffer = _buffer.SplitInPlace(Math.Min(_buffer.Length, protoHeader.MessageLength));
         _requiredBufferedLength = 0;
-        buffer = fastSeq.Sequence;
-        Debug.Assert(fastSeq.Length <= uint.MaxValue);
-        bufferLength = unchecked((uint)fastSeq.Length);
+        Debug.Assert(buffer.Length <= uint.MaxValue);
+        bufferLength = unchecked((uint)buffer.Length);
         header = BackendHeader.FromHeader(protoHeader);
         return true;
     }
@@ -92,7 +104,7 @@ struct BackendMessageCursor(ReadOnlySequence<byte> buffer)
 
     // Keeps the public position components scalar so consuming the first segment does not repeatedly
     // reconstruct and rediscover the backing of a ReadOnlySequence. Materialize one only at API seams.
-    struct FastReadOnlySequence<T>
+    internal struct FastReadOnlySequence<T>
     {
         object? _startObject;
         object? _endObject;
@@ -143,6 +155,10 @@ struct BackendMessageCursor(ReadOnlySequence<byte> buffer)
             }
         }
         public long Length => _length;
+        public object? StartObject => _startObject;
+        public object? EndObject => _endObject;
+        public int StartIndex => _startIndex;
+        public int EndIndex => _endIndex;
 
         public ReadOnlySpan<T> FirstSpan
         {

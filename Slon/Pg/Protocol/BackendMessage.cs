@@ -73,6 +73,25 @@ public readonly struct BackendMessage
         WriteGranularly(ref destination, in value, destinationIsZero: false);
     }
 
+    internal static void Initialize(ref BackendMessage destination, BackendHeader header,
+        in BackendMessageCursor.FastReadOnlySequence<byte> buffer,
+        BackendMessageContext context, short token, bool buffered)
+    {
+        var firstObject = buffer.StartObject;
+        if (!ReferenceEquals(destination._contextOrEndObject, context))
+            Unsafe.AsRef(in destination._contextOrEndObject) = context;
+        if (!ReferenceEquals(destination._firstObject, firstObject))
+            Unsafe.AsRef(in destination._firstObject) = firstObject;
+
+        Unsafe.AsRef(in destination._state) = (buffered ? 1u : 0)
+            | ((uint)(byte)header.Type << 2)
+            | ((uint)(ushort)token << 10);
+        Unsafe.AsRef(in destination._length) = header.Length;
+        Unsafe.AsRef(in destination._startIndex) = buffer.StartIndex;
+        Unsafe.AsRef(in destination._endIndexOrBufferedLength) = checked((int)buffer.Length);
+        context.SetCurrentFallbackBuffer(in buffer);
+    }
+
     // The JIT should have a phase for picking granular writes (and write barriers) over full struct assignments.
     // This translation is entirely mechanical (even though these implementations need to deviate for external types).
     [MethodImpl(MethodImplOptions.AggressiveInlining)]

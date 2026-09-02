@@ -39,12 +39,19 @@ sealed class BackendMessageContext
         {
             var start = (ReadOnlySequenceSegment<byte>)buffer.Start.GetObject()!;
             var end = (ReadOnlySequenceSegment<byte>)buffer.End.GetObject()!;
+            Set(start, buffer.Start.GetInteger() & int.MaxValue,
+                end, buffer.End.GetInteger() & int.MaxValue);
+        }
+
+        public void Set(ReadOnlySequenceSegment<byte> start, int startIndex,
+            ReadOnlySequenceSegment<byte> end, int endIndex)
+        {
             if (!ReferenceEquals(_start, start))
                 _start = start;
             if (!ReferenceEquals(_end, end))
                 _end = end;
-            _startIndex = buffer.Start.GetInteger() & int.MaxValue;
-            _endIndex = buffer.End.GetInteger() & int.MaxValue;
+            _startIndex = startIndex;
+            _endIndex = endIndex;
         }
 
         public void Clear()
@@ -192,6 +199,20 @@ sealed class BackendMessageContext
             _currentFallbackBuffer.Set(in buffer);
         else if (!_currentFallbackBuffer.IsEmpty)
             _currentFallbackBuffer.Clear();
+    }
+
+    internal void SetCurrentFallbackBuffer(
+        in BackendMessageCursor.FastReadOnlySequence<byte> buffer)
+    {
+        if (buffer.StartObject is ReadOnlySequenceSegment<byte> start)
+        {
+            _currentFallbackBuffer.Set(start, buffer.StartIndex,
+                (ReadOnlySequenceSegment<byte>)buffer.EndObject!, buffer.EndIndex);
+        }
+        else if (!_currentFallbackBuffer.IsEmpty)
+        {
+            _currentFallbackBuffer.Clear();
+        }
     }
 
     internal ReadOnlySequence<byte> GetFallbackBuffer(short token)
@@ -422,7 +443,7 @@ sealed class BackendMessageContext
             PublishPeeked();
             return true;
         }
-        if (!_cursor.TryReadNextInPlace(out var header, out var buffer, out var bufferLength))
+        if (!_cursor.TryReadNextBuffer(out var header, out var buffer, out var bufferLength))
             return false;
         ResetMessageState();
         if (bufferLength < header.MessageLength)
@@ -505,7 +526,7 @@ sealed class BackendMessageContext
             header = _current.Header;
             return true;
         }
-        if (!_cursor.TryReadNextInPlace(
+        if (!_cursor.TryReadNextBuffer(
                 out header, out var buffer, out var bufferLength))
         {
             return false;
