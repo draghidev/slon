@@ -40,6 +40,7 @@ struct BackendMessageCursor(ReadOnlySequence<byte> buffer)
             _dataRowStreamingThreshold, _initialLength);
     }
 
+    [MethodImpl(MethodImplOptions.NoInlining)]
     public bool TryReadNextInPlace(out BackendHeader header, out ReadOnlySequence<byte> buffer, out uint bufferLength)
     {
         if (!Header.TryParse(_buffer.FirstSpan, out var protoHeader) && !Header.TryParseMultiSegment(_buffer.Sequence, out protoHeader))
