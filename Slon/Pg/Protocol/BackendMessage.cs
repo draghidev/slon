@@ -429,6 +429,18 @@ public readonly struct BackendMessage
             => throw new PgProtocolException($"Unexpected backend message: {actual}, expected: {expected}.");
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal void EnsureExpected(BackendType expected1, BackendType expected2)
+    {
+        var actual = Type;
+        if (actual != expected1 && actual != expected2)
+            Throw(actual, expected1, expected2);
+
+        static void Throw(BackendType actual, BackendType expected1, BackendType expected2)
+            => throw new PgProtocolException(
+                $"Unexpected backend message: {actual}, expected: {expected1} or {expected2}.");
+    }
+
     // Inlining helps as it's usually run over a few RVA items at most.
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public BackendType EnsureExpected(params ReadOnlySpan<BackendType> expected)

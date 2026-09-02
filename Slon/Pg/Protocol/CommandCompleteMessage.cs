@@ -56,13 +56,14 @@ public readonly struct CommandCompleteMessage
 
     internal static CommandCompleteMessage Create(in BackendMessage message)
     {
+        var header = message.Header;
         message.EnsureExpected(PgTypes.BackendType.EmptyQueryResponse, PgTypes.BackendType.CommandComplete);
         message.EnsureBuffered();
-        if (message.Header.Type is PgTypes.BackendType.EmptyQueryResponse)
+        if (header.Type is PgTypes.BackendType.EmptyQueryResponse)
             return new(StatementType.Empty, 0, 0);
 
         Span<byte> scratch = stackalloc byte[64];
-        var bodyLength = message.Header.BodyLength;
+        var bodyLength = header.BodyLength;
         var bytes = message.TryGetFirstSpan(0, out var first) && first.Length >= bodyLength
             ? first[..bodyLength]
             : CopyToScratch(message.GetSequence(), scratch);
