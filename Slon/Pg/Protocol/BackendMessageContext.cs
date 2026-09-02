@@ -487,6 +487,7 @@ sealed class BackendMessageContext
     // slot and the follow-up TryMoveNext picks it up without re-parsing. The returned
     // BackendMessage is valid until the next TryMoveNext (which bumps the version token);
     // use it immediately, don't store it.
+    [MethodImpl(MethodImplOptions.NoInlining)]
     public bool TryPeekNext(out BackendHeader header)
     {
         if (_publicationState is PublicationState.Peeked)
