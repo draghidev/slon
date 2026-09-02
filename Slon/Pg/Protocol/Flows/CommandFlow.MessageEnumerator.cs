@@ -273,11 +273,7 @@ partial class CommandFlow
                     {
                         try
                         {
-                            var row = _decoder.TryGetCurrentBufferedArray(
-                                out var array, out var offset, out var length)
-                                ? new CommandResult.RowView(array, offset, length)
-                                : new CommandResult.RowView(_decoder.CurrentBufferedBody);
-                            collector(state, row);
+                            collector(state, new CommandResult.RowView(_decoder.CurrentBufferedBody));
                         }
                         catch (Exception ex)
                         {

@@ -260,16 +260,10 @@ public sealed class CommandResult
 
     internal readonly struct RowView
     {
-        readonly byte[]? _array;
         readonly ReadOnlyMemory<byte> _memory;
-        readonly int _offset;
-        readonly int _length;
 
         internal RowView(ReadOnlyMemory<byte> memory)
-            => (_array, _memory, _offset, _length) = (null, memory, 0, 0);
-
-        internal RowView(byte[] array, int offset, int length)
-            => (_array, _memory, _offset, _length) = (array, default, offset, length);
+            => _memory = memory;
 
         public T GetValue<T>(int ordinal)
             => BootstrapFieldDecoder.Read<T>(GetFieldSpan(ordinal));
@@ -278,9 +272,7 @@ public sealed class CommandResult
         {
             if (ordinal == 0)
             {
-                var row = _array is { } array
-                    ? array.AsSpan(_offset, _length)
-                    : _memory.Span;
+                var row = _memory.Span;
                 const int valueOffset = sizeof(short) + sizeof(int);
                 if (row.Length >= valueOffset + sizeof(int)
                     && BinaryPrimitives.ReadInt32BigEndian(row[sizeof(short)..]) == sizeof(int))
@@ -293,9 +285,7 @@ public sealed class CommandResult
         ReadOnlySpan<byte> GetFieldSpan(int ordinal)
         {
             ArgumentOutOfRangeException.ThrowIfNegative(ordinal);
-            var fields = _array is { } array
-                ? array.AsSpan(_offset, _length)
-                : _memory.Span;
+            var fields = _memory.Span;
             if (fields.Length >= sizeof(short))
             {
                 var remaining = fields[sizeof(short)..];

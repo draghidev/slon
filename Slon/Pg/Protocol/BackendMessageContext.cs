@@ -128,19 +128,13 @@ sealed class BackendMessageContext
         get
         {
             Debug.Assert(_publicationState is PublicationState.Current);
-            if (!_current.TryGetBufferedFirstMemory(0, out var body))
-                ThrowHelper.ThrowInvalidOperation("The current backend message is not buffered contiguously.");
-            return body;
-        }
-    }
+            if (_current.TryGetBufferedFirstMemory(0, out var body)
+                && body.Length == _current.Header.BodyLength)
+                return body;
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public bool TryGetCurrentBufferedArray(
-        [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out byte[]? array,
-        out int start, out int length)
-    {
-        Debug.Assert(_publicationState is PublicationState.Current);
-        return _current.TryGetBufferedFirstArray(0, out array, out start, out length);
+            var sequence = _current.GetSequence();
+            return _current.GetContiguousMemory(sequence);
+        }
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]

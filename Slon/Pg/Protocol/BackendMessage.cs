@@ -204,6 +204,15 @@ public readonly struct BackendMessage
     {
         Debug.Assert(Buffered);
         offset += BackendHeader.ByteCount;
+        var firstLength = IsIndependent
+            ? _endIndexOrBufferedLength - _startIndex
+            : _endIndexOrBufferedLength;
+        if (_firstObject is byte[] array && (uint)offset <= (uint)firstLength)
+        {
+            memory = array.AsMemory(_startIndex + offset, firstLength - offset);
+            return true;
+        }
+
         var firstMemory = GetFirstMemory();
         if ((uint)offset <= (uint)firstMemory.Length)
         {
@@ -212,30 +221,6 @@ public readonly struct BackendMessage
         }
 
         memory = default;
-        return false;
-    }
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    internal bool TryGetBufferedFirstArray(int offset,
-        [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out byte[]? array,
-        out int start, out int length)
-    {
-        Debug.Assert(Buffered);
-        offset += BackendHeader.ByteCount;
-        var firstLength = IsIndependent
-            ? _endIndexOrBufferedLength - _startIndex
-            : _endIndexOrBufferedLength;
-        if (_firstObject is byte[] firstArray && (uint)offset <= (uint)firstLength)
-        {
-            array = firstArray;
-            start = _startIndex + offset;
-            length = firstLength - offset;
-            return true;
-        }
-
-        array = null;
-        start = 0;
-        length = 0;
         return false;
     }
 
