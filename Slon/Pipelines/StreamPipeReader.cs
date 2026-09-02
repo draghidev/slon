@@ -336,13 +336,7 @@ abstract class StreamPipeReader : PipeReader
             do
             {
                 // We know minimumSize must be null or larger than what we have buffered to get here.
-                var segmentSize = minimumSize;
-                if (minimumSize is not 0)
-                {
-                    // We must request a segment that is minimumSize - BufferedBytes.
-                    Debug.Assert(Segments.BufferedBytes <= minimumSize);
-                    segmentSize -= (int)Segments.BufferedBytes;
-                }
+                var segmentSize = GetReadSizeHint(minimumSize);
 
                 // We don't mind if we get smaller segments, we just want to make progress towards minimumSize.
                 var buffer = Segments.Reserve(segmentSize, enforceHint: false);
@@ -426,12 +420,7 @@ abstract class StreamPipeReader : PipeReader
                 int length;
                 do
                 {
-                    var segmentSize = minimumSize;
-                    if (minimumSize is not 0)
-                    {
-                        Debug.Assert(Segments.BufferedBytes <= minimumSize);
-                        segmentSize -= (int)Segments.BufferedBytes;
-                    }
+                    var segmentSize = GetReadSizeHint(minimumSize);
 
                     var buffer = Segments.Reserve(segmentSize, enforceHint: false);
                     length = await Stream.ReadAsync(buffer, token).ConfigureAwait(false);
@@ -464,6 +453,17 @@ abstract class StreamPipeReader : PipeReader
                 }
             }
         }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    int GetReadSizeHint(int minimumSize)
+    {
+        if (minimumSize is 0)
+            return 0;
+        var bufferedBytes = Segments.BufferedBytes;
+        return bufferedBytes < minimumSize
+            ? minimumSize - (int)bufferedBytes
+            : 0;
     }
 
     protected async Task CopyToAsyncCore(PipeWriter destination, CancellationToken cancellationToken = default)
