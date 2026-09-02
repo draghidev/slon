@@ -624,10 +624,10 @@ public sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
 
         if ((options & FlowEnqueueOptions.RequireExistingPipeline) != 0)
         {
-            if (!TryQueueFlow(flow, options, static protocol => protocol.PipelineDepth > 0, this))
+            if (!TryQueueFlow(flow, options, requireExistingPipeline: true))
                 return false;
         }
-        else if (!TryQueueFlow(flow, options, null, (object?)null))
+        else if (!TryQueueFlow(flow, options))
             return false;
 
         try
@@ -752,14 +752,14 @@ public sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         return scope;
     }
 
-    bool TryQueueFlow<TState>(PgClientFlow flow, FlowEnqueueOptions options,
-        Func<TState, bool>? predicate = null, TState state = default!)
-        => TryQueueFlow(flow, ProtocolStatus.Ready, options, predicate, state);
+    bool TryQueueFlow(PgClientFlow flow, FlowEnqueueOptions options,
+        bool requireExistingPipeline = false)
+        => TryQueueFlow(flow, ProtocolStatus.Ready, options, requireExistingPipeline);
 
     bool TryQueueFlow(PgClientFlow flow, ProtocolStatus requiredStatus)
-        => TryQueueFlow<bool>(flow, requiredStatus, FlowEnqueueOptions.None);
-    bool TryQueueFlow<TState>(PgClientFlow flow, ProtocolStatus requiredStatus,
-        FlowEnqueueOptions options, Func<TState, bool>? predicate = null, TState state = default!)
+        => TryQueueFlow(flow, requiredStatus, FlowEnqueueOptions.None, requireExistingPipeline: false);
+    bool TryQueueFlow(PgClientFlow flow, ProtocolStatus requiredStatus,
+        FlowEnqueueOptions options, bool requireExistingPipeline)
     {
         // A handoff-capable sync flow is held at its FIFO turn. Consumer-driven flows defer the
         // handoff; self-driven flows take it as part of admission.
@@ -772,7 +772,7 @@ public sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
                 (requiredStatus is ProtocolStatus.Ready && _admissionBlocked != 0))
                 return false;
 
-            if (predicate?.Invoke(state) == false)
+            if (requireExistingPipeline && _pipeline.Depth == 0)
                 return false;
 
             if (requiredStatus is ProtocolStatus.Ready &&
