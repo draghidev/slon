@@ -637,7 +637,17 @@ public sealed class Row : PgFieldReader
 
     void CaptureBufferedBody(in BackendMessage.Accessor message)
     {
-        if (_bodyReader is null && message.TryGetBufferedFirstMemory(0, out var body))
+        if (_bodyReader is null
+            && message.TryGetBufferedArray(0, out var array, out var offset, out var length))
+        {
+            if (!ReferenceEquals(_bufferedArray, array))
+                _bufferedArray = array;
+            _bufferedOffset = offset;
+            _bufferedLength = length;
+            if (!_bufferedBody.IsEmpty)
+                _bufferedBody = default;
+        }
+        else if (_bodyReader is null && message.TryGetBufferedFirstMemory(0, out var body))
         {
             if (MemoryMarshal.TryGetArray(body, out var segment))
             {

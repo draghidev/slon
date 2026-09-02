@@ -1,5 +1,6 @@
 using System.Buffers;
 using System.Diagnostics;
+using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
 using Slon.Pipelines;
 
@@ -173,6 +174,15 @@ sealed class BackendMessageContext
     {
         Validate(token);
         return _current.TryGetBufferedFirstMemory(offset, out memory);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal bool TryGetCurrentBufferedArray(short token, int offset,
+        [NotNullWhen(true)] out byte[]? array,
+        out int arrayOffset, out int length)
+    {
+        Validate(token);
+        return _current.TryGetBufferedArray(offset, out array, out arrayOffset, out length);
     }
 
     internal void SetCurrentFallbackBuffer(

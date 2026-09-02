@@ -243,6 +243,29 @@ public readonly struct BackendMessage
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal bool TryGetBufferedArray(int offset, [NotNullWhen(true)] out byte[]? array,
+        out int arrayOffset, out int length)
+    {
+        Debug.Assert(Buffered);
+        offset += BackendHeader.ByteCount;
+        var firstLength = IsIndependent
+            ? _endIndexOrBufferedLength - _startIndex
+            : _endIndexOrBufferedLength;
+        if (_firstObject is byte[] value && (uint)offset <= (uint)firstLength)
+        {
+            array = value;
+            arrayOffset = _startIndex + offset;
+            length = firstLength - offset;
+            return true;
+        }
+
+        array = null;
+        arrayOffset = 0;
+        length = 0;
+        return false;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     ReadOnlyMemory<byte> GetFirstMemory()
     {
         var length = IsIndependent
@@ -328,6 +351,9 @@ public readonly struct BackendMessage
             => _context.OpenCurrentBodyReader(_token);
         internal bool TryGetBufferedFirstMemory(int offset, out ReadOnlyMemory<byte> memory)
             => _context.TryGetCurrentBufferedFirstMemory(_token, offset, out memory);
+        internal bool TryGetBufferedArray(int offset, [NotNullWhen(true)] out byte[]? array,
+            out int arrayOffset, out int length)
+            => _context.TryGetCurrentBufferedArray(_token, offset, out array, out arrayOffset, out length);
         internal void BufferBody() => _context.BufferCurrentMessage(_token);
         internal ValueTask BufferBodyAsync(CancellationToken cancellationToken)
             => _context.BufferCurrentMessageAsync(_token, cancellationToken);

@@ -150,7 +150,14 @@ struct BackendMessageCursor(ReadOnlySequence<byte> buffer)
             {
                 if (_startObject is null)
                     return default;
-                var memory = FirstMemory;
+                if (_startObject is T[] array)
+                {
+                    Debug.Assert(ReferenceEquals(_startObject, _endObject));
+                    return array.AsSpan(_startIndex, _endIndex - _startIndex);
+                }
+                var memory = _startObject is MemoryManager<T> manager
+                    ? manager.Memory
+                    : ((ReadOnlySequenceSegment<T>)_startObject).Memory;
                 var end = ReferenceEquals(_startObject, _endObject)
                     ? _endIndex
                     : memory.Length;
