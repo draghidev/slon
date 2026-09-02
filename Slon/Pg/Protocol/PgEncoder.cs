@@ -1,5 +1,6 @@
 using System.Buffers.Binary;
 using System.Collections.Immutable;
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Text;
 using Slon.Runtime;
@@ -250,9 +251,8 @@ public readonly struct PgEncoder
             _executionControl.OnMessageWrite(FrontendType.Sync);
     }
 
-    // Each message is still armed and advanced on its own so the per-message declared-length check
-    // holds. The reserved span stays valid across the advances because the buffering writer only
-    // reallocates on a reservation it cannot satisfy.
+    // The complete sequence is sized before its span is acquired and published only after every
+    // message has been filled. Incremental message tracking remains for streaming writers.
     internal static void WritePreparedExecutionCore(ProtocolDataWriter writer, Encoding encoding,
         EncodedCString commandName, bool describe, bool execute, int syncCount)
     {
@@ -268,9 +268,8 @@ public readonly struct PgEncoder
             + (describe ? header + describeBody : 0)
             + (execute ? header + executeBody : 0)
             + syncCount * header);
-        var span = writer.GetSpan(total);
+        var span = writer.GetCompleteMessagesSpan(total);
 
-        writer.StartMessage(header + bindBody);
         WriteHeader(span, FrontendType.Bind, bindBody);
         span[header] = 0; // unnamed portal
         commandNameBytes.CopyTo(span.Slice(header + 1));
@@ -279,36 +278,31 @@ public readonly struct PgEncoder
         BinaryPrimitives.WriteUInt16BigEndian(formats.Slice(2), 0); // parameters
         BinaryPrimitives.WriteUInt16BigEndian(formats.Slice(4), 1); // result format codes
         BinaryPrimitives.WriteUInt16BigEndian(formats.Slice(6), 1); // all binary
-        writer.Advance(header + bindBody);
         span = span.Slice(header + bindBody);
 
         if (describe)
         {
-            writer.StartMessage(header + describeBody);
             WriteHeader(span, FrontendType.Describe, describeBody);
             span[header] = (byte)'P';
             span[header + 1] = 0;
-            writer.Advance(header + describeBody);
             span = span.Slice(header + describeBody);
         }
 
         if (execute)
         {
-            writer.StartMessage(header + executeBody);
             WriteHeader(span, FrontendType.Execute, executeBody);
             span[header] = 0; // unnamed portal
             BinaryPrimitives.WriteUInt32BigEndian(span.Slice(header + 1), 0); // all rows
-            writer.Advance(header + executeBody);
             span = span.Slice(header + executeBody);
         }
 
         for (var i = 0; i < syncCount; i++)
         {
-            writer.StartMessage(header);
             WriteHeader(span, FrontendType.Sync, 0);
-            writer.Advance(header);
             span = span.Slice(header);
         }
+        Debug.Assert(span.IsEmpty);
+        writer.AdvanceCompleteMessages(total);
 
         static void WriteHeader(Span<byte> span, FrontendType type, int bodyLength)
         {

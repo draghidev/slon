@@ -6,8 +6,8 @@ using Slon.Text;
 namespace Slon.Tests.Pg;
 
 // The fused prepared-execution write must produce exactly the bytes the message-per-message writers
-// produce, for every Describe, Execute, and Sync combination, and must leave the writer's
-// per-message framing validation intact.
+// produce for every Describe, Execute, and Sync combination, then return the writer at a complete
+// message boundary.
 [TestClass]
 public class PgEncoderPreparedExecutionTests
 {
@@ -82,13 +82,14 @@ public class PgEncoderPreparedExecutionTests
     }
 
     [TestMethod]
-    public void EveryMessageIsFramedForTheDeclaredLengthCheck()
+    public void CompleteSequence_LeavesIncrementalTrackerIdle()
     {
         var (writer, sink) = NewWriter();
 
         PgEncoder.WritePreparedExecutionCore(writer, Encoding, new EncodedCString("prepared_probe"),
             describe: true, execute: true, syncCount: 2);
-        // Arming the next message validates that the previous one was written to its declared length.
+        Assert.AreEqual(0, writer.CurrentMessagePaddingLength);
+        // The next incremental message starts from a clean boundary.
         writer.StartMessage(totalLength: 5);
         writer.WriteRaw(new byte[5]);
         writer.Flush();

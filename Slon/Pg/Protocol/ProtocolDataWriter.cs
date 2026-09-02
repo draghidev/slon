@@ -90,6 +90,10 @@ sealed class ProtocolDataWriter : IOutputWriter
     public Memory<byte> GetMemory(int sizeHint = 0) => _pipe.GetMemory(sizeHint);
     public Span<byte> GetSpan(int sizeHint = 0) => _pipe.GetSpan(sizeHint);
     public void Advance(int count) => _pipe.Advance(count);
+    internal Span<byte> GetCompleteMessagesSpan(int totalLength)
+        => _pipe.GetCompleteMessagesSpan(totalLength);
+    internal void AdvanceCompleteMessages(int totalLength)
+        => _pipe.AdvanceCompleteMessages(totalLength);
 
     internal const long UnflushedBytesFlushThreshold = ProtocolWritePipe.UnflushedBytesFlushThreshold;
 

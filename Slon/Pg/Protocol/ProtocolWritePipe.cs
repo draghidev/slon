@@ -68,6 +68,25 @@ sealed class ProtocolWritePipe(IOutputWriter writer, Encoding clientEncoding, Ac
     internal Span<byte> GetSpan(int sizeHint = 0) => _bufferingWriter.GetSpan(sizeHint);
     internal void Advance(int count) => _bufferingWriter.Advance(count);
 
+    // A trusted encoder which has computed and filled a complete sequence can publish it once.
+    // Validate any preceding incrementally-written message before granting the span; until Advance
+    // nothing from the new sequence is visible to the underlying writer.
+    internal Span<byte> GetCompleteMessagesSpan(int totalLength)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(totalLength);
+        var unflushed = checked((int)_bufferingWriter.UnflushedBytes);
+        if (_messageLength is { } previous && unflushed + _messageBytesFlushed != previous)
+            ThrowUnderwritten(previous, unflushed + _messageBytesFlushed);
+        return _bufferingWriter.GetSpan(totalLength);
+    }
+
+    internal void AdvanceCompleteMessages(int totalLength)
+    {
+        _bufferingWriter.Advance(totalLength);
+        _messageLength = null;
+        _messageBytesFlushed = 0;
+    }
+
     // Validates the previous message, arms length tracking for the new one, then writes its
     // five-byte header directly into the buffered span. Keeping these together avoids a second
     // shell traversal and a temporary header copy. Mid-message flushes are handled by
@@ -112,12 +131,13 @@ sealed class ProtocolWritePipe(IOutputWriter writer, Encoding clientEncoding, Ac
     // re-validates and commits exactly the bytes that remain.
     void CheckMessageBytesFlushed(int count)
     {
-        if (_messageLength is null)
+        if (!_messageLength.HasValue)
             return; // Pre-startup raw writes (e.g. StartupMessage's CopyStartupBuffer).
+        ref readonly var messageLength = ref Nullable.GetValueRefOrDefaultRef(in _messageLength);
         if (count < 0)
             throw new ArgumentOutOfRangeException(nameof(count));
-        if ((long)_messageBytesFlushed + count > _messageLength)
-            ThrowOverwritten(_messageLength.Value, _messageBytesFlushed + (long)count);
+        if ((long)_messageBytesFlushed + count > messageLength)
+            ThrowOverwritten(messageLength, _messageBytesFlushed + (long)count);
     }
 
     // Commit the counter for bytes that actually left the buffer (the drained delta: before-after
@@ -149,10 +169,11 @@ sealed class ProtocolWritePipe(IOutputWriter writer, Encoding clientEncoding, Ac
     {
         get
         {
-            if (_messageLength is null)
+            if (!_messageLength.HasValue)
                 return 0;
+            ref readonly var messageLength = ref Nullable.GetValueRefOrDefaultRef(in _messageLength);
             var unflushed = checked((int)_bufferingWriter.UnflushedBytes);
-            return Math.Max(0, _messageLength.Value - (unflushed + _messageBytesFlushed));
+            return Math.Max(0, messageLength - (unflushed + _messageBytesFlushed));
         }
     }
 

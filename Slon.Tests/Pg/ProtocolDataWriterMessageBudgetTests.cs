@@ -59,6 +59,17 @@ public class ProtocolDataWriterMessageBudgetTests
     }
 
     [TestMethod]
+    public void UnderWrite_FaultsBeforeCompleteMessageReservation()
+    {
+        var (writer, sink) = NewWriter();
+        writer.StartMessage(totalLength: 5);
+        writer.WriteRaw(new byte[3]);
+
+        Assert.ThrowsExactly<InvalidOperationException>(() => writer.GetCompleteMessagesSpan(5));
+        Assert.AreEqual(0, sink.ToArray().Length);
+    }
+
+    [TestMethod]
     public void ExactWrite_Flushes_AllBytesReachWire()
     {
         var (writer, sink) = NewWriter();
