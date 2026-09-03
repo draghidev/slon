@@ -396,7 +396,11 @@ abstract class StreamPipeWriter : PipeWriter, IOutputWriter
 
                     if (didWrite)
                     {
-                        await Stream.FlushAsync(token).ConfigureAwait(false);
+                        var flush = Stream.FlushAsync(token);
+                        if (!flush.IsCompletedSuccessfully)
+                            await AwaitFlush(flush).ConfigureAwait(false);
+                        else
+                            flush.GetAwaiter().GetResult();
                     }
                 }
 
@@ -428,6 +432,11 @@ abstract class StreamPipeWriter : PipeWriter, IOutputWriter
                     EndStartedFlush();
                 }
             }
+
+            [RuntimeAsyncMethodGeneration(false)]
+            [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
+            static async ValueTask AwaitFlush(Task flush)
+                => await flush.ConfigureAwait(false);
         }
     }
 
