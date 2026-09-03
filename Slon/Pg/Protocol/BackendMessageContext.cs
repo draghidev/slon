@@ -327,12 +327,14 @@ sealed class BackendMessageContext
         return true;
     }
 
-    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
-    public async ValueTask<CurrentMessageBuffer> ExtendAsync(short token, CancellationToken cancellationToken)
+    public ValueTask<CurrentMessageBuffer> BeginExtendAsync(short token, CancellationToken cancellationToken)
     {
         EnsureBodyWindowAvailable(token);
-        return GetBodyBuffer(token, await _decoder.ExtendCurrentMessageAsync(cancellationToken).ConfigureAwait(false));
+        return _decoder.ExtendCurrentMessageAsync(cancellationToken);
     }
+
+    public CurrentMessageBuffer CompleteExtend(short token, CurrentMessageBuffer result)
+        => GetBodyBuffer(token, result);
 
     public CurrentMessageBuffer Extend(short token)
     {
@@ -391,7 +393,11 @@ sealed class BackendMessageContext
         async ValueTask Core(short token, CancellationToken cancellationToken)
         {
             CurrentMessageBuffer result;
-            do result = await ExtendAsync(token, cancellationToken).ConfigureAwait(false);
+            do
+            {
+                result = CompleteExtend(token,
+                    await BeginExtendAsync(token, cancellationToken).ConfigureAwait(false));
+            }
             while (!result.IsComplete);
         }
     }

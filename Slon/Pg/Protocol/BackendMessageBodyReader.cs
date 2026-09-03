@@ -97,17 +97,18 @@ sealed class BackendMessageBodyReader : IInputReader
     public ValueTask ExtendAsync(CancellationToken cancellationToken = default)
     {
         EnsureCanExtend();
-        var task = _context.ExtendAsync(_token, cancellationToken);
+        var task = _context.BeginExtendAsync(_token, cancellationToken);
         if (task.IsCompletedSuccessfully)
         {
-            Publish(task.Result, retained: true);
+            Publish(_context.CompleteExtend(_token, task.Result), retained: true);
             return default;
         }
         return Core(task);
 
         [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
         async ValueTask Core(ValueTask<CurrentMessageBuffer> task)
-            => Publish(await task.ConfigureAwait(false), retained: true);
+            => Publish(_context.CompleteExtend(
+                _token, await task.ConfigureAwait(false)), retained: true);
     }
 
     public void Extend()
