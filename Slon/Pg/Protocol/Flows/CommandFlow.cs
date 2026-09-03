@@ -319,27 +319,18 @@ public partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
             // Writes are independent of consumer admission. Inter-result gates provide backpressure.
             // Async writes use transport completion; sync writes use the resumable non-blocking path so
             // the caller thread retains execution ownership across readiness waits.
-            var encoder = IsAsync ? default : context.GetEncoder();
             var appendSync = !_commands[CommandCount - 1].WithSync;
             _readFlowRfq = appendSync;
-            if (IsAsync)
-            {
-                // Caller cancellation never cancels wire I/O. A partially cancelled write requires
-                // protocol recovery and can strand already-pipelined successors; the body instead
-                // observes the latched intent and drains every written command to RFQ.
-                writeTask = _commands.WriteCommandsAsync(context.GetEncoder(), appendSync, default);
-            }
-            else
-            {
-                using (encoder.BeginResumableWriteScope())
-                    writeTask = _commands.WriteCommandsResumable(encoder, appendSync);
-            }
+            // Caller cancellation never cancels wire I/O. A partially cancelled write requires
+            // protocol recovery and can strand already-pipelined successors; the body instead
+            // observes the latched intent and drains every written command to RFQ.
+            writeTask = IsAsync
+                ? _commands.WriteCommandsAsync(context.GetEncoder(), appendSync, default)
+                : WriteCommandsResumable(context, appendSync);
 
             // Observe synchronous faults here; pending writes remain the framework-owned trailing task.
             if (writeTask.IsCompleted)
                 writeTask.GetAwaiter().GetResult();
-            else if (!IsAsync)
-                writeTask = encoder.RunResumableTask(writeTask);
         }
         catch (Exception ex)
         {
@@ -354,6 +345,16 @@ public partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
             trailingExecutionTask: writeTask,
             pipelineTask: DispatchPipelinedRead(
                 context, context.GetProtocolStatic<ReadPromiseState>().Promise));
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    ValueTask WriteCommandsResumable(Context context, bool appendSync)
+    {
+        var encoder = context.GetEncoder();
+        ValueTask writeTask;
+        using (encoder.BeginResumableWriteScope())
+            writeTask = _commands.WriteCommandsResumable(encoder, appendSync);
+        return writeTask.IsCompleted ? writeTask : encoder.RunResumableTask(writeTask);
     }
 
     // Defer state-machine creation until activation because all flows share one protocol-static promise.
