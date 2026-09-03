@@ -13,6 +13,8 @@
     </PropertyGroup>
 
     <ItemGroup>
+        <InternalsVisibleTo Include="PantherTE"/>
+        <InternalsVisibleTo Include="PantherTE.Micro"/>
         <InternalsVisibleTo Include="Slon.Benchmark"/>
         <InternalsVisibleTo Include="Slon.NativeAotSample"/>
         <InternalsVisibleTo Include="Slon.Tests"/>
