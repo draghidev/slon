@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
+using System.Runtime.ExceptionServices;
 using System.Threading.Tasks.Sources;
 using Slon.Runtime.CompilerServices;
 // A unique result type distinguishes the caller gate from this flow's other IValueTaskSource instantiations.
@@ -742,35 +743,7 @@ public partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
         }
         catch (TimeoutException ex)
         {
-            CompleteEnumerationWithException(ex);
-            RequestCancel(default, CancellationScope.RemainingFlow, BackendCancellationTiming.Immediate,
-                BackendCancellationTiming.AtReadFrontier, allowCompletedEnumeration: true);
-            if (context.IsProtocolClosed)
-                throw;
-
-            // The timeout is terminal for the consumer, not for the body. Keep ownership of the
-            // command sequence and drain every remaining RFQ window; reaching each RFQ requests
-            // cancellation for the next window through OnCancellationWindowCompleted. Recovery is
-            // reserved for a failure of this semantic drain, where only wire obligations remain.
-            if (Volatile.Read(ref _cancellationState) is { } cancellation)
-                await DisposeCancellationRegistrations(cancellation).ConfigureAwait(false);
-            ((CommandFlowObserver?)GetObserver(out var observerState))
-                ?.OnDrainStarted(this, observerState);
-            try
-            {
-                while (context.OutstandingRfqCount != 0)
-                    _ = await _decoder!.GetNextAuto().ConfigureAwait(false);
-            }
-            catch (TimeoutException)
-            {
-                // The semantic drain owns the same cancellation episode. A timeout here would
-                // otherwise bypass the outer catch and leave the episode unaware that its first
-                // read-timeout escalation produced no protocol progress.
-                RequestCancel(default, CancellationScope.RemainingFlow,
-                    BackendCancellationTiming.Immediate, BackendCancellationTiming.AtReadFrontier,
-                    allowCompletedEnumeration: true);
-                throw;
-            }
+            await HandleTimeoutAsync(context, ex).ConfigureAwait(false);
             return;
         }
         catch (Exception ex)
@@ -837,6 +810,38 @@ public partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
         }
         else
             TrySetEnumeratorResult(true, runContinuationsAsynchronously: true);
+    }
+
+    async ValueTask HandleTimeoutAsync(Context context, TimeoutException exception)
+    {
+        CompleteEnumerationWithException(exception);
+        RequestCancel(default, CancellationScope.RemainingFlow, BackendCancellationTiming.Immediate,
+            BackendCancellationTiming.AtReadFrontier, allowCompletedEnumeration: true);
+        if (context.IsProtocolClosed)
+            ExceptionDispatchInfo.Throw(exception);
+
+        // The timeout is terminal for the consumer, not for the body. Keep ownership of the
+        // command sequence and drain every remaining RFQ window; reaching each RFQ requests
+        // cancellation for each following window through the cancellation coordinator. Recovery is
+        // reserved for a failure of this semantic drain, where only wire obligations remain.
+        if (Volatile.Read(ref _cancellationState) is { } cancellation)
+            await DisposeCancellationRegistrations(cancellation).ConfigureAwait(false);
+        ((CommandFlowObserver?)GetObserver(out var observerState))
+            ?.OnDrainStarted(this, observerState);
+        try
+        {
+            while (context.OutstandingRfqCount != 0)
+                _ = await _decoder!.GetNextAuto().ConfigureAwait(false);
+        }
+        catch (TimeoutException)
+        {
+            // The semantic drain owns the same cancellation episode. A timeout here would otherwise
+            // leave the episode unaware that its first read-timeout escalation made no protocol progress.
+            RequestCancel(default, CancellationScope.RemainingFlow,
+                BackendCancellationTiming.Immediate, BackendCancellationTiming.AtReadFrontier,
+                allowCompletedEnumeration: true);
+            throw;
+        }
     }
 
     static async ValueTask ReadRfqAsync(PgDecoder decoder)
