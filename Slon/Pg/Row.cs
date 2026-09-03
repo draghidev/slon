@@ -532,6 +532,7 @@ public sealed class Row : PgFieldReader
             return default;
         return Core(cancellationToken);
 
+        [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
         async ValueTask Core(CancellationToken token)
         {
             await _bodyReader.BufferAllAsync(token).ConfigureAwait(false);

@@ -320,6 +320,7 @@ public sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<Bac
 
         return Core(cancellationToken);
 
+        [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
         async ValueTask<CurrentMessageBuffer> Core(CancellationToken cancellationToken)
         {
             var timeoutSet = false;

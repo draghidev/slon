@@ -149,6 +149,7 @@ partial class CommandFlow
 
                 return Core();
 
+                [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
                 async ValueTask<bool> Core()
                 {
                     try

@@ -327,6 +327,7 @@ sealed class BackendMessageContext
         return true;
     }
 
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
     public async ValueTask<CurrentMessageBuffer> ExtendAsync(short token, CancellationToken cancellationToken)
     {
         EnsureBodyWindowAvailable(token);
