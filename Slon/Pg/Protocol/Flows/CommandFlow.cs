@@ -595,8 +595,7 @@ public partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
                     CompleteEnumerationWithClose(close);
                     MarkBodyInitiatedDrain();
                 }
-                var consumeInternally = IsConsumingNonQuery || suppressEnumeration;
-                if (!IsDraining && !consumeInternally)
+                if (!IsDraining && !IsConsumingNonQuery && !suppressEnumeration)
                 {
                     // Eager async execution must wait for the consumer to arm generation zero before
                     // publishing its first result. Synchronous execution already runs on that caller.
@@ -657,24 +656,11 @@ public partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
                 // remaining rows. Re-read the current execution mode after every resumption.
                 (PgError Error, TransactionStatus TransactionStatus)? completeError;
                 // Consumption mode may change while the body is suspended; use the current value.
-                if (consumeInternally || IsConsumingNonQuery)
+                if (IsConsumingNonQuery || suppressEnumeration)
                 {
-                    while (_decoder.Current.Header.Type is PgTypes.BackendType.DataRow)
-                    {
-                        if (!_decoder.TryMoveNext())
-                            await _decoder.GetNextAsync().ConfigureAwait(false);
-                    }
-                    result.CompleteNonQuery(_decoder.Current);
-                    var completion = _commands.ItemRef(_commandIndex).CompleteAsync(_decoder);
-                    completeError = await completion.ConfigureAwait(false);
-                    if (_pgError is null && completeError is null)
-                    {
-                        var recordsAffected = result.GetCommandComplete().BatchRecordsAffected;
-                        if (recordsAffected >= 0)
-                            _nonQueryRecordsAffected = _nonQueryRecordsAffected < 0
-                                ? recordsAffected
-                                : checked(_nonQueryRecordsAffected + recordsAffected);
-                    }
+                    await CompleteInternalConsumptionAsync(
+                        result, suppressEnumeration, capturedThisCommand).ConfigureAwait(false);
+                    continue;
                 }
                 else if (IsAsync)
                 {
@@ -691,7 +677,7 @@ public partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
 
                 if (result.Error is not null || completeError is not null)
                     await HandleCommandErrorsAsync(
-                        result, suppressEnumeration, consumeInternally,
+                        result, suppressEnumeration, consumeInternally: false,
                         capturedThisCommand, completeError).ConfigureAwait(false);
             }
 
@@ -901,6 +887,34 @@ public partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
             (flow._pgError, state.ParameterTypes, flow._requestedRowDescription) =
                 await read.ConfigureAwait(false);
         }
+    }
+
+    [RuntimeAsyncMethodGeneration(false)]
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
+    async ValueTask CompleteInternalConsumptionAsync(
+        CommandResult result, bool suppressEnumeration, bool capturedThisCommand)
+    {
+        while (_decoder!.Current.Header.Type is PgTypes.BackendType.DataRow)
+        {
+            if (!_decoder.TryMoveNext())
+                await _decoder.GetNextAsync().ConfigureAwait(false);
+        }
+        result.CompleteNonQuery(_decoder.Current);
+        var completeError = await _commands.ItemRef(_commandIndex)
+            .CompleteAsync(_decoder).ConfigureAwait(false);
+        if (_pgError is null && completeError is null)
+        {
+            var recordsAffected = result.GetCommandComplete().BatchRecordsAffected;
+            if (recordsAffected >= 0)
+                _nonQueryRecordsAffected = _nonQueryRecordsAffected < 0
+                    ? recordsAffected
+                    : checked(_nonQueryRecordsAffected + recordsAffected);
+        }
+
+        if (result.Error is not null || completeError is not null)
+            await HandleCommandErrorsAsync(
+                result, suppressEnumeration, consumeInternally: true,
+                capturedThisCommand, completeError).ConfigureAwait(false);
     }
 
     async ValueTask HandleCommandErrorsAsync(
