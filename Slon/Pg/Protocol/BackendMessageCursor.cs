@@ -56,11 +56,12 @@ struct BackendMessageCursor(ReadOnlySequence<byte> buffer)
     internal bool TryReadNextBuffer(out BackendHeader header,
         out FastReadOnlySequence<byte> buffer, out uint bufferLength)
     {
+        var bufferedLength = _buffer.Length;
         if (!Header.TryParse(_buffer.FirstSpan, out var protoHeader)
-            && (_buffer.Length < Header.ByteCount
+            && (bufferedLength < Header.ByteCount
                 || !Header.TryParseMultiSegment(_buffer.Sequence, out protoHeader)))
         {
-            _requiredBufferedLength = ConsumedLength + Header.ByteCount;
+            _requiredBufferedLength = _initialLength - bufferedLength + Header.ByteCount;
             buffer = default;
             bufferLength = default;
             header = default;
@@ -74,16 +75,16 @@ struct BackendMessageCursor(ReadOnlySequence<byte> buffer)
         var required = backendType is BackendType.DataRow
             ? Math.Min(messageLength, (uint)_dataRowStreamingThreshold)
             : messageLength;
-        if (_buffer.Length < required)
+        if (bufferedLength < required)
         {
-            _requiredBufferedLength = ConsumedLength + required;
+            _requiredBufferedLength = _initialLength - bufferedLength + required;
             buffer = default;
             bufferLength = default;
             header = default;
             return false;
         }
 
-        buffer = _buffer.SplitInPlace(Math.Min(_buffer.Length, messageLength));
+        buffer = _buffer.SplitInPlace(Math.Min(bufferedLength, messageLength));
         _requiredBufferedLength = 0;
         Debug.Assert(buffer.Length <= uint.MaxValue);
         bufferLength = unchecked((uint)buffer.Length);
