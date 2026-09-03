@@ -623,7 +623,7 @@ public partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
                         // Result continuations run asynchronously so the body can reach the next gate
                         // before user code asks for the next result. Buffered batches then advance inline
                         // from MoveNextAsync instead of suspending one Task state machine per result.
-                        SetResult(result);
+                        PublishEnumeratorResult(context, result);
 
                         if (!IsDraining && !IsConsumingNonQuery)
                         {
@@ -718,7 +718,7 @@ public partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
                 }
             }
 
-            SetResult(null);
+            PublishEnumeratorResult(context, null);
         }
         catch (PgClientClosedException) when (context.IsProtocolClosed)
         {
@@ -729,7 +729,7 @@ public partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
             if (IsDraining)
             {
                 if (!IsEnumerationCompleted)
-                    SetResult(null);
+                    PublishEnumeratorResult(context, null);
                 return;
             }
             CompleteEnumerationWithException(context.FlowTerminationException);
@@ -787,57 +787,56 @@ public partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
             readState.Reset();
             PublishBodyTerminated();
         }
-        void SetResult(CommandResult? next)
+    }
+
+    void PublishEnumeratorResult(Context context, CommandResult? next)
+    {
+        var completed = next is null;
+        var publishAsync = IsAsync;
+        if (completed)
         {
-            var completed = next is null;
-            var publishAsync = IsAsync;
-            if (completed)
-            {
-                _enumeratorCurrent = null;
-            }
-            else
-            {
-                if (Volatile.Read(ref _cancellationState) is { } cancellation)
-                    cancellation.CallerToken = default;
+            _enumeratorCurrent = null;
+        }
+        else
+        {
+            if (Volatile.Read(ref _cancellationState) is { } cancellation)
+                cancellation.CallerToken = default;
 
-                if (!ReferenceEquals(_enumeratorCurrent, next))
-                    _enumeratorCurrent = next;
-
-            }
-
-            // Close is durable across generations; complete the current one without publishing a result.
-            if (_callerInteractionCore.CloseException is not null)
-            {
-                CompleteEnumerationWithClose(_callerInteractionCore.CloseException);
-                return;
-            }
-            if (completed)
-            {
-                // Publish durable terminal state atomically with respect to consumer rearming. Async
-                // consumers complete from the protocol scheduler so they cannot reenter this lock or
-                // the pipeline frame that still owns the shared promise; sync consumers retain their
-                // caller-driven completion.
-                using (_rearmLock.EnterScope())
-                {
-                    PublishEnumerationCompleted();
-                    if (!publishAsync)
-                        CompleteEnumeration();
-                }
-                if (publishAsync)
-                    SubmitPublication(context, DetachedPublication.Completion);
-                return;
-            }
-            if (publishAsync)
-            {
-                // Queue the publication itself so the body reaches its next caller gate before user code
-                // resumes. Routing through the protocol scheduler preserves that ordering without forcing
-                // every result continuation onto the ThreadPool.
-                SubmitPublication(context, DetachedPublication.Result);
-            }
-            else
-                TrySetEnumeratorResult(true, runContinuationsAsynchronously: true);
+            if (!ReferenceEquals(_enumeratorCurrent, next))
+                _enumeratorCurrent = next;
         }
 
+        // Close is durable across generations; complete the current one without publishing a result.
+        if (_callerInteractionCore.CloseException is not null)
+        {
+            CompleteEnumerationWithClose(_callerInteractionCore.CloseException);
+            return;
+        }
+        if (completed)
+        {
+            // Publish durable terminal state atomically with respect to consumer rearming. Async
+            // consumers complete from the protocol scheduler so they cannot reenter this lock or
+            // the pipeline frame that still owns the shared promise; sync consumers retain their
+            // caller-driven completion.
+            using (_rearmLock.EnterScope())
+            {
+                PublishEnumerationCompleted();
+                if (!publishAsync)
+                    CompleteEnumeration();
+            }
+            if (publishAsync)
+                SubmitPublication(context, DetachedPublication.Completion);
+            return;
+        }
+        if (publishAsync)
+        {
+            // Queue the publication itself so the body reaches its next caller gate before user code
+            // resumes. Routing through the protocol scheduler preserves that ordering without forcing
+            // every result continuation onto the ThreadPool.
+            SubmitPublication(context, DetachedPublication.Result);
+        }
+        else
+            TrySetEnumeratorResult(true, runContinuationsAsynchronously: true);
     }
 
     static async ValueTask ReadRfqAsync(PgDecoder decoder)
