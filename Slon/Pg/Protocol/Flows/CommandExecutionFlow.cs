@@ -27,6 +27,7 @@ internal readonly struct CommandExecutionFlowOptions
 // CommandFlow contract; the eventual single-command specialization will remain a separate sealed type.
 internal sealed class CommandExecutionFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSource
 {
+    static readonly TimeSpan ConsumerDrainCancellationGracePeriod = TimeSpan.FromSeconds(1);
     // Decoder ownership. Reading and Draining name a frame that owns the decoder. Initial and
     // ResultReady are idle states which exactly one party leaves by compare-exchange.
     const int PhaseInitial = 0;
@@ -35,6 +36,12 @@ internal sealed class CommandExecutionFlow : PgClientFlow, IValueTaskSource<bool
     const int PhaseDraining = 3;
     const int PhaseCompleted = 4;
     int _phase;
+
+    enum CancellationScope : byte
+    {
+        CurrentWindow = 1,
+        RemainingFlow = 2
+    }
 
     CommandList _commands;
     TimeSpan? _pendingTimeout;
@@ -55,8 +62,8 @@ internal sealed class CommandExecutionFlow : PgClientFlow, IValueTaskSource<bool
     // The framework's pipeline task, completed by whichever frame consumes RFQ.
     Slon.Threading.Tasks.Sources.ManualResetValueTaskSourceCore<bool> _pipelineTaskSource;
 
-    // The submission token occupies this slot until a consumer attaches, after which the consumer
-    // token replaces it, including with default. Cancellation delivery, close, and failures stay cold.
+    // Flow-lifetime and per-read cancellation are distinct: the former reaches the remaining physical
+    // command list, while the latter is bounded to the read window in which the caller supplied it.
     CancellationToken _flowToken;
     CancellationTokenRegistration _flowRegistration;
     ColdState? _coldState;
@@ -68,12 +75,20 @@ internal sealed class CommandExecutionFlow : PgClientFlow, IValueTaskSource<bool
     sealed class ColdState
     {
         internal bool CancelRequested;
+        internal CancellationToken CallerToken;
+        internal CancellationTokenRegistration CallerRegistration;
         internal CancellationToken DeliverToken;
+        internal int Scope;
+        internal int Timing;
+        internal int SubsequentTiming;
+        internal TaskCompletionSource? Delivery;
+        internal object? EpisodeKey;
         internal Exception? CloseException;
         // Replayed by later consumer calls once the flow reached its terminal.
         internal Exception? TerminalException;
-        // A command error observed while draining without a consumer.
-        internal Exception? DrainError;
+        // Command errors observed while draining without a consumer. Multiple Sync windows may each
+        // produce an independent ErrorResponse, all of which belong to the waiting disposer.
+        internal List<Exception>? DrainErrors;
     }
 
     CommandExecutionFlow(bool async, TimeSpan? pendingTimeout = null)
@@ -133,6 +148,10 @@ internal sealed class CommandExecutionFlow : PgClientFlow, IValueTaskSource<bool
     private protected override FlowHandoffEvent? HandoffEvent => _handoffEvent;
     protected override bool EnableActivationTimeout => _enableActivationTimeout;
     protected override TimeSpan? PendingTimeout => _pendingTimeout;
+    internal override TimeSpan? BackendCancellationGracePeriod
+        => Volatile.Read(ref _consumerDetached)
+            ? ConsumerDrainCancellationGracePeriod
+            : null;
 
     internal override void BindCallerToken(CancellationToken cancellationToken)
         => _flowToken = cancellationToken;
@@ -144,7 +163,9 @@ internal sealed class CommandExecutionFlow : PgClientFlow, IValueTaskSource<bool
 
     public Enumerator GetAsyncEnumerator(CancellationToken cancellationToken = default)
     {
-        _flowToken = cancellationToken;
+        // A missing enumeration token must not erase the token captured when the flow was queued.
+        if (cancellationToken.CanBeCanceled)
+            _flowToken = cancellationToken;
         return new(this, cancellationToken);
     }
 
@@ -350,6 +371,11 @@ internal sealed class CommandExecutionFlow : PgClientFlow, IValueTaskSource<bool
             var result = ReadNextPublishedResult();
             return result is not null && PublishSynchronousResult(result);
         }
+        catch (TimeoutException ex)
+        {
+            HandleReadTimeout(ex);
+            throw;
+        }
         catch (Exception ex)
         {
             FaultFromOwner(ex);
@@ -365,6 +391,14 @@ internal sealed class CommandExecutionFlow : PgClientFlow, IValueTaskSource<bool
             var result = _current!;
             var completeError = CompleteCurrentResult();
             _currentPublished = false;
+            if (Volatile.Read(ref _coldState)?.TerminalException is { } consumerFault)
+            {
+                Interlocked.Exchange(ref _phase, PhaseDraining);
+                NotifyDrainStarted();
+                _consumerDetached = true;
+                Drain();
+                ExceptionDispatchInfo.Throw(consumerFault);
+            }
             if (completeError is { TransactionStatus: TransactionStatus.Unknown })
                 SkipDiscardedCommands();
 
@@ -374,6 +408,11 @@ internal sealed class CommandExecutionFlow : PgClientFlow, IValueTaskSource<bool
                 return PublishSynchronousResult(next);
 
             return false;
+        }
+        catch (TimeoutException ex)
+        {
+            HandleReadTimeout(ex);
+            throw;
         }
         catch (Exception ex)
         {
@@ -450,7 +489,7 @@ internal sealed class CommandExecutionFlow : PgClientFlow, IValueTaskSource<bool
     // A pre-cancelled token releases the caller immediately. The wire still drains to RFQ.
     ValueTask<bool> CancelBeforeRead(CancellationToken cancellationToken)
     {
-        RequestCancel(cancellationToken);
+        RequestCancel(cancellationToken, CancellationScope.CurrentWindow);
         return ValueTask.FromException<bool>(new OperationCanceledException(cancellationToken));
     }
 
@@ -498,6 +537,11 @@ internal sealed class CommandExecutionFlow : PgClientFlow, IValueTaskSource<bool
             }
             deliver = Volatile.Read(ref _coldState)?.TerminalException;
         }
+        catch (TimeoutException ex)
+        {
+            HandleReadTimeout(ex);
+            throw;
+        }
         catch (Exception ex)
         {
             FaultFromOwner(ex);
@@ -519,6 +563,14 @@ internal sealed class CommandExecutionFlow : PgClientFlow, IValueTaskSource<bool
             await resultEnumerator.DisposeAsync().ConfigureAwait(false);
             var completeError = resultEnumerator.CompleteError;
             _currentPublished = false;
+            if (Volatile.Read(ref _coldState)?.TerminalException is { } consumerFault)
+            {
+                Interlocked.Exchange(ref _phase, PhaseDraining);
+                NotifyDrainStarted();
+                _consumerDetached = true;
+                await DrainAsync().ConfigureAwait(false);
+                ExceptionDispatchInfo.Throw(consumerFault);
+            }
             if (completeError is { TransactionStatus: TransactionStatus.Unknown })
                 await SkipDiscardedCommandsAsync().ConfigureAwait(false);
 
@@ -546,6 +598,11 @@ internal sealed class CommandExecutionFlow : PgClientFlow, IValueTaskSource<bool
             }
 
             return false;
+        }
+        catch (TimeoutException ex)
+        {
+            HandleReadTimeout(ex);
+            throw;
         }
         catch (Exception ex)
         {
@@ -576,7 +633,11 @@ internal sealed class CommandExecutionFlow : PgClientFlow, IValueTaskSource<bool
                 var exception = PgErrorException.Create(suppressedError);
                 var cold = GetOrCreateColdState();
                 Interlocked.CompareExchange(ref cold.TerminalException, exception, null);
-                cold.DrainError ??= exception;
+                (cold.DrainErrors ??= new()).Add(exception);
+                if (completeError is { TransactionStatus: TransactionStatus.Unknown })
+                    await SkipDiscardedCommandsAsync().ConfigureAwait(false);
+                _commandIndex++;
+                _current = null;
                 Interlocked.Exchange(ref _phase, PhaseDraining);
                 NotifyDrainStarted();
                 _consumerDetached = true;
@@ -589,7 +650,7 @@ internal sealed class CommandExecutionFlow : PgClientFlow, IValueTaskSource<bool
 
         if (result is null)
             throw ThrowHelper.ThrowInvalidOperation("The flow contains no commands.");
-        await CompleteBatchAsync(result).ConfigureAwait(false);
+        await CompleteBatchAsync().ConfigureAwait(false);
         _consumerObservedCompletion = true;
         return null;
     }
@@ -614,7 +675,11 @@ internal sealed class CommandExecutionFlow : PgClientFlow, IValueTaskSource<bool
                 var exception = PgErrorException.Create(suppressedError);
                 var cold = GetOrCreateColdState();
                 Interlocked.CompareExchange(ref cold.TerminalException, exception, null);
-                cold.DrainError ??= exception;
+                (cold.DrainErrors ??= new()).Add(exception);
+                if (completeError is { TransactionStatus: TransactionStatus.Unknown })
+                    SkipDiscardedCommands();
+                _commandIndex++;
+                _current = null;
                 Interlocked.Exchange(ref _phase, PhaseDraining);
                 NotifyDrainStarted();
                 _consumerDetached = true;
@@ -627,7 +692,7 @@ internal sealed class CommandExecutionFlow : PgClientFlow, IValueTaskSource<bool
 
         if (result is null)
             throw ThrowHelper.ThrowInvalidOperation("The flow contains no commands.");
-        CompleteBatch(result);
+        CompleteBatch();
         _consumerObservedCompletion = true;
         return null;
     }
@@ -790,29 +855,26 @@ internal sealed class CommandExecutionFlow : PgClientFlow, IValueTaskSource<bool
             PgErrorException.Throw(rfqError);
     }
 
-    async ValueTask CompleteBatchAsync(CommandResult result)
+    async ValueTask CompleteBatchAsync()
     {
         if (_readFlowRfq)
             await ReadRfqAsync().ConfigureAwait(false);
         await DisposeRegistrationsAsync().ConfigureAwait(false);
-        Finish(result);
+        Finish();
     }
 
-    void CompleteBatch(CommandResult result)
+    void CompleteBatch()
     {
         if (_readFlowRfq)
             ReadRfq();
         DisposeRegistrations();
-        Finish(result);
+        Finish();
     }
 
     // The wire is at this command's RFQ. Release the shared read objects, record the outcome the
     // consumer must observe, then complete the pipeline task.
-    void Finish(CommandResult result)
+    void Finish()
     {
-        if (result.Error is { } error && _consumerDetached && !_currentPublished
-            && !IsOwnCancellation(error))
-            GetOrCreateColdState().DrainError = PgErrorException.Create(error);
         _context.GetProtocolStatic<CommandFlow.ReadState>().Reset();
         _current = null;
         _currentPublished = false;
@@ -877,25 +939,57 @@ internal sealed class CommandExecutionFlow : PgClientFlow, IValueTaskSource<bool
             if (result is null)
             {
                 await new ValueTask<bool>(this, _readySource.Version).ConfigureAwait(false);
-                _commandIndex = 0;
+                if (_commandIndex < 0)
+                    _commandIndex = 0;
+                if (_commandIndex >= _commands.Count)
+                {
+                    await CompleteBatchAsync().ConfigureAwait(false);
+                    return;
+                }
                 result = await ReadResultAsync(_commandIndex).ConfigureAwait(false);
             }
 
             while (true)
             {
                 var completeError = await CompleteCurrentResultAsync().ConfigureAwait(false);
+                CaptureDrainError(result, completeError);
+                _currentPublished = false;
                 if (completeError is { TransactionStatus: TransactionStatus.Unknown })
                     await SkipDiscardedCommandsAsync().ConfigureAwait(false);
                 if (++_commandIndex >= _commands.Count)
                     break;
                 result = await ReadResultAsync(_commandIndex).ConfigureAwait(false);
             }
-            await CompleteBatchAsync(result).ConfigureAwait(false);
+            await CompleteBatchAsync().ConfigureAwait(false);
+        }
+        catch (TimeoutException ex)
+        {
+            // A timeout during semantic drain escalates the same cancellation episode immediately.
+            // The pipeline failure then hands any remaining wire obligation to recovery.
+            RequestCancel(default, CancellationScope.RemainingFlow,
+                BackendCancellationTiming.Immediate, BackendCancellationTiming.AtReadFrontier);
+            FaultFromOwner(ex);
         }
         catch (Exception ex)
         {
             FaultFromOwner(ex);
         }
+    }
+
+    // A read timeout is terminal for the consumer but not for the wire obligation. This frame has
+    // released the decoder read tenure, so transfer ownership to an autonomous semantic drain while
+    // the original MoveNext returns its timeout immediately.
+    void HandleReadTimeout(TimeoutException exception)
+    {
+        Interlocked.CompareExchange(
+            ref GetOrCreateColdState().TerminalException, exception, null);
+        _consumerDetached = true;
+        NotifyDrainStarted();
+        Interlocked.Exchange(ref _phase, PhaseDraining);
+        RequestCancel(default, CancellationScope.RemainingFlow,
+            BackendCancellationTiming.Immediate, BackendCancellationTiming.AtReadFrontier);
+        ThreadPool.UnsafeQueueUserWorkItem(
+            static state => _ = ((CommandExecutionFlow)state!).DrainAsync(), this);
     }
 
     void Drain()
@@ -908,20 +1002,28 @@ internal sealed class CommandExecutionFlow : PgClientFlow, IValueTaskSource<bool
                 // Synchronous disposal before any read. The activation bridge normally completed long
                 // ago, so this bridge is rarely more than a status check.
                 new ValueTask<bool>(this, _readySource.Version).AsTask().GetAwaiter().GetResult();
-                _commandIndex = 0;
+                if (_commandIndex < 0)
+                    _commandIndex = 0;
+                if (_commandIndex >= _commands.Count)
+                {
+                    CompleteBatch();
+                    return;
+                }
                 result = ReadResult(_commandIndex);
             }
 
             while (true)
             {
                 var completeError = CompleteCurrentResult();
+                CaptureDrainError(result, completeError);
+                _currentPublished = false;
                 if (completeError is { TransactionStatus: TransactionStatus.Unknown })
                     SkipDiscardedCommands();
                 if (++_commandIndex >= _commands.Count)
                     break;
                 result = ReadResult(_commandIndex);
             }
-            CompleteBatch(result);
+            CompleteBatch();
         }
         catch (Exception ex)
         {
@@ -944,11 +1046,13 @@ internal sealed class CommandExecutionFlow : PgClientFlow, IValueTaskSource<bool
                     _consumerDetached = true;
                     if (_current is { IsComplete: false }
                         || _commandIndex + 1 < _commands.Count)
-                        RequestCancel(default);
+                        RequestCancel(default, CancellationScope.RemainingFlow);
                     return WaitForDrainOnDispose ? DisposeDrainAsync() : FireAndForgetDrain();
                 case PhaseReading:
-                    return ValueTask.FromException(
-                        ThrowHelper.ThrowInvalidOperation("Cannot dispose the flow while a read is in progress."));
+                    _consumerDetached = true;
+                    NotifyDrainStarted();
+                    RequestCancel(default, CancellationScope.RemainingFlow);
+                    return WaitForDrainOnDispose ? DisposeCompletedAsync() : default;
                 default:
                     return !WaitForDrainOnDispose || _consumerObservedCompletion
                         ? default
@@ -973,8 +1077,7 @@ internal sealed class CommandExecutionFlow : PgClientFlow, IValueTaskSource<bool
     async ValueTask DisposeCompletedAsync()
     {
         await WaitForCompletionAsync().ConfigureAwait(false);
-        if (Volatile.Read(ref _coldState)?.DrainError is { } drainError)
-            throw drainError;
+        ThrowDrainErrors();
     }
 
     // Flow completion is independent of errors accumulated while draining. A close is a clean
@@ -1007,13 +1110,17 @@ internal sealed class CommandExecutionFlow : PgClientFlow, IValueTaskSource<bool
                     _consumerDetached = true;
                     if (_current is { IsComplete: false }
                         || _commandIndex + 1 < _commands.Count)
-                        RequestCancel(default);
+                        RequestCancel(default, CancellationScope.RemainingFlow);
                     Drain();
                     if (WaitForDrainOnDispose)
                         DisposeCompleted();
                     return;
                 case PhaseReading:
-                    ThrowHelper.ThrowInvalidOperation("Cannot dispose the flow while a read is in progress.");
+                    _consumerDetached = true;
+                    NotifyDrainStarted();
+                    RequestCancel(default, CancellationScope.RemainingFlow);
+                    if (WaitForDrainOnDispose)
+                        DisposeCompleted();
                     return;
                 default:
                     if (WaitForDrainOnDispose && !_consumerObservedCompletion)
@@ -1032,8 +1139,28 @@ internal sealed class CommandExecutionFlow : PgClientFlow, IValueTaskSource<bool
         catch (PgClientClosedException)
         {
         }
-        if (Volatile.Read(ref _coldState)?.DrainError is { } drainError)
-            throw drainError;
+        ThrowDrainErrors();
+    }
+
+    void CaptureDrainError(CommandResult result,
+        (PgError Error, TransactionStatus TransactionStatus)? completeError)
+    {
+        if (!_consumerDetached || _currentPublished)
+            return;
+        var error = result.Error ?? completeError?.Error;
+        if (error is null || IsOwnCancellation(error))
+            return;
+        var cold = GetOrCreateColdState();
+        (cold.DrainErrors ??= new()).Add(PgErrorException.Create(error));
+    }
+
+    void ThrowDrainErrors()
+    {
+        if (Volatile.Read(ref _coldState)?.DrainErrors is not { Count: > 0 } errors)
+            return;
+        if (errors.Count is 1)
+            ExceptionDispatchInfo.Throw(errors[0]);
+        throw new AggregateException(errors);
     }
 
     // When true, disposal waits for the drain to reach RFQ and for framework release. Otherwise it
@@ -1042,56 +1169,147 @@ internal sealed class CommandExecutionFlow : PgClientFlow, IValueTaskSource<bool
 
     void RegisterCancellation(CancellationToken callerToken)
     {
-        if (callerToken == _flowToken &&
-            (_flowRegistration != default || !callerToken.CanBeCanceled))
-            return;
-        var registration = _flowRegistration;
-        _flowRegistration = default;
-        registration.Dispose();
-        _flowToken = callerToken;
-        if (callerToken.CanBeCanceled)
-            _flowRegistration = callerToken.UnsafeRegister(static (state, token)
-                => ((CommandExecutionFlow)state!).RequestCancel(token), this);
+        // Keep the second token/registration pair off ordinary flow objects. Default-token traffic
+        // does not need cancellation state at all and remains the allocation/footprint hot path.
+        var cancellation = Volatile.Read(ref _coldState);
+        if (callerToken.CanBeCanceled || cancellation is not null)
+        {
+            cancellation ??= GetOrCreateColdState();
+            if (callerToken != cancellation.CallerToken)
+            {
+                var callerRegistration = cancellation.CallerRegistration;
+                cancellation.CallerRegistration = default;
+                callerRegistration.Dispose();
+                cancellation.CallerToken = callerToken;
+            }
+            if (callerToken.CanBeCanceled && cancellation.CallerRegistration == default)
+                cancellation.CallerRegistration = callerToken.UnsafeRegister(static (state, token)
+                    => ((CommandExecutionFlow)state!).RequestCancel(
+                        token, CancellationScope.CurrentWindow), this);
+        }
+
+        if (_flowToken.CanBeCanceled && _flowRegistration == default)
+            _flowRegistration = _flowToken.UnsafeRegister(static (state, token)
+                => ((CommandExecutionFlow)state!).RequestCancel(
+                    token, CancellationScope.RemainingFlow), this);
     }
 
     ValueTask DisposeRegistrationsAsync()
     {
-        if (_flowRegistration == default)
+        var cancellation = Volatile.Read(ref _coldState);
+        var callerRegistration = cancellation?.CallerRegistration ?? default;
+        if (callerRegistration == default && _flowRegistration == default)
             return default;
+        if (cancellation is not null)
+            cancellation.CallerRegistration = default;
         var flowRegistration = _flowRegistration;
         _flowRegistration = default;
-        return flowRegistration.DisposeAsync();
+        return DisposeRegistrationsAsync(callerRegistration, flowRegistration);
+
+        static async ValueTask DisposeRegistrationsAsync(
+            CancellationTokenRegistration callerRegistration,
+            CancellationTokenRegistration flowRegistration)
+        {
+            await callerRegistration.DisposeAsync().ConfigureAwait(false);
+            await flowRegistration.DisposeAsync().ConfigureAwait(false);
+        }
     }
 
     void DisposeRegistrations()
     {
+        var cancellation = Volatile.Read(ref _coldState);
+        var callerRegistration = cancellation?.CallerRegistration ?? default;
+        if (cancellation is not null)
+            cancellation.CallerRegistration = default;
         var flowRegistration = _flowRegistration;
         _flowRegistration = default;
+        callerRegistration.Dispose();
         flowRegistration.Dispose();
     }
 
     // Cancellation only latches intent and requests a backend cancel. The frame owning the decoder
     // delivers it after the wire is back at RFQ. An idle flow drains autonomously first.
-    void RequestCancel(CancellationToken token)
+    void RequestCancel(CancellationToken token, CancellationScope scope,
+        BackendCancellationTiming timing = BackendCancellationTiming.AfterGrace,
+        BackendCancellationTiming subsequentTiming = BackendCancellationTiming.AfterGrace)
     {
         if (Volatile.Read(ref _phase) == PhaseCompleted)
             return;
         var cancellation = GetOrCreateColdState();
         cancellation.DeliverToken = token;
+        RaiseCancellationScope(cancellation, scope);
+        RaiseCancellationTiming(ref cancellation.Timing, timing);
+        RaiseCancellationTiming(ref cancellation.SubsequentTiming, subsequentTiming);
         Interlocked.Exchange(ref cancellation.CancelRequested, true);
         if (HasDecoder)
             RequestBackendCancellation();
         TryTakeOverDrain();
     }
 
+    static void RaiseCancellationScope(ColdState cancellation, CancellationScope scope)
+    {
+        var requested = (int)scope;
+        var current = Volatile.Read(ref cancellation.Scope);
+        while (current < requested)
+        {
+            var observed = Interlocked.CompareExchange(
+                ref cancellation.Scope, requested, current);
+            if (observed == current)
+                return;
+            current = observed;
+        }
+    }
+
+    static void RaiseCancellationTiming(
+        ref int location, BackendCancellationTiming timing)
+    {
+        var requested = (int)timing;
+        var current = Volatile.Read(ref location);
+        while (current < requested)
+        {
+            var observed = Interlocked.CompareExchange(ref location, requested, current);
+            if (observed == current)
+                return;
+            current = observed;
+        }
+    }
+
     internal Task CancelAsync()
     {
-        RequestCancel(default);
-        return WaitForComplete().AsTask();
+        var cancellation = GetOrCreateColdState();
+        var delivery = Volatile.Read(ref cancellation.Delivery)
+            ?? Interlocked.CompareExchange(ref cancellation.Delivery,
+                new(TaskCreationOptions.RunContinuationsAsynchronously), null)
+            ?? cancellation.Delivery;
+        if (Volatile.Read(ref _phase) is PhaseCompleted)
+        {
+            delivery.TrySetResult();
+            return delivery.Task;
+        }
+        RequestCancel(default, CancellationScope.RemainingFlow);
+        if (Volatile.Read(ref _phase) is PhaseCompleted)
+            delivery.TrySetResult();
+        return delivery.Task;
     }
 
     void RequestBackendCancellation()
-        => _context.RequestBackendCancellation(this, CancellationWindow, BackendCancellationTiming.AfterGrace);
+    {
+        var cancellation = GetOrCreateColdState();
+        var episodeKey = Volatile.Read(ref cancellation.EpisodeKey);
+        if (episodeKey is null)
+        {
+            var created = new object();
+            episodeKey = Interlocked.CompareExchange(
+                ref cancellation.EpisodeKey, created, null) ?? created;
+        }
+        _context.RequestBackendCancellation(
+            this, CancellationWindow,
+            (BackendCancellationTiming)Volatile.Read(ref cancellation.Timing),
+            Volatile.Read(ref cancellation.Delivery),
+            episodeKey,
+            Math.Max(Volatile.Read(ref cancellation.Scope), (int)CancellationScope.CurrentWindow),
+            (BackendCancellationTiming)Volatile.Read(ref cancellation.SubsequentTiming));
+    }
 
     // Finish and FaultFromOwner reset the shared read objects before the pipeline task completes, and
     // Current is null once the consumer observed the terminal, so nothing outlives the flow.
@@ -1141,6 +1359,7 @@ internal sealed class CommandExecutionFlow : PgClientFlow, IValueTaskSource<bool
 
     protected override void OnReleasing(Exception? exception)
     {
+        Volatile.Read(ref _coldState)?.Delivery?.TrySetResult();
         DisposeRegistrations();
         _commands.Return();
     }
@@ -1165,6 +1384,8 @@ internal sealed class CommandExecutionFlow : PgClientFlow, IValueTaskSource<bool
         _pipelineTaskSource.Reset();
         _readyCompletion = 0;
         _drainStarted = 0;
+        _flowToken = default;
+        _flowRegistration = default;
         _coldState = null;
         _syncHandoffClaimed = false;
         _handoffEvent?.ResetInteraction();

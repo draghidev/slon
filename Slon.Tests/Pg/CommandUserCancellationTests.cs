@@ -131,6 +131,9 @@ public class CommandUserCancellationTests : ConnectionCreatingTest
     // Autonomous execution may enter the command read before the consumer supplies its per-read
     // token. The late token must still arm backend cancellation for that active read.
     [TestMethod]
+#if COMMAND_FLOW_NEXT
+    [Ignore("Requires the legacy body to enter a read before the consumer supplies its token; the replacement consumer owns the read from entry.")]
+#endif
     public async Task UserCt_SuppliedAfterReadStarted_RequestsCancellation_ProtocolUsable()
     {
         await using var blocker = await PgAdvisoryLock.AcquireAsync();
@@ -571,6 +574,9 @@ public class CommandUserCancellationTests : ConnectionCreatingTest
     }
 
     [TestMethod]
+#if COMMAND_FLOW_NEXT
+    [Ignore("Requires a second body-owned drain read after the consumer read times out; the replacement retains one read owner through drain.")]
+#endif
     public async Task ServerCancel_ReadTimeoutAfterAmbiguousRetryAbortsWire()
     {
         var iterations = StressEnv.Iterations(fallback: 1, cap: 5_000);

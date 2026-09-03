@@ -399,6 +399,9 @@ public class RacingDisposeInMemoryTests
     // a forceful abort faults that read -> body's closed catch. Pre-fix: rethrow escaped DisposeAsync.
     // Now: DisposeAsyncCore swallows it.
     [TestMethod]
+#if COMMAND_FLOW_NEXT
+    [Ignore("Exercises legacy body-driven throw and caller-gate ordering.")]
+#endif
     public async Task Ordering1_BodyDrivenThrow_DisposeConverges()
     {
         await using var s = await BuildToFirstResultParked();
@@ -421,6 +424,9 @@ public class RacingDisposeInMemoryTests
     // This isolates terminal publication and the continuation handoff without ThreadPool admission,
     // PostgreSQL timing, or an advisory lock.
     [TestMethod]
+#if COMMAND_FLOW_NEXT
+    [Ignore("Exercises takeover of the legacy body coroutine during synchronous disposal.")]
+#endif
     public async Task SyncDispose_InFlightReadFault_Converges()
     {
         var iterations = Math.Clamp(StressEnv.Iterations(fallback: 1, cap: int.MaxValue), 1, 500);
@@ -449,6 +455,9 @@ public class RacingDisposeInMemoryTests
     // bounded exactly as production bounds it - advance past CompletionTimeout (30s) so the graceful->abort
     // escalation faults the parked drain read and DisposeAsync converges, swallowing the close.
     [TestMethod]
+#if COMMAND_FLOW_NEXT
+    [Ignore("Exercises the legacy caller gate winning before the body throw.")]
+#endif
     public async Task Ordering2_GateFirstThrow_DisposeConverges()
     {
         await using var s = await BuildToFirstResultParked();
@@ -473,6 +482,9 @@ public class RacingDisposeInMemoryTests
     // consume that progress without receiving a continuation and transfer to AwaitDrainOnDispose.
     // Escalation must still redrive/fault the held read and complete both teardown participants.
     [TestMethod]
+#if COMMAND_FLOW_NEXT
+    [Ignore("Exercises the legacy caller gate's progress-before-takeover ordering.")]
+#endif
     public async Task SyncDispose_GateProgressBeforeTakeover_Converges()
     {
         var iterations = Math.Clamp(StressEnv.Iterations(fallback: 1, cap: int.MaxValue), 1, 500);
@@ -500,6 +512,9 @@ public class RacingDisposeInMemoryTests
     // progress-only wake; only afterwards does releasing the response let the body publish its sync
     // handoff continuation. Null progress cannot be mistaken for body termination.
     [TestMethod]
+#if COMMAND_FLOW_NEXT
+    [Ignore("Exercises late publication of a legacy body handoff continuation.")]
+#endif
     public async Task SyncDispose_ProgressWakeBeforeLateHandoff_DrivesBodyToTermination()
     {
         var clock = new FakeTimeProvider();
@@ -539,6 +554,9 @@ public class RacingDisposeInMemoryTests
     // A sync-at-bind body parked between command results still owns a continuation after close becomes
     // consumer-terminal. Dispose must drive that continuation before returning or surfacing the close.
     [TestMethod]
+#if COMMAND_FLOW_NEXT
+    [Ignore("Exercises the legacy body's inter-result caller gate.")]
+#endif
     public async Task SyncFlow_CloseAtInterResultPark_DisposeRetainsDriveObligation()
     {
         var clock = new FakeTimeProvider();
@@ -583,6 +601,9 @@ public class RacingDisposeInMemoryTests
     // published CancelException, so the consumer's next MoveNextAsync self-delivers the close and the
     // loop converges. Asserts convergence (a hang here would regress that protection).
     [TestMethod]
+#if COMMAND_FLOW_NEXT
+    [Ignore("Exercises self-delivery after a no-op fault on the legacy caller gate.")]
+#endif
     public async Task Ordering3_GateFaultNoOp_SelfDeliverConverges()
     {
         await using var s = await BuildToFirstResultParked();
@@ -607,6 +628,9 @@ public class RacingDisposeInMemoryTests
     // abort lands CompleteEnumerationWithException on the LIVE (Reset) generation, because every body read in this flow
     // is preceded by a consumer Reset. Documents why the read-fault alone cannot produce the hang.
     [TestMethod]
+#if COMMAND_FLOW_NEXT
+    [Ignore("Exercises the legacy body's read-fault-to-caller-gate transition.")]
+#endif
     public async Task Ordering3_ReadFaultPath_NeverNoOps_Converges()
     {
         await using var s = await BuildToFirstResultParked();
@@ -632,6 +656,9 @@ public class RacingDisposeInMemoryTests
     // inline ping-pong), so this is a convergence regression test, not an isolation of any one waker. The
     // never-started lost-completion (the actual reported hang) is gated by the stress repro + dump.
     [TestMethod]
+#if COMMAND_FLOW_NEXT
+    [Ignore("Exercises graceful close while the legacy body is parked at its inter-result gate.")]
+#endif
     public async Task MultiCommand_GracefulCloseAtInterResultGate_Converges()
     {
         await using var s = await BuildMultiToFirstResultParked();
@@ -664,6 +691,9 @@ public class RacingDisposeInMemoryTests
     // the stale result 1. Ordering3_GateFaultNoOp asserts the read loop converges; a stale re-yield does
     // not hang, so this pins the specific next-call outcome the loop cannot catch.
     [TestMethod]
+#if COMMAND_FLOW_NEXT
+    [Ignore("Exercises stale continuation suppression in the legacy caller gate.")]
+#endif
     public async Task GateFaultBeforeNextMoveNext_SelfDeliversClose_NeverReYieldsStale()
     {
         await using var s = await BuildToFirstResultParked();
