@@ -333,6 +333,12 @@ sealed class BackendMessageContext
         return _decoder.ExtendCurrentMessageAsync(cancellationToken);
     }
 
+    public ValueTask<CurrentMessageBuffer> BeginBufferAsync(short token, CancellationToken cancellationToken)
+    {
+        EnsureBodyWindowAvailable(token);
+        return _decoder.BufferCurrentMessageAsync(cancellationToken);
+    }
+
     public CurrentMessageBuffer CompleteExtend(short token, CurrentMessageBuffer result)
         => GetBodyBuffer(token, result);
 

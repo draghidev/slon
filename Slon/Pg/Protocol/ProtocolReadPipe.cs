@@ -265,6 +265,17 @@ sealed class ProtocolReadPipe(
         return reader.ReadAsync(cancellationToken);
     }
 
+    public ValueTask<ReadResult> BeginBufferCurrentMessageAsync(
+        CancellationToken cancellationToken)
+    {
+        PrepareCurrentMessageRead(
+            _retainedStart, consumedLength: 0, PendingRead.Extend);
+        var requiredLength = checked(_currentMessageOffset + _currentMessageLength);
+        return requiredLength <= int.MaxValue
+            ? reader.ReadAtLeastAsync((int)requiredLength, cancellationToken)
+            : reader.ReadAsync(cancellationToken);
+    }
+
     public CurrentMessageBuffer ExtendCurrentMessage(TimeSpan timeout)
     {
         if (reader is not StreamPipeReader syncReader)

@@ -319,38 +319,49 @@ public sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<Bac
         if (_pipe.TryExtendCurrentMessage(out var result))
             return new(result);
 
-        return Core(cancellationToken);
+        return ReadCurrentMessageAsync(cancellationToken, bufferAll: false);
+    }
 
-        [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
-        async ValueTask<CurrentMessageBuffer> Core(CancellationToken cancellationToken)
+    internal ValueTask<CurrentMessageBuffer> BufferCurrentMessageAsync(
+        CancellationToken cancellationToken)
+    {
+        EnsureUsableCts();
+        return ReadCurrentMessageAsync(cancellationToken, bufferAll: true);
+    }
+
+    [RuntimeAsyncMethodGeneration(false)]
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
+    async ValueTask<CurrentMessageBuffer> ReadCurrentMessageAsync(
+        CancellationToken cancellationToken, bool bufferAll)
+    {
+        var timeoutSet = false;
+        var frontierFlow = EnterCancellationReadFrontier();
+        var registration = cancellationToken.UnsafeRegister(
+            static (state, _) => ((CancellationTokenSource)state!).Cancel(), _cancellationTokenSource);
+        try
         {
-            var timeoutSet = false;
-            var frontierFlow = EnterCancellationReadFrontier();
-            var registration = cancellationToken.UnsafeRegister(
-                static (state, _) => ((CancellationTokenSource)state!).Cancel(), _cancellationTokenSource);
-            try
-            {
-                ArmReadTimeout();
-                timeoutSet = true;
-                var read = await _pipe.BeginExtendCurrentMessageAsync(
-                    _cancellationTokenSource.Token).ConfigureAwait(false);
-                return _pipe.CompleteCurrentMessageRead(read, _cancellationTokenSource.Token);
-            }
-            catch (Exception ex) when (_cancellationTokenSource.IsCancellationRequested)
-            {
-                throw TranslateReadCancellation(ex, cancellationToken);
-            }
-            catch (EndOfStreamException ex)
-            {
-                throw TranslateEof(ex);
-            }
-            finally
-            {
-                LeaveCancellationReadFrontier(frontierFlow);
-                registration.Dispose();
-                if (timeoutSet)
-                    SetRemainingTimeout(Timeout.InfiniteTimeSpan);
-            }
+            ArmReadTimeout();
+            timeoutSet = true;
+            var read = await (bufferAll
+                    ? _pipe.BeginBufferCurrentMessageAsync(_cancellationTokenSource.Token)
+                    : _pipe.BeginExtendCurrentMessageAsync(_cancellationTokenSource.Token))
+                .ConfigureAwait(false);
+            return _pipe.CompleteCurrentMessageRead(read, _cancellationTokenSource.Token);
+        }
+        catch (Exception ex) when (_cancellationTokenSource.IsCancellationRequested)
+        {
+            throw TranslateReadCancellation(ex, cancellationToken);
+        }
+        catch (EndOfStreamException ex)
+        {
+            throw TranslateEof(ex);
+        }
+        finally
+        {
+            LeaveCancellationReadFrontier(frontierFlow);
+            registration.Dispose();
+            if (timeoutSet)
+                SetRemainingTimeout(Timeout.InfiniteTimeSpan);
         }
     }
 

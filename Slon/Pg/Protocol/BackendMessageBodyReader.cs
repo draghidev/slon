@@ -180,7 +180,14 @@ sealed class BackendMessageBodyReader : IInputReader
         async ValueTask Core(CancellationToken cancellationToken)
         {
             while (!IsComplete)
-                await ExtendAsync(cancellationToken).ConfigureAwait(false);
+            {
+                EnsureCanExtend();
+                var task = _context.BeginBufferAsync(_token, cancellationToken);
+                var result = task.IsCompletedSuccessfully
+                    ? task.Result
+                    : await task.ConfigureAwait(false);
+                Publish(_context.CompleteExtend(_token, result), retained: true);
+            }
         }
     }
 
