@@ -527,7 +527,7 @@ public abstract class PgClientFlow : IValueTaskSource<FlowActivation>, IValueTas
         => _activationTaskSource.OnCompleted(continuation, state, token, flags);
 
 
-    protected readonly struct Context
+    protected internal readonly struct Context
     {
         readonly ExecutionControl _executionControl;
         internal Context(ExecutionControl executionControl)
@@ -600,7 +600,7 @@ public abstract class PgClientFlow : IValueTaskSource<FlowActivation>, IValueTas
     // compiler checks IsCompleted and only schedules via (Unsafe)OnCompleted(Action) when not ready.
     // Direct dispatchers (CommandFlow's shared-promise pattern) instead use IsCompleted +
     // (Unsafe)OnCompleted(Action<object?>, object?) to register without a closure allocation.
-    protected readonly struct DecoderAwaitable : ICriticalNotifyCompletion
+    protected internal readonly struct DecoderAwaitable : ICriticalNotifyCompletion
     {
         readonly ExecutionControl control;
         readonly CancellationToken cancellationToken;
@@ -675,7 +675,7 @@ public abstract class PgClientFlow : IValueTaskSource<FlowActivation>, IValueTas
 
     // The ConfigureAwait(false) variant: skips scheduling-context capture. Action overloads are
     // for the C# `await` syntax (compiler calls UnsafeOnCompleted on ICriticalNotifyCompletion).
-    protected readonly struct ConfiguredDecoderAwaitable : ICriticalNotifyCompletion
+    protected internal readonly struct ConfiguredDecoderAwaitable : ICriticalNotifyCompletion
     {
         readonly ExecutionControl control;
         readonly CancellationToken cancellationToken;
