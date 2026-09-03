@@ -25,12 +25,19 @@ public class ExclusiveAccessFlowTests : ConnectionCreatingTest
         protocol.SetFlowBindingContext(new BindingProbeContext("wire"));
         var flow = protocol.Queue(new BindingProbeFlow(fail: true));
 
-        await Assert.ThrowsExactlyAsync<InvalidOperationException>(async () => await DrainAsync(flow));
+        await Assert.ThrowsExactlyAsync<InvalidOperationException>(async () => await DrainBindingProbeAsync(flow));
         Assert.AreEqual(1, flow.BindCount);
 
         await DrainAsync(protocol.Queue(new CommandFlow(async: true, Command.Create("select 1"))));
     }
     static async Task DrainAsync(CommandFlow flow)
+    {
+        var e = flow.GetAsyncEnumerator();
+        while (await e.MoveNextAsync()) { }
+        await e.DisposeAsync();
+    }
+
+    static async Task DrainBindingProbeAsync(BindingProbeFlow flow)
     {
         var e = flow.GetAsyncEnumerator();
         while (await e.MoveNextAsync()) { }
@@ -86,7 +93,7 @@ public class ExclusiveAccessFlowTests : ConnectionCreatingTest
 
         Assert.IsTrue(protocol.IsSchedulable);
         Assert.IsTrue(protocol.TryQueue(bindProbe));
-        await DrainAsync(bindProbe);
+        await DrainBindingProbeAsync(bindProbe);
         Assert.AreEqual(1, bindProbe.BindCount,
             "the portable flow must bind exactly once when its later placement reaches dispatch");
     }

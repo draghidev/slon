@@ -6,6 +6,22 @@ using Slon.Runtime.CompilerServices;
 
 namespace Slon.Pg.Protocol.Flows;
 
+internal abstract class CommandExecutionFlowObserver : PgClientFlowObserver
+{
+    protected internal virtual void OnStarted(CommandExecutionFlow flow, object? state) { }
+    protected internal virtual void OnCommandResult(
+        CommandExecutionFlow flow, CommandResult result, object? state) { }
+    protected internal virtual void OnDrainStarted(CommandExecutionFlow flow, object? state) { }
+}
+
+internal readonly struct CommandExecutionFlowOptions
+{
+    public CommandExecutionFlowObserver? Observer { get; init; }
+    public object? ObserverState { get; init; }
+    public CommandList Commands { get; init; }
+    public TimeSpan? PendingTimeout { get; init; }
+}
+
 // Replacement-flow prototype: one consumer-owned decoder lifecycle for synchronous and asynchronous
 // execution, with the general multi-command result shape. Kept internal until it covers the complete
 // CommandFlow contract; the eventual single-command specialization will remain a separate sealed type.
@@ -20,10 +36,10 @@ internal sealed class CommandExecutionFlow : PgClientFlow, IValueTaskSource<bool
     const int PhaseCompleted = 4;
     int _phase;
 
-    readonly CommandList _commands;
-    readonly TimeSpan? _pendingTimeout;
-    readonly Action<CommandResult, object?>? _resultObserver;
-    readonly object? _resultObserverState;
+    CommandList _commands;
+    TimeSpan? _pendingTimeout;
+    CommandExecutionFlowObserver? _commandObserver;
+    object? _commandObserverState;
     int _commandIndex = -1;
     Context _context;
     CommandResult? _current;
@@ -45,6 +61,8 @@ internal sealed class CommandExecutionFlow : PgClientFlow, IValueTaskSource<bool
     ColdState? _coldState;
     FlowHandoffEvent? _handoffEvent;
     bool _syncHandoffClaimed;
+    int _drainStarted;
+    bool _enableActivationTimeout = true;
 
     sealed class ColdState
     {
@@ -57,39 +75,68 @@ internal sealed class CommandExecutionFlow : PgClientFlow, IValueTaskSource<bool
         internal Exception? DrainError;
     }
 
-    internal CommandExecutionFlow(
-        bool async, CommandList commands, TimeSpan? pendingTimeout = null)
-        : this(async, commands, pendingTimeout, null, null, null, null)
-    { }
-
-    internal CommandExecutionFlow(
-        bool async, CommandList commands, TimeSpan? pendingTimeout,
-        Action<CommandResult, object?>? resultObserver, object? resultObserverState,
-        PgClientFlowObserver? lifecycleObserver, object? lifecycleState)
+    CommandExecutionFlow(bool async, TimeSpan? pendingTimeout = null)
         : base(supportsDeferredFlush: true)
     {
-        if (commands.Count is 0)
-            ThrowHelper.ThrowArgumentException(nameof(commands), "A batch must contain at least one command.");
-        foreach (ref readonly var command in commands)
-        {
-            if (command.DescribeForPreparation || command.SuppressEnumeration)
-                ThrowHelper.ThrowArgumentException(nameof(commands),
-                    "Preparation and suppressed commands require the general command flow.");
-        }
-        _commands = commands;
         _pendingTimeout = pendingTimeout;
-        _resultObserver = resultObserver;
-        _resultObserverState = resultObserverState;
-        if (lifecycleObserver is not null)
-            SetObserver(lifecycleObserver, lifecycleState);
         IsAsync = async;
         if (!async)
             _handoffEvent = new(false);
     }
 
+    internal CommandExecutionFlow(bool async, params ReadOnlySpan<Command> commands)
+        : this(async)
+        => Initialize(async, commands);
+
+    internal CommandExecutionFlow(
+        bool async, bool enableActivationTimeout, params ReadOnlySpan<Command> commands)
+        : this(async, commands)
+        => _enableActivationTimeout = enableActivationTimeout;
+
+    internal CommandExecutionFlow(bool async, CommandList commands, TimeSpan? pendingTimeout = null)
+        : this(async, pendingTimeout)
+        => Initialize(async, new CommandExecutionFlowOptions
+        {
+            Commands = commands,
+            PendingTimeout = pendingTimeout
+        });
+
+    internal CommandExecutionFlow(bool async, in CommandExecutionFlowOptions options)
+        : this(async, options.PendingTimeout)
+        => Initialize(async, options);
+
+    internal CommandExecutionFlow Initialize(bool async, params ReadOnlySpan<Command> commands)
+        => Initialize(async, new CommandExecutionFlowOptions { Commands = new(commands) });
+
+    internal CommandExecutionFlow Initialize(bool async, in CommandExecutionFlowOptions options)
+    {
+        IsAsync = async;
+        if (!async)
+            _handoffEvent ??= new(false);
+        var commands = options.Commands;
+        if (commands.Count is 0)
+            return this;
+        foreach (ref readonly var command in commands)
+        {
+            if (command.DescribeForPreparation || command.SuppressEnumeration)
+                ThrowHelper.ThrowArgumentException(nameof(options),
+                    "Preparation and suppressed commands are not implemented by the replacement flow yet.");
+        }
+        _commands = commands;
+        _pendingTimeout = options.PendingTimeout;
+        _commandObserver = options.Observer;
+        _commandObserverState = options.ObserverState;
+        if (options.Observer is { } observer)
+        {
+            SetObserver(observer, options.ObserverState);
+            observer.OnStarted(this, options.ObserverState);
+        }
+        return this;
+    }
+
     internal override bool DefersSyncHandoff => true;
     private protected override FlowHandoffEvent? HandoffEvent => _handoffEvent;
-    protected override bool EnableActivationTimeout => true;
+    protected override bool EnableActivationTimeout => _enableActivationTimeout;
     protected override TimeSpan? PendingTimeout => _pendingTimeout;
 
     internal override void BindCallerToken(CancellationToken cancellationToken)
@@ -97,10 +144,10 @@ internal sealed class CommandExecutionFlow : PgClientFlow, IValueTaskSource<bool
     internal override CancellationToken MigrationCancellationToken
         => _flowToken;
 
-    internal Enumerator GetEnumerator()
+    public Enumerator GetEnumerator()
         => new(this, default);
 
-    internal Enumerator GetAsyncEnumerator(CancellationToken cancellationToken = default)
+    public Enumerator GetAsyncEnumerator(CancellationToken cancellationToken = default)
     {
         _flowToken = cancellationToken;
         return new(this, cancellationToken);
@@ -113,6 +160,33 @@ internal sealed class CommandExecutionFlow : PgClientFlow, IValueTaskSource<bool
         => MoveNextAsync(cancellationToken);
     internal void DisposeResults() => Dispose();
     internal ValueTask DisposeResultsAsync() => DisposeAsync();
+
+    [RuntimeAsyncMethodGeneration(false)]
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
+    internal async ValueTask<long> ConsumeNonQueryAsync(
+        CancellationToken cancellationToken = default)
+    {
+        var recordsAffected = -1L;
+        var results = GetAsyncEnumerator(cancellationToken);
+        try
+        {
+            while (await results.MoveNextAsync().ConfigureAwait(false))
+            {
+                var result = results.Current;
+                await result.CompleteAsync().ConfigureAwait(false);
+                result.GetCommandComplete();
+                if (result.RecordsAffected is { } affected and >= 0)
+                    recordsAffected = recordsAffected < 0
+                        ? affected
+                        : checked(recordsAffected + affected);
+            }
+            return recordsAffected;
+        }
+        finally
+        {
+            await results.DisposeAsync().ConfigureAwait(false);
+        }
+    }
 
     ColdState GetOrCreateColdState()
         => Volatile.Read(ref _coldState) ??
@@ -593,7 +667,7 @@ internal sealed class CommandExecutionFlow : PgClientFlow, IValueTaskSource<bool
         }
         result.Initialize(this, commandIndex, descriptor, requestedRowDescription,
             !command.DescribeOnly, command.IsSimple(), error);
-        _resultObserver?.Invoke(result, _resultObserverState);
+        _commandObserver?.OnCommandResult(this, result, _commandObserverState);
         return result;
     }
 
@@ -703,10 +777,17 @@ internal sealed class CommandExecutionFlow : PgClientFlow, IValueTaskSource<bool
                 return false;
             if (Interlocked.CompareExchange(ref _phase, PhaseDraining, phase) != phase)
                 continue;
+            NotifyDrainStarted();
             _consumerDetached = true;
             ThreadPool.UnsafeQueueUserWorkItem(static state => _ = ((CommandExecutionFlow)state!).DrainAsync(), this);
             return true;
         }
+    }
+
+    void NotifyDrainStarted()
+    {
+        if (Interlocked.Exchange(ref _drainStarted, 1) is 0)
+            _commandObserver?.OnDrainStarted(this, _commandObserverState);
     }
 
     // Autonomous drain. Owns the decoder until the pipeline task completes. Never throws.
@@ -781,6 +862,7 @@ internal sealed class CommandExecutionFlow : PgClientFlow, IValueTaskSource<bool
                 case PhaseResultReady:
                     if (Interlocked.CompareExchange(ref _phase, PhaseDraining, phase) != phase)
                         continue;
+                    NotifyDrainStarted();
                     _consumerDetached = true;
                     if (_current is { IsComplete: false }
                         || _commandIndex + 1 < _commands.Count)
@@ -843,6 +925,7 @@ internal sealed class CommandExecutionFlow : PgClientFlow, IValueTaskSource<bool
                 case PhaseResultReady:
                     if (Interlocked.CompareExchange(ref _phase, PhaseDraining, phase) != phase)
                         continue;
+                    NotifyDrainStarted();
                     _consumerDetached = true;
                     if (_current is { IsComplete: false }
                         || _commandIndex + 1 < _commands.Count)
@@ -1002,6 +1085,7 @@ internal sealed class CommandExecutionFlow : PgClientFlow, IValueTaskSource<bool
         _readySource.Reset();
         _pipelineTaskSource.Reset();
         _readyCompletion = 0;
+        _drainStarted = 0;
         _coldState = null;
         _syncHandoffClaimed = false;
         _handoffEvent?.ResetInteraction();

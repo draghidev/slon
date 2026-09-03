@@ -241,7 +241,12 @@ public class CommandResultEnumerationTests
     public async Task Reset_ClearsEnumerationCompleted_ForNextTenure()
     {
         await using var protocol = await PgTestPool.NewIsolatedAsync();
+#if COMMAND_FLOW_NEXT
+        var flow = new CommandFlow(
+            async: true, enableActivationTimeout: false, Command.Create("select 1"));
+#else
         var flow = new ResettableCommandFlow(async: true, Command.Create("select 1"));
+#endif
         for (var tenure = 0; tenure < 2; tenure++)
         {
             if (tenure > 0)
@@ -259,9 +264,11 @@ public class CommandResultEnumerationTests
     }
 
     // Pooling a timeout-armed flow is refused by Reset. Opt out so the reset path itself is testable.
+#if !COMMAND_FLOW_NEXT
     sealed class ResettableCommandFlow(bool async, params ReadOnlySpan<Command> commands)
         : CommandFlow(async, commands)
     {
         protected override bool EnableActivationTimeout => false;
     }
+#endif
 }

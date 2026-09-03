@@ -1,6 +1,7 @@
 using Slon.Pg.Protocol;
 using Slon.Pg.Protocol.Flows;
 using Slon.Pg;
+using LegacyCommandFlow = Slon.Pg.Protocol.Flows.CommandFlow;
 
 namespace Slon.Tests;
 
@@ -9,7 +10,7 @@ sealed class BindingProbeContext(string name) : PgClientFlowBindingContext
     internal string Name { get; } = name;
 }
 
-sealed class BindingProbeFlow(bool fail = false) : CommandFlow(async: true, [])
+sealed class BindingProbeFlow(bool fail = false) : LegacyCommandFlow(async: true, [])
 {
     internal int BindCount { get; private set; }
     internal string? ContextName { get; private set; }
