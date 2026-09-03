@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
 using Slon.Pipelines;
+using Slon.Runtime.CompilerServices;
 
 namespace Slon.Pg.Protocol;
 
@@ -456,8 +457,11 @@ sealed class BackendMessageContext
             PublishPeeked();
             return true;
         }
-        if (!_cursor.TryReadNextBuffer(out var header, out var buffer, out var bufferLength))
+        var bufferSlot = default(StackValue<BackendMessageCursor.FastReadOnlySequence<byte>>);
+        if (!_cursor.TryReadNextBuffer(
+                out var header, ref bufferSlot, out var bufferLength))
             return false;
+        var buffer = bufferSlot.Value;
         ResetMessageState();
         if (bufferLength < header.MessageLength)
             _decoder.SetCurrentMessageLength(
@@ -539,11 +543,13 @@ sealed class BackendMessageContext
             header = _current.Header;
             return true;
         }
+        var bufferSlot = default(StackValue<BackendMessageCursor.FastReadOnlySequence<byte>>);
         if (!_cursor.TryReadNextBuffer(
-                out header, out var buffer, out var bufferLength))
+                out header, ref bufferSlot, out var bufferLength))
         {
             return false;
         }
+        var buffer = bufferSlot.Value;
         var messageLength = header.MessageLength;
         var buffered = bufferLength >= messageLength;
         if (!buffered)

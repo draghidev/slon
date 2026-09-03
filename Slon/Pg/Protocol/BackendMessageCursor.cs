@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
 using Slon.Pipelines;
+using Slon.Runtime.CompilerServices;
 using static Slon.Pg.Protocol.PgTypes;
 
 namespace Slon.Pg.Protocol;
@@ -43,18 +44,19 @@ struct BackendMessageCursor(ReadOnlySequence<byte> buffer)
     [MethodImpl(MethodImplOptions.NoInlining)]
     public bool TryReadNextInPlace(out BackendHeader header, out ReadOnlySequence<byte> buffer, out uint bufferLength)
     {
-        if (!TryReadNextBuffer(out header, out var fastBuffer, out bufferLength))
+        var bufferSlot = default(StackValue<FastReadOnlySequence<byte>>);
+        if (!TryReadNextBuffer(out header, ref bufferSlot, out bufferLength))
         {
             buffer = default;
             return false;
         }
-        buffer = fastBuffer.Sequence;
+        buffer = bufferSlot.Value.Sequence;
         return true;
     }
 
     [MethodImpl(MethodImplOptions.NoInlining)]
     internal bool TryReadNextBuffer(out BackendHeader header,
-        out FastReadOnlySequence<byte> buffer, out uint bufferLength)
+        ref StackValue<FastReadOnlySequence<byte>> buffer, out uint bufferLength)
     {
         var bufferedLength = _buffer.Length;
         if (!Header.TryParse(_buffer.FirstSpan, out var protoHeader)
@@ -62,7 +64,6 @@ struct BackendMessageCursor(ReadOnlySequence<byte> buffer)
                 || !Header.TryParseMultiSegment(_buffer.Sequence, out protoHeader)))
         {
             _requiredBufferedLength = _initialLength - bufferedLength + Header.ByteCount;
-            buffer = default;
             bufferLength = default;
             header = default;
             return false;
@@ -78,17 +79,17 @@ struct BackendMessageCursor(ReadOnlySequence<byte> buffer)
         if (bufferedLength < required)
         {
             _requiredBufferedLength = _initialLength - bufferedLength + required;
-            buffer = default;
             bufferLength = default;
             header = default;
             return false;
         }
 
-        buffer = _buffer.SplitInPlace(Math.Min(bufferedLength, messageLength));
+        var result = _buffer.SplitInPlace(Math.Min(bufferedLength, messageLength));
         _requiredBufferedLength = 0;
-        Debug.Assert(buffer.Length <= uint.MaxValue);
-        bufferLength = unchecked((uint)buffer.Length);
+        Debug.Assert(result.Length <= uint.MaxValue);
+        bufferLength = unchecked((uint)result.Length);
         header = BackendHeader.FromHeader(protoHeader);
+        buffer.Value = result;
         return true;
     }
 
