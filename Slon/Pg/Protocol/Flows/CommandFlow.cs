@@ -582,26 +582,8 @@ public partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
                         MarkBodyInitiatedDrain();
                 }
 
-                CommandResult result;
-                {
-                    ref readonly var readState = ref context.GetProtocolStatic<ReadState>();
-                    readState.ResultMessageEnumerator.Initialize(_commands.ItemRef(_commandIndex), _decoder);
-                    result = _enumeratorCurrent ?? readState.CommandResult;
-
-                    ref readonly var resultCommand = ref _commands.ItemRef(_commandIndex);
-                    var descriptor = resultCommand.Descriptor;
-                    // We were preparing and we have no error from parse, make a prepared descriptor.
-                    if (!descriptor.IsPrepared && !descriptor.CommandName.IsDefault
-                        && (_pgError is not { } err || !err.Expected.Contains(PgTypes.BackendType.ParseComplete)))
-                    {
-                        descriptor = CommandDescriptor.CreatePrepared(
-                            descriptor.CommandName,
-                            describeForPreparation ? describedParameterTypes : descriptor.ParameterTypes,
-                            _requestedRowDescription?.Preserve());
-                    }
-                    result.Initialize(this, _commandIndex, descriptor, _requestedRowDescription,
-                        !resultCommand.DescribeOnly, resultCommand.IsSimple(), _pgError);
-                }
+                var result = InitializeResult(
+                    context, describeForPreparation, describedParameterTypes);
                 ((CommandFlowObserver?)GetObserver(out var observerState))
                     ?.OnCommandResult(this, result, observerState);
 
@@ -711,43 +693,10 @@ public partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
                     completeError = resultEnumerator.CompleteError;
                 }
 
-                var resultErrorIsOwnCancellation = result.Error is { } resultError
-                    && IsOwnCancellation(resultError);
-                if (suppressEnumeration && result.Error is { } suppressedError
-                    && !resultErrorIsOwnCancellation)
-                {
-                    (_drainErrors ??= new()).Add(PgErrorException.Create(suppressedError));
-                    capturedThisCommand = true;
-                    if (!IsDraining)
-                        MarkBodyInitiatedDrain();
-                }
-
-                {
-                    // Accumulate each command's fresh error while draining, but do not duplicate an error
-                    // already captured during its read phase or delivered to a live consumer.
-                    var completeErrorIsOwnCancellation = completeError is { } completedWithError
-                        && IsOwnCancellation(completedWithError.Error);
-                    if ((consumeInternally || IsConsumingNonQuery || IsDraining && !_isResultReady)
-                        && !capturedThisCommand && completeError is { } err
-                        && !completeErrorIsOwnCancellation)
-                        (_drainErrors ??= new()).Add(PgErrorException.Create(err.Error));
-                }
-
-                // Extended-query errors discard every following command through the next Sync. Skip
-                // those commands locally and consume the RFQ which is their only wire response.
-                if (completeError is { TransactionStatus: TransactionStatus.Unknown })
-                {
-                    while (++_commandIndex < CommandCount && !_commands[_commandIndex].WithSync) { }
-
-                    if (IsAsync)
-                        await ReadRfqAsync(_decoder).ConfigureAwait(false);
-                    else
-                        ReadRfq(_decoder);
-
-                    // Reaching the end means the discarded segment terminated at our appended Sync.
-                    if (_commandIndex == CommandCount)
-                        _readFlowRfq = false;
-                }
+                if (result.Error is not null || completeError is not null)
+                    await HandleCommandErrorsAsync(
+                        result, suppressEnumeration, consumeInternally,
+                        capturedThisCommand, completeError).ConfigureAwait(false);
             }
 
             // The framework observes trailing write failure before releasing this flow.
@@ -889,19 +838,87 @@ public partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
                 TrySetEnumeratorResult(true, runContinuationsAsynchronously: true);
         }
 
-        async ValueTask ReadRfqAsync(PgDecoder decoder)
+    }
+
+    static async ValueTask ReadRfqAsync(PgDecoder decoder)
+    {
+        var message = await decoder.GetNextAsync().ConfigureAwait(false);
+        if (message.EnsureExpectedOrError(PgTypes.BackendType.ReadyForQuery) is { } rfqError)
+            PgErrorException.Throw(rfqError);
+    }
+
+    static void ReadRfq(PgDecoder decoder)
+    {
+        var message = decoder.GetNext();
+        if (message.EnsureExpectedOrError(PgTypes.BackendType.ReadyForQuery) is { } rfqError)
+            PgErrorException.Throw(rfqError);
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    CommandResult InitializeResult(
+        Context context, bool describeForPreparation,
+        ParameterTypeList describedParameterTypes)
+    {
+        ref readonly var readState = ref context.GetProtocolStatic<ReadState>();
+        readState.ResultMessageEnumerator.Initialize(_commands.ItemRef(_commandIndex), _decoder!);
+        var result = _enumeratorCurrent ?? readState.CommandResult;
+
+        ref readonly var command = ref _commands.ItemRef(_commandIndex);
+        var descriptor = command.Descriptor;
+        // We were preparing and we have no error from parse, make a prepared descriptor.
+        if (!descriptor.IsPrepared && !descriptor.CommandName.IsDefault
+            && (_pgError is not { } err || !err.Expected.Contains(PgTypes.BackendType.ParseComplete)))
         {
-            var message = await decoder.GetNextAsync().ConfigureAwait(false);
-            if (message.EnsureExpectedOrError(PgTypes.BackendType.ReadyForQuery) is { } rfqError)
-                PgErrorException.Throw(rfqError);
+            descriptor = CommandDescriptor.CreatePrepared(
+                descriptor.CommandName,
+                describeForPreparation ? describedParameterTypes : descriptor.ParameterTypes,
+                _requestedRowDescription?.Preserve());
+        }
+        result.Initialize(this, _commandIndex, descriptor, _requestedRowDescription,
+            !command.DescribeOnly, command.IsSimple(), _pgError);
+        return result;
+    }
+
+    async ValueTask HandleCommandErrorsAsync(
+        CommandResult result, bool suppressEnumeration, bool consumeInternally,
+        bool capturedThisCommand,
+        (PgError Error, TransactionStatus TransactionStatus)? completeError)
+    {
+        var resultErrorIsOwnCancellation = result.Error is { } resultError
+            && IsOwnCancellation(resultError);
+        if (suppressEnumeration && result.Error is { } suppressedError
+            && !resultErrorIsOwnCancellation)
+        {
+            (_drainErrors ??= new()).Add(PgErrorException.Create(suppressedError));
+            capturedThisCommand = true;
+            if (!IsDraining)
+                MarkBodyInitiatedDrain();
         }
 
-        static void ReadRfq(PgDecoder decoder)
-        {
-            var message = decoder.GetNext();
-            if (message.EnsureExpectedOrError(PgTypes.BackendType.ReadyForQuery) is { } rfqError)
-                PgErrorException.Throw(rfqError);
-        }
+        // Accumulate each command's fresh error while draining, but do not duplicate an error
+        // already captured during its read phase or delivered to a live consumer.
+        var completeErrorIsOwnCancellation = completeError is { } completedWithError
+            && IsOwnCancellation(completedWithError.Error);
+        if ((consumeInternally || IsConsumingNonQuery || IsDraining && !_isResultReady)
+            && !capturedThisCommand && completeError is { } error
+            && !completeErrorIsOwnCancellation)
+            (_drainErrors ??= new()).Add(PgErrorException.Create(error.Error));
+
+        // Extended-query errors discard every following command through the next Sync. Skip
+        // those commands locally and consume the RFQ which is their only wire response.
+        if (completeError is not { TransactionStatus: TransactionStatus.Unknown })
+            return;
+
+        while (++_commandIndex < CommandCount && !_commands[_commandIndex].WithSync) { }
+
+        if (IsAsync)
+            await ReadRfqAsync(_decoder!).ConfigureAwait(false);
+        else
+            ReadRfq(_decoder!);
+
+        // Reaching the end means the discarded segment terminated at our appended Sync.
+        if (_commandIndex == CommandCount)
+            _readFlowRfq = false;
     }
 
     void SubmitPublication(Context context, DetachedPublication publication)
