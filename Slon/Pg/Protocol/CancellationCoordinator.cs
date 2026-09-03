@@ -335,8 +335,14 @@ sealed class CancellationCoordinator<TOwner> : IDisposable
         // Sender delegates may execute arbitrary synchronous work before returning their ValueTask.
         // The queued callback claims physical start immediately before invocation, so neither a
         // dormant work item nor blocked sender can occupy the coordinator lock or deadline thread.
-        if (!ThreadPool.UnsafeQueueUserWorkItem(static state => state.Coordinator.InvokeDispatch(state.Lease),
-                (Coordinator: this, Lease: lease), preferLocal: false))
+        if (!Slon.Threading.SchedulingContext.TrySubmitDetached(
+                static state =>
+                {
+                    var dispatch = ((CancellationCoordinator<TOwner> Coordinator, DispatchLease Lease))state!;
+                    dispatch.Coordinator.InvokeDispatch(dispatch.Lease);
+                },
+                (this, lease),
+                preferLocal: false))
             _ = ObserveDispatchAsync(lease, new(CancelRequestState.NotSent));
     }
 

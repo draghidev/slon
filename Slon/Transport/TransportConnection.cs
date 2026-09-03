@@ -1,4 +1,5 @@
 using System.IO.Pipelines;
+using Slon.Threading;
 
 namespace Slon.Transport;
 
@@ -30,6 +31,7 @@ public abstract class TransportConnection
     // The protocol completes both endpoints after all borrowed buffers have been returned.
     public abstract PipeReader Reader { get; }
     public abstract PipeWriter Writer { get; }
+    internal virtual Scheduler? Scheduler => null;
 
     // Classifies transport-specific exceptions that mean the established byte stream was lost.
     public virtual bool IsConnectionLost(Exception exception) => false;

@@ -305,9 +305,16 @@ public sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
 
     void Initialize(TransportConnection connection, Hosting hosting)
     {
+        PipelineScheduler? connectionScheduler = null;
+        if ((_options.ExecutionScheduler is null || _options.ActivationScheduler is null)
+            && connection.Scheduler is { } scheduler)
+            connectionScheduler = new DelegatedPipelineScheduler(scheduler);
+
         _executionScheduler = _options.ExecutionScheduler
+            ?? connectionScheduler
             ?? PipelineScheduler.ThreadPool;
         _activationScheduler = _options.ActivationScheduler
+            ?? connectionScheduler
             ?? PipelineScheduler.ThreadPool;
 
         _connection = connection;

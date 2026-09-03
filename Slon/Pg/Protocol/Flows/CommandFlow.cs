@@ -1043,9 +1043,11 @@ readonly struct CommandFlowCore<TOps>(TOps ops)
             NotifyDrainStarted();
             // Decoder takeover does not imply consumer abandonment. Explicit cancellation and
             // graceful close also drain autonomously while retaining their consumer semantics.
-            ThreadPool.UnsafeQueueUserWorkItem(static state =>
-                _ = new CommandFlowCore<TOps>(TOps.Create((PgClientFlow)state!)).DrainAsync(),
-                _ops.Flow);
+            Slon.Threading.SchedulingContext.SubmitDetached(
+                static state =>
+                    _ = new CommandFlowCore<TOps>(TOps.Create((PgClientFlow)state!)).DrainAsync(),
+                _ops.Flow,
+                preferLocal: false);
             return true;
         }
     }
@@ -1113,9 +1115,11 @@ readonly struct CommandFlowCore<TOps>(TOps ops)
         Interlocked.Exchange(ref _state.Phase, PhaseDraining);
         RequestCancel(default, CommandExecutionCancellationScope.RemainingFlow,
             BackendCancellationTiming.Immediate, BackendCancellationTiming.AtReadFrontier);
-        ThreadPool.UnsafeQueueUserWorkItem(static state =>
-            _ = new CommandFlowCore<TOps>(TOps.Create((PgClientFlow)state!)).DrainAsync(),
-            _ops.Flow);
+        Slon.Threading.SchedulingContext.SubmitDetached(
+            static state =>
+                _ = new CommandFlowCore<TOps>(TOps.Create((PgClientFlow)state!)).DrainAsync(),
+            _ops.Flow,
+            preferLocal: false);
     }
 
     void Drain()

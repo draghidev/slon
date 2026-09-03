@@ -252,7 +252,10 @@ sealed class ValueTaskSourcePromise<TResult> : IValueTaskSource<TResult>, IValue
         }
         catch (Exception ex)
         {
-            ThreadPool.QueueUserWorkItem(state => ((ExceptionDispatchInfo)state!).Throw(), ExceptionDispatchInfo.Capture(ex));
+            Slon.Threading.SchedulingContext.Submit(
+                static state => ((ExceptionDispatchInfo)state!).Throw(),
+                ExceptionDispatchInfo.Capture(ex),
+                preferLocal: false);
         }
     }
 

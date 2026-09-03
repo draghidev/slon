@@ -147,7 +147,10 @@ struct FlowCallerInteractionCore<TResult>
     {
         if (!useDedicatedDriver)
         {
-            ThreadPool.UnsafeQueueUserWorkItem(static s => ((Action)s!)(), (object)continuation);
+            Slon.Threading.SchedulingContext.SubmitDetached(
+                static state => ((Action)state!)(),
+                continuation,
+                preferLocal: false);
             return;
         }
 

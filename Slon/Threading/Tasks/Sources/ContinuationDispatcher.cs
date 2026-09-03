@@ -53,7 +53,7 @@ readonly ref struct ContinuationDispatcher(ref Action<object?>? continuation, re
         {
             if (runContinuationsAsynchronously)
             {
-                ThreadPool.UnsafeQueueUserWorkItem(continuation, _continuationState, preferLocal: true);
+                SchedulingContext.SubmitDetached(continuation, _continuationState, preferLocal: true);
             }
             else
             {
@@ -136,11 +136,11 @@ readonly ref struct ContinuationDispatcher(ref Action<object?>? continuation, re
         switch (capturedContext)
         {
             case null:
-                ThreadPool.UnsafeQueueUserWorkItem(continuation, state, preferLocal: true);
+                SchedulingContext.SubmitDetached(continuation, state, preferLocal: true);
                 break;
 
             case ExecutionContext:
-                ThreadPool.QueueUserWorkItem(continuation, state, preferLocal: true);
+                SchedulingContext.Submit(continuation, state, preferLocal: true);
                 break;
 
             default:
@@ -204,7 +204,7 @@ readonly ref struct ContinuationDispatcher(ref Action<object?>? continuation, re
             {
                 try
                 {
-                    ThreadPool.QueueUserWorkItem(continuation, continuationState, preferLocal: true);
+                    SchedulingContext.Submit(continuation, continuationState, preferLocal: true);
                 }
                 finally
                 {
