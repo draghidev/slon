@@ -544,13 +544,15 @@ sealed class BackendMessageContext
         {
             return false;
         }
-        if (bufferLength < header.MessageLength)
+        var messageLength = header.MessageLength;
+        var buffered = bufferLength >= messageLength;
+        if (!buffered)
             _decoder.SetCurrentMessageLength(
                 _cursor.ConsumedLength - bufferLength
-                + header.MessageLength);
+                + messageLength);
         _messageState = 0;
         BackendMessage.Initialize(ref _current, header, buffer, this, ++_version,
-            bufferLength >= header.MessageLength);
+            buffered);
         _publicationState = PublicationState.Peeked;
         return true;
     }
