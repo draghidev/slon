@@ -43,6 +43,7 @@ internal sealed class CommandExecutionFlow : PgClientFlow, IValueTaskSource<bool
     int _commandIndex = -1;
     Context _context;
     CommandResult? _current;
+    bool _currentPublished;
     bool _readFlowRfq;
     // Set by the consumer once it has started reading, so a drain knows whether to publish nothing.
     bool _consumerDetached;
@@ -116,12 +117,6 @@ internal sealed class CommandExecutionFlow : PgClientFlow, IValueTaskSource<bool
         var commands = options.Commands;
         if (commands.Count is 0)
             return this;
-        foreach (ref readonly var command in commands)
-        {
-            if (command.DescribeForPreparation || command.SuppressEnumeration)
-                ThrowHelper.ThrowArgumentException(nameof(options),
-                    "Preparation and suppressed commands are not implemented by the replacement flow yet.");
-        }
         _commands = commands;
         _pendingTimeout = options.PendingTimeout;
         _commandObserver = options.Observer;
@@ -352,7 +347,8 @@ internal sealed class CommandExecutionFlow : PgClientFlow, IValueTaskSource<bool
             WaitForReadySynchronously();
             Debug.Assert(!_consumerDetached);
             RegisterCancellation(default);
-            return PublishSynchronousResult(ReadResult(_commandIndex));
+            var result = ReadNextPublishedResult();
+            return result is not null && PublishSynchronousResult(result);
         }
         catch (Exception ex)
         {
@@ -368,14 +364,15 @@ internal sealed class CommandExecutionFlow : PgClientFlow, IValueTaskSource<bool
             RegisterCancellation(default);
             var result = _current!;
             var completeError = CompleteCurrentResult();
+            _currentPublished = false;
             if (completeError is { TransactionStatus: TransactionStatus.Unknown })
                 SkipDiscardedCommands();
 
-            if (++_commandIndex < _commands.Count)
-                return PublishSynchronousResult(ReadResult(_commandIndex));
+            _commandIndex++;
+            var next = ReadNextPublishedResult();
+            if (next is not null)
+                return PublishSynchronousResult(next);
 
-            CompleteBatch(result);
-            _consumerObservedCompletion = true;
             return false;
         }
         catch (Exception ex)
@@ -388,6 +385,7 @@ internal sealed class CommandExecutionFlow : PgClientFlow, IValueTaskSource<bool
     bool PublishSynchronousResult(CommandResult result)
     {
         _current = result;
+        _currentPublished = true;
         Interlocked.Exchange(ref _phase, PhaseResultReady);
         var context = _context;
         if (!IsClosed && context.StoppingToken.IsCancellationRequested)
@@ -473,43 +471,11 @@ internal sealed class CommandExecutionFlow : PgClientFlow, IValueTaskSource<bool
             await new ValueTask<bool>(this, _readySource.Version).ConfigureAwait(false);
             Debug.Assert(!_consumerDetached);
             RegisterCancellation(cancellationToken);
-            CommandResult result;
-            if (!_commands.ItemRef(_commandIndex).DescribeOnly
-                && _commands.ItemRef(_commandIndex).Descriptor
-                    is { IsPrepared: true, PreparedRowDescription: not null })
-            {
-                var decoder = _context.Decoder;
-                if (_context.IsProtocolClosed)
-                    throw _context.FlowTerminationException;
-                decoder.UseReadTimeout(_commands.ItemRef(_commandIndex).Timeout);
-                PgError? error;
-                if (!decoder.TryMoveNext())
-                {
-                    if (!await decoder.MoveNextAsync().ConfigureAwait(false))
-                        decoder.ThrowUnexpectedEof();
-                }
-                if (decoder.Current.EnsureExpectedOrError(PgTypes.BackendType.BindComplete) is { } bindError)
-                {
-                    error = bindError;
-                }
-                else
-                {
-                    if (!decoder.TryMoveNext())
-                    {
-                        if (!await decoder.MoveNextAsync().ConfigureAwait(false))
-                            decoder.ThrowUnexpectedEof();
-                    }
-                    decoder.Current.DebugEnsureExpected(
-                        PgTypes.BackendType.DataRow, PgTypes.BackendType.CommandComplete);
-                    error = null;
-                }
-                result = InitializeResult(_commandIndex, error, null);
-            }
-            else
-            {
-                result = await ReadResultAsync(_commandIndex).ConfigureAwait(false);
-            }
+            var result = await ReadNextPublishedResultAsync().ConfigureAwait(false);
+            if (result is null)
+                return false;
             _current = result;
+            _currentPublished = true;
             // Publish the idle state, then recheck the latches. A latch that landed between the read
             // and this publication found no idle owner to take over, so this frame must act on it.
             Interlocked.Exchange(ref _phase, PhaseResultReady);
@@ -552,13 +518,17 @@ internal sealed class CommandExecutionFlow : PgClientFlow, IValueTaskSource<bool
                 .ResultMessageEnumerator;
             await resultEnumerator.DisposeAsync().ConfigureAwait(false);
             var completeError = resultEnumerator.CompleteError;
+            _currentPublished = false;
             if (completeError is { TransactionStatus: TransactionStatus.Unknown })
                 await SkipDiscardedCommandsAsync().ConfigureAwait(false);
 
-            if (++_commandIndex < _commands.Count)
+            _commandIndex++;
+            var next = await ReadNextPublishedResultAsync().ConfigureAwait(false);
+            if (next is not null)
             {
-                result = await ReadResultAsync(_commandIndex).ConfigureAwait(false);
+                result = next;
                 _current = result;
+                _currentPublished = true;
                 Interlocked.Exchange(ref _phase, PhaseResultReady);
                 var context = _context;
                 if (!IsClosed && context.StoppingToken.IsCancellationRequested)
@@ -575,8 +545,6 @@ internal sealed class CommandExecutionFlow : PgClientFlow, IValueTaskSource<bool
                     ?? ThrowHelper.ThrowUnexpected("A latched flow completed without a terminal outcome.");
             }
 
-            await CompleteBatchAsync(result).ConfigureAwait(false);
-            _consumerObservedCompletion = true;
             return false;
         }
         catch (Exception ex)
@@ -584,6 +552,84 @@ internal sealed class CommandExecutionFlow : PgClientFlow, IValueTaskSource<bool
             FaultFromOwner(ex);
             throw;
         }
+    }
+
+    [RuntimeAsyncMethodGeneration(false)]
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
+    async ValueTask<CommandResult?> ReadNextPublishedResultAsync()
+    {
+        CommandResult? result = _current;
+        while (_commandIndex < _commands.Count)
+        {
+            result = await ReadResultAsync(_commandIndex).ConfigureAwait(false);
+            _current = result;
+            _currentPublished = false;
+            if (!_commands.ItemRef(_commandIndex).SuppressEnumeration)
+                return result;
+
+            var completeError = await CompleteCurrentResultAsync().ConfigureAwait(false);
+            var suppressedError = result.Error;
+            if (suppressedError is null && completeError is { } completionError)
+                suppressedError = completionError.Error;
+            if (suppressedError is not null)
+            {
+                var exception = PgErrorException.Create(suppressedError);
+                var cold = GetOrCreateColdState();
+                Interlocked.CompareExchange(ref cold.TerminalException, exception, null);
+                cold.DrainError ??= exception;
+                Interlocked.Exchange(ref _phase, PhaseDraining);
+                NotifyDrainStarted();
+                _consumerDetached = true;
+                await DrainAsync().ConfigureAwait(false);
+                throw exception;
+            }
+
+            _commandIndex++;
+        }
+
+        if (result is null)
+            throw ThrowHelper.ThrowInvalidOperation("The flow contains no commands.");
+        await CompleteBatchAsync(result).ConfigureAwait(false);
+        _consumerObservedCompletion = true;
+        return null;
+    }
+
+    CommandResult? ReadNextPublishedResult()
+    {
+        CommandResult? result = _current;
+        while (_commandIndex < _commands.Count)
+        {
+            result = ReadResult(_commandIndex);
+            _current = result;
+            _currentPublished = false;
+            if (!_commands.ItemRef(_commandIndex).SuppressEnumeration)
+                return result;
+
+            var completeError = CompleteCurrentResult();
+            var suppressedError = result.Error;
+            if (suppressedError is null && completeError is { } completionError)
+                suppressedError = completionError.Error;
+            if (suppressedError is not null)
+            {
+                var exception = PgErrorException.Create(suppressedError);
+                var cold = GetOrCreateColdState();
+                Interlocked.CompareExchange(ref cold.TerminalException, exception, null);
+                cold.DrainError ??= exception;
+                Interlocked.Exchange(ref _phase, PhaseDraining);
+                NotifyDrainStarted();
+                _consumerDetached = true;
+                Drain();
+                throw exception;
+            }
+
+            _commandIndex++;
+        }
+
+        if (result is null)
+            throw ThrowHelper.ThrowInvalidOperation("The flow contains no commands.");
+        CompleteBatch(result);
+        _consumerObservedCompletion = true;
+        return null;
     }
 
     // Reads through the command's execute prelude and initializes the protocol-static result.
@@ -596,11 +642,22 @@ internal sealed class CommandExecutionFlow : PgClientFlow, IValueTaskSource<bool
             throw context.FlowTerminationException;
         PgError? error;
         RowDescription? requestedRowDescription;
-        var describeOnly = _commands.ItemRef(commandIndex).DescribeOnly;
-        var hasPreparedDescription = _commands.ItemRef(commandIndex).Descriptor
+        ref readonly var command = ref _commands.ItemRef(commandIndex);
+        var describeOnly = command.DescribeOnly;
+        var hasPreparedDescription = command.Descriptor
             is { IsPrepared: true, PreparedRowDescription: not null };
-        decoder.UseReadTimeout(_commands.ItemRef(commandIndex).Timeout);
-        if (hasPreparedDescription && !describeOnly)
+        decoder.UseReadTimeout(command.Timeout);
+        ParameterTypeList? preparationParameterTypes = null;
+        if (command.DescribeForPreparation)
+        {
+            var preparation = await command.ReadPreparationDescriptionAsync(
+                decoder, context.GetProtocolStatic<CommandFlow.ReadState>().RowDescription)
+                .ConfigureAwait(false);
+            error = preparation.Item1;
+            preparationParameterTypes = preparation.Item2;
+            requestedRowDescription = preparation.Item3;
+        }
+        else if (hasPreparedDescription && !describeOnly)
         {
             // Prepared commands with a known description have the compact BindComplete ->
             // DataRow/CommandComplete prelude. Await the decoder directly so a read wake resumes this
@@ -629,11 +686,12 @@ internal sealed class CommandExecutionFlow : PgClientFlow, IValueTaskSource<bool
         }
         else
         {
-            (error, requestedRowDescription) = await _commands.ItemRef(commandIndex)
+            (error, requestedRowDescription) = await command
                 .ReadUntilExecuteAsync(decoder, context.GetProtocolStatic<CommandFlow.ReadState>().RowDescription)
                 .ConfigureAwait(false);
         }
-        return InitializeResult(commandIndex, error, requestedRowDescription);
+        return InitializeResult(
+            commandIndex, error, requestedRowDescription, preparationParameterTypes);
     }
 
     CommandResult ReadResult(int commandIndex)
@@ -644,13 +702,29 @@ internal sealed class CommandExecutionFlow : PgClientFlow, IValueTaskSource<bool
             throw context.FlowTerminationException;
         ref readonly var command = ref _commands.ItemRef(commandIndex);
         decoder.UseReadTimeout(command.Timeout);
-        var (error, requestedRowDescription) = command
-            .ReadUntilExecute(decoder, context.GetProtocolStatic<CommandFlow.ReadState>().RowDescription);
-        return InitializeResult(commandIndex, error, requestedRowDescription);
+        PgError? error;
+        RowDescription? requestedRowDescription;
+        ParameterTypeList? preparationParameterTypes = null;
+        if (command.DescribeForPreparation)
+        {
+            var preparation = command.ReadPreparationDescription(
+                decoder, context.GetProtocolStatic<CommandFlow.ReadState>().RowDescription);
+            error = preparation.Item1;
+            preparationParameterTypes = preparation.Item2;
+            requestedRowDescription = preparation.Item3;
+        }
+        else
+        {
+            (error, requestedRowDescription) = command.ReadUntilExecute(
+                decoder, context.GetProtocolStatic<CommandFlow.ReadState>().RowDescription);
+        }
+        return InitializeResult(
+            commandIndex, error, requestedRowDescription, preparationParameterTypes);
     }
 
     CommandResult InitializeResult(
-        int commandIndex, PgError? error, RowDescription? requestedRowDescription)
+        int commandIndex, PgError? error, RowDescription? requestedRowDescription,
+        ParameterTypeList? preparationParameterTypes = null)
     {
         var context = _context;
         ref readonly var readState = ref context.GetProtocolStatic<CommandFlow.ReadState>();
@@ -662,7 +736,8 @@ internal sealed class CommandExecutionFlow : PgClientFlow, IValueTaskSource<bool
         if (!descriptor.IsPrepared && !descriptor.CommandName.IsDefault
             && (error is not { } err || !err.Expected.Contains(PgTypes.BackendType.ParseComplete)))
         {
-            descriptor = CommandDescriptor.CreatePrepared(descriptor.CommandName, descriptor.ParameterTypes,
+            descriptor = CommandDescriptor.CreatePrepared(descriptor.CommandName,
+                preparationParameterTypes ?? descriptor.ParameterTypes,
                 requestedRowDescription?.Preserve());
         }
         result.Initialize(this, commandIndex, descriptor, requestedRowDescription,
@@ -735,10 +810,12 @@ internal sealed class CommandExecutionFlow : PgClientFlow, IValueTaskSource<bool
     // consumer must observe, then complete the pipeline task.
     void Finish(CommandResult result)
     {
-        if (result.Error is { } error && _consumerDetached && !IsOwnCancellation(error))
+        if (result.Error is { } error && _consumerDetached && !_currentPublished
+            && !IsOwnCancellation(error))
             GetOrCreateColdState().DrainError = PgErrorException.Create(error);
         _context.GetProtocolStatic<CommandFlow.ReadState>().Reset();
         _current = null;
+        _currentPublished = false;
         if (IsCancelRequested)
             Interlocked.CompareExchange(ref GetOrCreateColdState().TerminalException,
                 new OperationCanceledException(_coldState!.DeliverToken), null);
@@ -759,6 +836,7 @@ internal sealed class CommandExecutionFlow : PgClientFlow, IValueTaskSource<bool
             return;
         DisposeRegistrations();
         _current = null;
+        _currentPublished = false;
         if (HasDecoder)
             _context.GetProtocolStatic<CommandFlow.ReadState>().Reset();
         CompletePipelineTask(exception);
@@ -1079,6 +1157,7 @@ internal sealed class CommandExecutionFlow : PgClientFlow, IValueTaskSource<bool
         _commandIndex = -1;
         _context = default;
         _current = null;
+        _currentPublished = false;
         _readFlowRfq = false;
         _consumerDetached = false;
         _consumerObservedCompletion = false;
