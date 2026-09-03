@@ -268,7 +268,7 @@ public readonly struct PgEncoder
             + (describe ? header + describeBody : 0)
             + (execute ? header + executeBody : 0)
             + syncCount * header);
-        var span = writer.GetCompleteMessagesSpan(total);
+        var span = writer.GetCompleteMessagesSpan(total).Slice(0, total);
 
         WriteHeader(span, FrontendType.Bind, bindBody);
         span[header] = 0; // unnamed portal
