@@ -127,10 +127,8 @@ public partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
     // Pipelined dispatch state. Lives here (not on PgClientFlow base) because the shared-promise
     // optimization that needs these fields is CommandFlow-specific (see DispatchPipelinedRead).
     Slon.Threading.Tasks.Sources.ManualResetValueTaskSourceCore<bool> _executePipelinedCore;
-    ValueTaskSourcePromise<bool>? _pipelinePromise;
     Context _context;
     bool _contextPublished;
-    ValueTask _task;
     // Consumer terminality, body terminality, and framework release are distinct phases. Start and
     // pre-start termination race during shutdown, so one atomic state owns that decision.
     const int BodyNotStarted = 0;
@@ -379,7 +377,6 @@ public partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
             }
         }
 
-        _pipelinePromise = promise;
         // Static continuation: a bridge into framework state, so no captured scheduling context is needed.
         waiter.OnCompleted(static state =>
         {
@@ -394,20 +391,21 @@ public partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
                 catch (Exception ex) { flow._executePipelinedCore.SetException(ex); }
                 return;
             }
-            var promise = flow._pipelinePromise!;
+            var promise = ctx.GetProtocolStatic<ReadPromiseState>().Promise;
             PromiseAsyncValueTaskMethodBuilder.Promise = promise;
             ValueTask task = flow.ExecutePipelined(ctx);
             try
             {
                 if (!task.IsCompleted)
                 {
-                    flow._task = task;
                     ((IValueTaskSource)promise).OnCompleted(static state =>
                     {
                         var flow = (CommandFlow)state!;
                         try
                         {
-                            flow._task.GetAwaiter().GetResult();
+                            var promise = flow._context
+                                .GetProtocolStatic<ReadPromiseState>().Promise;
+                            ((IValueTaskSource)promise).GetResult(promise.Token);
                             flow._executePipelinedCore.SetResult(true);
                         }
                         catch (Exception ex)
@@ -1211,10 +1209,8 @@ public partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
         _drainModeEntered = false;
         WaitForDrainOnDispose = true;
         // Dispatch state is per-tenure.
-        _pipelinePromise = null;
         _contextPublished = false;
         _context = default;
-        _task = default;
         _bodyState = BodyNotStarted;
         _consumerAdvanced = false;
     }
