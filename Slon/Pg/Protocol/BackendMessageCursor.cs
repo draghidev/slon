@@ -68,11 +68,12 @@ struct BackendMessageCursor(ReadOnlySequence<byte> buffer)
         }
 
         var backendType = (BackendType)protoHeader.Tag;
-        if (protoHeader.MessageLength > MaxMessageLength)
-            ThrowMessageTooLong(protoHeader.MessageLength);
+        var messageLength = protoHeader.MessageLength;
+        if (messageLength > MaxMessageLength)
+            ThrowMessageTooLong(messageLength);
         var required = backendType is BackendType.DataRow
-            ? Math.Min(protoHeader.MessageLength, (uint)_dataRowStreamingThreshold)
-            : protoHeader.MessageLength;
+            ? Math.Min(messageLength, (uint)_dataRowStreamingThreshold)
+            : messageLength;
         if (_buffer.Length < required)
         {
             _requiredBufferedLength = ConsumedLength + required;
@@ -82,7 +83,7 @@ struct BackendMessageCursor(ReadOnlySequence<byte> buffer)
             return false;
         }
 
-        buffer = _buffer.SplitInPlace(Math.Min(_buffer.Length, protoHeader.MessageLength));
+        buffer = _buffer.SplitInPlace(Math.Min(_buffer.Length, messageLength));
         _requiredBufferedLength = 0;
         Debug.Assert(buffer.Length <= uint.MaxValue);
         bufferLength = unchecked((uint)buffer.Length);
