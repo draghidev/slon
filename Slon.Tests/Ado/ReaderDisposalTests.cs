@@ -97,17 +97,17 @@ public class ReaderDisposalTests
         Assert.IsTrue(HasCancellationState(flow));
     }
 
-    static CommandFlow GetFlow(SlonDataReader reader)
+    static AdoCommandExecutionFlow GetFlow(SlonDataReader reader)
     {
         var enumerator = typeof(SlonDataReader).GetField("_enumerator", AllInstanceFields)!
             .GetValue(reader)!;
         var flowField = enumerator.GetType().GetFields(AllInstanceFields)
-            .Single(static field => field.FieldType == typeof(CommandFlow));
-        return (CommandFlow)flowField.GetValue(enumerator)!;
+            .Single(static field => field.FieldType == typeof(AdoCommandExecutionFlow));
+        return (AdoCommandExecutionFlow)flowField.GetValue(enumerator)!;
     }
 
-    static bool HasCancellationState(CommandFlow flow)
-        => FindField(flow.GetType(), "_cancellationState").GetValue(flow) is not null;
+    static bool HasCancellationState(AdoCommandExecutionFlow flow)
+        => flow.HasCancellationState;
 
     static FieldInfo FindField(Type type, string name)
     {

@@ -1,5 +1,6 @@
 using System.Data;
 using System.Data.Common;
+using System.Threading.Tasks.Sources;
 using Slon.Pg;
 using Slon.Pg.Protocol;
 using Slon.Pg.Protocol.Flows;
@@ -15,40 +16,23 @@ readonly struct AdoCommandFlowOptions
     internal object? ResultObserverState { get; init; }
 }
 
-sealed class AdoCommandFlowObserver<TCommand> : CommandFlowObserver
-    where TCommand : IAdoCommand
+interface IAdoCommandExecutionOwner
 {
-    internal static readonly AdoCommandFlowObserver<TCommand> Instance = new();
+    AdoCommandFlowOptions CreateExecutionOptions(
+        DbParameterCollection? parameters, CommandBehavior behavior,
+        SlonDataSource.PgDbDependencies dependencies, SlonConnection? connection,
+        PgConnection pgConnection, TimeSpan? pendingTimeout, bool preparing);
+    void OnFlowStarted(AdoCommandExecutionFlow flow);
+    void OnFlowCompleting(AdoCommandExecutionFlow flow, Exception? exception);
+}
 
-    protected internal override void OnStarted(CommandFlow flow, object? state)
-    {
-        switch (((AdoCommandFlow<TCommand>)flow).LifetimeOwner)
-        {
-            case SlonCommand command:
-                command.OnFlowStarted(flow);
-                break;
-            case SlonBatch batch:
-                batch.OnFlowStarted(flow);
-                break;
-        }
-    }
+sealed class AdoCommandExecutionObserver : PgClientFlowObserver
+{
+    internal static readonly AdoCommandExecutionObserver Instance = new();
 
-    protected internal override void OnCommandResult(CommandFlow flow, CommandResult result, object? state)
-        => ((AdoCommandFlow<TCommand>)flow).ObserveResult(result);
-
-    protected internal override void OnCompleting(PgClientFlow flow, Exception? exception, object? state)
-    {
-        switch (((AdoCommandFlow<TCommand>)flow).LifetimeOwner)
-        {
-            case SlonCommand command:
-                command.OnFlowCompleting((CommandFlow)flow, exception);
-                break;
-            case SlonBatch batch:
-                batch.OnFlowCompleting((CommandFlow)flow, exception);
-                break;
-        }
-    }
-
+    protected internal override void OnCompleting(
+        PgClientFlow flow, Exception? exception, object? state)
+        => ((AdoCommandExecutionFlow)flow).CompleteLifetime(exception);
 }
 
 static class AdoCommandResultObserver
@@ -123,28 +107,29 @@ static class AdoCommandResultObserver
     }
 }
 
-sealed class AdoCommandFlow<TCommand> : CommandFlow
-    where TCommand : IAdoCommand
+sealed class AdoCommandExecutionFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSource
 {
-    readonly FieldRef<AdoBatchCore<TCommand>> _core;
+    readonly IAdoCommandExecutionOwner _bindingOwner;
     readonly DbParameterCollection? _parameters;
     readonly CommandBehavior _behavior;
     readonly SlonDataSource.PgDbDependencies _dependencies;
     readonly SlonConnection? _connection;
     readonly bool _preparing;
     readonly int _commandCount;
-    object? _lifetimeOwner;
+    IAdoCommandExecutionOwner? _lifetimeOwner;
     Action<CommandResult, object?>? _resultObserver;
     object? _resultObserverState;
+    CommandExecutionState _state;
 
-    internal AdoCommandFlow(
-        bool async, FieldRef<AdoBatchCore<TCommand>> core,
+    internal AdoCommandExecutionFlow(
+        bool async, IAdoCommandExecutionOwner bindingOwner,
         DbParameterCollection? parameters, CommandBehavior behavior,
         SlonDataSource.PgDbDependencies dependencies, SlonConnection? connection,
-        TimeSpan? pendingTimeout, bool preparing, int commandCount, object? lifetimeOwner)
-        : base(async, pendingTimeout)
+        TimeSpan? pendingTimeout, bool preparing, int commandCount,
+        IAdoCommandExecutionOwner? lifetimeOwner)
+        : base(supportsDeferredFlush: true)
     {
-        _core = core;
+        _bindingOwner = bindingOwner;
         _parameters = parameters;
         _behavior = behavior;
         _dependencies = dependencies;
@@ -152,36 +137,126 @@ sealed class AdoCommandFlow<TCommand> : CommandFlow
         _preparing = preparing;
         _commandCount = commandCount;
         _lifetimeOwner = lifetimeOwner;
-        SetObserver(AdoCommandFlowObserver<TCommand>.Instance, null);
-        AdoCommandFlowObserver<TCommand>.Instance.OnStarted(this, null);
+        _state.CommandIndex = -1;
+        _state.EnableActivationTimeout = true;
+        _state.WaitForDrainOnDispose = true;
+        _state.PendingTimeout = pendingTimeout;
+        IsAsync = async;
+        if (!async)
+            _state.HandoffEvent = new(false);
+        SetObserver(AdoCommandExecutionObserver.Instance, null);
+        lifetimeOwner?.OnFlowStarted(this);
     }
 
-    internal override int VisibleCommandCount => _commandCount;
-    internal object? LifetimeOwner => _lifetimeOwner;
+    internal override bool DefersSyncHandoff => true;
+    private protected override FlowHandoffEvent? HandoffEvent => _state.HandoffEvent;
+    protected override bool EnableActivationTimeout => true;
+    protected override TimeSpan? PendingTimeout => _state.PendingTimeout;
+    internal override TimeSpan? BackendCancellationGracePeriod
+        => Volatile.Read(ref _state.ConsumerDetached) ? TimeSpan.FromSeconds(1) : null;
 
-    internal void ObserveResult(CommandResult result)
+    internal override void BindCallerToken(CancellationToken cancellationToken)
+        => _state.FlowToken = cancellationToken;
+    internal override CancellationToken MigrationCancellationToken => _state.FlowToken;
+
+    internal int VisibleCommandCount => _commandCount;
+    internal CommandResult? CurrentResult => _state.Current;
+    internal bool IsResultReady => Core.IsResultReady;
+    internal bool HasCancellationState => _state.ColdState is not null;
+
+    public Enumerator GetEnumerator() => new(this, default);
+
+    public Enumerator GetAsyncEnumerator(CancellationToken cancellationToken = default)
+    {
+        if (cancellationToken.CanBeCanceled)
+            _state.FlowToken = cancellationToken;
+        return new(this, cancellationToken);
+    }
+
+    CommandExecutionCore<Ops> Core => new(new(this));
+
+    internal ValueTask<long> ConsumeNonQueryAsync(CancellationToken cancellationToken = default)
+        => Core.ConsumeNonQueryAsync(cancellationToken);
+
+    protected override ValueTask<FlowTasks> ExecuteAuto(Context context) => Core.ExecuteAuto(context);
+    internal Task CancelAsync() => Core.CancelAsync();
+    internal override bool ResetsSharedReadStateBeforeRelease => true;
+    protected override void OnStopping(Exception exception) => Core.OnStopping(exception);
+    protected override void OnAbort(Exception exception) => Core.OnAbort(exception);
+    internal override void Fail(Exception exception) => Core.Fail(exception);
+    protected override void OnReleasing(Exception? exception) => Core.OnReleasing(exception);
+    protected override void OnDiscarded() => Core.OnDiscarded();
+    protected override void OnReset() => Core.OnReset();
+
+    void ObserveResult(CommandResult result)
         => _resultObserver?.Invoke(result, _resultObserverState);
+
+    internal void CompleteLifetime(Exception? exception)
+        => Interlocked.Exchange(ref _lifetimeOwner, null)?.OnFlowCompleting(this, exception);
 
     internal override void Bind(PgClientFlowBindingContext? context)
     {
         var pgConnection = (context as PgConnection.FlowBindingContext)?.Connection
             ?? throw new InvalidOperationException(
                 "An ADO command requires a PgConnection flow binding context.");
-        ref var core = ref _core.Invoke();
-        InitializeAdo(IsAsync, core.CreateAdoCommandFlowOptions(
-            [_parameters], _behavior, _dependencies, _connection, pgConnection,
-            pendingTimeout: PendingTimeout, preparing: _preparing));
-    }
-
-    void InitializeAdo(bool async, in AdoCommandFlowOptions options)
-    {
+        var options = _bindingOwner.CreateExecutionOptions(
+            _parameters, _behavior, _dependencies, _connection, pgConnection,
+            PendingTimeout, _preparing);
         _resultObserver = options.ResultObserver;
         _resultObserverState = options.ResultObserverState;
-        Initialize(async, new CommandFlowOptions
+        _state.Commands = options.Commands;
+        _state.PendingTimeout = options.PendingTimeout;
+    }
+
+    readonly struct Ops(AdoCommandExecutionFlow owner) : ICommandExecutionFlowOps<Ops>
+    {
+        readonly AdoCommandExecutionFlow _owner = owner;
+
+        public static Ops Create(PgClientFlow flow) => new((AdoCommandExecutionFlow)flow);
+        public PgClientFlow Flow => _owner;
+        public ref CommandExecutionState State => ref _owner._state;
+        public bool IsAsync
         {
-            Commands = options.Commands,
-            PendingTimeout = options.PendingTimeout
-        });
+            get => _owner.IsAsync;
+            set => _owner.IsAsync = value;
+        }
+        public bool IsAsyncAtDispatch => _owner.IsAsyncAtDispatch;
+        public bool HasSuccessfulActivation => _owner.HasSuccessfulActivation;
+        public void WaitForSyncHandoff() => _owner.WaitForSyncHandoff();
+        public void OnCommandResult(CommandResult result) => _owner.ObserveResult(result);
+        public void OnDrainStarted() { }
+        public void OnDiscarded() => _owner.CompleteLifetime(null);
+    }
+
+    bool IValueTaskSource<bool>.GetResult(short token) => _state.ReadySource.GetResult(token);
+    ValueTaskSourceStatus IValueTaskSource<bool>.GetStatus(short token)
+        => _state.ReadySource.GetStatus(token);
+    void IValueTaskSource<bool>.OnCompleted(Action<object?> continuation, object? state, short token,
+        ValueTaskSourceOnCompletedFlags flags)
+        => _state.ReadySource.OnCompleted(continuation, state, token, flags);
+
+    void IValueTaskSource.GetResult(short token) => _state.PipelineTaskSource.GetResult(token);
+    ValueTaskSourceStatus IValueTaskSource.GetStatus(short token)
+        => _state.PipelineTaskSource.GetStatus(token);
+    void IValueTaskSource.OnCompleted(Action<object?> continuation, object? state, short token,
+        ValueTaskSourceOnCompletedFlags flags)
+        => _state.PipelineTaskSource.OnCompleted(continuation, state, token, flags);
+
+    public readonly struct Enumerator : IAsyncEnumerator<CommandResult>, IDisposable
+    {
+        readonly AdoCommandExecutionFlow? _flow;
+        readonly CancellationToken _cancellationToken;
+
+        internal Enumerator(AdoCommandExecutionFlow flow, CancellationToken cancellationToken)
+            => (_flow, _cancellationToken) = (flow, cancellationToken);
+
+        public bool MoveNext() => _flow?.Core.MoveNext() ?? false;
+        public ValueTask<bool> MoveNextAsync() => MoveNextAsync(_cancellationToken);
+        public ValueTask<bool> MoveNextAsync(CancellationToken cancellationToken)
+            => _flow is null ? new(false) : _flow.Core.MoveNextAsync(cancellationToken);
+        public CommandResult Current => _flow?._state.Current ?? default!;
+        public ValueTask DisposeAsync() => _flow is null ? default : _flow.Core.DisposeAsync();
+        public void Dispose() => _flow?.Core.Dispose();
     }
 }
 

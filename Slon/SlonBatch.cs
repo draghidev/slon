@@ -32,17 +32,32 @@ public sealed partial class SlonBatch
     unsafe SlonBatchCommands CreateBatchCommandCollection()
         => new(FieldRef<AdoBatchCore<SlonBatchCommand>>.Create(&GetBatchCore, this));
 
-    internal void OnFlowStarted(CommandFlow flow)
+    internal void OnFlowStarted(AdoCommandExecutionFlow flow)
         => _batchCore.OnFlowStarted(flow);
 
-    internal void OnFlowCompleting(CommandFlow flow, Exception? exception)
+    internal void OnFlowCompleting(AdoCommandExecutionFlow flow, Exception? exception)
         => _batchCore.OnFlowCompleting(flow, exception);
+
+    AdoCommandFlowOptions IAdoCommandExecutionOwner.CreateExecutionOptions(
+        DbParameterCollection? parameters, CommandBehavior behavior,
+        SlonDataSource.PgDbDependencies dependencies, SlonConnection? connection,
+        PgConnection pgConnection, TimeSpan? pendingTimeout, bool preparing)
+        => _batchCore.CreateAdoCommandFlowOptions(
+            [parameters], behavior, dependencies, connection, pgConnection,
+            pendingTimeout, preparing);
+
+    void IAdoCommandExecutionOwner.OnFlowStarted(AdoCommandExecutionFlow flow)
+        => OnFlowStarted(flow);
+
+    void IAdoCommandExecutionOwner.OnFlowCompleting(
+        AdoCommandExecutionFlow flow, Exception? exception)
+        => OnFlowCompleting(flow, exception);
 
     static ref AdoBatchCore<SlonBatchCommand> GetBatchCore(SlonBatch instance) => ref instance._batchCore;
 }
 
 // Public surface & ADO.NET
-public sealed partial class SlonBatch : DbBatch
+public sealed partial class SlonBatch : DbBatch, IAdoCommandExecutionOwner
 {
     /// Initializes an unbound batch.
     public SlonBatch() : this(null, null) {}

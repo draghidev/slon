@@ -81,7 +81,7 @@ public sealed partial class SlonDataSource : DbDataSource
 
     // The multiplexed path lets the pool select a wire before materializing connection-local command
     // state. A rejected candidate rolls that attempt back and reuses the still-unqueued flow shell.
-    internal CommandFlow EnqueueCommands(CommandFlow flow, TimeSpan pendingTimeout)
+    internal AdoCommandExecutionFlow EnqueueCommands(AdoCommandExecutionFlow flow, TimeSpan pendingTimeout)
     {
         try
         {
@@ -95,8 +95,8 @@ public sealed partial class SlonDataSource : DbDataSource
         }
     }
 
-    internal async ValueTask<CommandFlow> EnqueueCommandsAsync(
-        CommandFlow flow, TimeSpan pendingTimeout, CancellationToken cancellationToken)
+    internal async ValueTask<AdoCommandExecutionFlow> EnqueueCommandsAsync(
+        AdoCommandExecutionFlow flow, TimeSpan pendingTimeout, CancellationToken cancellationToken)
     {
         try
         {
@@ -111,7 +111,7 @@ public sealed partial class SlonDataSource : DbDataSource
         }
     }
 
-    static bool TrySchedule(ConnectionCandidate<PgConnection> context, CommandFlow flow)
+    static bool TrySchedule(ConnectionCandidate<PgConnection> context, AdoCommandExecutionFlow flow)
     {
         var enqueueOptions = context.IsIdleCandidate
             ? FlowEnqueueOptions.AllowMigration

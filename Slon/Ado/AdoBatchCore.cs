@@ -20,7 +20,7 @@ partial struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
     TimeSpan _timeout;
     TimeSpan? _pendingTimeout;
     bool _enableErrorBarriers;
-    CommandFlow? _activeFlow;
+    AdoCommandExecutionFlow? _activeFlow;
     AdoCommandList<TCommand> _commands;
 
     public AdoBatchCore(FieldRef<AdoBatchCore<TCommand>> fieldRef)
@@ -194,7 +194,7 @@ partial struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
         return (dataSource ?? connection!.DbDataSource).GetDbDependenciesAsync(cancellationToken);
     }
 
-    CommandFlow Enqueue(DbParameterCollection? parameters, CommandBehavior behavior,
+    AdoCommandExecutionFlow Enqueue(DbParameterCollection? parameters, CommandBehavior behavior,
         SlonDataSource.PgDbDependencies dependencies, bool preparing = false)
     {
         if (TryGetDataSource(out var dataSource, out var connection))
@@ -202,20 +202,24 @@ partial struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
             ThrowIfHasCloseConnection(behavior);
             var pendingTimeout = PendingTimeout;
             return dataSource.EnqueueCommands(
-                new AdoCommandFlow<TCommand>(
-                    async: false, _fieldRef, parameters, behavior, dependencies,
+                new AdoCommandExecutionFlow(
+                    async: false, (IAdoCommandExecutionOwner)_fieldRef.Instance,
+                    parameters, behavior, dependencies,
                     connection: null, pendingTimeout, preparing, _commands.Count,
-                    _explicitlyPrepared && _fieldRef.Instance is SlonCommand ? null : _fieldRef.Instance),
+                    _explicitlyPrepared && _fieldRef.Instance is SlonCommand
+                        ? null
+                        : (IAdoCommandExecutionOwner)_fieldRef.Instance),
                 pendingTimeout);
         }
 
         connection ??= ThrowConnectionNotInitialized();
-        return connection.Enqueue(new AdoCommandFlow<TCommand>(
-            async: false, _fieldRef, parameters, behavior, dependencies,
-            connection, PendingTimeout, preparing, _commands.Count, _fieldRef.Instance));
+        return connection.Enqueue(new AdoCommandExecutionFlow(
+            async: false, (IAdoCommandExecutionOwner)_fieldRef.Instance,
+            parameters, behavior, dependencies, connection, PendingTimeout, preparing,
+            _commands.Count, (IAdoCommandExecutionOwner)_fieldRef.Instance));
     }
 
-    ValueTask<CommandFlow> EnqueueAsync(DbParameterCollection? parameters,
+    ValueTask<AdoCommandExecutionFlow> EnqueueAsync(DbParameterCollection? parameters,
         CommandBehavior behavior, SlonDataSource.PgDbDependencies dependencies,
         CancellationToken cancellationToken, bool preparing = false)
     {
@@ -224,17 +228,21 @@ partial struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
             ThrowIfHasCloseConnection(behavior);
             var pendingTimeout = PendingTimeout;
             return dataSource.EnqueueCommandsAsync(
-                new AdoCommandFlow<TCommand>(
-                    async: true, _fieldRef, parameters, behavior, dependencies,
+                new AdoCommandExecutionFlow(
+                    async: true, (IAdoCommandExecutionOwner)_fieldRef.Instance,
+                    parameters, behavior, dependencies,
                     connection: null, pendingTimeout, preparing, _commands.Count,
-                    _explicitlyPrepared && _fieldRef.Instance is SlonCommand ? null : _fieldRef.Instance),
+                    _explicitlyPrepared && _fieldRef.Instance is SlonCommand
+                        ? null
+                        : (IAdoCommandExecutionOwner)_fieldRef.Instance),
                 pendingTimeout, cancellationToken);
         }
 
         connection ??= ThrowConnectionNotInitialized();
-        return connection.EnqueueAsync<CommandFlow>(new AdoCommandFlow<TCommand>(
-            async: true, _fieldRef, parameters, behavior, dependencies,
-            connection, PendingTimeout, preparing, _commands.Count, _fieldRef.Instance), cancellationToken);
+        return connection.EnqueueAsync<AdoCommandExecutionFlow>(new AdoCommandExecutionFlow(
+            async: true, (IAdoCommandExecutionOwner)_fieldRef.Instance,
+            parameters, behavior, dependencies, connection, PendingTimeout, preparing,
+            _commands.Count, (IAdoCommandExecutionOwner)_fieldRef.Instance), cancellationToken);
     }
 
     [DoesNotReturn]
@@ -346,7 +354,7 @@ partial struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
     {
         ref var thisRef = ref fieldRef.Invoke();
         using var activity = thisRef.StartActivity();
-        CommandFlow.Enumerator enumerator = default;
+        AdoCommandExecutionFlow.Enumerator enumerator = default;
         try
         {
             thisRef.ThrowIfDisposed();
@@ -607,9 +615,9 @@ partial struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
         => throw new NotSupportedException(
             "A datasource-prepared command can have multiple executions; cancel an execution with its token.");
 
-    internal void OnFlowStarted(CommandFlow flow) => Volatile.Write(ref _activeFlow, flow);
+    internal void OnFlowStarted(AdoCommandExecutionFlow flow) => Volatile.Write(ref _activeFlow, flow);
 
-    internal void OnFlowCompleting(CommandFlow flow, Exception? exception)
+    internal void OnFlowCompleting(AdoCommandExecutionFlow flow, Exception? exception)
     {
         // A flow-level fault while holding an ADO connection lease breaks that lease. SQL errors don't
         // reach here: they surface on CommandResult and the flow completes cleanly. OnCompleting runs

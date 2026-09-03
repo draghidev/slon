@@ -25,7 +25,7 @@ partial struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
     void PrepareCore(DbParameterCollection? parameters)
     {
         var operation = Preparation.Begin(_fieldRef);
-        CommandFlow.Enumerator enumerator = default;
+        AdoCommandExecutionFlow.Enumerator enumerator = default;
         try
         {
             var flow = Enqueue(parameters, CommandBehavior.SchemaOnly, GetDependencies(),
@@ -85,7 +85,7 @@ partial struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
         DbParameterCollection? parameters, CancellationToken cancellationToken)
     {
         var operation = Preparation.Begin(fieldRef);
-        CommandFlow.Enumerator enumerator = default;
+        AdoCommandExecutionFlow.Enumerator enumerator = default;
         try
         {
             var dependencies = await fieldRef.Invoke().GetDependenciesAsync(cancellationToken)

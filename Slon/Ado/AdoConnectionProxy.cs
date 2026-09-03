@@ -48,7 +48,7 @@ sealed class AdoConnectionProxy
                 return ConnectionState.Open;
 
             var activatedFlow = scope.ActivatedFlow;
-            if (activatedFlow is CommandFlow { IsResultReady: true })
+            if (activatedFlow is AdoCommandExecutionFlow { IsResultReady: true })
                 return ConnectionState.Fetching;
 
             return activatedFlow is not null || scope.ExecutingFlow is not null

@@ -39,12 +39,12 @@ public sealed partial class SlonDataReader
     CommandResult.RowEnumerator _rowEnumerator;
     PgSerializerFieldReader _fieldReader;
     int _remainingResults;
-    CommandFlow.Enumerator _enumerator;
+    AdoCommandExecutionFlow.Enumerator _enumerator;
     long? _recordsAffected;
 
     SlonDataReader() { }
 
-    void Initialize(CommandFlow.Enumerator enumerator, CommandBehavior behavior, int remainingResults,
+    void Initialize(AdoCommandExecutionFlow.Enumerator enumerator, CommandBehavior behavior, int remainingResults,
         PgSerializerOptions serializerOptions, SlonConnection? connectionToClose,
         long? recordsAffected, bool hasCurrent)
     {
@@ -84,7 +84,7 @@ public sealed partial class SlonDataReader
     static bool ShouldEnumerateCommandResults(CommandBehavior behavior)
         => behavior.HasFlag(EnumerateCommandResultsBehavior);
 
-    static SlonDataReader CreateReader(CommandFlow.Enumerator enumerator, CommandBehavior behavior,
+    static SlonDataReader CreateReader(AdoCommandExecutionFlow.Enumerator enumerator, CommandBehavior behavior,
         int remainingResults, PgSerializerOptions serializerOptions,
         SlonConnection? connectionToClose, long? recordsAffected, bool hasCurrent)
     {
@@ -99,7 +99,7 @@ public sealed partial class SlonDataReader
     CommandResult? Current => _enumerator.Current;
     bool IsSequential => _rowBuffering is CommandResult.RowBuffering.Streaming;
 
-    internal static SlonDataReader Create(CommandBehavior behavior, CommandFlow flow,
+    internal static SlonDataReader Create(CommandBehavior behavior, AdoCommandExecutionFlow flow,
         PgSerializerOptions serializerOptions,
         SlonConnection? connectionToClose = null)
     {
@@ -127,13 +127,13 @@ public sealed partial class SlonDataReader
     }
 
     internal static async ValueTask<TReader> CreateAsync<TReader>(CommandBehavior behavior,
-        ValueTask<CommandFlow> flowTask, PgSerializerOptions serializerOptions,
+        ValueTask<AdoCommandExecutionFlow> flowTask, PgSerializerOptions serializerOptions,
         CancellationToken cancellationToken = default,
         SlonConnection? connectionToClose = null, Activity? activity = null)
         where TReader : DbDataReader
     {
         Debug.Assert(typeof(TReader) == typeof(SlonDataReader) || typeof(TReader) == typeof(DbDataReader));
-        CommandFlow.Enumerator enumerator = default;
+        AdoCommandExecutionFlow.Enumerator enumerator = default;
         try
         {
             var flow = await flowTask.ConfigureAwait(false);
@@ -473,7 +473,7 @@ public sealed partial class SlonDataReader
         }
     }
 
-    (CommandResult.RowEnumerator Rows, CommandFlow.Enumerator Results) BeginEnumeratorDisposal()
+    (CommandResult.RowEnumerator Rows, AdoCommandExecutionFlow.Enumerator Results) BeginEnumeratorDisposal()
     {
         if (_enumeratorDisposalActive)
             ThrowHelper.ThrowInvalidOperation("Invalid concurrent call.");

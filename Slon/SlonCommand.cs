@@ -66,11 +66,26 @@ public sealed partial class SlonCommand
         }
     }
 
-    internal void OnFlowStarted(CommandFlow flow)
+    internal void OnFlowStarted(AdoCommandExecutionFlow flow)
         => _batchCore.OnFlowStarted(flow);
 
-    internal void OnFlowCompleting(CommandFlow flow, Exception? exception)
+    internal void OnFlowCompleting(AdoCommandExecutionFlow flow, Exception? exception)
         => _batchCore.OnFlowCompleting(flow, exception);
+
+    AdoCommandFlowOptions IAdoCommandExecutionOwner.CreateExecutionOptions(
+        DbParameterCollection? parameters, CommandBehavior behavior,
+        SlonDataSource.PgDbDependencies dependencies, SlonConnection? connection,
+        PgConnection pgConnection, TimeSpan? pendingTimeout, bool preparing)
+        => _batchCore.CreateAdoCommandFlowOptions(
+            [parameters], behavior, dependencies, connection, pgConnection,
+            pendingTimeout, preparing);
+
+    void IAdoCommandExecutionOwner.OnFlowStarted(AdoCommandExecutionFlow flow)
+        => OnFlowStarted(flow);
+
+    void IAdoCommandExecutionOwner.OnFlowCompleting(
+        AdoCommandExecutionFlow flow, Exception? exception)
+        => OnFlowCompleting(flow, exception);
 
     struct AdoCommand : IAdoCommand
     {
@@ -85,7 +100,7 @@ public sealed partial class SlonCommand
 }
 
 // Public surface & ADO.NET
-public sealed partial class SlonCommand : DbCommand
+public sealed partial class SlonCommand : DbCommand, IAdoCommandExecutionOwner
 {
     /// Initializes an unbound command.
     public SlonCommand() : this(null, null, null) {}
