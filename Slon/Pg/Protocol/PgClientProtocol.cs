@@ -1334,22 +1334,53 @@ public sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
                 PromiseAsyncValueTaskMethodBuilder<PipelineItemResult>.Promise = null;
             }
 
-            [RuntimeAsyncMethodGeneration(false)]
-            [AsyncMethodBuilder(typeof(PromiseAsyncValueTaskMethodBuilder<>))]
-            static async ValueTask<PipelineItemResult> ExecuteCore(
+            static ValueTask<PipelineItemResult> ExecuteCore(
                 Control control, PgClientFlow item, CancellationToken cancellationToken)
             {
-                await control.WaitForCancellationAttempt().ConfigureAwait(false);
+                var pending = control.WaitForCancellationAttempt();
+                if (!pending.IsCompletedSuccessfully)
+                    return AwaitPriorWork(control, item, cancellationToken, pending, checkFlush: true);
+                pending.GetAwaiter().GetResult();
 
                 // A flow may defer this flush only when its first phase cannot wait for decoder input.
                 if (!item.SupportsDeferredFlush && control.UnflushedBytes != 0)
-                    await control.FlushAsync(cancellationToken).ConfigureAwait(false);
+                {
+                    pending = control.FlushAsync(cancellationToken);
+                    if (!pending.IsCompletedSuccessfully)
+                        return AwaitPriorWork(control, item, cancellationToken, pending, checkFlush: false);
+                    pending.GetAwaiter().GetResult();
+                }
 
-                var tasks = await control.Execute(item).ConfigureAwait(false);
-                return new PipelineItemResult(tasks.TrailingExecutionTask, tasks.PipelineTask);
+                var execution = control.Execute(item);
+                if (!execution.IsCompletedSuccessfully)
+                    return AwaitExecution(execution);
+                var tasks = execution.GetAwaiter().GetResult();
+                return new ValueTask<PipelineItemResult>(
+                    new PipelineItemResult(tasks.TrailingExecutionTask, tasks.PipelineTask));
             }
 
-            // Stock builder (no shared promise) for pipeline-task recovery. Body identical to ExecuteCore.
+            [RuntimeAsyncMethodGeneration(false)]
+            [AsyncMethodBuilder(typeof(PromiseAsyncValueTaskMethodBuilder<>))]
+            static async ValueTask<PipelineItemResult> AwaitPriorWork(
+                Control control, PgClientFlow item, CancellationToken cancellationToken,
+                ValueTask pending, bool checkFlush)
+            {
+                await pending.ConfigureAwait(false);
+                if (checkFlush && !item.SupportsDeferredFlush && control.UnflushedBytes != 0)
+                    await control.FlushAsync(cancellationToken).ConfigureAwait(false);
+                var tasks = await control.Execute(item).ConfigureAwait(false);
+                return new(tasks.TrailingExecutionTask, tasks.PipelineTask);
+            }
+
+            [RuntimeAsyncMethodGeneration(false)]
+            [AsyncMethodBuilder(typeof(PromiseAsyncValueTaskMethodBuilder<>))]
+            static async ValueTask<PipelineItemResult> AwaitExecution(ValueTask<FlowTasks> execution)
+            {
+                var tasks = await execution.ConfigureAwait(false);
+                return new(tasks.TrailingExecutionTask, tasks.PipelineTask);
+            }
+
+            // Stock builder (no shared promise) for pipeline-task recovery.
             static async ValueTask<PipelineItemResult> ExecutePipelineTaskRecovery(
                 Control control, PgClientFlow item, CancellationToken cancellationToken)
             {
