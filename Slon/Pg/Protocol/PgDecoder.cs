@@ -545,16 +545,7 @@ public sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<Bac
                     }
                 }
 
-                var readTask = pipe.ReadAsync(readToken);
-                if (!readTask.IsCompletedSuccessfully)
-                    return MoveNextAsyncCore(readTask, null, null, cancellationToken, frontierFlow);
-                LeaveCancellationReadFrontier(frontierFlow);
-                if (CompleteRead(
-                        readTask.Result, _cancellationTokenSource.Token,
-                        out var readCompleted))
-                    continue;
-                if (readCompleted)
-                    return new(ReadCompleted());
+                return BeginPipeRead(pipe, readToken, cancellationToken, frontierFlow);
             }
             catch (Exception ex) when (_cancellationTokenSource.IsCancellationRequested)
             {
@@ -573,6 +564,16 @@ public sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<Bac
             }
         }
 
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        ValueTask<bool> BeginPipeRead(
+            ProtocolReadPipe pipe,
+            CancellationToken readToken,
+            CancellationToken cancellationToken,
+            PgClientFlow frontierFlow)
+            => MoveNextAsyncCore(
+                pipe.ReadAsync(readToken), null, null,
+                cancellationToken, frontierFlow);
 
         [MethodImpl(MethodImplOptions.NoInlining)]
         ValueTask<bool> AwaitDirectRead(
