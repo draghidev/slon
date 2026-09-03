@@ -1,10 +1,10 @@
+using System.Collections;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Runtime.ExceptionServices;
+using System.Runtime.InteropServices;
 using System.Threading.Tasks.Sources;
 using Slon.Runtime.CompilerServices;
-// A unique result type distinguishes the caller gate from this flow's other IValueTaskSource instantiations.
-using FlowCallerInteractionCoreResult = System.ValueTuple;
 
 namespace Slon.Pg.Protocol.Flows;
 
@@ -12,7 +12,8 @@ namespace Slon.Pg.Protocol.Flows;
 public abstract class CommandFlowObserver : PgClientFlowObserver
 {
     protected internal virtual void OnStarted(CommandFlow flow, object? state) { }
-    protected internal virtual void OnCommandResult(CommandFlow flow, CommandResult result, object? state) { }
+    protected internal virtual void OnCommandResult(
+        CommandFlow flow, CommandResult result, object? state) { }
     protected internal virtual void OnDrainStarted(CommandFlow flow, object? state) { }
 }
 
@@ -26,1306 +27,1502 @@ public readonly struct CommandFlowOptions
     public TimeSpan? PendingTimeout { get; init; }
 }
 
-[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
-public partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSource<FlowCallerInteractionCoreResult>, IValueTaskSource
+internal sealed class CommandExecutionColdState
 {
-    sealed class PreparationReadState
-    {
-        internal ParameterTypeList ParameterTypes;
-    }
+    internal bool CancelRequested;
+    internal CancellationToken CallerToken;
+    internal CancellationTokenRegistration CallerRegistration;
+    internal CancellationToken DeliverToken;
+    internal int Scope;
+    internal int Timing;
+    internal int SubsequentTiming;
+    internal TaskCompletionSource? Delivery;
+    internal object? EpisodeKey;
+    internal Exception? CloseException;
+    // Replayed by later consumer calls once the flow reached its terminal.
+    internal Exception? TerminalException;
+    // Command errors observed while draining without a consumer. Multiple Sync windows may each
+    // produce an independent ErrorResponse, all of which belong to the waiting disposer.
+    internal List<Exception>? DrainErrors;
+}
 
+internal enum CommandExecutionCancellationScope : byte
+{
+    CurrentWindow = 1,
+    RemainingFlow = 2
+}
+
+// Mutable execution state is stored inline by each concrete host. Core algorithms re-enter this
+// field through their host-specific ops value after every await; they never mutate a copied struct.
+[StructLayout(LayoutKind.Auto)]
+internal struct CommandExecutionState
+{
+    internal int Phase;
+    internal CommandList Commands;
+    internal TimeSpan? PendingTimeout;
+    internal int CommandIndex;
+    internal PgClientFlow.Context Context;
+    internal bool ContextPublished;
+    internal CommandResult? Current;
+    internal bool CurrentPublished;
+    internal bool ReadFlowRfq;
+    internal bool ConsumerDetached;
+    internal bool ConsumerObservedCompletion;
+    internal Slon.Threading.Tasks.Sources.ManualResetValueTaskSourceCore<bool> ReadySource;
+    internal int ReadyCompletion;
+    internal Slon.Threading.Tasks.Sources.ManualResetValueTaskSourceCore<bool> PipelineTaskSource;
+    internal CancellationToken FlowToken;
+    internal CancellationTokenRegistration FlowRegistration;
+    internal CommandExecutionColdState? ColdState;
+    internal FlowHandoffEvent? HandoffEvent;
+    internal bool SyncHandoffClaimed;
+    internal int DrainStarted;
+    internal bool EnableActivationTimeout;
+    internal bool WaitForDrainOnDispose;
+}
+
+/// Executes an ordered command list with consumer-owned synchronous or asynchronous result decoding.
+[Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+public sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSource
+{
     static readonly TimeSpan ConsumerDrainCancellationGracePeriod = TimeSpan.FromSeconds(1);
+    CommandExecutionState _state;
+    CommandFlowObserver? _commandObserver;
+    object? _commandObserverState;
 
-    internal override bool DefersSyncHandoff => true;
-
-    internal enum CancellationScope : byte
+    CommandFlow(bool async, TimeSpan? pendingTimeout = null)
+        : base(supportsDeferredFlush: true)
     {
-        None,
-        CurrentWindow = 1,
-        RemainingFlow = 2
+        _state.CommandIndex = -1;
+        _state.EnableActivationTimeout = true;
+        _state.WaitForDrainOnDispose = true;
+        _state.PendingTimeout = pendingTimeout;
+        IsAsync = async;
+        if (!async)
+            _state.HandoffEvent = new(false);
     }
 
-    // Flow state
-    CommandList _commands;
-    TimeSpan? _pendingTimeout;
-    FlowCallerInteractionCore<FlowCallerInteractionCoreResult> _callerInteractionCore;
-    // Cancellation is cold; keep its tokens, registrations and attribution state off ordinary flows.
-    CancellationState? _cancellationState;
-    // Errors encountered while draining are surfaced by a waiting DisposeAsync. Live consumers observe
-    // their errors directly, and the list remains unallocated on the successful path.
-    List<Exception>? _drainErrors;
-    // Set only by ConsumeNonQueryAsync, after enqueue but before any consumer-side gate release.
-    // The body cannot reach first publication until such a release, and every release publishes
-    // this write, so plain accesses suffice and the body observes the mode at first wake.
-    bool _consumeNonQuery;
-    bool IsConsumingNonQuery => _consumeNonQuery;
-    bool IsConsumingAutonomously => IsDraining || IsConsumingNonQuery;
-    long _nonQueryRecordsAffected;
-
-    // Once draining, the body bypasses result handoffs and reads autonomously to RFQ. This is state, not
-    // an I/O cancellation token: canceling the I/O would prevent restoration of a clean wire boundary.
-    bool _draining;
-    internal bool IsDraining => Volatile.Read(ref _draining);
-    // Body-thread-only guard: later commands must not change the drive mode chosen on drain entry.
-    bool _drainModeEntered;
-
-
-    // Distinguishes consumer disposal from a body-initiated drain; disposal suppresses terminal OCE delivery.
-    bool _consumerDisposed;
-    // When true, DisposeAsync awaits the body's drain to RFQ. Otherwise it returns while the body drains;
-    // pipeline retirement still prevents the next flow from observing a dirty wire.
-    internal bool WaitForDrainOnDispose { get; set; } = true;
-
-    // Consumer disposal without waiting for the autonomous drain.
-    void MarkConsumerGone()
-    {
-        Volatile.Write(ref _consumerDisposed, true);
-        RequestCancel(default, CancellationScope.RemainingFlow, BackendCancellationTiming.AfterGrace,
-            BackendCancellationTiming.AtReadFrontier);
-    }
-
-    // Consumer disposal while waiting for the autonomous drain.
-    void MarkConsumerWaitForDrain()
-    {
-        Volatile.Write(ref _consumerDisposed, true);
-        RequestCancel(default, CancellationScope.RemainingFlow, BackendCancellationTiming.AfterGrace,
-            BackendCancellationTiming.AtReadFrontier);
-    }
-
-    // A synchronous consumer cannot abandon its drive obligation while the body is parked. Give the
-    // cancellation path a delivery source so WakeBody transfers that obligation to the dedicated driver.
-    void MarkSyncConsumerGone()
-    {
-        Volatile.Write(ref _consumerDisposed, true);
-        _ = GetOrCreateCancelDelivery();
-        RequestCancel(default, CancellationScope.RemainingFlow, BackendCancellationTiming.AfterGrace,
-            BackendCancellationTiming.AtReadFrontier);
-        _callerInteractionCore.ResumeBody(runContinuationsAsynchronously: true);
-        _callerInteractionCore.WakeBody(useDedicatedDriver: true);
-    }
-
-    // Enumeration already ended; only transfer the live body tail to autonomous ownership.
-    // There is no unfinished consumer work to justify a backend cancellation intent.
-    void MarkTerminalConsumerGone()
-    {
-        Volatile.Write(ref _consumerDisposed, true);
-        Volatile.Write(ref _draining, true);
-    }
-
-    // Result publication orders these body-owned fields before the consumer can observe the
-    // CommandResult. IsComplete is consumer-owned after that handoff. A behavior-limited reader may
-    // consider its visible result final while later commands still exist, so use the physical
-    // command index rather than an ADO-visible result count.
-    bool IsFullyConsumedFinalResult
-        => _isResultReady && _commandIndex >= CommandCount - 1
-            && _enumeratorCurrent is { IsComplete: true };
-
-    // A body-initiated drain keeps the consumer attached for terminal cancellation or close delivery.
-    void MarkBodyInitiatedDrain() => Volatile.Write(ref _draining, true);
-
-    // Result-production state
-    RowDescription? _requestedRowDescription;
-    PgError? _pgError;
-    int _commandIndex = -1;
-    PgDecoder? _decoder;
-    bool _readFlowRfq;
-
-    // Pipelined dispatch state. Lives here (not on PgClientFlow base) because the shared-promise
-    // optimization that needs these fields is CommandFlow-specific (see DispatchPipelinedRead).
-    Slon.Threading.Tasks.Sources.ManualResetValueTaskSourceCore<bool> _executePipelinedCore;
-    Context _context;
-    bool _contextPublished;
-    // Consumer terminality, body terminality, and framework release are distinct phases. Start and
-    // pre-start termination race during shutdown, so one atomic state owns that decision.
-    const int BodyNotStarted = 0;
-    const int BodyRunning = 1;
-    const int BodyTerminated = 2;
-    int _bodyState;
-    DetachedPublication _detachedPublication;
-
-    enum DetachedPublication : byte
-    {
-        None,
-        Result,
-        Completion
-    }
-
-    sealed class CancellationState
-    {
-        internal CancellationToken CallerToken;
-        internal CancellationToken FlowToken;
-        internal CancellationTokenRegistration CallerRegistration;
-        internal CancellationTokenRegistration FlowRegistration;
-        internal bool Requested;
-        internal int Scope;
-        internal int Timing;
-        internal int SubsequentTiming;
-        internal CancellationToken DeliverToken;
-        internal TaskCompletionSource? Delivery;
-        internal object? EpisodeKey;
-        internal bool DeliverOce;
-
-        internal void Reset()
-        {
-            CallerToken = default;
-            FlowToken = default;
-            CallerRegistration.Dispose();
-            CallerRegistration = default;
-            FlowRegistration.Dispose();
-            FlowRegistration = default;
-            Requested = false;
-            Scope = (int)CancellationScope.None;
-            Timing = (int)BackendCancellationTiming.AfterGrace;
-            SubsequentTiming = (int)BackendCancellationTiming.AfterGrace;
-            DeliverToken = default;
-            Delivery = null;
-            EpisodeKey = null;
-            DeliverOce = false;
-        }
-    }
-    CommandFlow() : base(supportsDeferredFlush: true)
-    {
-        _callerInteractionCore.Initialize();
-    }
-
-    // Interactive commands carry caller patience, so arm the activation timeout.
-    protected override bool EnableActivationTimeout => true;
-    protected override TimeSpan? PendingTimeout => _pendingTimeout;
-    internal override TimeSpan? BackendCancellationGracePeriod
-        => Volatile.Read(ref _consumerDisposed) ? ConsumerDrainCancellationGracePeriod : null;
-
-    public CommandFlow(bool async, params ReadOnlySpan<Command> commands) : this()
+    public CommandFlow(bool async, params ReadOnlySpan<Command> commands)
+        : this(async)
         => Initialize(async, commands);
-    public CommandFlow(bool async, in CommandFlowOptions options) : this()
+
+    internal CommandFlow(
+        bool async, bool enableActivationTimeout, params ReadOnlySpan<Command> commands)
+        : this(async, commands)
+        => _state.EnableActivationTimeout = enableActivationTimeout;
+
+    internal CommandFlow(bool async, CommandList commands, TimeSpan? pendingTimeout = null)
+        : this(async, pendingTimeout)
+        => Initialize(async, new CommandFlowOptions
+        {
+            Commands = commands,
+            PendingTimeout = pendingTimeout
+        });
+
+    public CommandFlow(bool async, in CommandFlowOptions options)
+        : this(async, options.PendingTimeout)
         => Initialize(async, options);
 
-    private protected CommandFlow(bool async, TimeSpan? pendingTimeout) : this()
-    {
-        IsAsync = async;
-        _pendingTimeout = pendingTimeout;
-    }
-
     public CommandFlow Initialize(bool async, params ReadOnlySpan<Command> commands)
-        => Initialize(async, options: new() { Commands = new(commands) });
+        => Initialize(async, new CommandFlowOptions { Commands = new(commands) });
 
     public CommandFlow Initialize(bool async, in CommandFlowOptions options)
     {
         IsAsync = async;
+        if (!async)
+            _state.HandoffEvent ??= new(false);
+        var commands = options.Commands;
+        if (commands.Count is 0)
+            return this;
+        _state.Commands = commands;
+        _state.PendingTimeout = options.PendingTimeout;
+        _commandObserver = options.Observer;
+        _commandObserverState = options.ObserverState;
         if (options.Observer is { } observer)
+        {
             SetObserver(observer, options.ObserverState);
-        _commands = options.Commands;
-        _pendingTimeout = options.PendingTimeout;
-        options.Observer?.OnStarted(this, options.ObserverState);
+            observer.OnStarted(this, options.ObserverState);
+        }
         return this;
     }
 
-    // Declares internal non-query consumption and runs it to completion. The single entry point
-    // makes the ownership rule structural: no enumerator is exposed on this path, so mixing
-    // enumeration with internal consumption is unrepresentable. The declaration precedes any
-    // consumer-side gate release, so the body observes it at first wake and never publishes.
-    [RuntimeAsyncMethodGeneration(false)]
-    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
-    internal async ValueTask<long> ConsumeNonQueryAsync(CancellationToken cancellationToken = default)
-    {
-        _consumeNonQuery = true;
-        _nonQueryRecordsAffected = -1;
-        var enumerator = GetAsyncEnumerator(cancellationToken);
-        try
-        {
-            // Release a body parked pre-publication and wake the flow.
-            _callerInteractionCore.ResumeBody(runContinuationsAsynchronously: false);
-            _callerInteractionCore.WakeBody();
-            _ = await EnumeratorMoveNextTask.ConfigureAwait(false);
-            // Internal consumption owns error delivery. Errors collected during the internal
-            // drain have no other outlet: DisposeAsync deliberately skips a completed flow.
-            if (_drainErrors is { Count: > 0 } errors)
-                throw errors.Count == 1 ? errors[0] : new AggregateException(errors);
-            return _nonQueryRecordsAffected;
-        }
-        finally
-        {
-            await enumerator.DisposeAsync().ConfigureAwait(false);
-        }
-    }
+    internal override bool DefersSyncHandoff => true;
+    private protected override FlowHandoffEvent? HandoffEvent => _state.HandoffEvent;
+    protected override bool EnableActivationTimeout => _state.EnableActivationTimeout;
+    protected override TimeSpan? PendingTimeout => _state.PendingTimeout;
+    internal override TimeSpan? BackendCancellationGracePeriod
+        => Volatile.Read(ref _state.ConsumerDetached)
+            ? ConsumerDrainCancellationGracePeriod
+            : null;
 
-    // The token in force for the current read: the flow token once fired (whole-flow cancel), else the
-    // per-read token if cancelable, else the flow token.
-    CancellationToken EffectiveCancellationToken
-        => GetEffectiveCancellationToken(Volatile.Read(ref _cancellationState));
-
-    static CancellationToken GetEffectiveCancellationToken(CancellationState? cancellation)
-        => cancellation is null ? default
-            : cancellation.FlowToken.IsCancellationRequested ? cancellation.FlowToken
-            : cancellation.CallerToken.CanBeCanceled ? cancellation.CallerToken
-            : cancellation.FlowToken;
-
-    public int CommandCount => _commands.Count;
-    internal virtual int VisibleCommandCount => _commands.VisibleCount;
-    public bool IsResultReady => _isResultReady;
+    internal override void BindCallerToken(CancellationToken cancellationToken)
+        => _state.FlowToken = cancellationToken;
+    internal override CancellationToken MigrationCancellationToken
+        => _state.FlowToken;
 
     public Enumerator GetEnumerator()
-    {
-        return new Enumerator(this);
-    }
-
-    // Bind at submission because eager writing precedes the first MoveNextAsync.
-    internal override void BindCallerToken(CancellationToken cancellationToken)
-        => GetOrCreateCancellationState().FlowToken = cancellationToken;
-    internal override CancellationToken MigrationCancellationToken
-        => Volatile.Read(ref _cancellationState)?.FlowToken ?? default;
+        => new(this, default);
 
     public Enumerator GetAsyncEnumerator(CancellationToken cancellationToken = default)
     {
-        // A missing per-call token must not replace the flow token captured at submission.
+        // A missing enumeration token must not erase the token captured when the flow was queued.
         if (cancellationToken.CanBeCanceled)
-            GetOrCreateCancellationState().FlowToken = cancellationToken;
-        return new(this);
+            _state.FlowToken = cancellationToken;
+        return new(this, cancellationToken);
     }
+
+    internal CommandResult? CurrentResult => _state.Current;
+    public int CommandCount => _state.Commands.Count;
+    public bool IsResultReady => Core.IsResultReady;
+    internal int VisibleCommandCount => _state.Commands.VisibleCount;
+    internal ValueTask<bool> MoveNextResultAsync(CancellationToken cancellationToken)
+        => Core.MoveNextAsync(cancellationToken);
+    internal void DisposeResults() => Core.Dispose();
+    internal ValueTask DisposeResultsAsync() => Core.DisposeAsync();
+    internal bool WaitForDrainOnDispose
+    {
+        get => _state.WaitForDrainOnDispose;
+        set => _state.WaitForDrainOnDispose = value;
+    }
+
+    CommandExecutionCore<Ops> Core => new(new(this));
+
+    internal ValueTask<long> ConsumeNonQueryAsync(CancellationToken cancellationToken = default)
+        => Core.ConsumeNonQueryAsync(cancellationToken);
 
     protected override ValueTask<FlowTasks> ExecuteAuto(Context context)
-    {
-        if (!IsAsync && _callerInteractionCore.IsWaiting)
-            return ExecuteAfterHandoff(context);
+        => Core.ExecuteAuto(context);
 
-        return new(ExecuteAutoCore(context));
+    internal Task CancelAsync() => Core.CancelAsync();
+
+    internal override bool ResetsSharedReadStateBeforeRelease => true;
+    protected override void OnStopping(Exception exception) => Core.OnStopping(exception);
+    protected override void OnAbort(Exception exception) => Core.OnAbort(exception);
+    internal override void Fail(Exception exception) => Core.Fail(exception);
+    protected override void OnReleasing(Exception? exception) => Core.OnReleasing(exception);
+    protected override void OnDiscarded() => Core.OnDiscarded();
+    protected override void OnReset() => Core.OnReset();
+
+    readonly struct Ops(CommandFlow owner) : ICommandExecutionFlowOps<Ops>
+    {
+        readonly CommandFlow _owner = owner;
+
+        public static Ops Create(PgClientFlow flow) => new((CommandFlow)flow);
+        public PgClientFlow Flow => _owner;
+        public ref CommandExecutionState State => ref _owner._state;
+        public bool IsAsync
+        {
+            get => _owner.IsAsync;
+            set => _owner.IsAsync = value;
+        }
+        public bool IsAsyncAtDispatch => _owner.IsAsyncAtDispatch;
+        public bool HasSuccessfulActivation => _owner.HasSuccessfulActivation;
+        public void WaitForSyncHandoff() => _owner.WaitForSyncHandoff();
+        public void OnCommandResult(CommandResult result)
+            => _owner._commandObserver?.OnCommandResult(
+                _owner, result, _owner._commandObserverState);
+        public void OnDrainStarted()
+            => _owner._commandObserver?.OnDrainStarted(
+                _owner, _owner._commandObserverState);
+        public void OnDiscarded()
+            => _owner.GetObserver(out var observerState)?.OnCompleting(
+                _owner, null, observerState);
     }
+}
+
+internal interface ICommandExecutionFlowOps<TSelf>
+    where TSelf : struct, ICommandExecutionFlowOps<TSelf>
+{
+    static abstract TSelf Create(PgClientFlow flow);
+    PgClientFlow Flow { get; }
+    ref CommandExecutionState State { get; }
+    bool IsAsync { get; set; }
+    bool IsAsyncAtDispatch { get; }
+    bool HasSuccessfulActivation { get; }
+    void WaitForSyncHandoff();
+    void OnCommandResult(CommandResult result);
+    void OnDrainStarted();
+    void OnDiscarded();
+}
+
+readonly struct CommandExecutionCore<TOps>(TOps ops)
+    where TOps : struct, ICommandExecutionFlowOps<TOps>
+{
+    const int PhaseInitial = 0;
+    const int PhaseReading = 1;
+    const int PhaseResultReady = 2;
+    const int PhaseDraining = 3;
+    const int PhaseCompleted = 4;
+
+    readonly TOps _ops = ops;
+    ref CommandExecutionState _state => ref _ops.State;
+    internal bool IsResultReady => Volatile.Read(ref _state.Phase) is PhaseResultReady;
 
     [RuntimeAsyncMethodGeneration(false)]
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
-    async ValueTask<FlowTasks> ExecuteAfterHandoff(Context context)
+    internal async ValueTask<long> ConsumeNonQueryAsync(
+        CancellationToken cancellationToken = default)
     {
+        var recordsAffected = -1L;
+        if (cancellationToken.CanBeCanceled)
+            _state.FlowToken = cancellationToken;
         try
         {
-            await YieldToCaller();
+            while (await MoveNextAsync(cancellationToken).ConfigureAwait(false))
+            {
+                var result = _state.Current!;
+                await result.CompleteAsync().ConfigureAwait(false);
+                var affected = result.GetCommandComplete().BatchRecordsAffected;
+                if (affected >= 0)
+                    recordsAffected = recordsAffected < 0
+                        ? affected
+                        : checked(recordsAffected + affected);
+            }
+            return recordsAffected;
         }
-        catch (Exception ex)
+        finally
         {
-            TerminateBodyBeforeStart();
-            CompleteEnumerationWithException(ex);
-            throw;
+            await DisposeAsync().ConfigureAwait(false);
         }
-
-        return ExecuteAutoCore(context);
     }
 
-    FlowTasks ExecuteAutoCore(Context context)
+    CommandExecutionColdState GetOrCreateColdState()
+        => Volatile.Read(ref _state.ColdState) ??
+            Interlocked.CompareExchange(ref _state.ColdState, new(), null) ?? _state.ColdState;
+
+    bool IsClosed => Volatile.Read(ref _state.ColdState)?.CloseException is not null;
+    bool IsCancelRequested => Volatile.Read(ref _state.ColdState) is { CancelRequested: true };
+    bool HasDecoder => _state.ContextPublished && _ops.HasSuccessfulActivation;
+
+    internal ValueTask<FlowTasks> ExecuteAuto(PgClientFlow.Context context)
     {
-        _context = context;
-        Volatile.Write(ref _contextPublished, true);
-        if (Volatile.Read(ref _cancellationState) is { } cancellation)
-        {
-            if (cancellation.FlowToken.IsCancellationRequested)
-                RequestCancel(cancellation.FlowToken, CancellationScope.RemainingFlow);
-            else if (Volatile.Read(ref cancellation.Requested))
-                RequestBackendCancellation((BackendCancellationTiming)Volatile.Read(ref cancellation.Timing),
-                    Volatile.Read(ref cancellation.Delivery));
-        }
+        _state.Context = context;
+        _state.ContextPublished = true;
         ValueTask writeTask;
         try
         {
-            // Writes are independent of consumer admission. Inter-result gates provide backpressure.
-            // Async writes use transport completion; sync writes use the resumable non-blocking path so
-            // the caller thread retains execution ownership across readiness waits.
-            var appendSync = !_commands[CommandCount - 1].WithSync;
-            _readFlowRfq = appendSync;
-            // Caller cancellation never cancels wire I/O. A partially cancelled write requires
-            // protocol recovery and can strand already-pipelined successors; the body instead
-            // observes the latched intent and drains every written command to RFQ.
-            writeTask = IsAsync
-                ? _commands.WriteCommandsAsync(context.GetEncoder(), appendSync, default)
+            ref readonly var template = ref _state.Commands.ItemRef(_state.Commands.Count - 1);
+            var appendSync = !template.WithSync;
+            _state.ReadFlowRfq = appendSync;
+            // Caller cancellation never cancels wire I/O. The consumer observes the latched intent and
+            // drains its command to RFQ instead.
+            writeTask = _ops.IsAsync
+                ? _state.Commands.WriteCommandsAsync(context.GetEncoder(), appendSync, default)
                 : WriteCommandsResumable(context, appendSync);
-
             // Observe synchronous faults here; pending writes remain the framework-owned trailing task.
             if (writeTask.IsCompleted)
                 writeTask.GetAwaiter().GetResult();
         }
         catch (Exception ex)
         {
-            TerminateBodyBeforeStart();
-            CompleteEnumerationWithException(ex);
+            // The framework recovers the wire from this throw. Only the consumer needs the fault.
+            FaultReady(ex);
             throw;
         }
 
-        // Read and write run concurrently; the framework observes the trailing write before releasing
-        // the flow, preserving single-writer tenure without blocking reads behind socket backpressure.
-        return new FlowTasks(
-            trailingExecutionTask: writeTask,
-            pipelineTask: DispatchPipelinedRead(
-                context, context.GetProtocolStatic<ReadPromiseState>().Promise));
+        // Activation may precede or follow execution. Bridging it here guarantees a consumer resumes
+        // against a published context, and delivers an activation fault to the pipeline task when no
+        // consumer ever arrives.
+        var activation = context.GetDecoderAsync().ConfigureAwait(false);
+        if (activation.IsCompleted)
+            OnActivationSettled(onExecutorStrand: true);
+        else
+            activation.UnsafeOnCompleted(static state =>
+                new CommandExecutionCore<TOps>(TOps.Create((PgClientFlow)state!))
+                    .OnActivationSettled(onExecutorStrand: false), _ops.Flow);
+        return new(new FlowTasks(writeTask, new ValueTask((IValueTaskSource)_ops.Flow, _state.PipelineTaskSource.Version)));
     }
 
     [MethodImpl(MethodImplOptions.NoInlining)]
-    ValueTask WriteCommandsResumable(Context context, bool appendSync)
+    ValueTask WriteCommandsResumable(PgClientFlow.Context context, bool appendSync)
     {
         var encoder = context.GetEncoder();
         ValueTask writeTask;
         using (encoder.BeginResumableWriteScope())
-            writeTask = _commands.WriteCommandsResumable(encoder, appendSync);
+            writeTask = _state.Commands.WriteCommandsResumable(encoder, appendSync);
         return writeTask.IsCompleted ? writeTask : encoder.RunResumableTask(writeTask);
     }
 
-    // Defer state-machine creation until activation because all flows share one protocol-static promise.
-    ValueTask DispatchPipelinedRead(Context context, ValueTaskSourcePromise<bool> promise)
+    // Runs on the executor strand when activation already settled, else on the activation dispatch.
+    // The executor strand never runs consumer code. An activation dispatch is a detached work item
+    // whose only remaining work is this wake, so the consumer may continue on it directly.
+    void OnActivationSettled(bool onExecutorStrand)
     {
-        // The shared promise may be tenured only after successful decoder activation.
-        var waiter = context.GetDecoderAsync().ConfigureAwait(false);
-        if (waiter.IsCompleted)
-        {
-            // Only successful activation owns the shared promise. A settled fault belongs to this flow's
-            // private completion source because it never claimed the wire.
-            if (!waiter.IsCompletedSuccessfully)
-            {
-                // Preserve the activation's close, timeout, or cancellation identity.
-                try { waiter.GetAwaiter().GetResult(); }
-                catch (Exception ex) { _executePipelinedCore.SetException(ex); }
-                return new ValueTask(this, _executePipelinedCore.Version);
-            }
-            // Handing the shared-promise-backed task to the framework is safe: the contract guarantees
-            // the waiter is consumed (releasing the promise tenure via GetResult's Reset) before the
-            // item's position is republished, so a successor's dispatch always finds the tenure released.
-            PromiseAsyncValueTaskMethodBuilder.Promise = promise;
-            try
-            {
-                return ExecutePipelined(context);
-            }
-            finally
-            {
-                PromiseAsyncValueTaskMethodBuilder.Promise = null;
-            }
-        }
-
-        // Static continuation: a bridge into framework state, so no captured scheduling context is needed.
-        waiter.OnCompleted(static state =>
-        {
-            var flow = (CommandFlow)state!;
-            var ctx = flow._context;
-            // A faulted activation never claimed the shared promise; complete only this flow's source.
-            var activation = ctx.GetDecoderAsync().GetAwaiter();
-            if (!activation.IsCompletedSuccessfully)
-            {
-                // Preserve the activation's close, timeout, or cancellation identity.
-                try { activation.GetResult(); }
-                catch (Exception ex) { flow._executePipelinedCore.SetException(ex); }
-                return;
-            }
-            var promise = ctx.GetProtocolStatic<ReadPromiseState>().Promise;
-            PromiseAsyncValueTaskMethodBuilder.Promise = promise;
-            ValueTask task = flow.ExecutePipelined(ctx);
-            try
-            {
-                if (!task.IsCompleted)
-                {
-                    ((IValueTaskSource)promise).OnCompleted(static state =>
-                    {
-                        var flow = (CommandFlow)state!;
-                        try
-                        {
-                            var promise = flow._context
-                                .GetProtocolStatic<ReadPromiseState>().Promise;
-                            ((IValueTaskSource)promise).GetResult(promise.Token);
-                            flow._executePipelinedCore.SetResult(true);
-                        }
-                        catch (Exception ex)
-                        {
-                            flow._executePipelinedCore.SetException(ex);
-                        }
-                        // This internal bridge runs no user code and requires no ExecutionContext flow.
-                    }, flow, promise.Token, ValueTaskSourceOnCompletedFlags.None);
-                }
-                else
-                {
-                    try
-                    {
-                        task.GetAwaiter().GetResult();
-                        flow._executePipelinedCore.SetResult(true);
-                    }
-                    catch (Exception ex)
-                    {
-                        flow._executePipelinedCore.SetException(ex);
-                    }
-                }
-            }
-            finally
-            {
-                PromiseAsyncValueTaskMethodBuilder.Promise = null;
-            }
-        }, this);
-
-        return new ValueTask(this, _executePipelinedCore.Version);
-    }
-
-    [RuntimeAsyncMethodGeneration(false)]
-    [AsyncMethodBuilder(typeof(PromiseAsyncValueTaskMethodBuilder))]
-    async ValueTask ExecutePipelined(Context context)
-    {
-        // Pre-start teardown may have already claimed terminality. In that case the consumer has its
-        // fault and this late dispatch has no body tenure to establish.
-        if (Interlocked.CompareExchange(ref _bodyState, BodyRunning, BodyNotStarted) != BodyNotStarted)
-            return;
         try
         {
-            // If we have a continuation stored we must already be on the caller thread,
-            // otherwise we must make sure to unblock the executor (see comment in the write phase).
-            // This first handoff is body execution too: close may fault it, so it belongs inside the
-            // same terminal envelope that publishes the consumer fault and body termination.
-            if (!IsAsync && !_callerInteractionCore.HasHandoff)
-                await YieldToCaller();
-
-            // User cancellation must not cancel activation or wire I/O. The flow observes it after
-            // activation, drains itself to RFQ, then delivers OCE without invoking pipeline recovery.
-            _decoder = await context.GetDecoderAuto().ConfigureAwait(false);
-            var publishedResult = false;
-            while (++_commandIndex < CommandCount)
-            {
-                _isResultReady = false;
-                bool hasPreparedDescription;
-                bool suppressEnumeration;
-                bool describeForPreparation;
-                {
-                    ref readonly var command = ref _commands.ItemRef(_commandIndex);
-                    _decoder.UseReadTimeout(command.Timeout);
-                    suppressEnumeration = command.SuppressEnumeration;
-                    describeForPreparation = command.DescribeForPreparation;
-                    hasPreparedDescription = command.Descriptor is { IsPrepared: true, PreparedRowDescription: not null }
-                        && !command.DescribeOnly;
-                }
-
-                // Registrations only latch and wake; terminal delivery remains body-owned. Dispose them
-                // before promise tenure ends so callbacks cannot reach the next flow. Do not rearm after
-                // consumer disposal, where a persistent cancellation could escape its intended wait.
-                if (Volatile.Read(ref _cancellationState) is { } cancellationAtReadStart && !IsDraining
-                    && (cancellationAtReadStart.CallerToken.CanBeCanceled
-                        || cancellationAtReadStart.FlowToken.CanBeCanceled))
-                    RegisterCancellationCallbacks(cancellationAtReadStart);
-                // After close, a fresh command must not consume bytes left by its predecessor. A draining
-                // flow may continue reading its own response to restore RFQ.
-                if (!IsDraining && context.IsProtocolClosed)
-                    throw context.FlowTerminationException;
-
-                PreparationReadState? preparationRead = null;
-                if (describeForPreparation)
-                {
-                    preparationRead = new();
-                    await ReadPreparationDescription(context, preparationRead).ConfigureAwait(false);
-                }
-                else if (IsAsync && hasPreparedDescription)
-                {
-                    // Prepared commands with a known description have the compact BindComplete ->
-                    // DataRow/CommandComplete prelude. Await the decoder directly so a read wake resumes
-                    // this outer body rather than a nested parser coroutine; the second message normally
-                    // comes from the same batch and is consumed synchronously.
-                    if (!_decoder.TryMoveNext())
-                    {
-                        if (!await _decoder.MoveNextAsync().ConfigureAwait(false))
-                            _decoder.ThrowUnexpectedEof();
-                    }
-                    var message = _decoder.Current;
-
-                    if (message.EnsureExpectedOrError(PgTypes.BackendType.BindComplete) is { } bindError)
-                    {
-                        _pgError = bindError;
-                        _requestedRowDescription = null;
-                    }
-                    else
-                    {
-                        if (!_decoder.TryMoveNext())
-                        {
-                            if (!await _decoder.MoveNextAsync().ConfigureAwait(false))
-                                _decoder.ThrowUnexpectedEof();
-                        }
-                        message = _decoder.Current;
-                        message.DebugEnsureExpected(PgTypes.BackendType.DataRow, PgTypes.BackendType.CommandComplete);
-                        _pgError = null;
-                        _requestedRowDescription = null;
-                    }
-                }
-                else if (IsAsync)
-                {
-                    var rowDescription = context.GetProtocolStatic<ReadState>().RowDescription;
-                    var read = _commands.ItemRef(_commandIndex).ReadUntilExecuteAsync(_decoder, rowDescription);
-                    (_pgError, _requestedRowDescription) = await read.ConfigureAwait(false);
-                }
-                else
-                {
-                    var rowDescription = context.GetProtocolStatic<ReadState>().RowDescription;
-                    (_pgError, _requestedRowDescription) = _commands.ItemRef(_commandIndex)
-                        .ReadUntilExecute(_decoder, rowDescription);
-                }
-
-                // A draining consumer cannot observe CommandResult, so retain read errors for disposal.
-                var capturedThisCommand = false;
-                var readErrorIsOwnCancellation = _pgError is { } readError
-                    && IsOwnCancellation(readError);
-                if (IsConsumingAutonomously && _pgError is { } readErrorToCapture
-                    && !readErrorIsOwnCancellation)
-                {
-                    (_drainErrors ??= new()).Add(PgErrorException.Create(readErrorToCapture));
-                    capturedThisCommand = true;
-                }
-
-                // Await in-flight callbacks before releasing shared promise tenure.
-                var cancellation = Volatile.Read(ref _cancellationState);
-                if (cancellation is not null)
-                    await DisposeCancellationRegistrations(cancellation).ConfigureAwait(false);
-                // Cancellation switches to autonomous drain; terminal delivery follows RFQ and tenure release.
-                var effectiveCancellationToken = GetEffectiveCancellationToken(cancellation);
-                if ((cancellation is { } && Volatile.Read(ref cancellation.Requested)
-                     || effectiveCancellationToken.IsCancellationRequested) && !IsEnumerationCompleted)
-                {
-                    cancellation ??= GetOrCreateCancellationState();
-                    if (effectiveCancellationToken.IsCancellationRequested)
-                        cancellation.DeliverToken = effectiveCancellationToken;
-                    cancellation.DeliverOce = true;
-                    if (!IsDraining)
-                        MarkBodyInitiatedDrain();
-                }
-
-                var result = InitializeResult(
-                    context, preparationRead);
-                ((CommandFlowObserver?)GetObserver(out var observerState))
-                    ?.OnCommandResult(this, result, observerState);
-
-                // Disposal drains without another result handoff. Graceful close instead faults the
-                // attached consumer, then uses the same autonomous drain. Command errors remain results.
-                if (context.StoppingToken.IsCancellationRequested && !IsDraining
-                    && !IsEnumerationCompleted)
-                {
-                    // Latch the close (a consumer that Resets past this point self-delivers it), wake a
-                    // parked consumer, then drain.
-                    var close = context.FlowTerminationException;
-                    _callerInteractionCore.SetCloseLatch(close);
-                    CompleteEnumerationWithClose(close);
-                    MarkBodyInitiatedDrain();
-                }
-                if (!IsDraining && !IsConsumingNonQuery && !suppressEnumeration)
-                {
-                    // Eager async execution must wait for the consumer to arm generation zero before
-                    // publishing its first result. Synchronous execution already runs on that caller.
-                    if (!publishedResult && IsAsync)
-                    {
-                        await _callerInteractionCore.WaitForCaller(this).ConfigureAwait(false);
-                        // The first consumer can arrive after the response prelude was already read
-                        // and its registrations were disposed. Its token was armed by MoveNextAsync;
-                        // the result has now won that race, so retire the late registration before
-                        // publishing the result.
-                        if (Volatile.Read(ref _cancellationState) is { } lateCancellation)
-                            await DisposeCancellationRegistrations(lateCancellation).ConfigureAwait(false);
-                        EnterStoppingDrainIfNeeded(context);
-                    }
-
-                    if (!IsDraining && !IsConsumingNonQuery)
-                    {
-                        _isResultReady = true;
-                        publishedResult = true;
-                        // Result continuations run asynchronously so the body can reach the next gate
-                        // before user code asks for the next result. Buffered batches then advance inline
-                        // from MoveNextAsync instead of suspending one Task state machine per result.
-                        PublishEnumeratorResult(context, result);
-
-                        if (!IsDraining && !IsConsumingNonQuery)
-                        {
-                            if (IsAsync)
-                            {
-                                await _callerInteractionCore.WaitForCaller(this).ConfigureAwait(false);
-                                EnterStoppingDrainIfNeeded(context);
-                            }
-                            else
-                                await YieldToCaller();
-
-                            /* The next MoveNext or MoveNextAsync call resumes here. */
-                        }
-                    }
-                }
-                else if (!_drainModeEntered && IsAsyncAtDispatch && !IsAsync)
-                {
-                    // An async I/O wake raced a synchronous disposer before the body reached its handoff.
-                    if (WaitForDrainOnDispose)
-                    {
-                        // Hand the continuation to the disposer, which waits on the rendezvous rather than
-                        // this task and can therefore drive the remaining drain without sync-over-async.
-                        await YieldToCaller();
-                    }
-                    else
-                    {
-                        // No disposer is waiting to drive; retain asynchronous background draining.
-                        IsAsync = IsAsyncAtDispatch;
-                    }
-                }
-                // Preserve the drive mode chosen on first drain entry.
-                _drainModeEntered = _drainModeEntered || IsDraining;
-
-                // Disposing the message enumerator completes the command and, in drain mode, consumes its
-                // remaining rows. Re-read the current execution mode after every resumption.
-                (PgError Error, TransactionStatus TransactionStatus)? completeError;
-                // Consumption mode may change while the body is suspended; use the current value.
-                if (IsConsumingNonQuery || suppressEnumeration)
-                {
-                    await CompleteInternalConsumptionAsync(
-                        result, suppressEnumeration, capturedThisCommand).ConfigureAwait(false);
-                    continue;
-                }
-                else if (IsAsync)
-                {
-                    var resultEnumerator = context.GetProtocolStatic<ReadState>().ResultMessageEnumerator;
-                    await resultEnumerator.DisposeAsync().ConfigureAwait(false);
-                    completeError = resultEnumerator.CompleteError;
-                }
-                else
-                {
-                    var resultEnumerator = context.GetProtocolStatic<ReadState>().ResultMessageEnumerator;
-                    resultEnumerator.Dispose();
-                    completeError = resultEnumerator.CompleteError;
-                }
-
-                if (result.Error is not null || completeError is not null)
-                    await HandleCommandErrorsAsync(
-                        result, suppressEnumeration, consumeInternally: false,
-                        capturedThisCommand, completeError).ConfigureAwait(false);
-            }
-
-            // The framework observes trailing write failure before releasing this flow.
-            if (_readFlowRfq)
-            {
-                if (_decoder.TryMoveNext())
-                {
-                    var message = _decoder.Current;
-                    if (message.EnsureExpectedOrError(PgTypes.BackendType.ReadyForQuery) is { } rfqError)
-                        PgErrorException.Throw(rfqError);
-                }
-                else if (IsAsync)
-                {
-                    await ReadRfqAsync(_decoder).ConfigureAwait(false);
-                }
-                else
-                {
-                    ReadRfq(_decoder);
-                }
-            }
-
-            PublishEnumeratorResult(context, null);
+            _ = _state.Context.GetDecoderAsync().ConfigureAwait(false).GetAwaiter().GetResult();
         }
-        catch (PgClientClosedException) when (context.IsProtocolClosed)
+        catch (Exception fault)
         {
-            // Scope to our own closure so a nested protocol's close doesn't get treated as ours.
-            // Latch the close so a consumer that Resets after this point self-delivers it.
-            _callerInteractionCore.SetCloseLatch(context.FlowTerminationException);
-            // A detached consumer treats close as drain completion; a live consumer observes the close.
-            if (IsDraining)
-            {
-                if (!IsEnumerationCompleted)
-                    PublishEnumeratorResult(context, null);
-                return;
-            }
-            CompleteEnumerationWithException(context.FlowTerminationException);
-            throw;
+            // Preserve the activation's close, timeout, or cancellation identity. The pipeline task
+            // faults first so a consumer woken by the ready source never races its retirement.
+            CompletePipelineTask(fault, runContinuationsAsynchronously: true);
+            FaultReady(fault);
+            return;
         }
-        catch (OperationCanceledException ex) when (IsCancellationToken(ex.CancellationToken))
+
+        if (IsCancelRequested)
+            RequestBackendCancellation();
+        if (!CompleteReady(null, runContinuationsAsynchronously: onExecutorStrand))
         {
-            CompleteEnumerationWithException(ex);
-            throw;
+            // Teardown released the consumer while this flow waited for its turn. Nothing reads the
+            // response, the closing wire owns it.
+            CompletePipelineTask(null, runContinuationsAsynchronously: true);
+            return;
+        }
+        // A cancel latched before activation may have released its caller already. The response
+        // still has to reach RFQ, so drain it unless a consumer already owns the decoder.
+        if (IsCancelRequested)
+            TryTakeOverDrain();
+    }
+
+    void FaultReady(Exception exception)
+    {
+        Interlocked.CompareExchange(ref GetOrCreateColdState().TerminalException, exception, null);
+        CompleteReady(exception, runContinuationsAsynchronously: true);
+    }
+
+    bool CompleteReady(Exception? exception, bool runContinuationsAsynchronously)
+    {
+        if (Interlocked.CompareExchange(ref _state.ReadyCompletion, 1, 0) != 0)
+            return false;
+        if (exception is null)
+            _state.ReadySource.SetResult(true, runContinuationsAsynchronously);
+        else
+            _state.ReadySource.SetException(exception, runContinuationsAsynchronously);
+        return true;
+    }
+
+    void CompletePipelineTask(Exception? exception, bool runContinuationsAsynchronously = false)
+    {
+        if (Interlocked.Exchange(ref _state.Phase, PhaseCompleted) is PhaseCompleted)
+            return;
+        if (exception is null)
+            _state.PipelineTaskSource.SetResult(true, runContinuationsAsynchronously);
+        else
+            _state.PipelineTaskSource.SetException(exception, runContinuationsAsynchronously);
+    }
+
+    void EnsureSyncHandoff()
+    {
+        if (_ops.IsAsyncAtDispatch)
+            ThrowHelper.ThrowInvalidOperation(
+                "Synchronous result consumption requires a flow initialized for synchronous execution.");
+        if (_state.SyncHandoffClaimed)
+            return;
+        _ops.WaitForSyncHandoff();
+        _state.SyncHandoffClaimed = true;
+    }
+
+    internal bool MoveNext()
+    {
+        EnsureSyncHandoff();
+        while (true)
+        {
+            var phase = Volatile.Read(ref _state.Phase);
+            switch (phase)
+            {
+                case PhaseInitial:
+                    if (Interlocked.CompareExchange(ref _state.Phase, PhaseReading, PhaseInitial) != PhaseInitial)
+                        continue;
+                    _state.CommandIndex = 0;
+                    return First();
+                case PhaseResultReady:
+                    if (Interlocked.CompareExchange(ref _state.Phase, PhaseReading, PhaseResultReady) != PhaseResultReady)
+                        continue;
+                    return NextBatch();
+                case PhaseReading:
+                    ThrowHelper.ThrowInvalidOperation("A read is already in progress on this flow.");
+                    return false;
+                case PhaseDraining:
+                    _ops.Flow.WaitForCompleteSynchronously();
+                    throw Volatile.Read(ref _state.ColdState)?.TerminalException
+                        ?? ThrowHelper.ThrowInvalidOperation("The flow was disposed.");
+                default:
+                    if (Volatile.Read(ref _state.ColdState)?.TerminalException is { } terminal)
+                        ExceptionDispatchInfo.Throw(terminal);
+                    return false;
+            }
+        }
+    }
+
+    bool First()
+    {
+        try
+        {
+            WaitForReadySynchronously();
+            Debug.Assert(!_state.ConsumerDetached);
+            RegisterCancellation(default);
+            var result = ReadNextPublishedResult();
+            return result is not null && PublishSynchronousResult(result);
         }
         catch (TimeoutException ex)
         {
-            await HandleTimeoutAsync(context, ex).ConfigureAwait(false);
-            return;
+            HandleReadTimeout(ex);
+            throw;
         }
         catch (Exception ex)
         {
-            CompleteEnumerationWithException(ex);
+            FaultFromOwner(ex);
             throw;
         }
-        finally
-        {
-            // The body is the sole owner of protocol-static row metadata. Recovery consumes only
-            // decoder/wire state, so a faulted body can release oversized storage while recovery
-            // retains the failed flow's framework tenure.
-            ref readonly var readState = ref context.GetProtocolStatic<ReadState>();
-            readState.Reset();
-            PublishBodyTerminated();
-        }
     }
 
-    void PublishEnumeratorResult(Context context, CommandResult? next)
+    bool NextBatch()
     {
-        var completed = next is null;
-        var publishAsync = IsAsync;
-        if (completed)
-        {
-            _enumeratorCurrent = null;
-        }
-        else
-        {
-            if (Volatile.Read(ref _cancellationState) is { } cancellation)
-                cancellation.CallerToken = default;
-
-            if (!ReferenceEquals(_enumeratorCurrent, next))
-                _enumeratorCurrent = next;
-        }
-
-        // Close is durable across generations; complete the current one without publishing a result.
-        if (_callerInteractionCore.CloseException is not null)
-        {
-            CompleteEnumerationWithClose(_callerInteractionCore.CloseException);
-            return;
-        }
-        if (completed)
-        {
-            // Publish durable terminal state atomically with respect to consumer rearming. Async
-            // consumers complete from the protocol scheduler so they cannot reenter this lock or
-            // the pipeline frame that still owns the shared promise; sync consumers retain their
-            // caller-driven completion.
-            using (_rearmLock.EnterScope())
-            {
-                PublishEnumerationCompleted();
-                if (!publishAsync)
-                    CompleteEnumeration();
-            }
-            if (publishAsync)
-                SubmitPublication(context, DetachedPublication.Completion);
-            return;
-        }
-        if (publishAsync)
-        {
-            // Queue the publication itself so the body reaches its next caller gate before user code
-            // resumes. Routing through the protocol scheduler preserves that ordering without forcing
-            // every result continuation onto the ThreadPool.
-            SubmitPublication(context, DetachedPublication.Result);
-        }
-        else
-            TrySetEnumeratorResult(true, runContinuationsAsynchronously: true);
-    }
-
-    async ValueTask HandleTimeoutAsync(Context context, TimeoutException exception)
-    {
-        CompleteEnumerationWithException(exception);
-        RequestCancel(default, CancellationScope.RemainingFlow, BackendCancellationTiming.Immediate,
-            BackendCancellationTiming.AtReadFrontier, allowCompletedEnumeration: true);
-        if (context.IsProtocolClosed)
-            ExceptionDispatchInfo.Throw(exception);
-
-        // The timeout is terminal for the consumer, not for the body. Keep ownership of the
-        // command sequence and drain every remaining RFQ window; reaching each RFQ requests
-        // cancellation for each following window through the cancellation coordinator. Recovery is
-        // reserved for a failure of this semantic drain, where only wire obligations remain.
-        if (Volatile.Read(ref _cancellationState) is { } cancellation)
-            await DisposeCancellationRegistrations(cancellation).ConfigureAwait(false);
-        ((CommandFlowObserver?)GetObserver(out var observerState))
-            ?.OnDrainStarted(this, observerState);
         try
         {
-            while (context.OutstandingRfqCount != 0)
-                _ = await _decoder!.GetNextAuto().ConfigureAwait(false);
+            RegisterCancellation(default);
+            var result = _state.Current!;
+            var completeError = CompleteCurrentResult();
+            _state.CurrentPublished = false;
+            if (Volatile.Read(ref _state.ColdState)?.TerminalException is { } consumerFault)
+            {
+                Interlocked.Exchange(ref _state.Phase, PhaseDraining);
+                NotifyDrainStarted();
+                _state.ConsumerDetached = true;
+                Drain();
+                ExceptionDispatchInfo.Throw(consumerFault);
+            }
+            if (completeError is { TransactionStatus: TransactionStatus.Unknown })
+                SkipDiscardedCommands();
+
+            _state.CommandIndex++;
+            var next = ReadNextPublishedResult();
+            if (next is not null)
+                return PublishSynchronousResult(next);
+
+            return false;
         }
-        catch (TimeoutException)
+        catch (TimeoutException ex)
         {
-            // The semantic drain owns the same cancellation episode. A timeout here would otherwise
-            // leave the episode unaware that its first read-timeout escalation made no protocol progress.
-            RequestCancel(default, CancellationScope.RemainingFlow,
-                BackendCancellationTiming.Immediate, BackendCancellationTiming.AtReadFrontier,
-                allowCompletedEnumeration: true);
+            HandleReadTimeout(ex);
+            throw;
+        }
+        catch (Exception ex)
+        {
+            FaultFromOwner(ex);
             throw;
         }
     }
 
-    static async ValueTask ReadRfqAsync(PgDecoder decoder)
+    bool PublishSynchronousResult(CommandResult result)
     {
-        var message = await decoder.GetNextAsync().ConfigureAwait(false);
-        if (message.EnsureExpectedOrError(PgTypes.BackendType.ReadyForQuery) is { } rfqError)
-            PgErrorException.Throw(rfqError);
+        _state.Current = result;
+        _state.CurrentPublished = true;
+        Interlocked.Exchange(ref _state.Phase, PhaseResultReady);
+        var context = _state.Context;
+        if (!IsClosed && context.StoppingToken.IsCancellationRequested)
+            Interlocked.CompareExchange(ref GetOrCreateColdState().CloseException,
+                context.FlowTerminationException, null);
+        if (!IsCancelRequested && !IsClosed)
+            return true;
+
+        if (Interlocked.CompareExchange(ref _state.Phase, PhaseReading, PhaseResultReady) == PhaseResultReady)
+            Drain();
+        else
+            _ops.Flow.WaitForCompleteSynchronously();
+        throw Volatile.Read(ref _state.ColdState)?.TerminalException
+            ?? ThrowHelper.ThrowUnexpected("A latched flow completed without a terminal outcome.");
     }
 
-    static void ReadRfq(PgDecoder decoder)
+    void WaitForReadySynchronously()
     {
-        var message = decoder.GetNext();
-        if (message.EnsureExpectedOrError(PgTypes.BackendType.ReadyForQuery) is { } rfqError)
-            PgErrorException.Throw(rfqError);
+        var ready = new ValueTask<bool>((IValueTaskSource<bool>)_ops.Flow, _state.ReadySource.Version);
+        if (ready.IsCompleted)
+            _ = ready.GetAwaiter().GetResult();
+        else
+            _ = ready.AsTask().GetAwaiter().GetResult();
     }
 
-    [MethodImpl(MethodImplOptions.NoInlining)]
-    CommandResult InitializeResult(
-        Context context, PreparationReadState? preparationRead)
+    internal ValueTask<bool> MoveNextAsync(CancellationToken cancellationToken)
     {
-        ref readonly var readState = ref context.GetProtocolStatic<ReadState>();
-        readState.ResultMessageEnumerator.Initialize(_commands.ItemRef(_commandIndex), _decoder!);
-        var result = _enumeratorCurrent ?? readState.CommandResult;
-
-        ref readonly var command = ref _commands.ItemRef(_commandIndex);
-        var descriptor = command.Descriptor;
-        // We were preparing and we have no error from parse, make a prepared descriptor.
-        if (!descriptor.IsPrepared && !descriptor.CommandName.IsDefault
-            && (_pgError is not { } err || !err.Expected.Contains(PgTypes.BackendType.ParseComplete)))
+        if (!_ops.IsAsyncAtDispatch)
+            return ValueTask.FromException<bool>(ThrowHelper.ThrowInvalidOperation(
+                "Asynchronous result consumption requires a flow initialized for asynchronous execution."));
+        while (true)
         {
-            descriptor = CommandDescriptor.CreatePrepared(
-                descriptor.CommandName,
-                preparationRead?.ParameterTypes ?? descriptor.ParameterTypes,
-                _requestedRowDescription?.Preserve());
+            var phase = Volatile.Read(ref _state.Phase);
+            switch (phase)
+            {
+                case PhaseInitial:
+                    if (cancellationToken.IsCancellationRequested)
+                        return CancelBeforeRead(cancellationToken);
+                    if (Interlocked.CompareExchange(ref _state.Phase, PhaseReading, PhaseInitial) != PhaseInitial)
+                        continue;
+                    _state.CommandIndex = 0;
+                    return FirstAsync(cancellationToken);
+                case PhaseResultReady:
+                    if (cancellationToken.IsCancellationRequested)
+                        return CancelBeforeRead(cancellationToken);
+                    if (Interlocked.CompareExchange(ref _state.Phase, PhaseReading, PhaseResultReady) != PhaseResultReady)
+                        continue;
+                    return NextBatchAsync(cancellationToken);
+                case PhaseReading:
+                    return ValueTask.FromException<bool>(
+                        ThrowHelper.ThrowInvalidOperation("A read is already in progress on this flow."));
+                case PhaseDraining:
+                    return AwaitTakeoverAsync();
+                default:
+                    return Volatile.Read(ref _state.ColdState)?.TerminalException is { } terminal
+                        ? ValueTask.FromException<bool>(terminal)
+                        : new(false);
+            }
         }
-        result.Initialize(this, _commandIndex, descriptor, _requestedRowDescription,
-            !command.DescribeOnly, command.IsSimple(), _pgError);
+    }
+
+    // A pre-cancelled token releases the caller immediately. The wire still drains to RFQ.
+    ValueTask<bool> CancelBeforeRead(CancellationToken cancellationToken)
+    {
+        RequestCancel(cancellationToken, CommandExecutionCancellationScope.CurrentWindow);
+        return ValueTask.FromException<bool>(new OperationCanceledException(cancellationToken));
+    }
+
+    // The consumer parks behind a takeover drain and receives the outcome that caused it.
+    async ValueTask<bool> AwaitTakeoverAsync()
+    {
+        await WaitForCompletionAsync().ConfigureAwait(false);
+        throw Volatile.Read(ref _state.ColdState)?.TerminalException ?? ThrowHelper.ThrowInvalidOperation("The flow was disposed.");
+    }
+
+    [RuntimeAsyncMethodGeneration(false)]
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
+    async ValueTask<bool> FirstAsync(CancellationToken cancellationToken)
+    {
+        Exception? deliver;
+        try
+        {
+            await new ValueTask<bool>((IValueTaskSource<bool>)_ops.Flow, _state.ReadySource.Version).ConfigureAwait(false);
+            Debug.Assert(!_state.ConsumerDetached);
+            RegisterCancellation(cancellationToken);
+            var result = await ReadNextPublishedResultAsync().ConfigureAwait(false);
+            if (result is null)
+                return false;
+            _state.Current = result;
+            _state.CurrentPublished = true;
+            // Publish the idle state, then recheck the latches. A latch that landed between the read
+            // and this publication found no idle owner to take over, so this frame must act on it.
+            Interlocked.Exchange(ref _state.Phase, PhaseResultReady);
+            // Graceful stopping faults a result that arrives after the close began, as the ordinary
+            // flow does at each result boundary. Latch it so the drain delivers that close.
+            var context = _state.Context;
+            if (!IsClosed && context.StoppingToken.IsCancellationRequested)
+                Interlocked.CompareExchange(ref GetOrCreateColdState().CloseException,
+                    context.FlowTerminationException, null);
+            if (!IsCancelRequested && !IsClosed)
+                return true;
+            if (Interlocked.CompareExchange(ref _state.Phase, PhaseReading, PhaseResultReady) == PhaseResultReady)
+            {
+                await DrainAsync().ConfigureAwait(false);
+            }
+            else
+            {
+                // The latching side took the decoder first. Park behind its drain.
+                await WaitForCompletionAsync().ConfigureAwait(false);
+            }
+            deliver = Volatile.Read(ref _state.ColdState)?.TerminalException;
+        }
+        catch (TimeoutException ex)
+        {
+            HandleReadTimeout(ex);
+            throw;
+        }
+        catch (Exception ex)
+        {
+            FaultFromOwner(ex);
+            throw;
+        }
+        throw deliver ?? ThrowHelper.ThrowUnexpected("A latched flow completed without a terminal outcome.");
+    }
+
+    [RuntimeAsyncMethodGeneration(false)]
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
+    async ValueTask<bool> NextBatchAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            RegisterCancellation(cancellationToken);
+            var result = _state.Current!;
+            var resultEnumerator = _state.Context.GetProtocolStatic<CommandFlow.ReadState>()
+                .ResultMessageEnumerator;
+            await resultEnumerator.DisposeAsync().ConfigureAwait(false);
+            var completeError = resultEnumerator.CompleteError;
+            _state.CurrentPublished = false;
+            if (Volatile.Read(ref _state.ColdState)?.TerminalException is { } consumerFault)
+            {
+                Interlocked.Exchange(ref _state.Phase, PhaseDraining);
+                NotifyDrainStarted();
+                _state.ConsumerDetached = true;
+                await DrainAsync().ConfigureAwait(false);
+                ExceptionDispatchInfo.Throw(consumerFault);
+            }
+            if (completeError is { TransactionStatus: TransactionStatus.Unknown })
+                await SkipDiscardedCommandsAsync().ConfigureAwait(false);
+
+            _state.CommandIndex++;
+            var next = await ReadNextPublishedResultAsync().ConfigureAwait(false);
+            if (next is not null)
+            {
+                result = next;
+                _state.Current = result;
+                _state.CurrentPublished = true;
+                Interlocked.Exchange(ref _state.Phase, PhaseResultReady);
+                var context = _state.Context;
+                if (!IsClosed && context.StoppingToken.IsCancellationRequested)
+                    Interlocked.CompareExchange(ref GetOrCreateColdState().CloseException,
+                        context.FlowTerminationException, null);
+                if (!IsCancelRequested && !IsClosed)
+                    return true;
+
+                if (Interlocked.CompareExchange(ref _state.Phase, PhaseReading, PhaseResultReady) == PhaseResultReady)
+                    await DrainAsync().ConfigureAwait(false);
+                else
+                    await WaitForCompletionAsync().ConfigureAwait(false);
+                throw Volatile.Read(ref _state.ColdState)?.TerminalException
+                    ?? ThrowHelper.ThrowUnexpected("A latched flow completed without a terminal outcome.");
+            }
+
+            return false;
+        }
+        catch (TimeoutException ex)
+        {
+            HandleReadTimeout(ex);
+            throw;
+        }
+        catch (Exception ex)
+        {
+            FaultFromOwner(ex);
+            throw;
+        }
+    }
+
+    [RuntimeAsyncMethodGeneration(false)]
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
+    async ValueTask<CommandResult?> ReadNextPublishedResultAsync()
+    {
+        CommandResult? result = _state.Current;
+        while (_state.CommandIndex < _state.Commands.Count)
+        {
+            result = await ReadResultAsync(_state.CommandIndex).ConfigureAwait(false);
+            _state.Current = result;
+            _state.CurrentPublished = false;
+            if (!_state.Commands.ItemRef(_state.CommandIndex).SuppressEnumeration)
+                return result;
+
+            var completeError = await CompleteCurrentResultAsync().ConfigureAwait(false);
+            var suppressedError = result.Error;
+            if (suppressedError is null && completeError is { } completionError)
+                suppressedError = completionError.Error;
+            if (suppressedError is not null)
+            {
+                var exception = PgErrorException.Create(suppressedError);
+                var cold = GetOrCreateColdState();
+                Interlocked.CompareExchange(ref cold.TerminalException, exception, null);
+                (cold.DrainErrors ??= new()).Add(exception);
+                if (completeError is { TransactionStatus: TransactionStatus.Unknown })
+                    await SkipDiscardedCommandsAsync().ConfigureAwait(false);
+                _state.CommandIndex++;
+                _state.Current = null;
+                Interlocked.Exchange(ref _state.Phase, PhaseDraining);
+                NotifyDrainStarted();
+                _state.ConsumerDetached = true;
+                await DrainAsync().ConfigureAwait(false);
+                throw exception;
+            }
+
+            _state.CommandIndex++;
+        }
+
+        if (result is null)
+            throw ThrowHelper.ThrowInvalidOperation("The flow contains no commands.");
+        await CompleteBatchAsync().ConfigureAwait(false);
+        _state.ConsumerObservedCompletion = true;
+        return null;
+    }
+
+    CommandResult? ReadNextPublishedResult()
+    {
+        CommandResult? result = _state.Current;
+        while (_state.CommandIndex < _state.Commands.Count)
+        {
+            result = ReadResult(_state.CommandIndex);
+            _state.Current = result;
+            _state.CurrentPublished = false;
+            if (!_state.Commands.ItemRef(_state.CommandIndex).SuppressEnumeration)
+                return result;
+
+            var completeError = CompleteCurrentResult();
+            var suppressedError = result.Error;
+            if (suppressedError is null && completeError is { } completionError)
+                suppressedError = completionError.Error;
+            if (suppressedError is not null)
+            {
+                var exception = PgErrorException.Create(suppressedError);
+                var cold = GetOrCreateColdState();
+                Interlocked.CompareExchange(ref cold.TerminalException, exception, null);
+                (cold.DrainErrors ??= new()).Add(exception);
+                if (completeError is { TransactionStatus: TransactionStatus.Unknown })
+                    SkipDiscardedCommands();
+                _state.CommandIndex++;
+                _state.Current = null;
+                Interlocked.Exchange(ref _state.Phase, PhaseDraining);
+                NotifyDrainStarted();
+                _state.ConsumerDetached = true;
+                Drain();
+                throw exception;
+            }
+
+            _state.CommandIndex++;
+        }
+
+        if (result is null)
+            throw ThrowHelper.ThrowInvalidOperation("The flow contains no commands.");
+        CompleteBatch();
+        _state.ConsumerObservedCompletion = true;
+        return null;
+    }
+
+    // Reads through the command's execute prelude and initializes the protocol-static result.
+    async ValueTask<CommandResult> ReadResultAsync(int commandIndex)
+    {
+        var context = _state.Context;
+        var decoder = context.Decoder;
+        // After close, a fresh command must not consume bytes left by its predecessor.
+        if (context.IsProtocolClosed)
+            throw context.FlowTerminationException;
+        PgError? error;
+        RowDescription? requestedRowDescription;
+        ref readonly var command = ref _state.Commands.ItemRef(commandIndex);
+        var describeOnly = command.DescribeOnly;
+        var hasPreparedDescription = command.Descriptor
+            is { IsPrepared: true, PreparedRowDescription: not null };
+        decoder.UseReadTimeout(command.Timeout);
+        ParameterTypeList? preparationParameterTypes = null;
+        if (command.DescribeForPreparation)
+        {
+            var preparation = await command.ReadPreparationDescriptionAsync(
+                decoder, context.GetProtocolStatic<CommandFlow.ReadState>().RowDescription)
+                .ConfigureAwait(false);
+            error = preparation.Item1;
+            preparationParameterTypes = preparation.Item2;
+            requestedRowDescription = preparation.Item3;
+        }
+        else if (hasPreparedDescription && !describeOnly)
+        {
+            // Prepared commands with a known description have the compact BindComplete ->
+            // DataRow/CommandComplete prelude. Await the decoder directly so a read wake resumes this
+            // frame rather than a nested parser coroutine.
+            if (!decoder.TryMoveNext())
+            {
+                if (!await decoder.MoveNextAsync().ConfigureAwait(false))
+                    decoder.ThrowUnexpectedEof();
+            }
+            var message = decoder.Current;
+            if (message.EnsureExpectedOrError(PgTypes.BackendType.BindComplete) is { } bindError)
+            {
+                error = bindError;
+            }
+            else
+            {
+                if (!decoder.TryMoveNext())
+                {
+                    if (!await decoder.MoveNextAsync().ConfigureAwait(false))
+                        decoder.ThrowUnexpectedEof();
+                }
+                decoder.Current.DebugEnsureExpected(PgTypes.BackendType.DataRow, PgTypes.BackendType.CommandComplete);
+                error = null;
+            }
+            requestedRowDescription = null;
+        }
+        else
+        {
+            (error, requestedRowDescription) = await command
+                .ReadUntilExecuteAsync(decoder, context.GetProtocolStatic<CommandFlow.ReadState>().RowDescription)
+                .ConfigureAwait(false);
+        }
+        return InitializeResult(
+            commandIndex, error, requestedRowDescription, preparationParameterTypes);
+    }
+
+    CommandResult ReadResult(int commandIndex)
+    {
+        var context = _state.Context;
+        var decoder = context.Decoder;
+        if (context.IsProtocolClosed)
+            throw context.FlowTerminationException;
+        ref readonly var command = ref _state.Commands.ItemRef(commandIndex);
+        decoder.UseReadTimeout(command.Timeout);
+        PgError? error;
+        RowDescription? requestedRowDescription;
+        ParameterTypeList? preparationParameterTypes = null;
+        if (command.DescribeForPreparation)
+        {
+            var preparation = command.ReadPreparationDescription(
+                decoder, context.GetProtocolStatic<CommandFlow.ReadState>().RowDescription);
+            error = preparation.Item1;
+            preparationParameterTypes = preparation.Item2;
+            requestedRowDescription = preparation.Item3;
+        }
+        else
+        {
+            (error, requestedRowDescription) = command.ReadUntilExecute(
+                decoder, context.GetProtocolStatic<CommandFlow.ReadState>().RowDescription);
+        }
+        return InitializeResult(
+            commandIndex, error, requestedRowDescription, preparationParameterTypes);
+    }
+
+    CommandResult InitializeResult(
+        int commandIndex, PgError? error, RowDescription? requestedRowDescription,
+        ParameterTypeList? preparationParameterTypes = null)
+    {
+        var context = _state.Context;
+        ref readonly var readState = ref context.GetProtocolStatic<CommandFlow.ReadState>();
+        ref readonly var command = ref _state.Commands.ItemRef(commandIndex);
+        readState.ResultMessageEnumerator.Initialize(command, context.Decoder);
+        var result = readState.CommandResult;
+        var descriptor = command.Descriptor;
+        // A named unprepared statement that parsed becomes a prepared descriptor.
+        if (!descriptor.IsPrepared && !descriptor.CommandName.IsDefault
+            && (error is not { } err || !err.Expected.Contains(PgTypes.BackendType.ParseComplete)))
+        {
+            descriptor = CommandDescriptor.CreatePrepared(descriptor.CommandName,
+                preparationParameterTypes ?? descriptor.ParameterTypes,
+                requestedRowDescription?.Preserve());
+        }
+        result.Initialize(_ops.Flow, commandIndex, descriptor, requestedRowDescription,
+            !command.DescribeOnly, command.IsSimple(), error);
+        _ops.OnCommandResult(result);
         return result;
     }
 
-    ValueTask ReadPreparationDescription(Context context, PreparationReadState state)
+    async ValueTask<(PgError Error, TransactionStatus TransactionStatus)?> CompleteCurrentResultAsync()
     {
-        var rowDescription = context.GetProtocolStatic<ReadState>().RowDescription;
-        ref readonly var command = ref _commands.ItemRef(_commandIndex);
-        if (!IsAsync)
-        {
-            (_pgError, state.ParameterTypes, _requestedRowDescription) =
-                command.ReadPreparationDescription(_decoder!, rowDescription);
-            return default;
-        }
+        var enumerator = _state.Context.GetProtocolStatic<CommandFlow.ReadState>().ResultMessageEnumerator;
+        await enumerator.DisposeAsync().ConfigureAwait(false);
+        return enumerator.CompleteError;
+    }
 
-        var read = command.ReadPreparationDescriptionAsync(_decoder!, rowDescription);
-        if (!read.IsCompletedSuccessfully)
-            return AwaitRead(this, state, read);
-        (_pgError, state.ParameterTypes, _requestedRowDescription) = read.Result;
+    (PgError Error, TransactionStatus TransactionStatus)? CompleteCurrentResult()
+    {
+        var enumerator = _state.Context.GetProtocolStatic<CommandFlow.ReadState>().ResultMessageEnumerator;
+        enumerator.Dispose();
+        return enumerator.CompleteError;
+    }
+
+    async ValueTask SkipDiscardedCommandsAsync()
+    {
+        while (++_state.CommandIndex < _state.Commands.Count && !_state.Commands[_state.CommandIndex].WithSync) { }
+        await ReadRfqAsync().ConfigureAwait(false);
+        if (_state.CommandIndex == _state.Commands.Count)
+            _state.ReadFlowRfq = false;
+    }
+
+    void SkipDiscardedCommands()
+    {
+        while (++_state.CommandIndex < _state.Commands.Count && !_state.Commands[_state.CommandIndex].WithSync) { }
+        ReadRfq();
+        if (_state.CommandIndex == _state.Commands.Count)
+            _state.ReadFlowRfq = false;
+    }
+
+    async ValueTask ReadRfqAsync()
+    {
+        var message = await _state.Context.Decoder.GetNextAsync().ConfigureAwait(false);
+        if (message.EnsureExpectedOrError(PgTypes.BackendType.ReadyForQuery) is { } rfqError)
+            PgErrorException.Throw(rfqError);
+    }
+
+    void ReadRfq()
+    {
+        var message = _state.Context.Decoder.GetNext();
+        if (message.EnsureExpectedOrError(PgTypes.BackendType.ReadyForQuery) is { } rfqError)
+            PgErrorException.Throw(rfqError);
+    }
+
+    async ValueTask CompleteBatchAsync()
+    {
+        if (_state.ReadFlowRfq)
+            await ReadRfqAsync().ConfigureAwait(false);
+        await DisposeRegistrationsAsync().ConfigureAwait(false);
+        Finish();
+    }
+
+    void CompleteBatch()
+    {
+        if (_state.ReadFlowRfq)
+            ReadRfq();
+        DisposeRegistrations();
+        Finish();
+    }
+
+    // The wire is at this command's RFQ. Release the shared read objects, record the outcome the
+    // consumer must observe, then complete the pipeline task.
+    void Finish()
+    {
+        _state.Context.GetProtocolStatic<CommandFlow.ReadState>().Reset();
+        _state.Current = null;
+        _state.CurrentPublished = false;
+        if (IsCancelRequested)
+            Interlocked.CompareExchange(ref GetOrCreateColdState().TerminalException,
+                new OperationCanceledException(_state.ColdState!.DeliverToken), null);
+        else if (Volatile.Read(ref _state.ColdState)?.CloseException is { } close)
+            Interlocked.CompareExchange(ref GetOrCreateColdState().TerminalException, close, null);
+        CompletePipelineTask(null);
+    }
+
+    bool IsOwnCancellation(PgError error)
+        => IsCancelRequested && error.SqlState == PgErrorCodes.QueryCanceled;
+
+    // The owning frame failed. The read error is the pipeline task's failure, which the framework
+    // recovers or drains. Later consumer calls replay it.
+    void FaultFromOwner(Exception exception)
+    {
+        Interlocked.CompareExchange(ref GetOrCreateColdState().TerminalException, exception, null);
+        if (Volatile.Read(ref _state.Phase) == PhaseCompleted)
+            return;
+        DisposeRegistrations();
+        _state.Current = null;
+        _state.CurrentPublished = false;
+        if (HasDecoder)
+            _state.Context.GetProtocolStatic<CommandFlow.ReadState>().Reset();
+        CompletePipelineTask(exception);
+    }
+
+    // Takes an idle decoder for a drain. Returns false when a frame already owns it, which will observe
+    // the latch itself, or when the flow reached its terminal.
+    bool TryTakeOverDrain()
+    {
+        while (true)
+        {
+            var phase = Volatile.Read(ref _state.Phase);
+            if (phase is PhaseInitial && !HasDecoder)
+                return false;
+            if (phase is not (PhaseInitial or PhaseResultReady))
+                return false;
+            if (Interlocked.CompareExchange(ref _state.Phase, PhaseDraining, phase) != phase)
+                continue;
+            NotifyDrainStarted();
+            _state.ConsumerDetached = true;
+            ThreadPool.UnsafeQueueUserWorkItem(static state =>
+                _ = new CommandExecutionCore<TOps>(TOps.Create((PgClientFlow)state!)).DrainAsync(),
+                _ops.Flow);
+            return true;
+        }
+    }
+
+    void NotifyDrainStarted()
+    {
+        if (Interlocked.Exchange(ref _state.DrainStarted, 1) is 0)
+            _ops.OnDrainStarted();
+    }
+
+    // Autonomous drain. Owns the decoder until the pipeline task completes. Never throws.
+    async ValueTask DrainAsync()
+    {
+        try
+        {
+            var result = _state.Current;
+            if (result is null)
+            {
+                await new ValueTask<bool>((IValueTaskSource<bool>)_ops.Flow, _state.ReadySource.Version).ConfigureAwait(false);
+                if (_state.CommandIndex < 0)
+                    _state.CommandIndex = 0;
+                if (_state.CommandIndex >= _state.Commands.Count)
+                {
+                    await CompleteBatchAsync().ConfigureAwait(false);
+                    return;
+                }
+                result = await ReadResultAsync(_state.CommandIndex).ConfigureAwait(false);
+            }
+
+            while (true)
+            {
+                var completeError = await CompleteCurrentResultAsync().ConfigureAwait(false);
+                CaptureDrainError(result, completeError);
+                _state.CurrentPublished = false;
+                if (completeError is { TransactionStatus: TransactionStatus.Unknown })
+                    await SkipDiscardedCommandsAsync().ConfigureAwait(false);
+                if (++_state.CommandIndex >= _state.Commands.Count)
+                    break;
+                result = await ReadResultAsync(_state.CommandIndex).ConfigureAwait(false);
+            }
+            await CompleteBatchAsync().ConfigureAwait(false);
+        }
+        catch (TimeoutException ex)
+        {
+            // A timeout during semantic drain escalates the same cancellation episode immediately.
+            // The pipeline failure then hands any remaining wire obligation to recovery.
+            RequestCancel(default, CommandExecutionCancellationScope.RemainingFlow,
+                BackendCancellationTiming.Immediate, BackendCancellationTiming.AtReadFrontier);
+            FaultFromOwner(ex);
+        }
+        catch (Exception ex)
+        {
+            FaultFromOwner(ex);
+        }
+    }
+
+    // A read timeout is terminal for the consumer but not for the wire obligation. This frame has
+    // released the decoder read tenure, so transfer ownership to an autonomous semantic drain while
+    // the original MoveNext returns its timeout immediately.
+    void HandleReadTimeout(TimeoutException exception)
+    {
+        Interlocked.CompareExchange(
+            ref GetOrCreateColdState().TerminalException, exception, null);
+        _state.ConsumerDetached = true;
+        NotifyDrainStarted();
+        Interlocked.Exchange(ref _state.Phase, PhaseDraining);
+        RequestCancel(default, CommandExecutionCancellationScope.RemainingFlow,
+            BackendCancellationTiming.Immediate, BackendCancellationTiming.AtReadFrontier);
+        ThreadPool.UnsafeQueueUserWorkItem(static state =>
+            _ = new CommandExecutionCore<TOps>(TOps.Create((PgClientFlow)state!)).DrainAsync(),
+            _ops.Flow);
+    }
+
+    void Drain()
+    {
+        try
+        {
+            var result = _state.Current;
+            if (result is null)
+            {
+                // Synchronous disposal before any read. The activation bridge normally completed long
+                // ago, so this bridge is rarely more than a status check.
+                new ValueTask<bool>((IValueTaskSource<bool>)_ops.Flow, _state.ReadySource.Version).AsTask().GetAwaiter().GetResult();
+                if (_state.CommandIndex < 0)
+                    _state.CommandIndex = 0;
+                if (_state.CommandIndex >= _state.Commands.Count)
+                {
+                    CompleteBatch();
+                    return;
+                }
+                result = ReadResult(_state.CommandIndex);
+            }
+
+            while (true)
+            {
+                var completeError = CompleteCurrentResult();
+                CaptureDrainError(result, completeError);
+                _state.CurrentPublished = false;
+                if (completeError is { TransactionStatus: TransactionStatus.Unknown })
+                    SkipDiscardedCommands();
+                if (++_state.CommandIndex >= _state.Commands.Count)
+                    break;
+                result = ReadResult(_state.CommandIndex);
+            }
+            CompleteBatch();
+        }
+        catch (Exception ex)
+        {
+            FaultFromOwner(ex);
+        }
+    }
+
+    internal ValueTask DisposeAsync()
+    {
+        while (true)
+        {
+            var phase = Volatile.Read(ref _state.Phase);
+            switch (phase)
+            {
+                case PhaseInitial:
+                case PhaseResultReady:
+                    if (Interlocked.CompareExchange(ref _state.Phase, PhaseDraining, phase) != phase)
+                        continue;
+                    NotifyDrainStarted();
+                    _state.ConsumerDetached = true;
+                    if (_state.Current is { IsComplete: false }
+                        || _state.CommandIndex + 1 < _state.Commands.Count)
+                        RequestCancel(default, CommandExecutionCancellationScope.RemainingFlow);
+                    return _state.WaitForDrainOnDispose ? DisposeDrainAsync() : FireAndForgetDrain();
+                case PhaseReading:
+                    _state.ConsumerDetached = true;
+                    NotifyDrainStarted();
+                    RequestCancel(default, CommandExecutionCancellationScope.RemainingFlow);
+                    return _state.WaitForDrainOnDispose ? DisposeCompletedAsync() : default;
+                default:
+                    return !_state.WaitForDrainOnDispose || _state.ConsumerObservedCompletion
+                        ? default
+                        : DisposeCompletedAsync();
+            }
+        }
+    }
+
+    // Drains on the disposer's frame, then waits for framework release so a drain error can surface.
+    async ValueTask DisposeDrainAsync()
+    {
+        await DrainAsync().ConfigureAwait(false);
+        await DisposeCompletedAsync().ConfigureAwait(false);
+    }
+
+    ValueTask FireAndForgetDrain()
+    {
+        _ = DrainAsync();
         return default;
-
-        static async ValueTask AwaitRead(
-            CommandFlow flow, PreparationReadState state,
-            ValueTask<(PgError?, ParameterTypeList, RowDescription?)> read)
-        {
-            (flow._pgError, state.ParameterTypes, flow._requestedRowDescription) =
-                await read.ConfigureAwait(false);
-        }
     }
 
-    [RuntimeAsyncMethodGeneration(false)]
-    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
-    async ValueTask CompleteInternalConsumptionAsync(
-        CommandResult result, bool suppressEnumeration, bool capturedThisCommand)
+    async ValueTask DisposeCompletedAsync()
     {
-        while (_decoder!.Current.Header.Type is PgTypes.BackendType.DataRow)
-        {
-            if (!_decoder.TryMoveNext())
-                await _decoder.GetNextAsync().ConfigureAwait(false);
-        }
-        result.CompleteNonQuery(_decoder.Current);
-        var completeError = await _commands.ItemRef(_commandIndex)
-            .CompleteAsync(_decoder).ConfigureAwait(false);
-        if (_pgError is null && completeError is null)
-        {
-            var recordsAffected = result.GetCommandComplete().BatchRecordsAffected;
-            if (recordsAffected >= 0)
-                _nonQueryRecordsAffected = _nonQueryRecordsAffected < 0
-                    ? recordsAffected
-                    : checked(_nonQueryRecordsAffected + recordsAffected);
-        }
-
-        if (result.Error is not null || completeError is not null)
-            await HandleCommandErrorsAsync(
-                result, suppressEnumeration, consumeInternally: true,
-                capturedThisCommand, completeError).ConfigureAwait(false);
+        await WaitForCompletionAsync().ConfigureAwait(false);
+        ThrowDrainErrors();
     }
 
-    async ValueTask HandleCommandErrorsAsync(
-        CommandResult result, bool suppressEnumeration, bool consumeInternally,
-        bool capturedThisCommand,
+    // Flow completion is independent of errors accumulated while draining. A close is a clean
+    // terminal for a disposing consumer.
+    async ValueTask WaitForCompletionAsync()
+    {
+        try
+        {
+            await _ops.Flow.WaitForComplete().ConfigureAwait(false);
+        }
+        catch (PgClientClosedException)
+        {
+        }
+    }
+
+    internal void Dispose()
+    {
+        if (!_ops.IsAsyncAtDispatch)
+            EnsureSyncHandoff();
+        while (true)
+        {
+            var phase = Volatile.Read(ref _state.Phase);
+            switch (phase)
+            {
+                case PhaseInitial:
+                case PhaseResultReady:
+                    if (Interlocked.CompareExchange(ref _state.Phase, PhaseDraining, phase) != phase)
+                        continue;
+                    NotifyDrainStarted();
+                    _state.ConsumerDetached = true;
+                    if (_state.Current is { IsComplete: false }
+                        || _state.CommandIndex + 1 < _state.Commands.Count)
+                        RequestCancel(default, CommandExecutionCancellationScope.RemainingFlow);
+                    Drain();
+                    if (_state.WaitForDrainOnDispose)
+                        DisposeCompleted();
+                    return;
+                case PhaseReading:
+                    _state.ConsumerDetached = true;
+                    NotifyDrainStarted();
+                    RequestCancel(default, CommandExecutionCancellationScope.RemainingFlow);
+                    if (_state.WaitForDrainOnDispose)
+                        DisposeCompleted();
+                    return;
+                default:
+                    if (_state.WaitForDrainOnDispose && !_state.ConsumerObservedCompletion)
+                        DisposeCompleted();
+                    return;
+            }
+        }
+    }
+
+    void DisposeCompleted()
+    {
+        try
+        {
+            _ops.Flow.WaitForCompleteSynchronously();
+        }
+        catch (PgClientClosedException)
+        {
+        }
+        ThrowDrainErrors();
+    }
+
+    void CaptureDrainError(CommandResult result,
         (PgError Error, TransactionStatus TransactionStatus)? completeError)
     {
-        var resultErrorIsOwnCancellation = result.Error is { } resultError
-            && IsOwnCancellation(resultError);
-        if (suppressEnumeration && result.Error is { } suppressedError
-            && !resultErrorIsOwnCancellation)
-        {
-            (_drainErrors ??= new()).Add(PgErrorException.Create(suppressedError));
-            capturedThisCommand = true;
-            if (!IsDraining)
-                MarkBodyInitiatedDrain();
-        }
-
-        // Accumulate each command's fresh error while draining, but do not duplicate an error
-        // already captured during its read phase or delivered to a live consumer.
-        var completeErrorIsOwnCancellation = completeError is { } completedWithError
-            && IsOwnCancellation(completedWithError.Error);
-        if ((consumeInternally || IsConsumingNonQuery || IsDraining && !_isResultReady)
-            && !capturedThisCommand && completeError is { } error
-            && !completeErrorIsOwnCancellation)
-            (_drainErrors ??= new()).Add(PgErrorException.Create(error.Error));
-
-        // Extended-query errors discard every following command through the next Sync. Skip
-        // those commands locally and consume the RFQ which is their only wire response.
-        if (completeError is not { TransactionStatus: TransactionStatus.Unknown })
+        if (!_state.ConsumerDetached || _state.CurrentPublished)
             return;
-
-        while (++_commandIndex < CommandCount && !_commands[_commandIndex].WithSync) { }
-
-        if (IsAsync)
-            await ReadRfqAsync(_decoder!).ConfigureAwait(false);
-        else
-            ReadRfq(_decoder!);
-
-        // Reaching the end means the discarded segment terminated at our appended Sync.
-        if (_commandIndex == CommandCount)
-            _readFlowRfq = false;
+        var error = result.Error ?? completeError?.Error;
+        if (error is null || IsOwnCancellation(error))
+            return;
+        var cold = GetOrCreateColdState();
+        (cold.DrainErrors ??= new()).Add(PgErrorException.Create(error));
     }
 
-    void SubmitPublication(Context context, DetachedPublication publication)
+    void ThrowDrainErrors()
     {
-        Debug.Assert(_detachedPublication is DetachedPublication.None);
-        _detachedPublication = publication;
-        context.SubmitDetached((IThreadPoolWorkItem)this);
+        if (Volatile.Read(ref _state.ColdState)?.DrainErrors is not { Count: > 0 } errors)
+            return;
+        if (errors.Count is 1)
+            ExceptionDispatchInfo.Throw(errors[0]);
+        throw new AggregateException(errors);
     }
 
-    private protected override void ExecuteDetachedWorkItem()
+    // When true, disposal waits for the drain to reach RFQ and for framework release. Otherwise it
+    // returns while the drain continues autonomously.
+    void RegisterCancellation(CancellationToken callerToken)
     {
-        var publication = _detachedPublication;
-        _detachedPublication = DetachedPublication.None;
-        switch (publication)
+        // Keep the second token/registration pair off ordinary flow objects. Default-token traffic
+        // does not need cancellation state at all and remains the allocation/footprint hot path.
+        var cancellation = Volatile.Read(ref _state.ColdState);
+        if (callerToken.CanBeCanceled || cancellation is not null)
         {
-            case DetachedPublication.Result:
-                TrySetEnumeratorResult(true, runContinuationsAsynchronously: false);
-                break;
-            case DetachedPublication.Completion:
-                CompleteEnumeration(runContinuationsAsynchronously: false);
-                break;
-            default:
-                ThrowHelper.ThrowInvalidOperation("The command flow has no publication pending.");
-                break;
+            cancellation ??= GetOrCreateColdState();
+            if (callerToken != cancellation.CallerToken)
+            {
+                var callerRegistration = cancellation.CallerRegistration;
+                cancellation.CallerRegistration = default;
+                callerRegistration.Dispose();
+                cancellation.CallerToken = callerToken;
+            }
+            if (callerToken.CanBeCanceled && cancellation.CallerRegistration == default)
+                cancellation.CallerRegistration = callerToken.UnsafeRegister(static (state, token)
+                    => new CommandExecutionCore<TOps>(TOps.Create((PgClientFlow)state!)).RequestCancel(
+                        token, CommandExecutionCancellationScope.CurrentWindow), _ops.Flow);
         }
+
+        if (_state.FlowToken.CanBeCanceled && _state.FlowRegistration == default)
+            _state.FlowRegistration = _state.FlowToken.UnsafeRegister(static (state, token)
+                => new CommandExecutionCore<TOps>(TOps.Create((PgClientFlow)state!)).RequestCancel(
+                    token, CommandExecutionCancellationScope.RemainingFlow), _ops.Flow);
     }
 
-    void SetCallerCancellationToken(CancellationToken token)
+    ValueTask DisposeRegistrationsAsync()
     {
-        var cancellation = GetOrCreateCancellationState();
-        lock (cancellation)
-        {
-            cancellation.CallerToken = token;
-            RegisterCancellationCallbacksLocked(cancellation);
-        }
-    }
-
-    void RegisterCancellationCallbacks(CancellationState cancellation)
-    {
-        lock (cancellation)
-            RegisterCancellationCallbacksLocked(cancellation);
-    }
-
-    void RegisterCancellationCallbacksLocked(CancellationState cancellation)
-    {
-        if (cancellation.CallerToken.CanBeCanceled)
-        {
-            Debug.Assert(IsAsync);
-            if (cancellation.CallerRegistration == default)
-                cancellation.CallerRegistration = cancellation.CallerToken.UnsafeRegister(static (state, token)
-                    => ((CommandFlow)state!).RequestCancelAndWake(token, CancellationScope.CurrentWindow), this);
-        }
-        if (cancellation.FlowToken.CanBeCanceled && cancellation.FlowRegistration == default)
-        {
-            cancellation.FlowRegistration = cancellation.FlowToken.UnsafeRegister(static (state, token)
-                => ((CommandFlow)state!).RequestCancelAndWake(token, CancellationScope.RemainingFlow), this);
-        }
-    }
-
-    [RuntimeAsyncMethodGeneration(false)]
-    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
-    async ValueTask DisposeCancellationRegistrations(CancellationState cancellation)
-    {
-        CancellationTokenRegistration callerRegistration;
-        CancellationTokenRegistration flowRegistration;
-        lock (cancellation)
-        {
-            callerRegistration = cancellation.CallerRegistration;
+        var cancellation = Volatile.Read(ref _state.ColdState);
+        var callerRegistration = cancellation?.CallerRegistration ?? default;
+        if (callerRegistration == default && _state.FlowRegistration == default)
+            return default;
+        if (cancellation is not null)
             cancellation.CallerRegistration = default;
-            flowRegistration = cancellation.FlowRegistration;
-            cancellation.FlowRegistration = default;
+        var flowRegistration = _state.FlowRegistration;
+        _state.FlowRegistration = default;
+        return DisposeRegistrationsAsync(callerRegistration, flowRegistration);
+
+        static async ValueTask DisposeRegistrationsAsync(
+            CancellationTokenRegistration callerRegistration,
+            CancellationTokenRegistration flowRegistration)
+        {
+            await callerRegistration.DisposeAsync().ConfigureAwait(false);
+            await flowRegistration.DisposeAsync().ConfigureAwait(false);
         }
-        await callerRegistration.DisposeAsync().ConfigureAwait(false);
-        await flowRegistration.DisposeAsync().ConfigureAwait(false);
     }
 
-    bool IsCancellationToken(CancellationToken token)
+    void DisposeRegistrations()
     {
-        var cancellation = Volatile.Read(ref _cancellationState);
-        return cancellation is not null
-            && (token == cancellation.CallerToken || token == cancellation.FlowToken);
+        var cancellation = Volatile.Read(ref _state.ColdState);
+        var callerRegistration = cancellation?.CallerRegistration ?? default;
+        if (cancellation is not null)
+            cancellation.CallerRegistration = default;
+        var flowRegistration = _state.FlowRegistration;
+        _state.FlowRegistration = default;
+        callerRegistration.Dispose();
+        flowRegistration.Dispose();
     }
 
-    // Cancellation callbacks only latch intent and wake the body. The body delivers cancellation after
-    // it has restored the wire boundary and is ready to release execution tenure.
+    // Cancellation only latches intent and requests a backend cancel. The frame owning the decoder
+    // delivers it after the wire is back at RFQ. An idle flow drains autonomously first.
+    void RequestCancel(CancellationToken token, CommandExecutionCancellationScope scope,
+        BackendCancellationTiming timing = BackendCancellationTiming.AfterGrace,
+        BackendCancellationTiming subsequentTiming = BackendCancellationTiming.AfterGrace)
+    {
+        if (Volatile.Read(ref _state.Phase) == PhaseCompleted)
+            return;
+        var cancellation = GetOrCreateColdState();
+        cancellation.DeliverToken = token;
+        RaiseCancellationScope(cancellation, scope);
+        RaiseCancellationTiming(ref cancellation.Timing, timing);
+        RaiseCancellationTiming(ref cancellation.SubsequentTiming, subsequentTiming);
+        Interlocked.Exchange(ref cancellation.CancelRequested, true);
+        if (HasDecoder)
+            RequestBackendCancellation();
+        TryTakeOverDrain();
+    }
+
+    static void RaiseCancellationScope(CommandExecutionColdState cancellation, CommandExecutionCancellationScope scope)
+    {
+        var requested = (int)scope;
+        var current = Volatile.Read(ref cancellation.Scope);
+        while (current < requested)
+        {
+            var observed = Interlocked.CompareExchange(
+                ref cancellation.Scope, requested, current);
+            if (observed == current)
+                return;
+            current = observed;
+        }
+    }
+
+    static void RaiseCancellationTiming(
+        ref int location, BackendCancellationTiming timing)
+    {
+        var requested = (int)timing;
+        var current = Volatile.Read(ref location);
+        while (current < requested)
+        {
+            var observed = Interlocked.CompareExchange(ref location, requested, current);
+            if (observed == current)
+                return;
+            current = observed;
+        }
+    }
+
     internal Task CancelAsync()
     {
-        var delivery = GetOrCreateCancelDelivery();
-        if (IsCompleted)
+        var cancellation = GetOrCreateColdState();
+        var delivery = Volatile.Read(ref cancellation.Delivery)
+            ?? Interlocked.CompareExchange(ref cancellation.Delivery,
+                new(TaskCreationOptions.RunContinuationsAsynchronously), null)
+            ?? cancellation.Delivery;
+        if (Volatile.Read(ref _state.Phase) is PhaseCompleted)
         {
             delivery.TrySetResult();
             return delivery.Task;
         }
-        RequestCancelAndWake(default, CancellationScope.RemainingFlow);
-        if (IsCompleted)
+        RequestCancel(default, CommandExecutionCancellationScope.RemainingFlow);
+        if (Volatile.Read(ref _state.Phase) is PhaseCompleted)
             delivery.TrySetResult();
         return delivery.Task;
     }
 
-    CancellationState GetOrCreateCancellationState()
+    void RequestBackendCancellation()
     {
-        if (Volatile.Read(ref _cancellationState) is { } cancellation)
-            return cancellation;
-        var created = new CancellationState();
-        return Interlocked.CompareExchange(ref _cancellationState, created, null) ?? created;
-    }
-
-    TaskCompletionSource GetOrCreateCancelDelivery()
-    {
-        var cancellation = GetOrCreateCancellationState();
-        var delivery = Volatile.Read(ref cancellation.Delivery);
-        if (delivery is not null)
-            return delivery;
-        var created = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        return Interlocked.CompareExchange(ref cancellation.Delivery, created, null) ?? created;
-    }
-
-    bool RequestCancel(CancellationToken token, CancellationScope scope,
-        BackendCancellationTiming timing = BackendCancellationTiming.AfterGrace,
-        BackendCancellationTiming subsequentTiming = BackendCancellationTiming.AfterGrace,
-        bool allowCompletedEnumeration = false)
-    {
-        if (IsEnumerationCompleted && !allowCompletedEnumeration)
-            return false;
-        var cancellation = GetOrCreateCancellationState();
-        cancellation.DeliverToken = token;
-        var observedScope = Volatile.Read(ref cancellation.Scope);
-        while ((int)scope > observedScope)
+        var cancellation = GetOrCreateColdState();
+        var episodeKey = Volatile.Read(ref cancellation.EpisodeKey);
+        if (episodeKey is null)
         {
-            var priorScope = Interlocked.CompareExchange(ref cancellation.Scope, (int)scope, observedScope);
-            if (priorScope == observedScope)
-                break;
-            observedScope = priorScope;
+            var created = new object();
+            episodeKey = Interlocked.CompareExchange(
+                ref cancellation.EpisodeKey, created, null) ?? created;
         }
-        Volatile.Write(ref cancellation.Requested, true);
-        Volatile.Write(ref _draining, true);
-        var observedTiming = Volatile.Read(ref cancellation.Timing);
-        while ((int)timing > observedTiming)
+        _state.Context.RequestBackendCancellation(
+            _ops.Flow, _ops.Flow.CancellationWindow,
+            (BackendCancellationTiming)Volatile.Read(ref cancellation.Timing),
+            Volatile.Read(ref cancellation.Delivery),
+            episodeKey,
+            Math.Max(Volatile.Read(ref cancellation.Scope), (int)CommandExecutionCancellationScope.CurrentWindow),
+            (BackendCancellationTiming)Volatile.Read(ref cancellation.SubsequentTiming));
+    }
+
+    // Graceful stop. An unactivated flow releases its consumer, the closing wire owns its response.
+    // An idle activated flow drains itself to RFQ so the pipeline can complete.
+    internal void OnStopping(Exception exception)
+    {
+        Interlocked.CompareExchange(ref GetOrCreateColdState().CloseException, exception, null);
+        if (CompleteReady(exception, runContinuationsAsynchronously: true))
         {
-            var priorTiming = Interlocked.CompareExchange(ref cancellation.Timing, (int)timing, observedTiming);
-            if (priorTiming == observedTiming)
-                break;
-            observedTiming = priorTiming;
-        }
-        var observedSubsequentTiming = Volatile.Read(ref cancellation.SubsequentTiming);
-        while ((int)subsequentTiming > observedSubsequentTiming)
-        {
-            var priorTiming = Interlocked.CompareExchange(ref cancellation.SubsequentTiming,
-                (int)subsequentTiming, observedSubsequentTiming);
-            if (priorTiming == observedSubsequentTiming)
-                break;
-            observedSubsequentTiming = priorTiming;
-        }
-        var delivery = Volatile.Read(ref cancellation.Delivery);
-        RequestBackendCancellation(timing, delivery);
-        return true;
-    }
-
-    void RequestCancelAndWake(CancellationToken token, CancellationScope scope)
-    {
-        if (!RequestCancel(token, scope))
-            return;
-        var delivery = Volatile.Read(ref _cancellationState) is { } cancellation
-            ? Volatile.Read(ref cancellation.Delivery)
-            : null;
-        _callerInteractionCore.ResumeBody(runContinuationsAsynchronously: true);
-        _callerInteractionCore.WakeBody(useDedicatedDriver: !IsAsync && delivery is not null);
-    }
-
-    void RequestBackendCancellation(BackendCancellationTiming timing = BackendCancellationTiming.AfterGrace,
-        TaskCompletionSource? delivery = null)
-    {
-        // Cancellation which wins before body entry remains latched in the cancellation state and is
-        // replayed immediately after the execution context is published.
-        if (Volatile.Read(ref _contextPublished) && Volatile.Read(ref _cancellationState) is { } cancellation)
-        {
-            var key = Volatile.Read(ref cancellation.EpisodeKey);
-            if (key is null)
-            {
-                var created = new object();
-                key = Interlocked.CompareExchange(ref cancellation.EpisodeKey, created, null) ?? created;
-            }
-            _context.RequestBackendCancellation(this, CancellationWindow, timing, delivery,
-                key, Volatile.Read(ref cancellation.Scope),
-                (BackendCancellationTiming)Volatile.Read(ref cancellation.SubsequentTiming));
-        }
-    }
-
-    bool IsOwnCancellation(PgError error)
-    {
-        if (Volatile.Read(ref _cancellationState) is not { } cancellation
-            || !Volatile.Read(ref cancellation.Requested) || error.SqlState != PgErrorCodes.QueryCanceled)
-            return false;
-        // PgDecoder records each ErrorResponse arrival exactly once. Classification may inspect the
-        // preserved error through several command-result paths, so it must not report the same strike.
-        return true;
-    }
-
-    void EnterStoppingDrainIfNeeded(Context context)
-    {
-        if (_callerInteractionCore.CloseException is { } close && context.StoppingToken.IsCancellationRequested
-            && !IsDraining && !IsEnumerationCompleted)
-        {
-            CompleteEnumerationWithException(close);
-            MarkBodyInitiatedDrain();
-        }
-    }
-
-    // Publish progress unconditionally. A terminal delivery can lose its task-source CAS to an already-
-    // completed generation; a synchronous disposer must still observe this sticky level rather than park.
-    void SignalPumpProgress()
-        => _callerInteractionCore.SignalProgress();
-
-    void CompleteEnumerationWithException(Exception ex)
-    {
-        // Close state must survive task-source rearming, including flows whose body never started.
-        if (ex is PgClientClosedException or PgCollateralException)
-            _callerInteractionCore.SetCloseLatch(ex);
-        if (IsEnumerationCompleted)
-            return;
-        // Teardown may race the consumer. The task source is the completion authority;
-        // _enumeratorCompleted follows only when this call wins the current generation.
-        if (TrySetEnumeratorException(ex, runContinuationsAsynchronously: true))
-            PublishEnumerationCompleted();
-        // A faulted body will not publish another continuation.
-        SignalPumpProgress();
-        // Wire recovery remains with the body or the framework recovery flow; this method only completes
-        // the consumer-facing generation.
-    }
-
-    void PublishBodyTerminated()
-    {
-        Volatile.Write(ref _bodyState, BodyTerminated);
-        SignalPumpProgress();
-    }
-
-    bool TerminateBodyBeforeStart()
-        => Interlocked.CompareExchange(ref _bodyState, BodyTerminated, BodyNotStarted) == BodyNotStarted;
-
-    bool IsBodyRunning => Volatile.Read(ref _bodyState) == BodyRunning;
-    bool IsBodyTerminated => Volatile.Read(ref _bodyState) == BodyTerminated;
-
-    // Source handoff finishes before body/consumer rendezvous begins, so both reuse the same wait event.
-    private protected override FlowHandoffEvent? HandoffEvent => _callerInteractionCore.GetWaitEvent();
-
-    // Return the rendezvous directly. An async wrapper could signal the disposer before registering the
-    // body's continuation, causing a late ThreadPool dispatch instead of caller-thread drain execution.
-    FlowCallerInteractionCore<FlowCallerInteractionCoreResult>.CallerHandoffAwaitable YieldToCaller()
-    {
-        FieldRef<FlowCallerInteractionCore<FlowCallerInteractionCoreResult>> fieldRef;
-        unsafe
-        {
-            fieldRef = FieldRef<FlowCallerInteractionCore<FlowCallerInteractionCoreResult>>.Create(&GetCallerInteractionCore, this);
-        }
-        return _callerInteractionCore.YieldToCaller(fieldRef);
-    }
-
-    static ref FlowCallerInteractionCore<FlowCallerInteractionCoreResult> GetCallerInteractionCore(CommandFlow instance)
-        => ref instance._callerInteractionCore;
-
-    protected override void OnAbort(Exception exception) => FaultCaller(exception);
-
-    // Graceful stopping is the early wire-close wake and is idempotent across heartbeat ticks.
-    protected override void OnStopping(Exception exception)
-    {
-        if (!IsBodyRunning || !IsAsync)
-        {
-            FaultCaller(exception);
+            Interlocked.CompareExchange(ref GetOrCreateColdState().TerminalException, exception, null);
             return;
         }
-
-        // Resume normally so the body observes the close latch and drains; abort faults the gate.
-        _callerInteractionCore.SetCloseLatch(exception);
-        _callerInteractionCore.ResumeBody(runContinuationsAsynchronously: true);
+        TryTakeOverDrain();
     }
 
-    // Wake a running body so it owns fault delivery; directly fault a flow whose body never started.
-    void FaultCaller(Exception exception)
+    // Forceful abort. No frame can read a dead wire, so an idle owner faults the pipeline task
+    // directly. A frame in flight fails on its own read.
+    internal void OnAbort(Exception exception)
     {
-        if (TerminateBodyBeforeStart())
+        Interlocked.CompareExchange(ref GetOrCreateColdState().CloseException, exception, null);
+        if (CompleteReady(exception, runContinuationsAsynchronously: true))
         {
-            CompleteEnumerationWithException(exception);
-            // A synchronous flow may already have entered ExecuteAfterHandoff while its inner read
-            // body is still NotStarted. Terminating that body does not complete the outer execution:
-            // fault and wake its initial handoff so the framework task can settle and release tenure.
-            _callerInteractionCore.FaultBodyWait(exception);
-            _callerInteractionCore.WakeBody();
+            Interlocked.CompareExchange(ref GetOrCreateColdState().TerminalException, exception, null);
             return;
         }
-
-        // A concurrent body start may have beaten the pre-start terminal claim.
-        if (IsBodyRunning)
-            _callerInteractionCore.FaultBodyWait(exception);
-        else
-            CompleteEnumerationWithException(exception);
-    }
-
-    internal override void Fail(Exception exception) => FaultCaller(exception);
-
-    protected override void OnReleasing(Exception? exception)
-    {
-        if (Volatile.Read(ref _cancellationState) is { } cancellation)
-            Volatile.Read(ref cancellation.Delivery)?.TrySetResult();
-        _commands.Return();
-    }
-
-    protected override void OnDiscarded()
-    {
-        // Discarded flows never enter the base release path.
-        GetObserver(out var observerState)?.OnCompleting(this, null, observerState);
-        _commands.Return();
-    }
-
-    protected override void OnReset()
-    {
-        Debug.Assert(IsPending || IsCompleted);
-        _commandIndex = -1;
-        _executePipelinedCore.Reset();
-        ResetEnumeratorMoveNextSource();
-        _enumeratorCurrent = default;
-        _enumeratorCompleted = false;
-        _isResultReady = false;
-        _callerInteractionCore.Reset();
-        if (_cancellationState is { } cancellation)
+        while (true)
         {
-            cancellation.Reset();
-            _cancellationState = null;
-        }
-        _drainErrors = null;
-        _consumeNonQuery = false;
-        _nonQueryRecordsAffected = 0;
-        _consumerDisposed = false;
-        _draining = false;
-        _drainModeEntered = false;
-        WaitForDrainOnDispose = true;
-        // Dispatch state is per-tenure.
-        _contextPublished = false;
-        _context = default;
-        _bodyState = BodyNotStarted;
-        _consumerAdvanced = false;
-    }
-
-    FlowCallerInteractionCoreResult IValueTaskSource<FlowCallerInteractionCoreResult>.GetResult(short token)
-        => _callerInteractionCore.ConsumeGateResult(token);
-
-    ValueTaskSourceStatus IValueTaskSource<FlowCallerInteractionCoreResult>.GetStatus(short token)
-        => _callerInteractionCore.GateStatus(token);
-
-    void IValueTaskSource<FlowCallerInteractionCoreResult>.OnCompleted(Action<object?> continuation, object? state, short token, ValueTaskSourceOnCompletedFlags flags)
-    {
-        _callerInteractionCore.OnGateCompleted(continuation, state, token, flags);
-        // Drain is a sticky level. Recheck it after registering so an earlier gate edge cannot be lost
-        // across gate reset. This is the body's suspending stack, so the wake must dispatch asynchronously.
-        if (IsDraining)
-        {
-            // A synchronous takeover would already have resumed the body inline. Reaching this callback
-            // means autonomous execution still owns the body.
-            IsAsync = true;
-            _callerInteractionCore.ResumeBody(runContinuationsAsynchronously: true);
+            var phase = Volatile.Read(ref _state.Phase);
+            if (phase is not (PhaseInitial or PhaseResultReady))
+                return;
+            if (Interlocked.CompareExchange(ref _state.Phase, PhaseCompleted, phase) != phase)
+                continue;
+            Interlocked.CompareExchange(ref GetOrCreateColdState().TerminalException, exception, null);
+            _state.PipelineTaskSource.SetException(exception, runContinuationsAsynchronously: true);
+            return;
         }
     }
 
-    // Backing for the pipelined-dispatch ValueTask. Returned to the framework when activation
-    // hasn't fired yet. Nested callback completes it when ExecutePipelined finishes.
-    void IValueTaskSource.GetResult(short token) => _executePipelinedCore.GetResult(token);
-    ValueTaskSourceStatus IValueTaskSource.GetStatus(short token) => _executePipelinedCore.GetStatus(token);
+    internal void Fail(Exception exception)
+    {
+        // A result callback failed on the frame that owns the decoder. Its throw propagates there.
+        Interlocked.CompareExchange(ref GetOrCreateColdState().TerminalException, exception, null);
+    }
+
+    internal void OnReleasing(Exception? exception)
+    {
+        Volatile.Read(ref _state.ColdState)?.Delivery?.TrySetResult();
+        DisposeRegistrations();
+        _state.Commands.Return();
+    }
+
+    internal void OnDiscarded()
+    {
+        _ops.OnDiscarded();
+        _state.Commands.Return();
+    }
+
+    internal void OnReset()
+    {
+        _state.Phase = PhaseInitial;
+        _state.CommandIndex = -1;
+        _state.Context = default;
+        _state.ContextPublished = false;
+        _state.Current = null;
+        _state.CurrentPublished = false;
+        _state.ReadFlowRfq = false;
+        _state.ConsumerDetached = false;
+        _state.ConsumerObservedCompletion = false;
+        _state.ReadySource.Reset();
+        _state.PipelineTaskSource.Reset();
+        _state.ReadyCompletion = 0;
+        _state.DrainStarted = 0;
+        _state.FlowToken = default;
+        _state.FlowRegistration = default;
+        _state.ColdState = null;
+        _state.SyncHandoffClaimed = false;
+        _state.HandoffEvent?.ResetInteraction();
+        _state.WaitForDrainOnDispose = true;
+    }
+
+}
+
+public sealed partial class CommandFlow
+{
+    bool IValueTaskSource<bool>.GetResult(short token) => _state.ReadySource.GetResult(token);
+    ValueTaskSourceStatus IValueTaskSource<bool>.GetStatus(short token) => _state.ReadySource.GetStatus(token);
+    void IValueTaskSource<bool>.OnCompleted(Action<object?> continuation, object? state, short token, ValueTaskSourceOnCompletedFlags flags)
+        => _state.ReadySource.OnCompleted(continuation, state, token, flags);
+
+    void IValueTaskSource.GetResult(short token) => _state.PipelineTaskSource.GetResult(token);
+    ValueTaskSourceStatus IValueTaskSource.GetStatus(short token) => _state.PipelineTaskSource.GetStatus(token);
     void IValueTaskSource.OnCompleted(Action<object?> continuation, object? state, short token, ValueTaskSourceOnCompletedFlags flags)
-        => _executePipelinedCore.OnCompleted(continuation, state, token, flags);
+        => _state.PipelineTaskSource.OnCompleted(continuation, state, token, flags);
 
+    public readonly struct Enumerator : IEnumerator<CommandResult>, IAsyncEnumerator<CommandResult>
+    {
+        readonly CommandFlow? _flow;
+        readonly CancellationToken _cancellationToken;
+
+        public Enumerator(CommandFlow flow)
+            : this(flow, default)
+        { }
+
+        internal Enumerator(CommandFlow flow, CancellationToken cancellationToken)
+        {
+            _flow = flow;
+            _cancellationToken = cancellationToken;
+        }
+
+        public Enumerator GetAsyncEnumerator() => this;
+
+        public Enumerator GetEnumerator() => this;
+
+        public bool MoveNext() => _flow?.Core.MoveNext() ?? false;
+
+        public ValueTask<bool> MoveNextAsync() => MoveNextAsync(_cancellationToken);
+
+        public ValueTask<bool> MoveNextAsync(CancellationToken cancellationToken)
+            => _flow is null ? new(false) : _flow.Core.MoveNextAsync(cancellationToken);
+
+        public CommandResult Current => _flow?._state.Current ?? default!;
+
+        object? IEnumerator.Current => Current;
+
+        void IEnumerator.Reset() => throw new NotSupportedException();
+
+        public ValueTask DisposeAsync() => _flow is null ? default : _flow.Core.DisposeAsync();
+
+        public void Dispose() => _flow?.Core.Dispose();
+    }
 }

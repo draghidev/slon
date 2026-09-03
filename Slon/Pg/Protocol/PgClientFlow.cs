@@ -579,7 +579,7 @@ public abstract class PgClientFlow : IValueTaskSource<FlowActivation>, IValueTas
         internal void RequestBackendCancellation(PgClientFlow instigator, int window,
             BackendCancellationTiming timing, TaskCompletionSource? delivery = null)
             => RequestBackendCancellation(instigator, window, timing, delivery, new object(),
-                (int)Flows.CommandFlow.CancellationScope.CurrentWindow, timing);
+                (int)Flows.LegacyCommandFlow.CancellationScope.CurrentWindow, timing);
 
         /// Returns an awaitable for the decoder. Activation is a cross-flow rendezvous completed by
         /// another flow's thread, so GetResult throws if not yet completed - async bodies await,

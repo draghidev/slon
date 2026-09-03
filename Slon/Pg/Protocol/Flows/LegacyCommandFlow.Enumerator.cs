@@ -3,7 +3,7 @@ using System.Threading.Tasks.Sources;
 
 namespace Slon.Pg.Protocol.Flows;
 
-partial class CommandFlow
+partial class LegacyCommandFlow
 {
     Slon.Threading.Tasks.Sources.ManualResetValueTaskSourceCore<bool> _enumeratorMoveNextTaskSource;
     int _enumeratorMoveNextCompletionClaim;
@@ -161,7 +161,7 @@ partial class CommandFlow
         }
     }
 
-    public readonly struct Enumerator(CommandFlow flow) : IEnumerator<CommandResult>, IAsyncEnumerator<CommandResult>
+    public readonly struct Enumerator(LegacyCommandFlow flow) : IEnumerator<CommandResult>, IAsyncEnumerator<CommandResult>
     {
         // Here so we can pass the cancellation token and enumerate without boxing the struct (which WithCancellation must do).
         /// <inheritdoc cref="IAsyncEnumerable{T}.GetAsyncEnumerator" />
@@ -375,7 +375,7 @@ partial class CommandFlow
             if (flow.WaitForDrainOnDispose)
                 flow.AwaitDrainOnDisposeSynchronously();
 
-            static void DriveBodyToTermination(CommandFlow flow)
+            static void DriveBodyToTermination(LegacyCommandFlow flow)
             {
                 while (!flow.IsBodyTerminated)
                 {
@@ -392,7 +392,7 @@ partial class CommandFlow
                 }
             }
 
-            static void FinishCompletedDisposal(CommandFlow flow)
+            static void FinishCompletedDisposal(LegacyCommandFlow flow)
             {
                 if (flow.TransferLiveBodyToDrain() && flow.WaitForDrainOnDispose)
                     flow.AwaitDrainOnDisposeSynchronously();
@@ -421,7 +421,7 @@ partial class CommandFlow
                 return flow.AwaitDrainOnDispose();
             return new();
 
-            static async ValueTask FinishFinalResultAsync(Enumerator enumerator, CommandFlow flow)
+            static async ValueTask FinishFinalResultAsync(Enumerator enumerator, LegacyCommandFlow flow)
             {
                 if (await enumerator.MoveNextAsync().ConfigureAwait(false))
                     ThrowHelper.ThrowInvalidOperation(
@@ -429,7 +429,7 @@ partial class CommandFlow
                 await FinishCompletedDisposalAsync(flow).ConfigureAwait(false);
             }
 
-            static ValueTask FinishCompletedDisposalAsync(CommandFlow flow)
+            static ValueTask FinishCompletedDisposalAsync(LegacyCommandFlow flow)
             {
                 // A completed awaited drain may still have errors to surface.
                 flow.TransferLiveBodyToDrain();

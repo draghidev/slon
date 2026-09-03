@@ -6,7 +6,7 @@ using Slon.Runtime.CompilerServices;
 
 namespace Slon.Pg.Protocol.Flows;
 
-partial class CommandFlow
+public sealed partial class CommandFlow
 {
     internal enum MoveNextStatus : byte
     {

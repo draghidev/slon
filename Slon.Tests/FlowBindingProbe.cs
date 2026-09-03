@@ -1,7 +1,7 @@
 using Slon.Pg.Protocol;
 using Slon.Pg.Protocol.Flows;
 using Slon.Pg;
-using LegacyCommandFlow = Slon.Pg.Protocol.Flows.CommandFlow;
+using LegacyCommandFlow = Slon.Pg.Protocol.Flows.LegacyCommandFlow;
 
 namespace Slon.Tests;
 

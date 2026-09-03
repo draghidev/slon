@@ -55,7 +55,7 @@ sealed partial class PgClientProtocol
             coordinator = GetOrCreateCancellationCoordinatorLocked();
         }
         coordinator.RequestCancellation(instigator, window, timing, delivery,
-            episodeKey, scope == (int)Flows.CommandFlow.CancellationScope.RemainingFlow,
+            episodeKey, scope == (int)Flows.LegacyCommandFlow.CancellationScope.RemainingFlow,
             subsequentTiming);
         // Flow release publishes its coordinator down-edge before IsCompleted. Recheck after
         // publishing the episode so either that down-edge or this observation retires it.
