@@ -128,6 +128,9 @@ public class CommandResultEnumerationTests
     }
 
     [ConnectionCreatingTestMethod]
+#if COMMAND_FLOW_NEXT
+    [Ignore("The replacement fixes the execution/consumption mode for a flow tenure; switching an async flow to synchronous driving is a legacy body-rendezvous behavior.")]
+#endif
     public async Task AsyncFlow_CanSwitchToSynchronousResultAdvancement()
     {
         await using var protocol = await PgTestPool.NewIsolatedAsync();
