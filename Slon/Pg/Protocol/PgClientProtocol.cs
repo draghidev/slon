@@ -1571,6 +1571,8 @@ public sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         public ValueTask FlushAsync(CancellationToken cancellationToken) => protocol.FlushAsync(cancellationToken);
         internal void SubmitDetached(Action<object?> action, object? state, bool preferLocal = true)
             => protocol._activationScheduler.SubmitDetached(action, state, preferLocal);
+        internal void SubmitDetached(IThreadPoolWorkItem workItem, bool preferLocal = true)
+            => protocol._activationScheduler.SubmitDetached(workItem, preferLocal);
         PgClientFlow? _cancellationActivatedFlow;
         internal (PgClientFlow? Owner, int Window) CancellationActivation
         {

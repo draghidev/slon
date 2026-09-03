@@ -137,7 +137,11 @@ public abstract class PgClientFlow : IValueTaskSource<FlowActivation>, IValueTas
     void IThreadPoolWorkItem.Execute()
     {
         var control = _pendingActivationControl;
-        Debug.Assert(control is not null);
+        if (control is null)
+        {
+            ExecuteDetachedWorkItem();
+            return;
+        }
         _pendingActivationControl = null;
         // The decoder bind already ran synchronously at activation; this dispatch is only the body
         // wake. Skip it for a flow the abort retired before the dispatch ran: its activation source is
@@ -146,6 +150,9 @@ public abstract class PgClientFlow : IValueTaskSource<FlowActivation>, IValueTas
             return;
         control!.Activate(this);
     }
+
+    private protected virtual void ExecuteDetachedWorkItem()
+        => ThrowHelper.ThrowInvalidOperation("The flow has no detached work item pending.");
 
     readonly bool _supportsDeferredFlush;
     internal bool SupportsDeferredFlush => _supportsDeferredFlush;
@@ -551,6 +558,8 @@ public abstract class PgClientFlow : IValueTaskSource<FlowActivation>, IValueTas
 
         internal void SubmitDetached(Action<object?> action, object? state, bool preferLocal = true)
             => _executionControl.SubmitDetached(action, state, preferLocal);
+        internal void SubmitDetached(IThreadPoolWorkItem workItem, bool preferLocal = true)
+            => _executionControl.SubmitDetached(workItem, preferLocal);
 
         internal void RequestBackendCancellation(PgClientFlow instigator, int window,
             BackendCancellationTiming timing, TaskCompletionSource? delivery, object episodeKey, int scope,
@@ -736,6 +745,8 @@ public abstract class PgClientFlow : IValueTaskSource<FlowActivation>, IValueTas
 
         internal void SubmitDetached(Action<object?> action, object? state, bool preferLocal = true)
             => control.SubmitDetached(action, state, preferLocal);
+        internal void SubmitDetached(IThreadPoolWorkItem workItem, bool preferLocal = true)
+            => control.SubmitDetached(workItem, preferLocal);
 
         // Small optimization to allow us to skip the final sync message if we can piggyback on the flow's final rfq.
         public bool LastMessageInducesRfq => flow._lastMessageInducesRfq;

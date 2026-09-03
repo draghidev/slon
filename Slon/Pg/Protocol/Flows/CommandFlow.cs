@@ -135,6 +135,14 @@ public partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
     const int BodyRunning = 1;
     const int BodyTerminated = 2;
     int _bodyState;
+    DetachedPublication _detachedPublication;
+
+    enum DetachedPublication : byte
+    {
+        None,
+        Result,
+        Completion
+    }
 
     sealed class CancellationState
     {
@@ -867,8 +875,7 @@ public partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
                         CompleteEnumeration();
                 }
                 if (publishAsync)
-                    context.SubmitDetached(static state => ((CommandFlow)state!)
-                        .CompleteEnumeration(runContinuationsAsynchronously: false), this);
+                    SubmitPublication(context, DetachedPublication.Completion);
                 return;
             }
             if (publishAsync)
@@ -876,8 +883,7 @@ public partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
                 // Queue the publication itself so the body reaches its next caller gate before user code
                 // resumes. Routing through the protocol scheduler preserves that ordering without forcing
                 // every result continuation onto the ThreadPool.
-                context.SubmitDetached(static state => ((CommandFlow)state!)
-                    .TrySetEnumeratorResult(true, runContinuationsAsynchronously: false), this);
+                SubmitPublication(context, DetachedPublication.Result);
             }
             else
                 TrySetEnumeratorResult(true, runContinuationsAsynchronously: true);
@@ -895,6 +901,31 @@ public partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
             var message = decoder.GetNext();
             if (message.EnsureExpectedOrError(PgTypes.BackendType.ReadyForQuery) is { } rfqError)
                 PgErrorException.Throw(rfqError);
+        }
+    }
+
+    void SubmitPublication(Context context, DetachedPublication publication)
+    {
+        Debug.Assert(_detachedPublication is DetachedPublication.None);
+        _detachedPublication = publication;
+        context.SubmitDetached((IThreadPoolWorkItem)this);
+    }
+
+    private protected override void ExecuteDetachedWorkItem()
+    {
+        var publication = _detachedPublication;
+        _detachedPublication = DetachedPublication.None;
+        switch (publication)
+        {
+            case DetachedPublication.Result:
+                TrySetEnumeratorResult(true, runContinuationsAsynchronously: false);
+                break;
+            case DetachedPublication.Completion:
+                CompleteEnumeration(runContinuationsAsynchronously: false);
+                break;
+            default:
+                ThrowHelper.ThrowInvalidOperation("The command flow has no publication pending.");
+                break;
         }
     }
 
