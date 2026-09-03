@@ -111,6 +111,9 @@ struct BackendMessageCursor(ReadOnlySequence<byte> buffer)
     // reconstruct and rediscover the backing of a ReadOnlySequence. Materialize one only at API seams.
     internal struct FastReadOnlySequence<T>
     {
+        const int SegmentFlag = int.MinValue;
+        const int IndexMask = int.MaxValue;
+
         object? _startObject;
         object? _endObject;
         int _startIndex;
@@ -118,13 +121,13 @@ struct BackendMessageCursor(ReadOnlySequence<byte> buffer)
         long _length;
 
         FastReadOnlySequence(object? startObject, int startIndex,
-            object? endObject, int endIndex, long length)
+            object? endObject, int endIndex, long length, bool segmentBacked)
         {
             Debug.Assert(Unsafe.SizeOf<FastReadOnlySequence<T>>() is 32);
             _startObject = startObject;
             _endObject = endObject;
-            _startIndex = startIndex;
-            _endIndex = endIndex;
+            _startIndex = EncodeIndex(startIndex, segmentBacked);
+            _endIndex = EncodeIndex(endIndex, segmentBacked);
             _length = length;
         }
 
@@ -133,10 +136,18 @@ struct BackendMessageCursor(ReadOnlySequence<byte> buffer)
             Debug.Assert(Unsafe.SizeOf<FastReadOnlySequence<T>>() is 32);
             _startObject = sequence.Start.GetObject();
             _endObject = sequence.End.GetObject();
-            _startIndex = sequence.Start.GetInteger() & int.MaxValue;
-            _endIndex = sequence.End.GetInteger() & int.MaxValue;
+            var segmentBacked = _startObject is ReadOnlySequenceSegment<T>;
+            _startIndex = EncodeIndex(
+                sequence.Start.GetInteger() & IndexMask, segmentBacked);
+            _endIndex = EncodeIndex(
+                sequence.End.GetInteger() & IndexMask, segmentBacked);
             _length = sequence.Length;
         }
+
+        static int EncodeIndex(int index, bool segmentBacked)
+            => segmentBacked ? index | SegmentFlag : index;
+
+        readonly bool IsSegmentBacked => _startIndex < 0;
 
         public ReadOnlySequence<T> Sequence
         {
@@ -144,26 +155,28 @@ struct BackendMessageCursor(ReadOnlySequence<byte> buffer)
             {
                 if (_startObject is null)
                     return default;
+                var startIndex = StartIndex;
+                var endIndex = EndIndex;
+                if (IsSegmentBacked)
+                {
+                    return new((ReadOnlySequenceSegment<T>)_startObject, startIndex,
+                        (ReadOnlySequenceSegment<T>)_endObject!, endIndex);
+                }
                 if (_startObject is T[] array)
                 {
                     Debug.Assert(ReferenceEquals(_startObject, _endObject));
-                    return new(array, _startIndex, _endIndex - _startIndex);
+                    return new(array, startIndex, endIndex - startIndex);
                 }
-                if (_startObject is MemoryManager<T> manager)
-                {
-                    Debug.Assert(ReferenceEquals(_startObject, _endObject));
-                    return new(manager.Memory.Slice(
-                        _startIndex, _endIndex - _startIndex));
-                }
-                return new((ReadOnlySequenceSegment<T>)_startObject!, _startIndex,
-                    (ReadOnlySequenceSegment<T>)_endObject!, _endIndex);
+                var manager = (MemoryManager<T>)_startObject;
+                Debug.Assert(ReferenceEquals(_startObject, _endObject));
+                return new(manager.Memory.Slice(startIndex, endIndex - startIndex));
             }
         }
         public long Length => _length;
         public object? StartObject => _startObject;
         public object? EndObject => _endObject;
-        public int StartIndex => _startIndex;
-        public int EndIndex => _endIndex;
+        public int StartIndex => _startIndex & IndexMask;
+        public int EndIndex => _endIndex & IndexMask;
 
         public ReadOnlySpan<T> FirstSpan
         {
@@ -171,37 +184,45 @@ struct BackendMessageCursor(ReadOnlySequence<byte> buffer)
             {
                 if (_startObject is null)
                     return default;
+                var startIndex = StartIndex;
+                var endIndex = EndIndex;
+                if (IsSegmentBacked)
+                {
+                    var memory = ((ReadOnlySequenceSegment<T>)_startObject).Memory;
+                    var end = ReferenceEquals(_startObject, _endObject)
+                        ? endIndex
+                        : memory.Length;
+                    return memory.Span.Slice(startIndex, end - startIndex);
+                }
                 if (_startObject is T[] array)
                 {
                     Debug.Assert(ReferenceEquals(_startObject, _endObject));
-                    return array.AsSpan(_startIndex, _endIndex - _startIndex);
+                    return array.AsSpan(startIndex, endIndex - startIndex);
                 }
-                var memory = _startObject is MemoryManager<T> manager
-                    ? manager.Memory
-                    : ((ReadOnlySequenceSegment<T>)_startObject).Memory;
-                var end = ReferenceEquals(_startObject, _endObject)
-                    ? _endIndex
-                    : memory.Length;
-                return memory.Span.Slice(_startIndex, end - _startIndex);
+                return ((MemoryManager<T>)_startObject).Memory.Span
+                    .Slice(startIndex, endIndex - startIndex);
             }
         }
 
-        ReadOnlyMemory<T> FirstMemory => _startObject switch
-        {
-            T[] array => array,
-            MemoryManager<T> manager => manager.Memory,
-            ReadOnlySequenceSegment<T> segment => segment.Memory,
-            _ => throw new UnreachableException()
-        };
+        ReadOnlyMemory<T> FirstMemory
+            => IsSegmentBacked
+                ? ((ReadOnlySequenceSegment<T>)_startObject!).Memory
+                : _startObject switch
+                {
+                    T[] array => array,
+                    MemoryManager<T> manager => manager.Memory,
+                    _ => throw new UnreachableException()
+                };
 
         // Returns the sequence before the index, stores the sequence after it in place.
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public FastReadOnlySequence<T> SplitInPlace(long offset)
         {
+            var startIndex = StartIndex;
             var firstEnd = ReferenceEquals(_startObject, _endObject)
-                ? _endIndex
+                ? EndIndex
                 : FirstMemory.Length;
-            var firstLength = firstEnd - _startIndex;
+            var firstLength = firstEnd - startIndex;
             if (offset == _length)
             {
                 var exhausted = this;
@@ -211,22 +232,24 @@ struct BackendMessageCursor(ReadOnlySequence<byte> buffer)
                 return exhausted;
             }
             if (offset == firstLength
-                && _startObject is ReadOnlySequenceSegment<T> segment
-                && segment.Next is { } next)
+                && IsSegmentBacked
+                && ((ReadOnlySequenceSegment<T>)_startObject!).Next is { } next)
             {
                 var boundaryPrefix = new FastReadOnlySequence<T>(
-                    segment, _startIndex, segment, firstEnd, offset);
+                    _startObject, startIndex, _startObject, firstEnd, offset,
+                    segmentBacked: true);
                 _startObject = next;
-                _startIndex = 0;
+                _startIndex = SegmentFlag;
                 _length -= offset;
                 return boundaryPrefix;
             }
             if ((ulong)offset < (uint)firstLength)
             {
-                var splitIndex = _startIndex + (int)offset;
+                var splitIndex = startIndex + (int)offset;
                 var prev = new FastReadOnlySequence<T>(
-                    _startObject, _startIndex, _startObject, splitIndex, offset);
-                _startIndex = splitIndex;
+                    _startObject, startIndex, _startObject, splitIndex, offset,
+                    IsSegmentBacked);
+                _startIndex = EncodeIndex(splitIndex, IsSegmentBacked);
                 _length -= offset;
                 return prev;
             }

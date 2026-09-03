@@ -31,6 +31,15 @@ public class BackendMessageStreamingTests
             => new(this, 0, end, end.Memory.Length);
     }
 
+    sealed class TestMemoryManager(byte[] buffer) : MemoryManager<byte>
+    {
+        public override Span<byte> GetSpan() => buffer;
+        public override MemoryHandle Pin(int elementIndex = 0)
+            => throw new NotSupportedException();
+        public override void Unpin() { }
+        protected override void Dispose(bool disposing) { }
+    }
+
     sealed class RejectRetiredSuppliedReadReader(PipeReader inner) : PipeReader
     {
         ReadResult _activeRead;
@@ -563,6 +572,21 @@ public class BackendMessageStreamingTests
 
         Assert.IsTrue(cursor.TryReadNextInPlace(out var header, out _, out _));
         Assert.AreEqual((BackendType)(byte)'o', header.Type);
+    }
+
+    [TestMethod]
+    public void BackendCursor_FramesMemoryManagerBackedMessage()
+    {
+        using var manager = new TestMemoryManager(
+            BackendMessageBytes(BackendType.CommandComplete, 8));
+        var cursor = new BackendMessageCursor(
+            new ReadOnlySequence<byte>(manager.Memory));
+
+        Assert.IsTrue(cursor.TryReadNextInPlace(
+            out var header, out var message, out var bufferedLength));
+        Assert.AreEqual(BackendType.CommandComplete, header.Type);
+        Assert.AreEqual(8, message.Length);
+        Assert.AreEqual(8u, bufferedLength);
     }
 
     [TestMethod]
