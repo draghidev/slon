@@ -29,6 +29,11 @@ public readonly struct CommandFlowOptions
 [Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
 public partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueTaskSource<FlowCallerInteractionCoreResult>, IValueTaskSource
 {
+    sealed class PreparationReadState
+    {
+        internal ParameterTypeList ParameterTypes;
+    }
+
     static readonly TimeSpan ConsumerDrainCancellationGracePeriod = TimeSpan.FromSeconds(1);
 
     internal override bool DefersSyncHandoff => true;
@@ -495,22 +500,11 @@ public partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
                 if (!IsDraining && context.IsProtocolClosed)
                     throw context.FlowTerminationException;
 
-                ParameterTypeList describedParameterTypes = default;
+                PreparationReadState? preparationRead = null;
                 if (describeForPreparation)
                 {
-                    var rowDescription = context.GetProtocolStatic<ReadState>().RowDescription;
-                    if (IsAsync)
-                    {
-                        (_pgError, describedParameterTypes, _requestedRowDescription) =
-                            await _commands.ItemRef(_commandIndex)
-                                .ReadPreparationDescriptionAsync(_decoder, rowDescription).ConfigureAwait(false);
-                    }
-                    else
-                    {
-                        (_pgError, describedParameterTypes, _requestedRowDescription) =
-                            _commands.ItemRef(_commandIndex)
-                                .ReadPreparationDescription(_decoder, rowDescription);
-                    }
+                    preparationRead = new();
+                    await ReadPreparationDescription(context, preparationRead).ConfigureAwait(false);
                 }
                 else if (IsAsync && hasPreparedDescription)
                 {
@@ -585,7 +579,7 @@ public partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
                 }
 
                 var result = InitializeResult(
-                    context, describeForPreparation, describedParameterTypes);
+                    context, preparationRead);
                 ((CommandFlowObserver?)GetObserver(out var observerState))
                     ?.OnCommandResult(this, result, observerState);
 
@@ -861,8 +855,7 @@ public partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
 
     [MethodImpl(MethodImplOptions.NoInlining)]
     CommandResult InitializeResult(
-        Context context, bool describeForPreparation,
-        ParameterTypeList describedParameterTypes)
+        Context context, PreparationReadState? preparationRead)
     {
         ref readonly var readState = ref context.GetProtocolStatic<ReadState>();
         readState.ResultMessageEnumerator.Initialize(_commands.ItemRef(_commandIndex), _decoder!);
@@ -876,12 +869,38 @@ public partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
         {
             descriptor = CommandDescriptor.CreatePrepared(
                 descriptor.CommandName,
-                describeForPreparation ? describedParameterTypes : descriptor.ParameterTypes,
+                preparationRead?.ParameterTypes ?? descriptor.ParameterTypes,
                 _requestedRowDescription?.Preserve());
         }
         result.Initialize(this, _commandIndex, descriptor, _requestedRowDescription,
             !command.DescribeOnly, command.IsSimple(), _pgError);
         return result;
+    }
+
+    ValueTask ReadPreparationDescription(Context context, PreparationReadState state)
+    {
+        var rowDescription = context.GetProtocolStatic<ReadState>().RowDescription;
+        ref readonly var command = ref _commands.ItemRef(_commandIndex);
+        if (!IsAsync)
+        {
+            (_pgError, state.ParameterTypes, _requestedRowDescription) =
+                command.ReadPreparationDescription(_decoder!, rowDescription);
+            return default;
+        }
+
+        var read = command.ReadPreparationDescriptionAsync(_decoder!, rowDescription);
+        if (!read.IsCompletedSuccessfully)
+            return AwaitRead(this, state, read);
+        (_pgError, state.ParameterTypes, _requestedRowDescription) = read.Result;
+        return default;
+
+        static async ValueTask AwaitRead(
+            CommandFlow flow, PreparationReadState state,
+            ValueTask<(PgError?, ParameterTypeList, RowDescription?)> read)
+        {
+            (flow._pgError, state.ParameterTypes, flow._requestedRowDescription) =
+                await read.ConfigureAwait(false);
+        }
     }
 
     async ValueTask HandleCommandErrorsAsync(
