@@ -345,7 +345,8 @@ public partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, IValueT
         // the flow, preserving single-writer tenure without blocking reads behind socket backpressure.
         return new FlowTasks(
             trailingExecutionTask: writeTask,
-            pipelineTask: DispatchPipelinedRead(context, context.GetProtocolStatic<ReadState>().ReadPromise));
+            pipelineTask: DispatchPipelinedRead(
+                context, context.GetProtocolStatic<ReadPromiseState>().Promise));
     }
 
     // Defer state-machine creation until activation because all flows share one protocol-static promise.

@@ -1543,7 +1543,9 @@ public sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         }
     }
 
-    internal sealed class Control(PgClientProtocol protocol, bool poolFacing) : IProtocolStatic<CommandFlow.ReadState>
+    internal sealed class Control(PgClientProtocol protocol, bool poolFacing) :
+        IProtocolStatic<CommandFlow.ReadState>,
+        IProtocolStatic<CommandFlow.ReadPromiseState>
     {
         // The pipeline whose slots this Control reads, bound right after that pipeline is created. The
         // outer (pool-facing) Control reads the protocol's own pipeline; an exclusive flow's inner
@@ -1909,5 +1911,8 @@ public sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         CommandFlow.ReadState _commandFlowReadState = new();
         ref readonly CommandFlow.ReadState IProtocolStatic<CommandFlow.ReadState>.Value
             => ref _commandFlowReadState;
+        readonly CommandFlow.ReadPromiseState _commandFlowReadPromiseState = new();
+        ref readonly CommandFlow.ReadPromiseState IProtocolStatic<CommandFlow.ReadPromiseState>.Value
+            => ref _commandFlowReadPromiseState;
     }
 }

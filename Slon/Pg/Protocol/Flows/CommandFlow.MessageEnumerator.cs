@@ -19,14 +19,12 @@ partial class CommandFlow
     {
         public ResultMessageEnumerator ResultMessageEnumerator { get; }
         public CommandResult CommandResult { get; }
-        public ValueTaskSourcePromise<bool> ReadPromise { get; }
         public RowDescription RowDescription { get; }
 
         public ReadState()
         {
             ResultMessageEnumerator = new();
             CommandResult = new(ResultMessageEnumerator);
-            ReadPromise = new();
             RowDescription = new();
         }
 
@@ -36,6 +34,11 @@ partial class CommandFlow
             ResultMessageEnumerator.Reset();
             RowDescription.Reset();
         }
+    }
+
+    internal readonly struct ReadPromiseState()
+    {
+        public ValueTaskSourcePromise<bool> Promise { get; } = new();
     }
 
     // The value wrapper lets ReadState and CommandResult share one MessageEnumerator instance
