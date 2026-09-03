@@ -79,6 +79,12 @@ sealed class FlowHandoffEvent : ManualResetEventSlim
 [Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
 public abstract class PgClientFlow : IValueTaskSource<FlowActivation>, IValueTaskSource<FlowCompletion>, IThreadPoolWorkItem
 {
+    sealed class OptionalState
+    {
+        internal ManualResetEventSlim? CompletionEvent;
+        internal CancellationTokenRegistration ActivationRegistration;
+    }
+
     PgClientProtocol.Control? _pendingActivationControl;
     FlowEnqueueOptions _enqueueOptions;
     bool _ownsWireCapacity;
@@ -169,7 +175,7 @@ public abstract class PgClientFlow : IValueTaskSource<FlowActivation>, IValueTas
     // pattern). At most one pending waiter per tenure; post-completion awaits resolve
     // synchronously.
     Slon.Threading.Tasks.Sources.ManualResetValueTaskSourceCore<FlowCompletion> _completionCore;
-    ManualResetEventSlim? _completionEvent;
+    OptionalState? _optionalState;
     // 1 while a WaitForComplete token is live (set at capture, cleared after GetResult consumed the
     // core). Guards reuse: Reset bumps the core's version, so it must not run while this is set.
     int _completionWaiterPending;
@@ -177,7 +183,6 @@ public abstract class PgClientFlow : IValueTaskSource<FlowActivation>, IValueTas
     // Activation state.
     Slon.Threading.Tasks.Sources.ManualResetValueTaskSourceCore<FlowActivation> _activationTaskSource;
     int _activationClaim;
-    CancellationTokenRegistration _activationCancellationTokenRegistration;
     TimeSpan _remainingActivationTimeout;
     bool _pendingTimeoutStarted;
 
@@ -273,6 +278,21 @@ public abstract class PgClientFlow : IValueTaskSource<FlowActivation>, IValueTas
         _supportsDeferredFlush = supportsDeferredFlush;
     }
 
+    OptionalState GetOrCreateOptionalState()
+        => Volatile.Read(ref _optionalState)
+            ?? Interlocked.CompareExchange(ref _optionalState, new(), null)
+            ?? _optionalState;
+
+    CancellationTokenRegistration TakeActivationRegistration()
+    {
+        var state = Volatile.Read(ref _optionalState);
+        if (state is null)
+            return default;
+        var registration = state.ActivationRegistration;
+        state.ActivationRegistration = default;
+        return registration;
+    }
+
     bool TrySetActivationResult(bool runContinuationsAsynchronously)
     {
         if (Interlocked.CompareExchange(ref _activationClaim, 1, 0) != 0)
@@ -366,11 +386,13 @@ public abstract class PgClientFlow : IValueTaskSource<FlowActivation>, IValueTas
         cancellationToken.ThrowIfCancellationRequested();
         Volatile.Write(ref _completionWaiterPending, 1);
         var token = _completionCore.Version;
-        var completionEvent = _completionEvent;
+        var state = GetOrCreateOptionalState();
+        var completionEvent = state.CompletionEvent;
         if (completionEvent is null)
         {
             var created = new ManualResetEventSlim();
-            completionEvent = Interlocked.CompareExchange(ref _completionEvent, created, null) ?? created;
+            completionEvent = Interlocked.CompareExchange(
+                ref state.CompletionEvent, created, null) ?? created;
             if (!ReferenceEquals(completionEvent, created))
                 created.Dispose();
         }
@@ -409,7 +431,7 @@ public abstract class PgClientFlow : IValueTaskSource<FlowActivation>, IValueTas
         // Version bump per tenure. Cross-tenure completer staleness rests on the done -> torn-down
         // -> retired layering (Complete precedes recycle), the same basis as the rest of this reset.
         _completionCore.Reset();
-        _completionEvent?.Reset();
+        Volatile.Read(ref _optionalState)?.CompletionEvent?.Reset();
         ResetActivationSource();
         _rfqCount = 0;
         _cancellationWindow = 0;
@@ -894,12 +916,13 @@ public abstract class PgClientFlow : IValueTaskSource<FlowActivation>, IValueTas
 
         public void Activate()
         {
-            flow._activationCancellationTokenRegistration.Dispose();
+            var activationRegistration = flow.TakeActivationRegistration();
+            activationRegistration.Dispose();
             // If none of the cancellations triggered, we have a problem, throw.
             if (!flow.TrySetActivationResult(runContinuationsAsynchronously: false)
                 && !(flow._remainingActivationTimeout <= TimeSpan.Zero)
                 && !control.AbortToken.IsCancellationRequested
-                && !flow._activationCancellationTokenRegistration.Token.IsCancellationRequested)
+                && !activationRegistration.Token.IsCancellationRequested)
                 ThrowHelper.ThrowInvalidOperation("Flow was already activated unexpectedly.");
         }
 
@@ -986,7 +1009,7 @@ public abstract class PgClientFlow : IValueTaskSource<FlowActivation>, IValueTas
             Debug.Assert(!flow._started && !flow._completed);
             // No body has awaited activation yet, so there is no activation-cycle registration to
             // dismantle and reconstruct on the replacement source.
-            Debug.Assert(flow._activationCancellationTokenRegistration == default);
+            Debug.Assert(Volatile.Read(ref flow._optionalState)?.ActivationRegistration == default);
             // Forceful shutdown may have propagated the retired wire's abort into this inert flow
             // before the source drain transferred it. No body can have observed the pre-start gate;
             // reset that wire-local verdict so replacement dispatch can activate the same operation.
@@ -1017,7 +1040,7 @@ public abstract class PgClientFlow : IValueTaskSource<FlowActivation>, IValueTas
             flow._completed = true;
             if (flow.OwnsAdmissionBarrier)
                 control.ReleaseAdmissionBarrier();
-            flow._activationCancellationTokenRegistration.Dispose();
+            flow.TakeActivationRegistration().Dispose();
             var observer = flow._observer;
             var observerState = flow._observerState;
             try { flow.OnReleasing(exception); }
@@ -1042,7 +1065,7 @@ public abstract class PgClientFlow : IValueTaskSource<FlowActivation>, IValueTas
             // inline caller continuations are a re-entrancy hazard, the contract the old TCS's
             // RunContinuationsAsynchronously carried, minus its unconditional thread-pool destination.
             flow.CompleteFlow(exception);
-            flow._completionEvent?.Set();
+            Volatile.Read(ref flow._optionalState)?.CompletionEvent?.Set();
             // The completed observer runs from CompleteItem in the advancer/retirement work-item
             // context: a raw throw would crash that thread unobserved. Don't swallow either - a
             // throwing completed observer means the consumer-side integration is broken, so the
@@ -1117,9 +1140,10 @@ public abstract class PgClientFlow : IValueTaskSource<FlowActivation>, IValueTas
         {
             if (!cancellationToken.CanBeCanceled)
                 return;
-            if (flow._activationCancellationTokenRegistration != default)
+            var state = flow.GetOrCreateOptionalState();
+            if (state.ActivationRegistration != default)
                 ThrowHelper.ThrowInvalidOperation("Concurrent activation result awaits are not supported.");
-            flow._activationCancellationTokenRegistration = cancellationToken.UnsafeRegister(
+            state.ActivationRegistration = cancellationToken.UnsafeRegister(
                 static (state, token) =>
                     ((PgClientFlow)state!).TrySetActivationException(new OperationCanceledException(token), runContinuationsAsynchronously: true),
                 flow);
