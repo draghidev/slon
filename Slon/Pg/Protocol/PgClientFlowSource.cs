@@ -543,6 +543,7 @@ readonly struct PgClientFlowSource : IPipelineSource<PgClientFlow, PgClientFlowS
 
         // Only reached on real write backpressure (the flush didn't complete inline), so a pooled
         // box is plenty - the promise-reuse builder would be overkill for how rarely this fires.
+        [RuntimeAsyncMethodGeneration(false)]
         [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
         async ValueTask<bool> FlushThenWaitAsync(ValueTask flushTask)
         {

@@ -532,6 +532,7 @@ public sealed class Row : PgFieldReader
             return default;
         return Core(cancellationToken);
 
+        [RuntimeAsyncMethodGeneration(false)]
         [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
         async ValueTask Core(CancellationToken token)
         {

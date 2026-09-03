@@ -247,6 +247,7 @@ public sealed class CommandResult
     }
 
     [MethodImpl(MethodImplOptions.NoInlining)]
+    [RuntimeAsyncMethodGeneration(false)]
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
     async ValueTask CompleteAsyncCore()
     {
@@ -559,6 +560,7 @@ public sealed class CommandResult
         }
 
         [MethodImpl(MethodImplOptions.NoInlining)]
+        [RuntimeAsyncMethodGeneration(false)]
         [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
         async ValueTask<bool> MoveNextAsyncCore(ValueTask<bool> task)
         {
@@ -588,6 +590,7 @@ public sealed class CommandResult
         }
 
         [MethodImpl(MethodImplOptions.NoInlining)]
+        [RuntimeAsyncMethodGeneration(false)]
         [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
         async ValueTask<bool> BufferRowAsync(ValueTask task, Row row)
         {

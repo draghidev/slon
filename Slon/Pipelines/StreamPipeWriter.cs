@@ -175,6 +175,7 @@ abstract class StreamPipeWriter : PipeWriter, IOutputWriter
         EnsureFlushed(flushTask.Result);
         return default;
 
+        [RuntimeAsyncMethodGeneration(false)]
         [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
         static async ValueTask Core(ValueTask<FlushResult> flushTask)
             => EnsureFlushed(await flushTask.ConfigureAwait(false));

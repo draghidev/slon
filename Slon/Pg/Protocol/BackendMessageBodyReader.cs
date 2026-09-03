@@ -74,6 +74,7 @@ sealed class BackendMessageBodyReader : IInputReader
         }
         return Core(task);
 
+        [RuntimeAsyncMethodGeneration(false)]
         [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
         async ValueTask Core(ValueTask<CurrentMessageBuffer> task)
             => Publish(await task.ConfigureAwait(false));
@@ -105,6 +106,7 @@ sealed class BackendMessageBodyReader : IInputReader
         }
         return Core(task);
 
+        [RuntimeAsyncMethodGeneration(false)]
         [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
         async ValueTask Core(ValueTask<CurrentMessageBuffer> task)
             => Publish(_context.CompleteExtend(
@@ -176,6 +178,7 @@ sealed class BackendMessageBodyReader : IInputReader
             return default;
         return Core(cancellationToken);
 
+        [RuntimeAsyncMethodGeneration(false)]
         [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
         async ValueTask Core(CancellationToken cancellationToken)
         {

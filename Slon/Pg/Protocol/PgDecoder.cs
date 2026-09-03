@@ -1010,6 +1010,7 @@ public sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<Bac
         return default;
     }
 
+    [RuntimeAsyncMethodGeneration(false)]
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
     async ValueTask<BackendMessage> GetNextAsyncCore(ValueTask<bool> task)
     {

@@ -42,6 +42,7 @@ sealed class PipeOutputWriter(PipeWriter pipeWriter) : IOutputWriter
         EnsureFlushed(flushTask.Result);
         return new();
 
+        [RuntimeAsyncMethodGeneration(false)]
         [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
         static async ValueTask Core(ValueTask<FlushResult> flushTask)
             => EnsureFlushed(await flushTask.ConfigureAwait(false));

@@ -451,6 +451,7 @@ public sealed partial class SlonDataReader
         }
     }
 
+    [RuntimeAsyncMethodGeneration(false)]
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
     async ValueTask DisposeEnumeratorAsync()
     {
@@ -572,6 +573,7 @@ public sealed partial class SlonDataReader
         }
     }
 
+    [RuntimeAsyncMethodGeneration(false)]
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
     async ValueTask CloseAsyncCore(bool resetForReuse)
     {

@@ -67,6 +67,7 @@ static class PgStreamingConverterHelpers
 {
     // Split out from the generic class to amortize the huge size penalty per async state machine, which would otherwise be per
     // instantiation.
+    [RuntimeAsyncMethodGeneration(false)]
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
     public static async ValueTask<object?> AwaitTask(Task task, Continuation continuation)
     {
