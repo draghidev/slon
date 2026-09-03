@@ -488,6 +488,10 @@ public abstract class PgClientFlow : IValueTaskSource<FlowActivation>, IValueTas
     protected virtual void OnDiscarded() {}
     protected virtual void OnReset() {}
 
+    private protected bool HasSuccessfulActivation
+        => _activationTaskSource.GetStatus(_activationTaskSource.Version)
+            is ValueTaskSourceStatus.Succeeded;
+
     // The per-flow handoff rendezvous primitive for the (wait-list-free) sync source handoff: non-null only
     // for a flow that needs a caller takeover (a sync CommandFlow with a parked caller). The source signals
     // it when it dequeues-and-holds the flow for that caller (OnExecutorSuspended), and the caller parks on
@@ -528,6 +532,7 @@ public abstract class PgClientFlow : IValueTaskSource<FlowActivation>, IValueTas
         readonly ExecutionControl _executionControl;
         internal Context(ExecutionControl executionControl)
             => _executionControl = executionControl;
+        internal PgDecoder Decoder => _executionControl.Decoder;
 
         /// Graceful drain signal. Poll at handoff/coordination boundaries (per-CommandResult for
         /// CommandFlow) to switch to drain mode. I/O keeps running so the wire reaches a clean
@@ -741,6 +746,7 @@ public abstract class PgClientFlow : IValueTaskSource<FlowActivation>, IValueTas
     internal readonly struct ExecutionControl(PgClientFlow flow, PgClientProtocol.Control control)
     {
         internal PgClientFlow Flow => flow;
+        internal PgDecoder Decoder => control.Decoder;
 
         public bool SupportsDeferredFlush => flow is { _supportsDeferredFlush: true, _isAsyncAtDispatch: true };
         public bool StallsPipeline => !SupportsDeferredFlush;
