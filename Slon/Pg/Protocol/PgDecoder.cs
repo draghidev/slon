@@ -188,6 +188,7 @@ public sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<Bac
         return false;
     }
 
+    [MethodImpl(MethodImplOptions.NoInlining)]
     bool CompleteDirectRead(int length, CancellationToken cancellationToken,
         out ValueTask<int> next, out bool readFinished, out bool completed)
     {
