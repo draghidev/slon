@@ -19,9 +19,7 @@ namespace Slon.Pg.Protocol;
 public sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<BackendMessage>
 {
     readonly ProtocolReadPipe _pipe;
-#if !NET11_0_OR_GREATER
     readonly StreamPipeReader? _directReader;
-#endif
     readonly CancellationToken _abortToken;
     readonly TimeSpan _defaultReadTimeout;
     readonly Action? _readTimeoutArmed;
@@ -89,9 +87,7 @@ public sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<Bac
         Action? readTimeoutArmed)
     {
         _pipe = pipe;
-#if !NET11_0_OR_GREATER
         _directReader = pipe.PipeReader as StreamPipeReader;
-#endif
         _abortToken = abortToken;
         _defaultReadTimeout = defaultReadTimeout;
         _readTimeout = defaultReadTimeout;
@@ -176,7 +172,6 @@ public sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<Bac
         return _pipe.MoveNext(timeout);
     }
 
-#if !NET11_0_OR_GREATER
     bool TryBeginDirectRead(CancellationToken cancellationToken, out ValueTask<int> task)
     {
         if (_directReader is { SupportsDirectRead: true } directReader)
@@ -203,7 +198,6 @@ public sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<Bac
     }
 
     void AbortDirectRead() => _directReader!.AbortDirectRead();
-#endif
     // Builds a scope-bound shell over the shared pipe with the scope's abort token.
     internal static PgDecoder CreateScopeShell(PgDecoder baseShell, CancellationToken abortToken, TimeSpan defaultReadTimeout)
         => new(baseShell._pipe, abortToken, defaultReadTimeout, baseShell._readTimeoutArmed);
@@ -492,7 +486,6 @@ public sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<Bac
     /// Flow-owned cancellation path for a parked read. Without it the only break-out is protocol
     /// abort. An uncaught firing triggers the protocol's recovery path, so prefer a
     /// coordination-boundary check in connection-preserving flows.
-#if !NET11_0_OR_GREATER
     public ValueTask<bool> MoveNextAsync(CancellationToken cancellationToken = default)
     {
         EnsureUsableCts();
@@ -586,6 +579,7 @@ public sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<Bac
                 : MoveNextDirectAsync(directReadTask, frontierFlow);
 
         [MethodImpl(MethodImplOptions.NoInlining)]
+        [RuntimeAsyncMethodGeneration(false)]
         [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
         async ValueTask<bool> MoveNextDirectAsync(
             ValueTask<int> directReadTask,
@@ -694,28 +688,18 @@ public sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<Bac
             }
         }
 
-#endif
-#if NET11_0_OR_GREATER
-    public async ValueTask<bool> MoveNextAsync(CancellationToken cancellationToken = default)
-    {
-        EnsureUsableCts();
-        var pipe = _pipe;
-        PgClientFlow? frontierFlow = null;
-#else
         [MethodImpl(MethodImplOptions.NoInlining)]
         async ValueTask<bool> MoveNextAsyncCore(ValueTask<ReadResult>? readTask,
             ValueTask<int>? directReadTask, ValueTask<bool>? messageHandledTask,
             CancellationToken cancellationToken, PgClientFlow? frontierFlow = null)
         {
             var pipe = _pipe;
-#endif
             var timeoutSet = false;
             var registration = cancellationToken.UnsafeRegister(static (state, _) => ((CancellationTokenSource)state!).Cancel(), _cancellationTokenSource);
             try
             {
                 while (true)
                 {
-#if !NET11_0_OR_GREATER
                     if (messageHandledTask is { } t)
                     {
                         if (!await t.ConfigureAwait(false))
@@ -752,9 +736,7 @@ public sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<Bac
                             throw TranslateEof(ex);
                         }
                     }
-#endif
 
-#if !NET11_0_OR_GREATER
                     if (directReadTask is { } pendingDirectRead)
                     {
                         try
@@ -801,15 +783,10 @@ public sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<Bac
                             throw;
                         }
                     }
-#endif
 
                     while (TryMoveNext(pipe))
                     {
                         var handleTask = CurrentExecutionControl.HandleMessageAuto(pipe.Current);
-#if NET11_0_OR_GREATER
-                        if (!await handleTask.ConfigureAwait(false))
-                            return true;
-#else
                         if (!handleTask.IsCompletedSuccessfully)
                         {
                             messageHandledTask = handleTask;
@@ -817,12 +794,9 @@ public sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<Bac
                         }
                         if (!handleTask.Result)
                             return true;
-#endif
                     }
-#if !NET11_0_OR_GREATER
                     if (messageHandledTask.HasValue)
                         continue;
-#endif
 
                     PrepareRead();
 
@@ -830,33 +804,13 @@ public sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<Bac
                     {
                         var token = _cancellationTokenSource.Token;
                         frontierFlow = EnterCancellationReadFrontier();
-#if NET11_0_OR_GREATER
-                        var nextRead = pipe.ReadAsync(token);
-                        if (!nextRead.IsCompletedSuccessfully && !timeoutSet)
-                        {
-                            ArmReadTimeout();
-                            timeoutSet = true;
-                        }
-                        var result = await nextRead.ConfigureAwait(false);
-                        LeaveCancellationReadFrontier(frontierFlow);
-                        frontierFlow = null;
-                        if (CompleteRead(result, token, out var readCompleted))
-                            continue;
-                        if (readCompleted)
-                            return ReadCompleted();
-#else
                         if (TryBeginDirectRead(token, out var nextDirectRead))
                             directReadTask = nextDirectRead;
                         else
                             readTask = pipe.ReadAsync(token);
-#endif
                     }
                     catch (Exception ex) when (_cancellationTokenSource.IsCancellationRequested)
                     { throw TranslateReadCancellation(ex, cancellationToken); }
-#if NET11_0_OR_GREATER
-                    catch (EndOfStreamException ex)
-                    { throw TranslateEof(ex); }
-#endif
                 }
             }
             finally
@@ -868,9 +822,7 @@ public sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<Bac
                     SetRemainingTimeout(Timeout.InfiniteTimeSpan);
             }
         }
-#if !NET11_0_OR_GREATER
     }
-#endif
 
     bool ReadCompleted()
     {

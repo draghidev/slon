@@ -12,10 +12,8 @@ interface IStreamOwner : IDisposable, IAsyncDisposable { }
 
 abstract class StreamPipeReader : PipeReader
 {
-#if !NET11_0_OR_GREATER
     readonly ValueTaskSourcePromise<ReadResult> _readAsyncCorePromise = new();
     bool _directReadAwaitingData;
-#endif
     readonly IStreamOwner? _streamOwner;
     int _isReadActive;
     int _readerCompleted;
@@ -231,7 +229,6 @@ abstract class StreamPipeReader : PipeReader
             throw new InvalidOperationException("The reader must be open, idle, and empty before its stream can be upgraded.");
     }
 
-#if !NET11_0_OR_GREATER
     // Direct reads retain reader tenure until their continuation returns through CompleteDirectRead
     // or AbortDirectRead. The protocol must interrupt and join that tenure before completing the
     // reader and returning its destination buffer.
@@ -308,7 +305,6 @@ abstract class StreamPipeReader : PipeReader
         var buffer = Segments.Reserve(0, enforceHint: false);
         return Stream.ReadAsync(buffer, cancellationToken);
     }
-#endif
 
     protected ReadResult ReadCore(int minimumSize, TimeSpan timeout)
     {
@@ -381,11 +377,6 @@ abstract class StreamPipeReader : PipeReader
 
     }
 
-#if NET11_0_OR_GREATER
-    protected async ValueTask<ReadResult> ReadAsyncCore(int minimumSize, CancellationToken cancellationToken)
-    {
-        var tokenSource = PendingReadTokenSource;
-#else
     protected ValueTask<ReadResult> ReadAsyncCore(int minimumSize, CancellationToken cancellationToken)
     {
         PromiseAsyncValueTaskMethodBuilder<ReadResult>.Promise = _readAsyncCorePromise;
@@ -403,7 +394,6 @@ abstract class StreamPipeReader : PipeReader
         async ValueTask<ReadResult> ReadAsyncCore(int minimumSize,
             AutoResetCancellationTokenSource? tokenSource, CancellationToken cancellationToken)
         {
-#endif
             // Cancellation token was already checked before getting here.
             if (!TryStartRead())
                 ThrowAlreadyReading();
@@ -462,9 +452,7 @@ abstract class StreamPipeReader : PipeReader
                 }
             }
         }
-#if !NET11_0_OR_GREATER
     }
-#endif
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     int GetReadSizeHint(int minimumSize)
