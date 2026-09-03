@@ -393,6 +393,12 @@ public abstract class PgClientFlow : IValueTaskSource<FlowActivation>, IValueTas
         cancellationToken.ThrowIfCancellationRequested();
         Volatile.Write(ref _completionWaiterPending, 1);
         var token = _completionCore.Version;
+        if (_completionCore.GetStatus(token) is not ValueTaskSourceStatus.Pending)
+        {
+            _ = ((IValueTaskSource<FlowCompletion>)this).GetResult(token);
+            return;
+        }
+
         var state = GetOrCreateOptionalState();
         var completionEvent = state.CompletionEvent;
         if (completionEvent is null)
