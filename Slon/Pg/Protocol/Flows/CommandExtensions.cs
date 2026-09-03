@@ -16,7 +16,6 @@ public static class CommandExtensions
     static bool CanWritePreparedExecution(in Command command, in CommandDescriptor descriptor)
         => descriptor.IsPrepared && command.Parameters.Count is 0
             && descriptor.ParameterTypes.Count is 0 && command.ResultFormats.Length is 0;
-
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     static ValueTask WritePreparedExecutionAsync(
         in Command command, in CommandDescriptor descriptor, PgEncoder encoder, bool appendSync,
@@ -36,6 +35,15 @@ public static class CommandExtensions
     public static ValueTask WriteCommandsAsync(this CommandList commands, PgEncoder encoder, bool appendSync,
         CancellationToken cancellationToken = default)
     {
+        if (commands.Count is 1)
+        {
+            var command = commands[0];
+            var descriptor = command.Descriptor;
+            if (CanWritePreparedExecution(command, descriptor))
+                return WritePreparedExecutionAsync(
+                    command, descriptor, encoder, appendSync, cancellationToken);
+        }
+
         for (var i = 0; i < commands.Count; i++)
         {
             var command = commands[i];
