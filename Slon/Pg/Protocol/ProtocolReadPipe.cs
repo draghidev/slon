@@ -1,6 +1,5 @@
 using System.Buffers;
 using System.IO.Pipelines;
-using System.Runtime.CompilerServices;
 using Slon.Pipelines;
 
 namespace Slon.Pg.Protocol;
@@ -228,13 +227,12 @@ sealed class ProtocolReadPipe(
         return true;
     }
 
-    public ValueTask<CurrentMessageBuffer> SlideCurrentMessageAsync(
+    public ValueTask<ReadResult> BeginSlideCurrentMessageAsync(
         SequencePosition consumed, long consumedLength,
         CancellationToken cancellationToken)
     {
         PrepareCurrentMessageRead(consumed, consumedLength, PendingRead.Slide);
-        return CompleteCurrentMessageReadAsync(
-            reader.ReadAsync(cancellationToken), cancellationToken);
+        return reader.ReadAsync(cancellationToken);
     }
 
     public CurrentMessageBuffer SlideCurrentMessage(
@@ -259,13 +257,12 @@ sealed class ProtocolReadPipe(
         return true;
     }
 
-    public ValueTask<CurrentMessageBuffer> ExtendCurrentMessageAsync(
+    public ValueTask<ReadResult> BeginExtendCurrentMessageAsync(
         CancellationToken cancellationToken)
     {
         PrepareCurrentMessageRead(
             _retainedStart, consumedLength: 0, PendingRead.Extend);
-        return CompleteCurrentMessageReadAsync(
-            reader.ReadAsync(cancellationToken), cancellationToken);
+        return reader.ReadAsync(cancellationToken);
     }
 
     public CurrentMessageBuffer ExtendCurrentMessage(TimeSpan timeout)
@@ -314,19 +311,7 @@ sealed class ProtocolReadPipe(
         _pendingRead = mode;
     }
 
-    ValueTask<CurrentMessageBuffer> CompleteCurrentMessageReadAsync(
-        ValueTask<ReadResult> task, CancellationToken cancellationToken)
-        => task.IsCompletedSuccessfully
-            ? new(CompleteCurrentMessageRead(task.Result, cancellationToken))
-            : Core(task, cancellationToken);
-
-    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
-    async ValueTask<CurrentMessageBuffer> Core(
-        ValueTask<ReadResult> task, CancellationToken cancellationToken)
-        => CompleteCurrentMessageRead(
-            await task.ConfigureAwait(false), cancellationToken);
-
-    CurrentMessageBuffer CompleteCurrentMessageRead(
+    public CurrentMessageBuffer CompleteCurrentMessageRead(
         in ReadResult result, CancellationToken cancellationToken = default)
     {
         if (_pendingRead is not (PendingRead.Slide or PendingRead.Extend))

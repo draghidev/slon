@@ -262,8 +262,9 @@ public sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<Bac
             {
                 ArmReadTimeout();
                 timeoutSet = true;
-                return await _pipe.SlideCurrentMessageAsync(
+                var read = await _pipe.BeginSlideCurrentMessageAsync(
                     consumed, consumedLength, _cancellationTokenSource.Token).ConfigureAwait(false);
+                return _pipe.CompleteCurrentMessageRead(read, _cancellationTokenSource.Token);
             }
             catch (Exception ex) when (_cancellationTokenSource.IsCancellationRequested)
             {
@@ -331,8 +332,9 @@ public sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<Bac
             {
                 ArmReadTimeout();
                 timeoutSet = true;
-                return await _pipe.ExtendCurrentMessageAsync(
+                var read = await _pipe.BeginExtendCurrentMessageAsync(
                     _cancellationTokenSource.Token).ConfigureAwait(false);
+                return _pipe.CompleteCurrentMessageRead(read, _cancellationTokenSource.Token);
             }
             catch (Exception ex) when (_cancellationTokenSource.IsCancellationRequested)
             {
