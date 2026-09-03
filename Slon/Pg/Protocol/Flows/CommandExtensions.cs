@@ -37,7 +37,7 @@ public static class CommandExtensions
     {
         if (commands.Count is 1)
         {
-            var command = commands[0];
+            ref readonly var command = ref commands.ItemRef(0);
             var descriptor = command.Descriptor;
             if (CanWritePreparedExecution(command, descriptor))
                 return WritePreparedExecutionAsync(
@@ -46,7 +46,7 @@ public static class CommandExtensions
 
         for (var i = 0; i < commands.Count; i++)
         {
-            var command = commands[i];
+            ref readonly var command = ref commands.ItemRef(i);
             var descriptor = command.Descriptor;
             if (!descriptor.IsPrepared || command.Parameters.Count is not 0
                 || descriptor.ParameterTypes.Count is not 0 || command.ResultFormats.Length is not 0)
