@@ -617,7 +617,7 @@ readonly struct CommandFlowCore<TOps>(TOps ops)
             Debug.Assert(!_state.ConsumerDetached);
             RegisterCancellation(cancellationToken);
             var result = IsSinglePublishedCommand
-                ? await ReadResultAsync(0).ConfigureAwait(false)
+                ? await ReadResultAsync().ConfigureAwait(false)
                 : await ReadNextPublishedResultAsync().ConfigureAwait(false);
             if (result is null)
                 return false;
@@ -666,20 +666,22 @@ readonly struct CommandFlowCore<TOps>(TOps ops)
         {
             RegisterCancellation(cancellationToken);
             var result = _state.Current!;
-            var resultEnumerator = _state.Context.GetProtocolStatic<CommandFlow.ReadState>()
-                .ResultMessageEnumerator;
-            await resultEnumerator.DisposeAsync().ConfigureAwait(false);
-            var completeError = resultEnumerator.CompleteError;
+            await _state.Context.GetProtocolStatic<CommandFlow.ReadState>()
+                .ResultMessageEnumerator.DisposeAsync().ConfigureAwait(false);
+            var skipDiscarded = _state.Context.GetProtocolStatic<CommandFlow.ReadState>()
+                .ResultMessageEnumerator.CompleteError
+                is { TransactionStatus: TransactionStatus.Unknown };
             _state.CurrentPublished = false;
-            if (Volatile.Read(ref _state.ColdState)?.TerminalException is { } consumerFault)
+            if (Volatile.Read(ref _state.ColdState)?.TerminalException is not null)
             {
                 Interlocked.Exchange(ref _state.Phase, PhaseDraining);
                 NotifyDrainStarted();
                 _state.ConsumerDetached = true;
                 await DrainAsync().ConfigureAwait(false);
-                ExceptionDispatchInfo.Throw(consumerFault);
+                ExceptionDispatchInfo.Throw(
+                    Volatile.Read(ref _state.ColdState)!.TerminalException!);
             }
-            if (completeError is { TransactionStatus: TransactionStatus.Unknown })
+            if (skipDiscarded)
                 await SkipDiscardedCommandsAsync().ConfigureAwait(false);
 
             _state.CommandIndex++;
@@ -732,7 +734,7 @@ readonly struct CommandFlowCore<TOps>(TOps ops)
         CommandResult? result = _state.Current;
         while (_state.CommandIndex < _state.Commands.Count)
         {
-            result = await ReadResultAsync(_state.CommandIndex).ConfigureAwait(false);
+            result = await ReadResultAsync().ConfigureAwait(false);
             _state.Current = result;
             _state.CurrentPublished = false;
             if (!_state.Commands.ItemRef(_state.CommandIndex).SuppressEnumeration)
@@ -812,7 +814,7 @@ readonly struct CommandFlowCore<TOps>(TOps ops)
     }
 
     // Reads through the command's execute prelude and initializes the protocol-static result.
-    async ValueTask<CommandResult> ReadResultAsync(int commandIndex)
+    async ValueTask<CommandResult> ReadResultAsync()
     {
         var context = _state.Context;
         var decoder = context.Decoder;
@@ -821,7 +823,7 @@ readonly struct CommandFlowCore<TOps>(TOps ops)
             throw context.FlowTerminationException;
         PgError? error;
         RowDescription? requestedRowDescription;
-        ref readonly var command = ref _state.Commands.ItemRef(commandIndex);
+        ref readonly var command = ref _state.Commands.ItemRef(_state.CommandIndex);
         var describeOnly = command.DescribeOnly;
         var hasPreparedDescription = command.Descriptor
             is { IsPrepared: true, PreparedRowDescription: not null };
@@ -870,7 +872,7 @@ readonly struct CommandFlowCore<TOps>(TOps ops)
                 .ConfigureAwait(false);
         }
         return InitializeResult(
-            commandIndex, error, requestedRowDescription, preparationParameterTypes);
+            _state.CommandIndex, error, requestedRowDescription, preparationParameterTypes);
     }
 
     CommandResult ReadResult(int commandIndex)
@@ -1063,7 +1065,7 @@ readonly struct CommandFlowCore<TOps>(TOps ops)
                     await CompleteBatchAsync().ConfigureAwait(false);
                     return;
                 }
-                result = await ReadResultAsync(_state.CommandIndex).ConfigureAwait(false);
+                result = await ReadResultAsync().ConfigureAwait(false);
             }
 
             while (true)
@@ -1075,7 +1077,7 @@ readonly struct CommandFlowCore<TOps>(TOps ops)
                     await SkipDiscardedCommandsAsync().ConfigureAwait(false);
                 if (++_state.CommandIndex >= _state.Commands.Count)
                     break;
-                result = await ReadResultAsync(_state.CommandIndex).ConfigureAwait(false);
+                result = await ReadResultAsync().ConfigureAwait(false);
             }
             await CompleteBatchAsync().ConfigureAwait(false);
         }
