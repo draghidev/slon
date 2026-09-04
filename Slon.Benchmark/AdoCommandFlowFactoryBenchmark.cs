@@ -144,5 +144,5 @@ public class AdoCommandFlowFactoryBenchmark : ClientBenchmark
     }
 
     [UnsafeAccessor(UnsafeAccessorKind.Field, Name = "_batchCore")]
-    static extern ref AdoBatchCore<SlonBatchCommand> GetBatchCore(SlonBatch batch);
+    static extern ref AdoBatchCore<SlonBatchCommand, SlonBatch.BatchCoreRef> GetBatchCore(SlonBatch batch);
 }

@@ -1,22 +1,21 @@
 using System.Data.Common;
-using Slon.Runtime.CompilerServices;
 
 namespace Slon;
 
 /// <inheritdoc cref="System.Data.Common.DbBatchCommandCollection" />
 public sealed class SlonBatchCommands : DbBatchCommandCollection, IList<SlonBatchCommand>
 {
-    readonly FieldRef<AdoBatchCore<SlonBatchCommand>> _batchRef;
+    readonly SlonBatch _batch;
 
-    internal SlonBatchCommands(FieldRef<AdoBatchCore<SlonBatchCommand>> batchRef) => _batchRef = batchRef;
+    internal SlonBatchCommands(SlonBatch batch) => _batch = batch;
 
-    ref AdoCommandList<SlonBatchCommand> List => ref _batchRef.Invoke().Commands;
+    ref AdoCommandList<SlonBatchCommand> List => ref _batch.BatchCore.Commands;
 
     /// <inheritdoc/>
     public override int Count => List.Count;
 
     /// <inheritdoc/>
-    public override bool IsReadOnly => _batchRef.Invoke().IsReadOnly;
+    public override bool IsReadOnly => _batch.BatchCore.IsReadOnly;
 
     /// <inheritdoc/>
     IEnumerator<SlonBatchCommand> IEnumerable<SlonBatchCommand>.GetEnumerator()
@@ -142,6 +141,6 @@ public sealed class SlonBatchCommands : DbBatchCommandCollection, IList<SlonBatc
 
     void ThrowIfReadOnly()
     {
-        _batchRef.Invoke().ThrowIfDisposedOrReadOnly();
+        _batch.BatchCore.ThrowIfDisposedOrReadOnly();
     }
 }

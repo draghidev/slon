@@ -209,7 +209,7 @@ public sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, 
 
         public static Ops Create(PgClientFlow flow) => new((CommandFlow)flow);
         public PgClientFlow Flow => _owner;
-        public ref CommandExecutionState State => ref _owner._state;
+        public ref CommandExecutionState GetField() => ref _owner._state;
         public bool IsAsync
         {
             get => _owner.IsAsync;
@@ -230,12 +230,11 @@ public sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, 
     }
 }
 
-internal interface ICommandExecutionFlowOps<TSelf>
+internal interface ICommandExecutionFlowOps<TSelf> : IFieldRef<TSelf, CommandExecutionState>
     where TSelf : struct, ICommandExecutionFlowOps<TSelf>
 {
     static abstract TSelf Create(PgClientFlow flow);
     PgClientFlow Flow { get; }
-    ref CommandExecutionState State { get; }
     bool IsAsync { get; set; }
     bool IsAsyncAtDispatch { get; }
     bool HasSuccessfulActivation { get; }
@@ -255,7 +254,7 @@ readonly struct CommandFlowCore<TOps>(TOps ops)
     const int PhaseCompleted = 4;
 
     readonly TOps _ops = ops;
-    ref CommandExecutionState _state => ref _ops.State;
+    ref CommandExecutionState _state => ref _ops.GetField();
     internal bool IsResultReady => Volatile.Read(ref _state.Phase) is PhaseResultReady;
     bool IsSinglePublishedCommand
         => _state.Commands.Count is 1

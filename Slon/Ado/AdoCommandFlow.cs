@@ -218,7 +218,7 @@ sealed class AdoCommandExecutionFlow : PgClientFlow, IValueTaskSource<bool>, IVa
 
         public static Ops Create(PgClientFlow flow) => new((AdoCommandExecutionFlow)flow);
         public PgClientFlow Flow => _owner;
-        public ref CommandExecutionState State => ref _owner._state;
+        public ref CommandExecutionState GetField() => ref _owner._state;
         public bool IsAsync
         {
             get => _owner.IsAsync;

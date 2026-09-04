@@ -34,7 +34,11 @@ public class SyncFlowHandoffTests
         internal FlowCallerInteractionCore<ValueTuple> Core;
     }
 
-    static ref FlowCallerInteractionCore<ValueTuple> GetWakeCore(WakeHolder holder) => ref holder.Core;
+    readonly struct WakeRef(WakeHolder holder)
+        : IFieldRef<WakeRef, FlowCallerInteractionCore<ValueTuple>>
+    {
+        public ref FlowCallerInteractionCore<ValueTuple> GetField() => ref holder.Core;
+    }
 
     [ConnectionCreatingTestMethod]
     public async Task PairedAsyncAndSync_NoSharedPromiseCollision()
@@ -73,12 +77,7 @@ public class SyncFlowHandoffTests
 
         static async Task Suspend(WakeHolder holder, TaskCompletionSource<bool> resumedOnThreadPool)
         {
-            FieldRef<FlowCallerInteractionCore<ValueTuple>> fieldRef;
-            unsafe
-            {
-                fieldRef = FieldRef<FlowCallerInteractionCore<ValueTuple>>.Create(&GetWakeCore, holder);
-            }
-            await holder.Core.YieldToCaller(fieldRef);
+            await holder.Core.YieldToCaller(new WakeRef(holder));
             resumedOnThreadPool.SetResult(Thread.CurrentThread.IsThreadPoolThread);
         }
     }

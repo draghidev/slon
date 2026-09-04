@@ -180,7 +180,9 @@ struct FlowCallerInteractionCore<TResult>
 
     bool ConsumeProgress() => Interlocked.Exchange(ref _progressSignaled, 0) != 0;
 
-    public CallerHandoffAwaitable YieldToCaller(FieldRef<FlowCallerInteractionCore<TResult>> fieldRef)
+    public CallerHandoffAwaitable<TFieldRef> YieldToCaller<TFieldRef>(TFieldRef fieldRef)
+        where TFieldRef : struct,
+            IFieldRef<TFieldRef, FlowCallerInteractionCore<TResult>>
         => new(fieldRef);
 
     public void Reset()
@@ -193,11 +195,13 @@ struct FlowCallerInteractionCore<TResult>
         Volatile.Write(ref _gateCompletionClaim, 0);
     }
 
-    public readonly struct CallerHandoffAwaitable(FieldRef<FlowCallerInteractionCore<TResult>> fieldRef)
+    public readonly struct CallerHandoffAwaitable<TFieldRef>(TFieldRef fieldRef)
+        where TFieldRef : struct,
+            IFieldRef<TFieldRef, FlowCallerInteractionCore<TResult>>
     {
         public Awaiter GetAwaiter() => new(fieldRef);
 
-        public readonly struct Awaiter(FieldRef<FlowCallerInteractionCore<TResult>> fieldRef) : ICriticalNotifyCompletion
+        public readonly struct Awaiter(TFieldRef fieldRef) : ICriticalNotifyCompletion
         {
             public bool IsCompleted => false;
 
@@ -206,14 +210,14 @@ struct FlowCallerInteractionCore<TResult>
                 // Surface a pending cancellation set by FaultBodyWait. The gate source is
                 // only completed when cancellation fires. In the normal sync-flow handoff path
                 // it stays Pending and we just return.
-                var gate = fieldRef.Invoke()._gate;
+                var gate = fieldRef.GetField()._gate;
                 if (gate.GetStatus(gate.Version) != System.Threading.Tasks.Sources.ValueTaskSourceStatus.Pending)
                     gate.GetResult(gate.Version);
             }
 
             public void OnCompleted(Action continuation)
             {
-                ref var field = ref fieldRef.Invoke();
+                ref var field = ref fieldRef.GetField();
                 var waitEvent = field.GetWaitEvent();
                 if (!ReferenceEquals(waitEvent.HandoffContinuation, continuation))
                     Volatile.Write(ref waitEvent.HandoffContinuation, continuation);

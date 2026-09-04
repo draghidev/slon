@@ -9,28 +9,36 @@ namespace Slon;
 /// <inheritdoc cref="System.Data.Common.DbBatch" />
 public sealed partial class SlonBatch
 {
-    AdoBatchCore<SlonBatchCommand> _batchCore;
+    internal readonly struct BatchCoreRef(SlonBatch owner)
+        : IAdoBatchCoreRef<SlonBatchCommand, BatchCoreRef>
+    {
+        public IAdoCommandExecutionOwner Owner => owner;
+        public ref AdoBatchCore<SlonBatchCommand, BatchCoreRef> GetField()
+            => ref owner._batchCore;
+    }
+
+    AdoBatchCore<SlonBatchCommand, BatchCoreRef> _batchCore;
     SlonBatchCommands? _batchCommands;
 
-    unsafe SlonBatch(SlonConnection? connection, SlonDataSource? dataSource)
+    SlonBatch(SlonConnection? connection, SlonDataSource? dataSource)
     {
-        var fieldRef = FieldRef<AdoBatchCore<SlonBatchCommand>>.Create(&GetBatchCore, this);
         if (connection is not null)
         {
-            _batchCore = new(connection, fieldRef);
+            _batchCore = new(new(this), connection);
             _batchCore.Timeout = connection.DefaultCommandTimeout;
         }
         else if (dataSource is not null)
         {
-            _batchCore = new(dataSource, fieldRef);
+            _batchCore = new(new(this), dataSource);
             _batchCore.Timeout = dataSource.DefaultCommandTimeout;
         }
         else
-            _batchCore = new(fieldRef);
+            _batchCore = new(new(this));
     }
 
-    unsafe SlonBatchCommands CreateBatchCommandCollection()
-        => new(FieldRef<AdoBatchCore<SlonBatchCommand>>.Create(&GetBatchCore, this));
+    SlonBatchCommands CreateBatchCommandCollection() => new(this);
+
+    internal ref AdoBatchCore<SlonBatchCommand, BatchCoreRef> BatchCore => ref _batchCore;
 
     internal void OnFlowStarted(AdoCommandExecutionFlow flow)
         => _batchCore.OnFlowStarted(flow);
@@ -53,7 +61,6 @@ public sealed partial class SlonBatch
         AdoCommandExecutionFlow flow, Exception? exception)
         => OnFlowCompleting(flow, exception);
 
-    static ref AdoBatchCore<SlonBatchCommand> GetBatchCore(SlonBatch instance) => ref instance._batchCore;
 }
 
 // Public surface & ADO.NET

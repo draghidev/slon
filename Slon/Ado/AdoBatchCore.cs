@@ -9,10 +9,20 @@ using Slon.Runtime.CompilerServices;
 
 namespace Slon;
 
-// Shared between DbBatch and DbCommand
-partial struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
+interface IAdoBatchCoreRef<TCommand, TFieldRef>
+    : IFieldRef<TFieldRef, AdoBatchCore<TCommand, TFieldRef>>
+    where TCommand : IAdoCommand
+    where TFieldRef : struct, IAdoBatchCoreRef<TCommand, TFieldRef>
 {
-    readonly FieldRef<AdoBatchCore<TCommand>> _fieldRef;
+    IAdoCommandExecutionOwner Owner { get; }
+}
+
+// Shared between DbBatch and DbCommand
+partial struct AdoBatchCore<TCommand, TFieldRef>
+    where TCommand : IAdoCommand
+    where TFieldRef : struct, IAdoBatchCoreRef<TCommand, TFieldRef>
+{
+    readonly TFieldRef _fieldRef;
     object _dataSourceOrConnection;
     bool _disposed;
     bool _explicitlyPrepared;
@@ -23,19 +33,19 @@ partial struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
     AdoCommandExecutionFlow? _activeFlow;
     AdoCommandList<TCommand> _commands;
 
-    public AdoBatchCore(FieldRef<AdoBatchCore<TCommand>> fieldRef)
+    public AdoBatchCore(TFieldRef fieldRef)
     {
         _dataSourceOrConnection = null!;
         _fieldRef = fieldRef;
     }
 
-    public AdoBatchCore(SlonConnection connection, FieldRef<AdoBatchCore<TCommand>> fieldRef)
+    public AdoBatchCore(TFieldRef fieldRef, SlonConnection connection)
     {
         _dataSourceOrConnection = connection;
         _fieldRef = fieldRef;
     }
 
-    public AdoBatchCore(SlonDataSource dataSource, FieldRef<AdoBatchCore<TCommand>> fieldRef)
+    public AdoBatchCore(TFieldRef fieldRef, SlonDataSource dataSource)
     {
         _dataSourceOrConnection = dataSource;
         _fieldRef = fieldRef;
@@ -113,7 +123,7 @@ partial struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
     public void ThrowIfDisposed()
     {
         if (_disposed)
-            Throw(_fieldRef.Instance);
+            Throw(_fieldRef.Owner);
 
         static void Throw(object instance) => throw new ObjectDisposedException(instance.GetType().Name);
     }
@@ -172,7 +182,7 @@ partial struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
         PgConnection? pgConnection = null, TimeSpan? pendingTimeout = null, bool preparing = false)
     {
         var factory = new AdoCommandFlowFactory<TCommand>(
-            _fieldRef.Instance, _commands.AsSpan(), dependencies);
+            _fieldRef.Owner, _commands.AsSpan(), dependencies);
         return factory.Create(
             parametersSpan, behavior, _explicitlyPrepared, _allowAutoPreparation,
             _enableErrorBarriers, Timeout,
@@ -211,16 +221,16 @@ partial struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
             var pendingTimeout = PendingTimeout;
             return dataSource.EnqueueCommands(
                 new AdoCommandExecutionFlow(
-                    async: false, (IAdoCommandExecutionOwner)_fieldRef.Instance,
+                    async: false, _fieldRef.Owner,
                     parameters, behavior, dependencies,
                     connection: null, pendingTimeout, preparing, _commands.Count,
-                    ownsLifetime: !(_explicitlyPrepared && _fieldRef.Instance is SlonCommand)),
+                    ownsLifetime: !(_explicitlyPrepared && _fieldRef.Owner is SlonCommand)),
                 pendingTimeout);
         }
 
         connection ??= ThrowConnectionNotInitialized();
         return connection.Enqueue(new AdoCommandExecutionFlow(
-            async: false, (IAdoCommandExecutionOwner)_fieldRef.Instance,
+            async: false, _fieldRef.Owner,
             parameters, behavior, dependencies, connection, PendingTimeout, preparing,
             _commands.Count, ownsLifetime: true));
     }
@@ -235,16 +245,16 @@ partial struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
             var pendingTimeout = PendingTimeout;
             return dataSource.EnqueueCommandsAsync(
                 new AdoCommandExecutionFlow(
-                    async: true, (IAdoCommandExecutionOwner)_fieldRef.Instance,
+                    async: true, _fieldRef.Owner,
                     parameters, behavior, dependencies,
                     connection: null, pendingTimeout, preparing, _commands.Count,
-                    ownsLifetime: !(_explicitlyPrepared && _fieldRef.Instance is SlonCommand)),
+                    ownsLifetime: !(_explicitlyPrepared && _fieldRef.Owner is SlonCommand)),
                 pendingTimeout, cancellationToken);
         }
 
         connection ??= ThrowConnectionNotInitialized();
         return connection.EnqueueAsync<AdoCommandExecutionFlow>(new AdoCommandExecutionFlow(
-            async: true, (IAdoCommandExecutionOwner)_fieldRef.Instance,
+            async: true, _fieldRef.Owner,
             parameters, behavior, dependencies, connection, PendingTimeout, preparing,
             _commands.Count, ownsLifetime: true), cancellationToken);
     }
@@ -289,9 +299,9 @@ partial struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
         return checked((int)recordsAffected);
     }
 
-    static async ValueTask<int> ExecuteNonQueryAsyncCore(FieldRef<AdoBatchCore<TCommand>> fieldRef, DbParameterCollection? parameters, CancellationToken cancellationToken)
+    static async ValueTask<int> ExecuteNonQueryAsyncCore(TFieldRef fieldRef, DbParameterCollection? parameters, CancellationToken cancellationToken)
     {
-        ref var thisRef = ref fieldRef.Invoke();
+        ref var thisRef = ref fieldRef.GetField();
         using var activity = thisRef.StartActivity();
         try
         {
@@ -299,7 +309,7 @@ partial struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
             cancellationToken.ThrowIfCancellationRequested();
             var dependencies = await thisRef.GetDependenciesAsync(cancellationToken)
                 .ConfigureAwait(false);
-            var flow = await fieldRef.Invoke().EnqueueAsync(parameters, CommandBehavior.Default,
+            var flow = await fieldRef.GetField().EnqueueAsync(parameters, CommandBehavior.Default,
                 dependencies, cancellationToken).ConfigureAwait(false);
             return checked((int)await flow.ConsumeNonQueryAsync(cancellationToken).ConfigureAwait(false));
         }
@@ -354,9 +364,9 @@ partial struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
         return null;
     }
 
-    static async ValueTask<object?> ExecuteScalarAsyncCore(FieldRef<AdoBatchCore<TCommand>> fieldRef, DbParameterCollection? parameters, CancellationToken cancellationToken)
+    static async ValueTask<object?> ExecuteScalarAsyncCore(TFieldRef fieldRef, DbParameterCollection? parameters, CancellationToken cancellationToken)
     {
-        ref var thisRef = ref fieldRef.Invoke();
+        ref var thisRef = ref fieldRef.GetField();
         using var activity = thisRef.StartActivity();
         AdoCommandExecutionFlow.Enumerator enumerator = default;
         try
@@ -366,7 +376,7 @@ partial struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
             var dependencies = await thisRef.GetDependenciesAsync(cancellationToken)
                 .ConfigureAwait(false);
             var fieldReader = new PgSerializerFieldReader(dependencies.SerializerOptions);
-            enumerator = (await fieldRef.Invoke().EnqueueAsync(parameters, CommandBehavior.Default,
+            enumerator = (await fieldRef.GetField().EnqueueAsync(parameters, CommandBehavior.Default,
                 dependencies, cancellationToken).ConfigureAwait(false))
                 .GetAsyncEnumerator(cancellationToken);
             while (await enumerator.MoveNextAsync().ConfigureAwait(false))
@@ -447,7 +457,7 @@ partial struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
     public ValueTask<DbDataReader> ExecuteDbReaderAsync(DbParameterCollection? parameters, CommandBehavior behavior, CancellationToken cancellationToken = default)
     {
         if (_disposed)
-            return ValueTask.FromException<DbDataReader>(new ObjectDisposedException(_fieldRef.Instance.GetType().Name));
+            return ValueTask.FromException<DbDataReader>(new ObjectDisposedException(_fieldRef.Owner.GetType().Name));
         if (cancellationToken.IsCancellationRequested)
             return ValueTask.FromCanceled<DbDataReader>(cancellationToken);
 
@@ -458,7 +468,7 @@ partial struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
     public ValueTask<SlonDataReader> ExecuteReaderAsync(DbParameterCollection? parameters, CommandBehavior behavior, CancellationToken cancellationToken = default)
     {
         if (_disposed)
-            return ValueTask.FromException<SlonDataReader>(new ObjectDisposedException(_fieldRef.Instance.GetType().Name));
+            return ValueTask.FromException<SlonDataReader>(new ObjectDisposedException(_fieldRef.Owner.GetType().Name));
         if (cancellationToken.IsCancellationRequested)
             return ValueTask.FromCanceled<SlonDataReader>(cancellationToken);
 
@@ -467,11 +477,11 @@ partial struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
     }
 
     static ValueTask<TReader> ExecuteReaderAsyncCore<TReader>(
-        FieldRef<AdoBatchCore<TCommand>> fieldRef, DbParameterCollection? parameters,
+        TFieldRef fieldRef, DbParameterCollection? parameters,
         CommandBehavior behavior, CancellationToken cancellationToken)
         where TReader : DbDataReader
     {
-        ref var core = ref fieldRef.Invoke();
+        ref var core = ref fieldRef.GetField();
         var activity = core.StartActivity();
         try
         {
@@ -491,7 +501,7 @@ partial struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
     }
 
     static ValueTask<TReader> BeginReaderCreation<TReader>(
-        FieldRef<AdoBatchCore<TCommand>> fieldRef, DbParameterCollection? parameters,
+        TFieldRef fieldRef, DbParameterCollection? parameters,
         CommandBehavior behavior, CancellationToken cancellationToken,
         SlonConnection? connection, bool closeConnection,
         SlonDataSource.PgDbDependencies dependencies,
@@ -501,7 +511,7 @@ partial struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
         try
         {
             return SlonDataReader.CreateAsync<TReader>(behavior,
-                fieldRef.Invoke().EnqueueAsync(parameters, behavior, dependencies, cancellationToken),
+                fieldRef.GetField().EnqueueAsync(parameters, behavior, dependencies, cancellationToken),
                 dependencies.SerializerOptions, cancellationToken,
                 closeConnection ? connection : null, activity);
         }
@@ -514,7 +524,7 @@ partial struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
     }
 
     static async ValueTask<TReader> AwaitDependenciesAndCreateReaderAsync<TReader>(
-        FieldRef<AdoBatchCore<TCommand>> fieldRef, DbParameterCollection? parameters,
+        TFieldRef fieldRef, DbParameterCollection? parameters,
         CommandBehavior behavior, CancellationToken cancellationToken,
         SlonConnection? connection, bool closeConnection,
         ValueTask<SlonDataSource.PgDbDependencies> dependenciesTask, Activity? activity)
@@ -601,12 +611,12 @@ partial struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
             return;
         if (TryGetDataSource(out var dataSource, out var connection))
         {
-            _ = dataSource.ReleaseOwnedPreparedCommand(_fieldRef.Instance, awaitable: false);
+            _ = dataSource.ReleaseOwnedPreparedCommand(_fieldRef.Owner, awaitable: false);
             return;
         }
 
         if (connection is not null)
-            connection.UnprepareOwned(async: false, _fieldRef.Instance).GetAwaiter().GetResult();
+            connection.UnprepareOwned(async: false, _fieldRef.Owner).GetAwaiter().GetResult();
     }
 
     public ValueTask DisposeAsync()
@@ -618,9 +628,9 @@ partial struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
         if (!_explicitlyPrepared)
             return new();
         if (TryGetDataSource(out var dataSource, out var connection))
-            return dataSource.ReleaseOwnedPreparedCommand(_fieldRef.Instance, awaitable: true);
+            return dataSource.ReleaseOwnedPreparedCommand(_fieldRef.Owner, awaitable: true);
 
-        return connection?.UnprepareOwned(async: true, _fieldRef.Instance) ?? default;
+        return connection?.UnprepareOwned(async: true, _fieldRef.Owner) ?? default;
     }
 
     public void Cancel()

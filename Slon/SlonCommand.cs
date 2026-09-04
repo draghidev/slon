@@ -11,7 +11,15 @@ namespace Slon;
 /// <inheritdoc cref="System.Data.Common.DbCommand" />
 public sealed partial class SlonCommand
 {
-    AdoBatchCore<AdoCommand> _batchCore;
+    readonly struct BatchCoreRef(SlonCommand owner)
+        : IAdoBatchCoreRef<AdoCommand, BatchCoreRef>
+    {
+        public IAdoCommandExecutionOwner Owner => owner;
+        public ref AdoBatchCore<AdoCommand, BatchCoreRef> GetField()
+            => ref owner._batchCore;
+    }
+
+    AdoBatchCore<AdoCommand, BatchCoreRef> _batchCore;
 
     // Supporting state for implicit batching through SQL parsing.
     string _overallCommandText;
@@ -19,28 +27,24 @@ public sealed partial class SlonCommand
     SlonParameters? _overallParameterCollection;
     bool _isOverallStateDirty;
 
-    internal unsafe SlonCommand(SlonConnection? connection, SlonDataSource? dataSource, string? commandText)
+    internal SlonCommand(SlonConnection? connection, SlonDataSource? dataSource, string? commandText)
     {
         GC.SuppressFinalize(this);
         _isOverallStateDirty = true;
         _overallCommandText = commandText ?? string.Empty;
         _overallCommandType = CommandType.Text;
-        var fieldRef = FieldRef<AdoBatchCore<AdoCommand>>.Create(&GetBatchCore, this);
         if (connection is not null)
         {
-            _batchCore = new(connection, fieldRef);
+            _batchCore = new(new(this), connection);
             _batchCore.Timeout = connection.DefaultCommandTimeout;
         }
         else if (dataSource is not null)
         {
-            _batchCore = new(dataSource, fieldRef);
+            _batchCore = new(new(this), dataSource);
             _batchCore.Timeout = dataSource.DefaultCommandTimeout;
         }
         else
-            _batchCore = new(fieldRef);
-
-        // ReSharper disable once AddressOfMarshalByRefObject
-        static ref AdoBatchCore<AdoCommand> GetBatchCore(SlonCommand instance) => ref instance._batchCore;
+            _batchCore = new(new(this));
     }
 
     void SetupCommands()
