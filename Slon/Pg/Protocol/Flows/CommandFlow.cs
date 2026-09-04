@@ -73,6 +73,13 @@ internal struct CommandExecutionState
     internal Slon.Threading.Tasks.Sources.ManualResetValueTaskSourceCore<bool> PipelineTaskSource;
     internal CancellationToken FlowToken;
     internal CancellationTokenRegistration FlowRegistration;
+    // Scratch owned by the single active result consumer. Keeping it with the flow lets the
+    // resumable frames carry only their control state across suspension.
+    internal CancellationToken WindowToken;
+    // Every pre-consumed successor can suspend in FirstAsync simultaneously. Retain that frame with
+    // its reusable flow instead of competing for the builder's one-thread/one-core cache slots.
+    internal ValueTaskSourcePromise<bool>? FirstPromise;
+    internal bool RetainFirstPromise;
     internal CommandExecutionColdState? ColdState;
     internal FlowHandoffEvent? HandoffEvent;
     internal bool SyncHandoffClaimed;
@@ -366,9 +373,14 @@ readonly struct CommandFlowCore<TOps>(TOps ops)
             return;
         }
 
-        if (IsCancelRequested)
+        var cancellationRequested = IsCancelRequested;
+        if (cancellationRequested)
             RequestBackendCancellation();
-        var dispatchReady = _ops.IsAsyncAtDispatch && onExecutorStrand;
+        var context = _state.Context;
+        var stopping = context.StoppingToken.IsCancellationRequested;
+        var stoppingException = stopping ? context.FlowTerminationException : null;
+        var dispatchReady = (_ops.IsAsyncAtDispatch && onExecutorStrand)
+            || stopping || cancellationRequested;
         if (!CompleteReady(null, runContinuationsAsynchronously: dispatchReady))
         {
             // Teardown released the consumer while this flow waited for its turn. Nothing reads the
@@ -380,14 +392,14 @@ readonly struct CommandFlowCore<TOps>(TOps ops)
         // the in-flight store into the activated slot while that pass is being taken and miss it.
         // Recheck after publishing readiness: OnStopping arbitrates PhaseInitial against a consumer's
         // PhaseReading claim, so exactly one side owns the decoder and eventual pipeline completion.
-        if (_state.Context.StoppingToken.IsCancellationRequested)
+        if (stopping)
         {
-            OnStopping(_state.Context.FlowTerminationException);
+            OnStopping(stoppingException!);
             return;
         }
         // A cancel latched before activation may have released its caller already. The response
         // still has to reach RFQ, so drain it unless a consumer already owns the decoder.
-        if (IsCancelRequested)
+        if (cancellationRequested)
             TryTakeOverDrain();
     }
 
@@ -574,13 +586,15 @@ readonly struct CommandFlowCore<TOps>(TOps ops)
                     if (Interlocked.CompareExchange(ref _state.Phase, PhaseReading, PhaseInitial) != PhaseInitial)
                         continue;
                     _state.CommandIndex = 0;
-                    return FirstAsync(cancellationToken);
+                    _state.WindowToken = cancellationToken;
+                    return FirstAsync();
                 case PhaseResultReady:
                     if (cancellationToken.IsCancellationRequested)
                         return CancelBeforeRead(cancellationToken);
                     if (Interlocked.CompareExchange(ref _state.Phase, PhaseReading, PhaseResultReady) != PhaseResultReady)
                         continue;
-                    return NextBatchAsync(cancellationToken);
+                    RegisterCancellation(cancellationToken);
+                    return NextBatchAsync();
                 case PhaseReading:
                     return ValueTask.FromException<bool>(
                         ThrowHelper.ThrowInvalidOperation("A read is already in progress on this flow."));
@@ -608,16 +622,72 @@ readonly struct CommandFlowCore<TOps>(TOps ops)
         throw Volatile.Read(ref _state.ColdState)?.TerminalException ?? ThrowHelper.ThrowInvalidOperation("The flow was disposed.");
     }
 
+    ValueTask<bool> FirstAsync()
+    {
+        var ready = new ValueTask<bool>((IValueTaskSource<bool>)_ops.Flow, _state.ReadySource.Version);
+        if (ready.IsCompletedSuccessfully)
+        {
+            _ = ready.Result;
+            return FirstAfterReadyAsync();
+        }
+        if (!_state.RetainFirstPromise)
+            return AwaitReadyPooledAsync(ready);
+        var promise = _state.FirstPromise ??= new();
+        using (PromiseAsyncValueTaskMethodBuilder<bool>.BeginCallScope(promise))
+            return AwaitReadyRetainedAsync(ready);
+    }
+
+    [RuntimeAsyncMethodGeneration(false)]
+    [AsyncMethodBuilder(typeof(PromiseAsyncValueTaskMethodBuilder<>))]
+    async ValueTask<bool> AwaitReadyRetainedAsync(ValueTask<bool> ready)
+    {
+        try
+        {
+            await ready.ConfigureAwait(false);
+        }
+        catch (TimeoutException ex)
+        {
+            HandleReadTimeout(ex);
+            throw;
+        }
+        catch (Exception ex)
+        {
+            FaultFromOwner(ex);
+            throw;
+        }
+        return await FirstAfterReadyAsync().ConfigureAwait(false);
+    }
+
     [RuntimeAsyncMethodGeneration(false)]
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
-    async ValueTask<bool> FirstAsync(CancellationToken cancellationToken)
+    async ValueTask<bool> AwaitReadyPooledAsync(ValueTask<bool> ready)
+    {
+        try
+        {
+            await ready.ConfigureAwait(false);
+        }
+        catch (TimeoutException ex)
+        {
+            HandleReadTimeout(ex);
+            throw;
+        }
+        catch (Exception ex)
+        {
+            FaultFromOwner(ex);
+            throw;
+        }
+        return await FirstAfterReadyAsync().ConfigureAwait(false);
+    }
+
+    [RuntimeAsyncMethodGeneration(false)]
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
+    async ValueTask<bool> FirstAfterReadyAsync()
     {
         Exception? deliver;
         try
         {
-            await new ValueTask<bool>((IValueTaskSource<bool>)_ops.Flow, _state.ReadySource.Version).ConfigureAwait(false);
             Debug.Assert(!_state.ConsumerDetached);
-            RegisterCancellation(cancellationToken);
+            RegisterCancellation(TakeWindowToken());
             var result = IsSinglePublishedCommand
                 ? await ReadResultAsync().ConfigureAwait(false)
                 : await ReadNextPublishedResultAsync().ConfigureAwait(false);
@@ -662,11 +732,10 @@ readonly struct CommandFlowCore<TOps>(TOps ops)
 
     [RuntimeAsyncMethodGeneration(false)]
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
-    async ValueTask<bool> NextBatchAsync(CancellationToken cancellationToken)
+    async ValueTask<bool> NextBatchAsync()
     {
         try
         {
-            RegisterCancellation(cancellationToken);
             var result = _state.Current!;
             await _state.Context.GetProtocolStatic<CommandFlow.ReadState>()
                 .ResultMessageEnumerator.DisposeAsync().ConfigureAwait(false);
@@ -727,6 +796,13 @@ readonly struct CommandFlowCore<TOps>(TOps ops)
             FaultFromOwner(ex);
             throw;
         }
+    }
+
+    CancellationToken TakeWindowToken()
+    {
+        var token = _state.WindowToken;
+        _state.WindowToken = default;
+        return token;
     }
 
     [RuntimeAsyncMethodGeneration(false)]
@@ -830,6 +906,8 @@ readonly struct CommandFlowCore<TOps>(TOps ops)
                 : ReadUnpreparedResultAsync();
     }
 
+    [RuntimeAsyncMethodGeneration(false)]
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
     async ValueTask<CommandResult> ReadPreparationResultAsync()
     {
         ref readonly var command = ref _state.Commands.ItemRef(_state.CommandIndex);
@@ -841,6 +919,8 @@ readonly struct CommandFlowCore<TOps>(TOps ops)
             _state.CommandIndex, preparation.Item1, preparation.Item3, preparation.Item2);
     }
 
+    [RuntimeAsyncMethodGeneration(false)]
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
     async ValueTask<CommandResult> ReadPreparedResultAsync()
     {
         // Prepared commands with a known description have the compact BindComplete ->
@@ -871,6 +951,8 @@ readonly struct CommandFlowCore<TOps>(TOps ops)
         return InitializeResult(_state.CommandIndex, error, null);
     }
 
+    [RuntimeAsyncMethodGeneration(false)]
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
     async ValueTask<CommandResult> ReadUnpreparedResultAsync()
     {
         ref readonly var command = ref _state.Commands.ItemRef(_state.CommandIndex);
@@ -964,11 +1046,13 @@ readonly struct CommandFlowCore<TOps>(TOps ops)
             _state.ReadFlowRfq = false;
     }
 
+    [RuntimeAsyncMethodGeneration(false)]
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
     async ValueTask ReadRfqAsync()
     {
         var message = await _state.Context.Decoder.GetNextAsync().ConfigureAwait(false);
-        if (message.EnsureExpectedOrError(PgTypes.BackendType.ReadyForQuery) is { } rfqError)
-            PgErrorException.Throw(rfqError);
+        if (message.EnsureExpectedOrError(PgTypes.BackendType.ReadyForQuery) is { } error)
+            PgErrorException.Throw(error);
     }
 
     void ReadRfq()
@@ -978,6 +1062,8 @@ readonly struct CommandFlowCore<TOps>(TOps ops)
             PgErrorException.Throw(rfqError);
     }
 
+    [RuntimeAsyncMethodGeneration(false)]
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
     async ValueTask CompleteBatchAsync()
     {
         if (_state.ReadFlowRfq)
@@ -1516,6 +1602,8 @@ readonly struct CommandFlowCore<TOps>(TOps ops)
         _state.DrainStarted = 0;
         _state.FlowToken = default;
         _state.FlowRegistration = default;
+        _state.WindowToken = default;
+        _state.RetainFirstPromise = true;
         _state.ColdState = null;
         _state.SyncHandoffClaimed = false;
         _state.HandoffEvent?.ResetInteraction();

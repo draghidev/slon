@@ -1146,27 +1146,46 @@ public sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
     void PropagateFlowHeartbeat(TimeSpan period)
     {
         var control = FlowControl;
+        control.BeginHeartbeatObservation();
         try
         {
-            _source.OnActivationHeartbeat(period);
-        }
-        catch (Exception ex)
-        {
-            SlonLogMessages.UnobservedCallbackException(
-                _logger, ex, "the source heartbeat callback");
-        }
+            // Backlog observation will get its own bounded source frontier. Holding the gate for
+            // this phase is sufficient for the experiment and free when the backlog is empty.
+            lock (control.HeartbeatObservationLock)
+            {
+                try
+                {
+                    _source.OnActivationHeartbeat(period);
+                }
+                catch (Exception ex)
+                {
+                    SlonLogMessages.UnobservedCallbackException(
+                        _logger, ex, "the source heartbeat callback");
+                }
+            }
 
-        foreach (var flow in GetFlows())
+            var flows = _pipeline.GetEnumerator(out var frontier);
+            while (flows.MoveNext())
+            {
+                lock (control.HeartbeatObservationLock)
+                {
+                    if (frontier.IsRetired(flows.Position))
+                        continue;
+                    try
+                    {
+                        flows.Current.GetExecutionControl(control).OnHeartbeat(period);
+                    }
+                    catch (Exception ex)
+                    {
+                        SlonLogMessages.UnobservedCallbackException(
+                            _logger, ex, "a flow heartbeat callback");
+                    }
+                }
+            }
+        }
+        finally
         {
-            try
-            {
-                flow.GetExecutionControl(control).OnHeartbeat(period);
-            }
-            catch (Exception ex)
-            {
-                SlonLogMessages.UnobservedCallbackException(
-                    _logger, ex, "a flow heartbeat callback");
-            }
+            control.EndHeartbeatObservation();
         }
     }
 
@@ -1220,6 +1239,18 @@ public sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public void CompleteItem(PgClientFlow item, Exception? exception)
+        {
+            if (_control.IsHeartbeatObserving)
+            {
+                lock (_control.HeartbeatObservationLock)
+                    CompleteItemCore(item, exception);
+                return;
+            }
+            CompleteItemCore(item, exception);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        void CompleteItemCore(PgClientFlow item, Exception? exception)
         {
             if (exception is PgClientClosedException && _control.ClosedException is not null)
                 exception = _control.FlowTerminationException;
@@ -1554,6 +1585,27 @@ public sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
         IProtocolStatic<CommandFlow.ReadState>,
         IProtocolStatic<CommandFlow.ReadPromiseState>
     {
+        readonly Lock _heartbeatObservationLock = new();
+        int _heartbeatObserving;
+
+        internal Lock HeartbeatObservationLock => _heartbeatObservationLock;
+        internal bool IsHeartbeatObserving => Volatile.Read(ref _heartbeatObserving) != 0;
+
+        internal void BeginHeartbeatObservation()
+        {
+            lock (_heartbeatObservationLock)
+            {
+                Debug.Assert(_heartbeatObserving == 0);
+                Volatile.Write(ref _heartbeatObserving, 1);
+            }
+        }
+
+        internal void EndHeartbeatObservation()
+        {
+            lock (_heartbeatObservationLock)
+                Volatile.Write(ref _heartbeatObserving, 0);
+        }
+
         // The pipeline whose slots this Control reads, bound right after that pipeline is created. The
         // outer (pool-facing) Control reads the protocol's own pipeline; an exclusive flow's inner
         // Control reads its inner pipeline - both through the same IPipelineSlots handle, so any
