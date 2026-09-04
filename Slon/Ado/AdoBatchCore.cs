@@ -180,16 +180,24 @@ partial struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
     }
 
     SlonDataSource.PgDbDependencies GetDependencies()
+        => GetDependencies(out _);
+
+    SlonDataSource.PgDbDependencies GetDependencies(
+        out SlonConnection? connection)
     {
-        TryGetDataSource(out var dataSource, out var connection);
+        TryGetDataSource(out var dataSource, out connection);
         connection ??= dataSource is null ? ThrowConnectionNotInitialized() : null;
         return (dataSource ?? connection!.DbDataSource).GetDbDependencies();
     }
 
     ValueTask<SlonDataSource.PgDbDependencies> GetDependenciesAsync(
         CancellationToken cancellationToken)
+        => GetDependenciesAsync(cancellationToken, out _);
+
+    ValueTask<SlonDataSource.PgDbDependencies> GetDependenciesAsync(
+        CancellationToken cancellationToken, out SlonConnection? connection)
     {
-        TryGetDataSource(out var dataSource, out var connection);
+        TryGetDataSource(out var dataSource, out connection);
         connection ??= dataSource is null ? ThrowConnectionNotInitialized() : null;
         return (dataSource ?? connection!.DbDataSource).GetDbDependenciesAsync(cancellationToken);
     }
@@ -434,16 +442,10 @@ partial struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
 
     SlonDataReader ExecuteReaderCore(DbParameterCollection? parameters, CommandBehavior behavior)
     {
-        var dependencies = GetDependencies();
+        var dependencies = GetDependencies(out var connection);
         return SlonDataReader.Create(behavior, Enqueue(parameters, behavior, dependencies),
-            dependencies.SerializerOptions, GetConnectionToClose(behavior));
-    }
-
-    SlonConnection? GetConnectionToClose(CommandBehavior behavior)
-    {
-        if (!HasCloseConnection(behavior) || TryGetDataSource(out _, out var connection))
-            return null;
-        return connection;
+            dependencies.SerializerOptions,
+            HasCloseConnection(behavior) ? connection : null);
     }
 
     public ValueTask<DbDataReader> ExecuteDbReaderAsync(DbParameterCollection? parameters, CommandBehavior behavior, CancellationToken cancellationToken = default)
@@ -477,13 +479,14 @@ partial struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
         var activity = core.StartActivity();
         try
         {
-            var connectionToClose = core.GetConnectionToClose(behavior);
-            var dependenciesTask = core.GetDependenciesAsync(cancellationToken);
+            var closeConnection = core.HasCloseConnection(behavior);
+            var dependenciesTask = core.GetDependenciesAsync(
+                cancellationToken, out var connection);
             return dependenciesTask.IsCompletedSuccessfully
                 ? BeginReaderCreation<TReader>(fieldRef, parameters, behavior, cancellationToken,
-                    connectionToClose, dependenciesTask.Result, activity)
+                    connection, closeConnection, dependenciesTask.Result, activity)
                 : AwaitDependenciesAndCreateReaderAsync<TReader>(fieldRef, parameters, behavior,
-                    cancellationToken, connectionToClose, dependenciesTask, activity);
+                    cancellationToken, connection, closeConnection, dependenciesTask, activity);
         }
         catch (Exception ex)
         {
@@ -494,7 +497,8 @@ partial struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
     static ValueTask<TReader> BeginReaderCreation<TReader>(
         FieldRef<AdoBatchCore<TCommand>> fieldRef, DbParameterCollection? parameters,
         CommandBehavior behavior, CancellationToken cancellationToken,
-        SlonConnection? connectionToClose, SlonDataSource.PgDbDependencies dependencies,
+        SlonConnection? connection, bool closeConnection,
+        SlonDataSource.PgDbDependencies dependencies,
         Activity? activity)
         where TReader : DbDataReader
     {
@@ -502,10 +506,13 @@ partial struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
         {
             return SlonDataReader.CreateAsync<TReader>(behavior,
                 fieldRef.Invoke().EnqueueAsync(parameters, behavior, dependencies, cancellationToken),
-                dependencies.SerializerOptions, cancellationToken, connectionToClose, activity);
+                dependencies.SerializerOptions, cancellationToken,
+                closeConnection ? connection : null, activity);
         }
         catch (Exception ex)
         {
+            if (closeConnection && connection is not null)
+                return FailAndCloseReaderCreation<TReader>(connection, activity, ex);
             return FailReaderCreation<TReader>(activity, ex);
         }
     }
@@ -513,7 +520,7 @@ partial struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
     static async ValueTask<TReader> AwaitDependenciesAndCreateReaderAsync<TReader>(
         FieldRef<AdoBatchCore<TCommand>> fieldRef, DbParameterCollection? parameters,
         CommandBehavior behavior, CancellationToken cancellationToken,
-        SlonConnection? connectionToClose,
+        SlonConnection? connection, bool closeConnection,
         ValueTask<SlonDataSource.PgDbDependencies> dependenciesTask, Activity? activity)
         where TReader : DbDataReader
     {
@@ -531,7 +538,7 @@ partial struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
         }
 
         return await BeginReaderCreation<TReader>(fieldRef, parameters, behavior, cancellationToken,
-            connectionToClose, dependencies, activity).ConfigureAwait(false);
+            connection, closeConnection, dependencies, activity).ConfigureAwait(false);
     }
 
     static ValueTask<TReader> FailReaderCreation<TReader>(Activity? activity, Exception exception)
@@ -542,7 +549,35 @@ partial struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
         return ValueTask.FromException<TReader>(AdoException.Project(exception));
     }
 
+    static async ValueTask<TReader> FailAndCloseReaderCreation<TReader>(
+        SlonConnection connection, Activity? activity, Exception exception)
+        where TReader : DbDataReader
+    {
+        try
+        {
+            await connection.CloseAsync().ConfigureAwait(false);
+        }
+        catch (Exception cleanupException)
+        {
+            exception = cleanupException;
+        }
+        SlonTracing.RecordException(activity, exception);
+        activity?.Dispose();
+        AdoException.Throw(exception);
+        return default!;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     Activity? StartActivity()
+    {
+        if (!SlonTracing.ShouldStart)
+            return null;
+
+        return StartActivityCore();
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    Activity? StartActivityCore()
     {
         TryGetDataSource(out var dataSource, out var connection);
         return dataSource is null && connection is null
