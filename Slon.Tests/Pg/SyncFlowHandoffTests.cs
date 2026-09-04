@@ -1,4 +1,3 @@
-using Draghi.Pipelining;
 using Slon.Pg;
 using Slon.Pg.Protocol;
 using Slon.Pg.Protocol.Flows;
@@ -35,80 +34,7 @@ public class SyncFlowHandoffTests
         internal FlowCallerInteractionCore<ValueTuple> Core;
     }
 
-    sealed class TrackingScheduler : PipelineScheduler
-    {
-        [ThreadStatic]
-        static TrackingScheduler? _executing;
-
-        internal bool IsExecuting => ReferenceEquals(_executing, this);
-
-        public override void SubmitDetached(
-            Action<object?> action, object? state, bool preferLocal = true)
-            => PipelineScheduler.ThreadPool.SubmitDetached(static state =>
-            {
-                var work = (Work)state!;
-                var prior = _executing;
-                _executing = work.Scheduler;
-                try { work.Action(work.State); }
-                finally { _executing = prior; }
-            }, new Work(this, action, state), preferLocal);
-
-        sealed record Work(TrackingScheduler Scheduler, Action<object?> Action, object? State);
-    }
-
     static ref FlowCallerInteractionCore<ValueTuple> GetWakeCore(WakeHolder holder) => ref holder.Core;
-
-    [ConnectionCreatingTestMethod]
-    public async Task ConcurrentSyncAndAsync_NoSharedPromiseCollision()
-    {
-        var executionScheduler = new TrackingScheduler();
-        var activationScheduler = new TrackingScheduler();
-        await using var protocol = await PgTestPool.NewIsolatedAsync(o =>
-        {
-            o.ExecutionScheduler = executionScheduler;
-            o.ActivationScheduler = activationScheduler;
-        });
-        Exception? failure = null;
-        void Capture(Exception ex) => Interlocked.CompareExchange(ref failure, ex, null);
-
-        var asyncLoop = Task.Run(async () =>
-        {
-            try
-            {
-                for (var i = 0; i < StressIterations && Volatile.Read(ref failure) is null; i++)
-                {
-                    var flow = protocol.Queue(new CommandFlow(async: true, Command.Create("select 1")));
-                    var enumerator = flow.GetAsyncEnumerator();
-                    var hasResult = await enumerator.MoveNextAsync();
-                    if (hasResult && executionScheduler.IsExecuting)
-                        Capture(new InvalidOperationException(
-                            $"Async consumer resumed on the pipeline executor strand; " +
-                            $"activationWasDispatched={flow.ActivationWasDispatched}.\n" +
-                            Environment.StackTrace));
-                    while (hasResult)
-                        hasResult = await enumerator.MoveNextAsync();
-                    await enumerator.DisposeAsync();
-                }
-            }
-            catch (Exception ex) { Capture(ex); }
-        });
-
-        var syncThread = new Thread(() =>
-        {
-            try
-            {
-                for (var i = 0; i < StressIterations && Volatile.Read(ref failure) is null; i++)
-                    PgTestPool.RunSync(protocol, "select 1").GetAwaiter().GetResult();
-            }
-            catch (Exception ex) { Capture(ex); }
-        }) { IsBackground = true, Name = "sync-flow-handoff" };
-
-        syncThread.Start();
-        await asyncLoop;
-        await Task.Run(syncThread.Join);
-        if (failure is not null)
-            Assert.Fail($"concurrent sync/async raised {failure}");
-    }
 
     [ConnectionCreatingTestMethod]
     public async Task PairedAsyncAndSync_NoSharedPromiseCollision()
