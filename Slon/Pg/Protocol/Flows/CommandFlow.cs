@@ -929,9 +929,10 @@ readonly struct CommandFlowCore<TOps>(TOps ops)
 
     async ValueTask<(PgError Error, TransactionStatus TransactionStatus)?> CompleteCurrentResultAsync()
     {
-        var enumerator = _state.Context.GetProtocolStatic<CommandFlow.ReadState>().ResultMessageEnumerator;
-        await enumerator.DisposeAsync().ConfigureAwait(false);
-        return enumerator.CompleteError;
+        await _state.Context.GetProtocolStatic<CommandFlow.ReadState>()
+            .ResultMessageEnumerator.DisposeAsync().ConfigureAwait(false);
+        return _state.Context.GetProtocolStatic<CommandFlow.ReadState>()
+            .ResultMessageEnumerator.CompleteError;
     }
 
     (PgError Error, TransactionStatus TransactionStatus)? CompleteCurrentResult()
