@@ -185,7 +185,7 @@ public sealed partial class CommandFlow : PgClientFlow, IValueTaskSource<bool>, 
         set => _state.WaitForDrainOnDispose = value;
     }
 
-    CommandExecutionCore<Ops> Core => new(new(this));
+    CommandFlowCore<Ops> Core => new(new(this));
 
     internal ValueTask<long> ConsumeNonQueryAsync(CancellationToken cancellationToken = default)
         => Core.ConsumeNonQueryAsync(cancellationToken);
@@ -245,7 +245,7 @@ internal interface ICommandExecutionFlowOps<TSelf>
     void OnDiscarded();
 }
 
-readonly struct CommandExecutionCore<TOps>(TOps ops)
+readonly struct CommandFlowCore<TOps>(TOps ops)
     where TOps : struct, ICommandExecutionFlowOps<TOps>
 {
     const int PhaseInitial = 0;
@@ -331,7 +331,7 @@ readonly struct CommandExecutionCore<TOps>(TOps ops)
             OnActivationSettled(onExecutorStrand: true);
         else
             activation.UnsafeOnCompleted(static state =>
-                new CommandExecutionCore<TOps>(TOps.Create((PgClientFlow)state!))
+                new CommandFlowCore<TOps>(TOps.Create((PgClientFlow)state!))
                     .OnActivationSettled(onExecutorStrand:
                         !((PgClientFlow)state!).ActivationWasDispatched), _ops.Flow);
         return new(new FlowTasks(writeTask, new ValueTask((IValueTaskSource)_ops.Flow, _state.PipelineTaskSource.Version)));
@@ -1036,7 +1036,7 @@ readonly struct CommandExecutionCore<TOps>(TOps ops)
             // Decoder takeover does not imply consumer abandonment. Explicit cancellation and
             // graceful close also drain autonomously while retaining their consumer semantics.
             ThreadPool.UnsafeQueueUserWorkItem(static state =>
-                _ = new CommandExecutionCore<TOps>(TOps.Create((PgClientFlow)state!)).DrainAsync(),
+                _ = new CommandFlowCore<TOps>(TOps.Create((PgClientFlow)state!)).DrainAsync(),
                 _ops.Flow);
             return true;
         }
@@ -1107,7 +1107,7 @@ readonly struct CommandExecutionCore<TOps>(TOps ops)
         RequestCancel(default, CommandExecutionCancellationScope.RemainingFlow,
             BackendCancellationTiming.Immediate, BackendCancellationTiming.AtReadFrontier);
         ThreadPool.UnsafeQueueUserWorkItem(static state =>
-            _ = new CommandExecutionCore<TOps>(TOps.Create((PgClientFlow)state!)).DrainAsync(),
+            _ = new CommandFlowCore<TOps>(TOps.Create((PgClientFlow)state!)).DrainAsync(),
             _ops.Flow);
     }
 
@@ -1306,13 +1306,13 @@ readonly struct CommandExecutionCore<TOps>(TOps ops)
             }
             if (callerToken.CanBeCanceled && cancellation.CallerRegistration == default)
                 cancellation.CallerRegistration = callerToken.UnsafeRegister(static (state, token)
-                    => new CommandExecutionCore<TOps>(TOps.Create((PgClientFlow)state!)).RequestCancel(
+                    => new CommandFlowCore<TOps>(TOps.Create((PgClientFlow)state!)).RequestCancel(
                         token, CommandExecutionCancellationScope.CurrentWindow), _ops.Flow);
         }
 
         if (_state.FlowToken.CanBeCanceled && _state.FlowRegistration == default)
             _state.FlowRegistration = _state.FlowToken.UnsafeRegister(static (state, token)
-                => new CommandExecutionCore<TOps>(TOps.Create((PgClientFlow)state!)).RequestCancel(
+                => new CommandFlowCore<TOps>(TOps.Create((PgClientFlow)state!)).RequestCancel(
                     token, CommandExecutionCancellationScope.RemainingFlow), _ops.Flow);
     }
 

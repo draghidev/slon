@@ -174,7 +174,7 @@ sealed class AdoCommandExecutionFlow : PgClientFlow, IValueTaskSource<bool>, IVa
         return new(this, cancellationToken);
     }
 
-    CommandExecutionCore<Ops> Core => new(new(this));
+    CommandFlowCore<Ops> Core => new(new(this));
 
     internal ValueTask<long> ConsumeNonQueryAsync(CancellationToken cancellationToken = default)
         => Core.ConsumeNonQueryAsync(cancellationToken);
