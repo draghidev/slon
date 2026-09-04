@@ -1881,7 +1881,7 @@ public sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
 
         internal void OnReleasing(PgClientFlow flow)
         {
-            Decoder.EndResultSetBuffering(flow);
+            Decoder.EndResultBuffering(flow);
             protocol._serverParameterState.CommitFlow();
             ClearCancellationActivation(flow);
             var idle = ActivatedFlow is null;

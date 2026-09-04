@@ -69,7 +69,7 @@ public sealed class Row : PgFieldReader
     /// that has been reused for unrelated data rather than throw.
     /// </para>
     /// <para>
-    /// Calling <see cref="CommandResult.EnableResultSetBuffering" /> before row enumeration extends
+    /// Calling <see cref="CommandResult.EnableResultBuffering" /> before row enumeration extends
     /// the borrow until that command result is released. Copy the memory when it must outlive the
     /// applicable boundary.
     /// </para>

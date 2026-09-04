@@ -104,18 +104,18 @@ public sealed class CommandResult
     }
 
     /// <summary>
-    /// Retains the memory backing this result set while its rows are enumerated.
+    /// Retains backend-message memory for this command result until it is released.
     /// </summary>
     /// <remarks>
-    /// Retention may cause subsequent rows to be buffered. Memory returned by
+    /// Retention may cause subsequent messages to be buffered. Memory returned by
     /// <see cref="Row.BorrowFieldMemory" /> remains valid until this command result is released.
     /// </remarks>
-    public void EnableResultSetBuffering()
+    public void EnableResultBuffering()
     {
         if (_firstRowEnumerated)
             ThrowHelper.ThrowInvalidOperation(
-                "Result-set buffering must be enabled before row enumeration begins.");
-        _messageEnumerator.EnableResultSetBuffering();
+                "Result buffering must be enabled before row enumeration begins.");
+        _messageEnumerator.EnableResultBuffering();
     }
 
     public bool TryGetCommandComplete([NotNullWhen(true)]out CommandCompleteMessage? value)
@@ -268,16 +268,34 @@ public sealed class CommandResult
         EnsureComplete();
     }
 
-    internal readonly struct RowView
+    /// <summary>A fully buffered PostgreSQL data row supplied to a collection callback.</summary>
+    /// <remarks>
+    /// The view normally remains valid only for the duration of its callback. Calling
+    /// <see cref="EnableResultBuffering" /> before <see cref="CollectAsync{TState}" /> retains
+    /// collected views until this command result is released.
+    /// </remarks>
+    [Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+    public readonly struct RowView
     {
         readonly ReadOnlyMemory<byte> _memory;
 
         internal RowView(ReadOnlyMemory<byte> memory)
             => _memory = memory;
 
+        /// <summary>Decodes the field at <paramref name="ordinal" /> as <typeparamref name="T" />.</summary>
         public T GetValue<T>(int ordinal)
             => BootstrapFieldDecoder.Read<T>(GetFieldSpan(ordinal));
 
+        /// <summary>Borrows the field's raw PostgreSQL representation as contiguous memory.</summary>
+        /// <remarks>
+        /// The memory normally remains valid only for the duration of the collection callback.
+        /// Calling <see cref="EnableResultBuffering" /> before collection retains it until this
+        /// command result is released.
+        /// </remarks>
+        public ReadOnlyMemory<byte> BorrowFieldMemory(int ordinal)
+            => GetFieldMemory(ordinal);
+
+        /// <summary>Decodes the Int32 field at <paramref name="ordinal" />.</summary>
         public int GetInt32(int ordinal)
         {
             if (ordinal == 0)
@@ -292,30 +310,32 @@ public sealed class CommandResult
             return BinaryPrimitives.ReadInt32BigEndian(GetFieldSpan(ordinal));
         }
 
-        ReadOnlySpan<byte> GetFieldSpan(int ordinal)
+        ReadOnlySpan<byte> GetFieldSpan(int ordinal) => GetFieldMemory(ordinal).Span;
+
+        ReadOnlyMemory<byte> GetFieldMemory(int ordinal)
         {
             ArgumentOutOfRangeException.ThrowIfNegative(ordinal);
             var fields = _memory.Span;
             if (fields.Length >= sizeof(short))
             {
-                var remaining = fields[sizeof(short)..];
+                var offset = sizeof(short);
                 for (var index = 0; ; index++)
                 {
-                    if (remaining.Length < sizeof(int))
+                    if (fields.Length - offset < sizeof(int))
                         ThrowHelper.ThrowInvalidOperation("The DataRow field length is truncated.");
-                    var length = BinaryPrimitives.ReadInt32BigEndian(remaining);
-                    remaining = remaining[sizeof(int)..];
+                    var length = BinaryPrimitives.ReadInt32BigEndian(fields[offset..]);
+                    offset += sizeof(int);
                     if (length < 0)
                     {
                         if (index == ordinal)
                             ThrowHelper.ThrowInvalidOperation("The requested field is null.");
                         continue;
                     }
-                    if ((uint)length > (uint)remaining.Length)
+                    if ((uint)length > (uint)(fields.Length - offset))
                         ThrowHelper.ThrowInvalidOperation("The DataRow field is truncated.");
                     if (index == ordinal)
-                        return remaining[..length];
-                    remaining = remaining[length..];
+                        return _memory.Slice(offset, length);
+                    offset += length;
                 }
             }
 
@@ -324,7 +344,18 @@ public sealed class CommandResult
         }
     }
 
-    internal async ValueTask CollectRowsAsync<TState>(
+    /// <summary>Collects every row through a synchronous callback.</summary>
+    /// <remarks>
+    /// Each complete DataRow body is buffered before <paramref name="collector" /> is invoked. If the
+    /// collector throws, the result is drained before that exception is rethrown. Call
+    /// <see cref="EnableResultBuffering" /> first when collected <see cref="RowView" /> values must
+    /// remain usable after their callback returns.
+    /// </remarks>
+    /// <param name="state">State passed to every collector invocation.</param>
+    /// <param name="collector">The synchronous callback invoked once for each row.</param>
+    /// <param name="cancellationToken">A token for cancelling collection.</param>
+    [Experimental(ExperimentalDiagnostics.PostgreSqlLowerLayer)]
+    public async ValueTask CollectAsync<TState>(
         TState state, Action<TState, RowView> collector,
         CancellationToken cancellationToken = default)
     {

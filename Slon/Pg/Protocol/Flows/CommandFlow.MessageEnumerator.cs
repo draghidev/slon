@@ -73,8 +73,8 @@ public sealed partial class CommandFlow
 
         public void Reset() => _messageEnumerator.Reset();
 
-        public void EnableResultSetBuffering()
-            => _messageEnumerator.EnableResultSetBuffering();
+        public void EnableResultBuffering()
+            => _messageEnumerator.EnableResultBuffering();
 
         public (PgError Error, TransactionStatus TransactionStatus)? CompleteError
             => _messageEnumerator.CompleteError;
@@ -460,7 +460,7 @@ public sealed partial class CommandFlow
             public void Initialize(in Command command, PgDecoder decoder)
             {
                 if (_decoder is not null)
-                    _decoder.ResultSetBuffering = false;
+                    _decoder.ResultBuffering = false;
                 _describeOnly = command.DescribeOnly;
                 _withSync = command.WithSync;
                 if (!ReferenceEquals(_decoder, decoder))
@@ -480,7 +480,7 @@ public sealed partial class CommandFlow
             public void Reset()
             {
                 if (_decoder is not null)
-                    _decoder.ResultSetBuffering = false;
+                    _decoder.ResultBuffering = false;
                 _describeOnly = false;
                 _withSync = false;
                 _decoder = null!;
@@ -493,12 +493,12 @@ public sealed partial class CommandFlow
                 _done = true;
             }
 
-            public void EnableResultSetBuffering()
+            public void EnableResultBuffering()
             {
                 if (_disposed)
                     ThrowHelper.ThrowInvalidOperation(
                         "The command result has already been released.");
-                _decoder.ResultSetBuffering = true;
+                _decoder.ResultBuffering = true;
             }
 
             public (PgError Error, TransactionStatus TransactionStatus)? CompleteError

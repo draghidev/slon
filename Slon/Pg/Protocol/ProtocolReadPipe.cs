@@ -22,7 +22,7 @@ sealed class ProtocolReadPipe(
     int _minimumReadSize;
     PendingRead _pendingRead;
     bool _hasActiveRead;
-    bool _retainsResultSet;
+    bool _retainsResult;
 
     public PipeReader PipeReader => reader;
     public BackendMessage Current => _messageContext.Current;
@@ -50,7 +50,7 @@ sealed class ProtocolReadPipe(
             ThrowHelper.ThrowInvalidOperation(
                 "The current message still has a pending read.");
 
-        var retainsResultSet = _retainsResultSet;
+        var retainsResult = _retainsResult;
 
         if (!_hasActiveRead)
         {
@@ -62,7 +62,7 @@ sealed class ProtocolReadPipe(
 
         if (_currentMessageLength > 0)
         {
-            PrepareAfterPartialMessage(retainsResultSet);
+            PrepareAfterPartialMessage(retainsResult);
             return;
         }
 
@@ -73,13 +73,13 @@ sealed class ProtocolReadPipe(
 
         var unreadOffset = checked(_pendingCursorOffset + cursorConsumedLength);
         var unread = _activeBuffer.GetPosition(unreadOffset);
-        _pendingCursorOffset = retainsResultSet
+        _pendingCursorOffset = retainsResult
             ? unreadOffset
             : 0;
         _messageContext.RetireCursor(
-            retainProjections: retainsResultSet);
+            retainProjections: retainsResult);
         reader.AdvanceTo(
-            retainsResultSet ? _retainedStart : unread, _examined);
+            retainsResult ? _retainedStart : unread, _examined);
         _hasActiveRead = false;
         _activeBuffer = default;
         _currentMessageLength = -1;
@@ -88,12 +88,12 @@ sealed class ProtocolReadPipe(
         _pendingRead = PendingRead.Messages;
     }
 
-    void PrepareAfterPartialMessage(bool retainsResultSet)
+    void PrepareAfterPartialMessage(bool retainsResult)
     {
         var current = _activeBuffer.Slice(_currentMessageOffset);
         _messageContext.RetireCursor(
-            retainProjections: retainsResultSet);
-        if (retainsResultSet)
+            retainProjections: retainsResult);
+        if (retainsResult)
         {
             _pendingCursorOffset = checked(
                 _currentMessageOffset + _currentMessageLength);
@@ -186,18 +186,18 @@ sealed class ProtocolReadPipe(
         if (cursorBuffer.IsEmpty)
         {
             completed = result.IsCompleted;
-            if (completed && !_retainsResultSet)
+            if (completed && !_retainsResult)
                 _messageContext.RetireCursor();
             if (!completed)
             {
                 reader.AdvanceTo(
-                    _retainsResultSet ? _retainedStart : result.Buffer.End,
+                    _retainsResult ? _retainedStart : result.Buffer.End,
                     result.Buffer.End);
                 _hasActiveRead = false;
                 _activeBuffer = default;
-                if (!_retainsResultSet)
+                if (!_retainsResult)
                     _pendingCursorOffset = 0;
-                _minimumReadSize = _retainsResultSet
+                _minimumReadSize = _retainsResult
                     ? int.CreateSaturating(
                         _pendingCursorOffset + BackendHeader.ByteCount)
                     : BackendHeader.ByteCount;
@@ -300,13 +300,13 @@ sealed class ProtocolReadPipe(
             throw new ArgumentOutOfRangeException(nameof(consumedLength));
 
         reader.AdvanceTo(
-            mode is PendingRead.Slide && !_retainsResultSet
+            mode is PendingRead.Slide && !_retainsResult
                 ? consumed
                 : _retainedStart,
             _examined);
         if (mode is PendingRead.Slide)
         {
-            if (_retainsResultSet)
+            if (_retainsResult)
             {
                 _currentMessageOffset = _activeBuffer.Slice(0, consumed).Length;
             }
@@ -391,18 +391,18 @@ sealed class ProtocolReadPipe(
     public void CompleteCurrentMessage()
         => _currentMessageLength = -1;
 
-    public void EnableResultSetRetention()
+    public void EnableResultRetention()
     {
         if (!_hasActiveRead || _pendingRead is not PendingRead.None)
             ThrowHelper.ThrowInvalidOperation(
-                "Result-set retention requires an active backend message.");
+                "Result retention requires an active backend message.");
         _ = _messageContext.Current;
-        _retainsResultSet = true;
+        _retainsResult = true;
     }
 
-    public void EndResultSetRetention()
+    public void EndResultRetention()
     {
-        _retainsResultSet = false;
+        _retainsResult = false;
         if (!_hasActiveRead || _pendingRead is not PendingRead.None
             || _currentMessageLength > 0
             || !_messageContext.TryGetCursorUnread(out var unread))

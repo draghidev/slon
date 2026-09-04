@@ -9,7 +9,7 @@ namespace Slon.Tests.Pg;
 public class CommandResultEnumerationTests
 {
     [ConnectionCreatingTestMethod]
-    public async Task ResultSetBuffering_CannotBeginAfterRowEnumeration()
+    public async Task ResultBuffering_CannotBeginAfterRowEnumeration()
     {
         await using var protocol = await PgTestPool.NewIsolatedAsync();
         var flow = protocol.Queue(new CommandFlow(
@@ -21,7 +21,7 @@ public class CommandResultEnumerationTests
         var rows = result.GetAsyncEnumerator();
         Assert.IsTrue(await rows.MoveNextAsync());
         Assert.ThrowsExactly<InvalidOperationException>(
-            result.EnableResultSetBuffering);
+            result.EnableResultBuffering);
 
         await rows.DisposeAsync();
         await results.DisposeAsync();
@@ -40,7 +40,7 @@ public class CommandResultEnumerationTests
         try
         {
             Assert.IsTrue(await results.MoveNextAsync());
-            results.Current.EnableResultSetBuffering();
+            results.Current.EnableResultBuffering();
             var rows = results.Current.GetAsyncEnumerator();
             while (await rows.MoveNextAsync())
             {
@@ -74,7 +74,7 @@ public class CommandResultEnumerationTests
         try
         {
             Assert.IsTrue(await results.MoveNextAsync());
-            results.Current.EnableResultSetBuffering();
+            results.Current.EnableResultBuffering();
             var rows = results.Current.GetAsyncEnumerator();
             while (await rows.MoveNextAsync())
                 values.Add(rows.Current.BorrowFieldMemory(1));
@@ -94,7 +94,7 @@ public class CommandResultEnumerationTests
     }
 
     [ConnectionCreatingTestMethod]
-    public async Task ResultSetBuffering_AbandonmentReleasesTheReadGrant()
+    public async Task ResultBuffering_AbandonmentReleasesTheReadGrant()
     {
         await using var protocol = await PgTestPool.NewIsolatedAsync();
         var flow = protocol.Queue(new CommandFlow(async: true, Command.Create(
@@ -102,7 +102,7 @@ public class CommandResultEnumerationTests
         var results = flow.GetAsyncEnumerator();
 
         Assert.IsTrue(await results.MoveNextAsync());
-        results.Current.EnableResultSetBuffering();
+        results.Current.EnableResultBuffering();
         var rows = results.Current.GetAsyncEnumerator();
         Assert.IsTrue(await rows.MoveNextAsync());
         var borrowed = rows.Current.BorrowFieldMemory(1);

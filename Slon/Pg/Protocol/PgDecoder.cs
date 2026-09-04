@@ -32,7 +32,7 @@ public sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<Bac
     long _remainingTimeoutTicks;
     int _cancellationReadFrontierWindow = -1;
     PgClientFlow? _cancellationReadFrontierFlow;
-    PgClientFlow? _resultSetBufferingOwner;
+    PgClientFlow? _resultBufferingOwner;
 
     PgClientFlow.ExecutionControl CurrentExecutionControl
     {
@@ -114,61 +114,61 @@ public sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<Bac
     internal void CompleteCurrentMessage()
         => _pipe.CompleteCurrentMessage();
 
-    internal bool ResultSetBuffering
+    internal bool ResultBuffering
     {
-        get => _resultSetBufferingOwner is not null;
+        get => _resultBufferingOwner is not null;
         set
         {
             if (value)
             {
                 var owner = CurrentExecutionControl.Flow;
-                if (!ReferenceEquals(_resultSetBufferingOwner, owner))
-                    _resultSetBufferingOwner = owner;
-                _pipe.EnableResultSetRetention();
+                if (!ReferenceEquals(_resultBufferingOwner, owner))
+                    _resultBufferingOwner = owner;
+                _pipe.EnableResultRetention();
             }
             else
             {
-                if (_resultSetBufferingOwner is null)
+                if (_resultBufferingOwner is null)
                     return;
-                _resultSetBufferingOwner = null;
-                _pipe.EndResultSetRetention();
+                _resultBufferingOwner = null;
+                _pipe.EndResultRetention();
             }
         }
     }
 
-    internal void EndResultSetBuffering(PgClientFlow owner)
+    internal void EndResultBuffering(PgClientFlow owner)
     {
-        if (!ReferenceEquals(_resultSetBufferingOwner, owner))
+        if (!ReferenceEquals(_resultBufferingOwner, owner))
             return;
-        _resultSetBufferingOwner = null;
-        _pipe.EndResultSetRetention();
+        _resultBufferingOwner = null;
+        _pipe.EndResultRetention();
     }
 
-    void ValidateResultSetBufferingOwner()
+    void ValidateResultBufferingOwner()
     {
-        var owner = _resultSetBufferingOwner;
+        var owner = _resultBufferingOwner;
         if (owner is not null
             && !ReferenceEquals(CurrentExecutionControl.Flow, owner))
-            EndResultSetBuffering(owner);
+            EndResultBuffering(owner);
     }
 
     void PrepareRead()
     {
-        ValidateResultSetBufferingOwner();
+        ValidateResultBufferingOwner();
         _pipe.PrepareRead();
     }
 
     bool CompleteRead(
         in ReadResult result, CancellationToken cancellationToken, out bool completed)
     {
-        ValidateResultSetBufferingOwner();
+        ValidateResultBufferingOwner();
         return _pipe.CompleteRead(
             result, cancellationToken, out completed);
     }
 
     bool ReadNext(TimeSpan timeout)
     {
-        ValidateResultSetBufferingOwner();
+        ValidateResultBufferingOwner();
         return _pipe.MoveNext(timeout);
     }
 
