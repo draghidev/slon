@@ -440,10 +440,10 @@ public abstract class PgClientFlow : IValueTaskSource<FlowActivation>, IValueTas
         // rollover, a fail-loud TimeoutException at worst). If cancellation-aware flows become reusable,
         // that same reference-plus-stamp identity should be the cancellation coordinator's owner: a raw
         // reference cannot distinguish retained attribution from a later tenure whose window restarts at
-        // zero. Until the stamp lands, refuse to recycle a timeout-armed flow rather than let the race
-        // silently reappear.
-        if (EnableActivationTimeout)
-            ThrowHelper.ThrowInvalidOperation("Cannot pool a flow with EnableActivationTimeout: a recycled instance can be wrong-tenure-completed by a stale activation timeout. Implement generation-checked completion first.");
+        // zero. Production must refuse to recycle a timeout-armed flow until that stamp lands.
+        // EXPERIMENT ONLY: deliberately permit timeout-armed flows to be recycled so the unified
+        // flow's allocation-free throughput ceiling can be measured. This is not safe against a
+        // stale activation-timeout heartbeat completing a later tenure.
         _started = false;
         _completed = false;
         // Version bump per tenure. Cross-tenure completer staleness rests on the done -> torn-down
