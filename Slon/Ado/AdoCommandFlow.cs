@@ -250,6 +250,8 @@ sealed class AdoCommandExecutionFlow : PgClientFlow, IValueTaskSource<bool>, IVa
         internal Enumerator(AdoCommandExecutionFlow flow, CancellationToken cancellationToken)
             => (_flow, _cancellationToken) = (flow, cancellationToken);
 
+        internal bool IsDefault => _flow is null;
+
         public bool MoveNext() => _flow?.Core.MoveNext() ?? false;
         public ValueTask<bool> MoveNextAsync() => MoveNextAsync(_cancellationToken);
         public ValueTask<bool> MoveNextAsync(CancellationToken cancellationToken)

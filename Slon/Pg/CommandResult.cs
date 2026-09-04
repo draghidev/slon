@@ -209,6 +209,9 @@ public sealed class CommandResult
         }
     }
 
+    internal long BatchRecordsAffected
+        => _commandCompleteMessage?.BatchRecordsAffected ?? -1;
+
     internal void CompleteNonQuery(BackendMessage message)
     {
         if (message.Header.Type is PgTypes.BackendType.DataRow)

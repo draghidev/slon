@@ -366,7 +366,6 @@ Slon.SlonConnectionInitializerContext.Connection.get -> Slon.SlonConnection!
 Slon.SlonDataReader
 Slon.SlonDataReader.GetBytes(int ordinal) -> byte[]!
 Slon.SlonDataReader.GetColumnSchema() -> System.Collections.ObjectModel.ReadOnlyCollection<Slon.SlonDbColumn!>!
-Slon.SlonDataReader.GetData(int ordinal) -> Slon.SlonDataReader!
 Slon.SlonDataReader.LongRecordsAffected.get -> long
 Slon.SlonDataSource
 Slon.SlonDataSource.CreateBatch() -> Slon.SlonBatch!

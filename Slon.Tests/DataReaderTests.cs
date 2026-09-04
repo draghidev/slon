@@ -182,6 +182,26 @@ public class DataReaderTests
     }
 
     [TestMethod]
+    public async Task ExecuteReader_ReportsRowsAffectedAfterSkippingNonRowResult()
+    {
+        await using var connection = await AdoTestPool.OpenConnectionAsync();
+        await using (var setup = connection.CreateCommand(
+                         "CREATE TEMP TABLE reader_records_affected (value int)"))
+            _ = await setup.ExecuteNonQueryAsync();
+        await using (var insert = connection.CreateCommand(
+                         "INSERT INTO reader_records_affected VALUES (1), (2)"))
+            _ = await insert.ExecuteNonQueryAsync();
+
+        await using var command = connection.CreateCommand(
+            "UPDATE reader_records_affected SET value = value + 1");
+        await using var reader = await command.ExecuteReaderAsync();
+
+        Assert.IsFalse(await reader.ReadAsync());
+        Assert.AreEqual(2, reader.RecordsAffected);
+        Assert.AreEqual(2L, reader.LongRecordsAffected);
+    }
+
+    [TestMethod]
     public async Task BatchExecuteNonQuery_SumsAllCommandResults()
     {
         var t = "slon_batch_ra_" + Guid.NewGuid().ToString("N");

@@ -16,6 +16,26 @@ public sealed partial class SlonDataReader
 {
     const CommandBehavior EnumerateCommandResultsBehavior = (CommandBehavior)int.MinValue;
 
+    interface IReadPolicy
+    {
+        static abstract ValueTask<bool> MoveNext(
+            ref CommandResult.RowEnumerator rows, CancellationToken cancellationToken);
+    }
+
+    readonly struct DefaultReadPolicy : IReadPolicy
+    {
+        public static ValueTask<bool> MoveNext(
+            ref CommandResult.RowEnumerator rows, CancellationToken cancellationToken)
+            => rows.MoveNextAsync();
+    }
+
+    readonly struct CancelableReadPolicy : IReadPolicy
+    {
+        public static ValueTask<bool> MoveNext(
+            ref CommandResult.RowEnumerator rows, CancellationToken cancellationToken)
+            => rows.MoveNextAsync(cancellationToken);
+    }
+
     int _state;
     ReaderState State
     {
@@ -126,6 +146,8 @@ public sealed partial class SlonDataReader
         }
     }
 
+    [RuntimeAsyncMethodGeneration(false)]
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
     internal static async ValueTask<TReader> CreateAsync<TReader>(CommandBehavior behavior,
         ValueTask<AdoCommandExecutionFlow> flowTask, PgSerializerOptions serializerOptions,
         CancellationToken cancellationToken = default,
@@ -196,7 +218,8 @@ public sealed partial class SlonDataReader
         {
             current.TryGetCommandComplete(out _);
             if (current.Error is null)
-                recordsAffected += current.RecordsAffected;
+                AccumulateRecordsAffected(
+                    ref recordsAffected, current.BatchRecordsAffected);
         }
     }
 
@@ -312,8 +335,16 @@ public sealed partial class SlonDataReader
     {
         SurfaceCompletion(current);
         if (current.Error is null)
-            _recordsAffected += current.RecordsAffected;
+            AccumulateRecordsAffected(
+                ref _recordsAffected, current.BatchRecordsAffected);
         _currentCompletion = ResultCompletionState.Applied;
+    }
+
+    static void AccumulateRecordsAffected(ref long? total, long current)
+    {
+        if (current < 0)
+            return;
+        total = total is { } existing ? checked(existing + current) : current;
     }
 
     bool ReadCore()
@@ -339,33 +370,78 @@ public sealed partial class SlonDataReader
         }
     }
 
-    async Task<bool> ReadAsyncCore(CancellationToken cancellationToken)
+    Task<bool> ReadAsyncCore<TPolicy>(CancellationToken cancellationToken)
+        where TPolicy : struct, IReadPolicy
     {
         try
         {
             Debug.Assert(_singleRowBehavior && _remainingResults is 0 || !_singleRowBehavior);
-            bool hasRow;
             if (_rowPresence is RowPresence.Prefetched)
             {
                 _rowPresence = RowPresence.Present;
-                return true;
+                return Task.FromResult(true);
             }
-            else if (_singleRowBehavior && _rowPresence is RowPresence.Present)
-            {
+
+            bool hasRow;
+            if (_singleRowBehavior && _rowPresence is RowPresence.Present)
                 hasRow = false;
-            }
             else
             {
-                hasRow = await _rowEnumerator.MoveNextAsync(cancellationToken)
-                    .ConfigureAwait(false);
+                var moveNext = TPolicy.MoveNext(ref _rowEnumerator, cancellationToken);
+                if (!moveNext.IsCompletedSuccessfully)
+                    return AwaitMoveNext(this, moveNext);
+                hasRow = moveNext.GetAwaiter().GetResult();
             }
 
-            if (hasRow)
-                return ProcessReadResult(hasRow: true);
+            return CompleteRead(this, hasRow);
+        }
+        catch (Exception ex)
+        {
+            return Task.FromException<bool>(AdoException.Project(ex));
+        }
+    }
 
-            if (Current is { IsComplete: false } current)
+    static Task<bool> CompleteRead(SlonDataReader reader, bool hasRow)
+    {
+        if (hasRow)
+            return Task.FromResult(reader.ProcessReadResult(hasRow: true));
+
+        if (reader.Current is { IsComplete: false } current)
+        {
+            var completion = current.CompleteAsync();
+            if (!completion.IsCompletedSuccessfully)
+                return AwaitCompletion(reader, completion);
+            completion.GetAwaiter().GetResult();
+        }
+        return Task.FromResult(reader.ProcessReadResult(hasRow: false));
+    }
+
+    static async Task<bool> AwaitMoveNext(
+        SlonDataReader reader, ValueTask<bool> moveNext)
+    {
+        try
+        {
+            var hasRow = await moveNext.ConfigureAwait(false);
+            if (hasRow)
+                return reader.ProcessReadResult(hasRow: true);
+            if (reader.Current is { IsComplete: false } current)
                 await current.CompleteAsync().ConfigureAwait(false);
-            return ProcessReadResult(hasRow: false);
+            return reader.ProcessReadResult(hasRow: false);
+        }
+        catch (Exception ex)
+        {
+            AdoException.Throw(ex);
+            return default;
+        }
+    }
+
+    static async Task<bool> AwaitCompletion(
+        SlonDataReader reader, ValueTask completion)
+    {
+        try
+        {
+            await completion.ConfigureAwait(false);
+            return reader.ProcessReadResult(hasRow: false);
         }
         catch (Exception ex)
         {
@@ -765,6 +841,8 @@ public sealed partial class SlonDataReader : DbDataReader, IDbColumnSchemaGenera
     {
         if (GetExceptionIfClosedOrDisposed() is { } exception)
             return Task.FromException<bool>(exception);
+        if (_remainingResults is 0 && _currentCompletion is ResultCompletionState.Applied)
+            return Task.FromResult(false);
 
         return NextResultAsyncCore(cancellationToken);
     }
@@ -783,7 +861,9 @@ public sealed partial class SlonDataReader : DbDataReader, IDbColumnSchemaGenera
         if (GetExceptionIfClosedOrDisposed() is { } exception)
             return Task.FromException<bool>(exception);
 
-        return ReadAsyncCore(cancellationToken);
+        return cancellationToken.CanBeCanceled
+            ? ReadAsyncCore<CancelableReadPolicy>(cancellationToken)
+            : ReadAsyncCore<DefaultReadPolicy>(default);
     }
 
     /// <inheritdoc/>
@@ -843,16 +923,9 @@ public sealed partial class SlonDataReader : DbDataReader, IDbColumnSchemaGenera
             : IsDBNullAsyncCore(ordinal, cancellationToken);
     }
 
-    /// <summary>Returns a nested data reader for the requested column.</summary>
-    /// <param name="ordinal">The zero-based column ordinal.</param>
-    /// <exception cref="T:System.NotSupportedException">Nested data readers are not supported.</exception>
-    /// <returns>A data reader.</returns>
-    public new SlonDataReader GetData(int ordinal)
-        => throw new NotSupportedException("Nested data readers are not supported.");
-
     /// <inheritdoc/>
     protected override DbDataReader GetDbDataReader(int ordinal)
-        => GetData(ordinal);
+        => throw new NotSupportedException("Nested data readers are not supported.");
 
     /// <summary>Reads the complete field at the specified ordinal as a byte array.</summary>
     /// <param name="ordinal">The zero-based column ordinal.</param>
@@ -1014,6 +1087,14 @@ public sealed partial class SlonDataReader : DbDataReader, IDbColumnSchemaGenera
             return;
 
         State = ReaderState.Disposed;
+        if (_remainingResults is 0
+            && _currentCompletion is ResultCompletionState.Applied
+            && _enumerator.IsDefault
+            && _connectionToClose is null)
+        {
+            Reset();
+            return;
+        }
         CloseCore(resetForReuse: true);
     }
 
@@ -1024,6 +1105,14 @@ public sealed partial class SlonDataReader : DbDataReader, IDbColumnSchemaGenera
             return new();
 
         State = ReaderState.Disposed;
+        if (_remainingResults is 0
+            && _currentCompletion is ResultCompletionState.Applied
+            && _enumerator.IsDefault
+            && _connectionToClose is null)
+        {
+            Reset();
+            return default;
+        }
         return CloseAsyncCore(resetForReuse: true);
     }
 }
