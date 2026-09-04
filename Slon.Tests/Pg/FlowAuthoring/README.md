@@ -10,8 +10,10 @@ result-shape tests remain with the implementation.
   task and needs no external consumer to reach RFQ.
 - `IConsumerDrivenFlowContract` applies when an external sync or async consumer
   owns result advancement and can abandon that ownership.
+- `IReusableConsumerDrivenFlowContract` adds the requirement that a completed
+  instance can be reset for an independent tenure.
 
-A flow exposing both kinds of entry point should register an adapter for every
+A flow exposing multiple kinds of entry point should register an adapter for every
 profile it supports. Profiles are separate interfaces so an implementation
 cannot silently opt out of individual required scenarios with capability flags.
 
@@ -50,6 +52,7 @@ lifecycle as independent axes. In particular:
   autonomous flow;
 - an async consumer never runs on the pipeline executor strand;
 - release occurs before completion makes a flow reusable.
+- a reset tenure does not retain terminal or consumer state from its predecessor.
 
 Contract scenarios must use explicit scheduler gates, in-memory transports, or
 `FakeTimeProvider` when ordering matters. Do not use wall-clock delays or

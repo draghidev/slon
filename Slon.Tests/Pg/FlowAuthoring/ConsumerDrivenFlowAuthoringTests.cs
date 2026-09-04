@@ -11,9 +11,17 @@ public interface IConsumerDrivenFlowContract
     PgClientFlow Create(bool async, params Command[] commands);
     IEnumerator<CommandResult> GetEnumerator(PgClientFlow flow);
     IAsyncEnumerator<CommandResult> GetAsyncEnumerator(PgClientFlow flow);
+    ValueTask<bool> MoveNextAsync(
+        IAsyncEnumerator<CommandResult> results, CancellationToken cancellationToken);
 }
 
-sealed class CommandFlowContract : IConsumerDrivenFlowContract
+public interface IReusableConsumerDrivenFlowContract : IConsumerDrivenFlowContract
+{
+    PgClientFlow CreateReusable(bool async, params Command[] commands);
+    void Reset(PgClientFlow flow, bool async, params Command[] commands);
+}
+
+sealed class CommandFlowContract : IReusableConsumerDrivenFlowContract
 {
     public static CommandFlowContract Instance { get; } = new();
     public string Name => nameof(CommandFlow);
@@ -27,6 +35,19 @@ sealed class CommandFlowContract : IConsumerDrivenFlowContract
     public IAsyncEnumerator<CommandResult> GetAsyncEnumerator(PgClientFlow flow)
         => ((CommandFlow)flow).GetAsyncEnumerator();
 
+    public ValueTask<bool> MoveNextAsync(
+        IAsyncEnumerator<CommandResult> results, CancellationToken cancellationToken)
+        => ((CommandFlow.Enumerator)results).MoveNextAsync(cancellationToken);
+
+    public PgClientFlow CreateReusable(bool async, params Command[] commands)
+        => new CommandFlow(async, enableActivationTimeout: false, commands);
+
+    public void Reset(PgClientFlow flow, bool async, params Command[] commands)
+    {
+        flow.Reset();
+        ((CommandFlow)flow).Initialize(async, commands);
+    }
+
     public override string ToString() => Name;
 }
 
@@ -34,6 +55,14 @@ sealed class CommandFlowContract : IConsumerDrivenFlowContract
 public class ConsumerDrivenFlowAuthoringTests : ConnectionCreatingTest
 {
     public static IEnumerable<object[]> Implementations
+    {
+        get
+        {
+            yield return [CommandFlowContract.Instance];
+        }
+    }
+
+    public static IEnumerable<object[]> ReusableImplementations
     {
         get
         {

@@ -236,28 +236,4 @@ public class CommandResultEnumerationTests
         await PgTestPool.RunAsync(protocol, "select 1");
     }
 
-    // Reset must clear the terminal enumeration state, or a reused flow reports exhaustion before
-    // its next tenure publishes anything.
-    [ConnectionCreatingTestMethod]
-    public async Task Reset_ClearsEnumerationCompleted_ForNextTenure()
-    {
-        await using var protocol = await PgTestPool.NewIsolatedAsync();
-        var flow = new CommandFlow(
-            async: true, enableActivationTimeout: false, Command.Create("select 1"));
-        for (var tenure = 0; tenure < 2; tenure++)
-        {
-            if (tenure > 0)
-            {
-                flow.Reset();
-                flow.Initialize(async: true, Command.Create("select 2"));
-            }
-            protocol.Queue(flow);
-            var e = flow.GetAsyncEnumerator();
-            Assert.IsTrue(await e.MoveNextAsync(), $"tenure {tenure} must publish its result");
-            await e.Current.DisposeAsync();
-            Assert.IsFalse(await e.MoveNextAsync());
-            await e.DisposeAsync();
-        }
-    }
-
 }

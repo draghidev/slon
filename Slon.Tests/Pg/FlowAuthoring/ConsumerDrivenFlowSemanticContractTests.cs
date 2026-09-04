@@ -5,17 +5,35 @@ using Slon.Pg.Serialization;
 using Slon.Pg.Types;
 using Slon.Text;
 
-namespace Slon.Tests.Pg;
+namespace Slon.Tests.Pg.FlowAuthoring;
 
 // Command-result semantics shared by consumer-driven PostgreSQL flows.
 [TestClass]
-public class CommandFlowContractTests
+public class ConsumerDrivenFlowSemanticContractTests
 {
+    public static IEnumerable<object[]> Implementations
+        => ConsumerDrivenFlowAuthoringTests.Implementations;
+
+    public static IEnumerable<object[]> ReusableImplementations
+        => ConsumerDrivenFlowAuthoringTests.ReusableImplementations;
+
+    public static IEnumerable<object[]> PreparedCases
+    {
+        get
+        {
+            foreach (var implementation in Implementations)
+            {
+                yield return [implementation[0], 0];
+                yield return [implementation[0], 3];
+            }
+        }
+    }
     static async Task<CommandDescriptor> Prepare(
+        IConsumerDrivenFlowContract contract,
         PgClientProtocol protocol, string sql, EncodedCString name)
     {
-        var results = protocol.Queue(new CommandFlow(async: true,
-            Command.Create(sql, commandName: name) with { DescribeOnly = true })).GetAsyncEnumerator();
+        var results = Queue(contract, protocol,
+            Command.Create(sql, commandName: name) with { DescribeOnly = true });
         CommandDescriptor descriptor = default;
         while (await results.MoveNextAsync())
             descriptor = results.Current.GetMetadata().ToPreparedDescriptor();
@@ -23,10 +41,13 @@ public class CommandFlowContractTests
         return descriptor;
     }
 
-    static Results Queue(PgClientProtocol protocol, in Command command,
+    static Results Queue(IConsumerDrivenFlowContract contract,
+        PgClientProtocol protocol, in Command command,
         CancellationToken cancellationToken = default)
-        => new(protocol.Queue(new CommandFlow(async: true, command), cancellationToken)
-            .GetAsyncEnumerator());
+    {
+        var flow = protocol.Queue(contract.Create(async: true, command), cancellationToken);
+        return new(contract, contract.GetAsyncEnumerator(flow));
+    }
 
     static async Task<int> CountRows(Results results)
     {
@@ -43,36 +64,38 @@ public class CommandFlowContractTests
     }
 
     [ConnectionCreatingTestMethod]
-    [DataRow(0)]
-    [DataRow(3)]
-    public async Task Prepared_NaturalExhaustion(int rowCount)
+    [DynamicData(nameof(PreparedCases))]
+    public async Task Prepared_NaturalExhaustion(
+        IConsumerDrivenFlowContract contract, int rowCount)
     {
         await using var protocol = await PgTestPool.NewIsolatedAsync();
-        var descriptor = await Prepare(protocol,
+        var descriptor = await Prepare(contract, protocol,
             $"select generate_series(1, {rowCount})", $"contract_rows_{rowCount}");
 
         Assert.AreEqual(rowCount,
-            await CountRows(Queue(protocol, Command.Create(descriptor))));
+            await CountRows(Queue(contract, protocol, Command.Create(descriptor))));
         await PgTestPool.RunAsync(protocol, "select 1");
     }
 
     [ConnectionCreatingTestMethod]
-    public async Task Unprepared_NaturalExhaustion()
+    [DynamicData(nameof(Implementations))]
+    public async Task Unprepared_NaturalExhaustion(IConsumerDrivenFlowContract contract)
     {
         await using var protocol = await PgTestPool.NewIsolatedAsync();
 
-        Assert.AreEqual(2, await CountRows(Queue(protocol,
+        Assert.AreEqual(2, await CountRows(Queue(contract, protocol,
             Command.Create("select generate_series(1, 2)"))));
         await PgTestPool.RunAsync(protocol, "select 1");
     }
 
     [ConnectionCreatingTestMethod]
-    public async Task DisposeBeforeAnyRead_DrainsAndKeepsWire()
+    [DynamicData(nameof(Implementations))]
+    public async Task DisposeBeforeAnyRead_DrainsAndKeepsWire(IConsumerDrivenFlowContract contract)
     {
         await using var protocol = await PgTestPool.NewIsolatedAsync();
-        var descriptor = await Prepare(protocol,
+        var descriptor = await Prepare(contract, protocol,
             "select generate_series(1, 1000)", "contract_unread");
-        var results = Queue(protocol, Command.Create(descriptor));
+        var results = Queue(contract, protocol, Command.Create(descriptor));
 
         await results.DisposeAsync();
 
@@ -80,12 +103,13 @@ public class CommandFlowContractTests
     }
 
     [ConnectionCreatingTestMethod]
-    public async Task DisposeAfterOneRow_DrainsAndKeepsWire()
+    [DynamicData(nameof(Implementations))]
+    public async Task DisposeAfterOneRow_DrainsAndKeepsWire(IConsumerDrivenFlowContract contract)
     {
         await using var protocol = await PgTestPool.NewIsolatedAsync();
-        var descriptor = await Prepare(protocol,
+        var descriptor = await Prepare(contract, protocol,
             "select generate_series(1, 20000)", "contract_partial");
-        var results = Queue(protocol, Command.Create(descriptor));
+        var results = Queue(contract, protocol, Command.Create(descriptor));
 
         Assert.IsTrue(await results.MoveNextAsync());
         var rows = results.Current.GetAsyncEnumerator();
@@ -96,11 +120,12 @@ public class CommandFlowContractTests
     }
 
     [ConnectionCreatingTestMethod]
-    public async Task CommandError_IsResultAndKeepsWire()
+    [DynamicData(nameof(Implementations))]
+    public async Task CommandError_IsResultAndKeepsWire(IConsumerDrivenFlowContract contract)
     {
         await using var protocol = await PgTestPool.NewIsolatedAsync();
-        var descriptor = await Prepare(protocol, "select 1 / 0", "contract_error");
-        var results = Queue(protocol, Command.Create(descriptor));
+        var descriptor = await Prepare(contract, protocol, "select 1 / 0", "contract_error");
+        var results = Queue(contract, protocol, Command.Create(descriptor));
 
         Assert.IsTrue(await results.MoveNextAsync());
         var failed = results.Current;
@@ -115,11 +140,12 @@ public class CommandFlowContractTests
     }
 
     [ConnectionCreatingTestMethod]
-    public async Task PreparedMetadataAndCompletion_Agree()
+    [DynamicData(nameof(Implementations))]
+    public async Task PreparedMetadataAndCompletion_Agree(IConsumerDrivenFlowContract contract)
     {
         await using var protocol = await PgTestPool.NewIsolatedAsync();
-        var descriptor = await Prepare(protocol, "select 42::int4", "contract_metadata");
-        var results = Queue(protocol, Command.Create(descriptor));
+        var descriptor = await Prepare(contract, protocol, "select 42::int4", "contract_metadata");
+        var results = Queue(contract, protocol, Command.Create(descriptor));
 
         Assert.IsTrue(await results.MoveNextAsync());
         var result = results.Current;
@@ -141,34 +167,38 @@ public class CommandFlowContractTests
     }
 
     [ConnectionCreatingTestMethod]
-    public async Task CancellationWhileReadPending_DeliversTokenAndKeepsWire()
+    [DynamicData(nameof(Implementations))]
+    public async Task CancellationWhileReadPending_DeliversTokenAndKeepsWire(IConsumerDrivenFlowContract contract)
     {
+        await using var blocker = await PgAdvisoryLock.AcquireAsync();
         await using var protocol = await NewCancelableProtocolAsync();
-        var descriptor = await Prepare(protocol, "select pg_sleep(30)", "contract_cancel_pending");
         using var cancellation = new CancellationTokenSource();
-        var results = Queue(protocol, Command.Create(descriptor));
+        var results = Queue(contract, protocol, blocker.WaitCommand);
 
         var pending = results.MoveNextAsync(cancellation.Token);
         Assert.IsFalse(pending.IsCompleted);
-        cancellation.CancelAfter(TimeSpan.FromMilliseconds(200));
+        await blocker.WaitUntilContendedAsync(protocol.FlowControl.BackendProcessId);
+        cancellation.Cancel();
         var exception = await Assert.ThrowsExactlyAsync<OperationCanceledException>(
             async () => await pending);
         Assert.AreEqual(cancellation.Token, exception.CancellationToken);
         await Assert.ThrowsExactlyAsync<OperationCanceledException>(
             async () => await results.MoveNextAsync());
         await results.DisposeAsync();
+        await blocker.ReleaseAsync();
 
         await PgTestPool.RunAsync(protocol, "select 1");
     }
 
     [ConnectionCreatingTestMethod]
-    public async Task CancellationAfterRow_DrainsAndKeepsWire()
+    [DynamicData(nameof(Implementations))]
+    public async Task CancellationAfterRow_DrainsAndKeepsWire(IConsumerDrivenFlowContract contract)
     {
         await using var protocol = await NewCancelableProtocolAsync();
-        var descriptor = await Prepare(protocol,
+        var descriptor = await Prepare(contract, protocol,
             "select generate_series(1, 20000)", "contract_cancel_row");
         using var cancellation = new CancellationTokenSource();
-        var results = Queue(protocol, Command.Create(descriptor));
+        var results = Queue(contract, protocol, Command.Create(descriptor));
 
         Assert.IsTrue(await results.MoveNextAsync(cancellation.Token));
         var rows = results.Current.GetAsyncEnumerator();
@@ -182,12 +212,13 @@ public class CommandFlowContractTests
     }
 
     [ConnectionCreatingTestMethod]
-    public async Task PreCancelledRead_ReleasesCallerAndKeepsWire()
+    [DynamicData(nameof(Implementations))]
+    public async Task PreCancelledRead_ReleasesCallerAndKeepsWire(IConsumerDrivenFlowContract contract)
     {
         await using var protocol = await NewCancelableProtocolAsync();
-        var descriptor = await Prepare(protocol,
+        var descriptor = await Prepare(contract, protocol,
             "select generate_series(1, 1000)", "contract_precancel");
-        var results = Queue(protocol, Command.Create(descriptor));
+        var results = Queue(contract, protocol, Command.Create(descriptor));
         var cancellationToken = new CancellationToken(canceled: true);
 
         var exception = await Assert.ThrowsExactlyAsync<OperationCanceledException>(
@@ -201,13 +232,14 @@ public class CommandFlowContractTests
     }
 
     [ConnectionCreatingTestMethod]
-    public async Task SuccessorProgressesAfterAbandonment()
+    [DynamicData(nameof(Implementations))]
+    public async Task SuccessorProgressesAfterAbandonment(IConsumerDrivenFlowContract contract)
     {
         await using var protocol = await PgTestPool.NewIsolatedAsync();
-        var descriptor = await Prepare(protocol,
+        var descriptor = await Prepare(contract, protocol,
             "select generate_series(1, 20000)", "contract_successor");
-        var first = Queue(protocol, Command.Create(descriptor));
-        var second = Queue(protocol, Command.Create(descriptor));
+        var first = Queue(contract, protocol, Command.Create(descriptor));
+        var second = Queue(contract, protocol, Command.Create(descriptor));
 
         Assert.IsTrue(await first.MoveNextAsync());
         await first.DisposeAsync();
@@ -217,23 +249,26 @@ public class CommandFlowContractTests
     }
 
     [ConnectionCreatingTestMethod]
-    public async Task GracefulStopDrainsHeldResultAndFaultsConsumer()
+    [DynamicData(nameof(Implementations))]
+    public async Task GracefulStopDrainsHeldResultAndFaultsConsumer(IConsumerDrivenFlowContract contract)
     {
-        var protocol = await PgTestPool.NewIsolatedAsync(options =>
-            options.HeartbeatInterval = TimeSpan.FromMilliseconds(20));
-        var descriptor = await Prepare(protocol,
+        var protocol = await PgTestPool.NewIsolatedAsync();
+        var descriptor = await Prepare(contract, protocol,
             "select generate_series(1, 1000)", "contract_graceful");
-        var results = Queue(protocol, Command.Create(descriptor));
+        var results = Queue(contract, protocol, Command.Create(descriptor));
         Assert.IsTrue(await results.MoveNextAsync());
 
-        await protocol.CompleteAsync().WaitAsync(TimeSpan.FromSeconds(5));
+        var complete = protocol.CompleteAsync();
+        await protocol.Heartbeat(TimeSpan.Zero);
+        await complete;
         await Assert.ThrowsAsync<PgClientClosedException>(
             async () => await results.MoveNextAsync());
         await results.DisposeAsync();
     }
 
     [ConnectionCreatingTestMethod(connections: 2)]
-    public async Task BackendTermination_IsCollateral()
+    [DynamicData(nameof(Implementations))]
+    public async Task BackendTermination_IsCollateral(IConsumerDrivenFlowContract contract)
     {
         await using var protocols = await PgTestPool.NewIsolatedProtocolsAsync(2);
         var killer = protocols.Items[1];
@@ -244,10 +279,10 @@ public class CommandFlowContractTests
         async Task<Exception> Terminate()
         {
             await using var victim = await PgTestPool.NewIsolatedAsync();
-            var pid = await ReadBackendPid(victim);
-            var descriptor = await Prepare(victim, "select pg_sleep(10)",
+            var pid = await ReadBackendPid(contract, victim);
+            var descriptor = await Prepare(contract, victim, "select pg_sleep(10)",
                 "contract_terminate_command");
-            var results = Queue(victim, Command.Create(descriptor));
+            var results = Queue(contract, victim, Command.Create(descriptor));
             var pending = results.MoveNextAsync();
             Assert.IsFalse(pending.IsCompleted);
             await PgTestPool.RunAsync(killer, $"select pg_terminate_backend({pid})");
@@ -259,10 +294,11 @@ public class CommandFlowContractTests
     }
 
     [ConnectionCreatingTestMethod]
-    public async Task TornTrailingWrite_RecoversWire()
+    [DynamicData(nameof(Implementations))]
+    public async Task TornTrailingWrite_RecoversWire(IConsumerDrivenFlowContract contract)
     {
         await using var protocol = await PgTestPool.NewIsolatedAsync();
-        var results = Queue(protocol, TornStreamedBind());
+        var results = Queue(contract, protocol, TornStreamedBind());
 
         Exception? observed = null;
         try
@@ -292,13 +328,37 @@ public class CommandFlowContractTests
         await PgTestPool.RunAsync(protocol, "select 42::int4");
     }
 
+    [ConnectionCreatingTestMethod]
+    [DynamicData(nameof(ReusableImplementations))]
+    public async Task ResetAfterCompletion_StartsIndependentTenure(
+        IReusableConsumerDrivenFlowContract contract)
+    {
+        await using var protocol = await PgTestPool.NewIsolatedAsync();
+        var flow = contract.CreateReusable(async: true, Command.Create("select 1"));
+
+        for (var tenure = 0; tenure < 2; tenure++)
+        {
+            if (tenure > 0)
+                contract.Reset(flow, async: true, Command.Create("select 2"));
+            protocol.Queue(flow);
+            var results = contract.GetAsyncEnumerator(flow);
+            Assert.IsTrue(await results.MoveNextAsync(),
+                $"tenure {tenure} must publish its result");
+            await results.Current.DisposeAsync();
+            Assert.IsFalse(await results.MoveNextAsync());
+            await results.DisposeAsync();
+            await flow.WaitForComplete();
+        }
+    }
+
     static Task<PgClientProtocol> NewCancelableProtocolAsync()
         => PgTestPool.NewIsolatedAsync(options =>
             options.CancelSender = PgTestPool.CreateCancelSender(PgTestPool.NewOptions()));
 
-    static async Task<int> ReadBackendPid(PgClientProtocol protocol)
+    static async Task<int> ReadBackendPid(
+        IConsumerDrivenFlowContract contract, PgClientProtocol protocol)
     {
-        var results = Queue(protocol, Command.Create("select pg_backend_pid()"));
+        var results = Queue(contract, protocol, Command.Create("select pg_backend_pid()"));
         var pid = 0;
         while (await results.MoveNextAsync())
         {
@@ -357,11 +417,13 @@ public class CommandFlowContractTests
             => Read(buffer.AsSpan(offset, count));
     }
 
-    readonly struct Results(CommandFlow.Enumerator inner) : IAsyncDisposable
+    readonly struct Results(
+        IConsumerDrivenFlowContract contract,
+        IAsyncEnumerator<CommandResult> inner) : IAsyncDisposable
     {
         internal CommandResult Current => inner.Current;
         internal ValueTask<bool> MoveNextAsync(CancellationToken cancellationToken = default)
-            => inner.MoveNextAsync(cancellationToken);
+            => contract.MoveNextAsync(inner, cancellationToken);
         public ValueTask DisposeAsync() => inner.DisposeAsync();
     }
 
