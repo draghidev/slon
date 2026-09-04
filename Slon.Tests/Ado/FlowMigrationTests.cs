@@ -184,10 +184,6 @@ public class FlowMigrationTests : ConnectionCreatingTest
     }
 
     static async Task DrainAsync(BindingProbeFlow flow)
-    {
-        var e = flow.GetAsyncEnumerator();
-        while (await e.MoveNextAsync()) { }
-        await e.DisposeAsync();
-    }
+        => await flow.WaitForComplete();
 
 }

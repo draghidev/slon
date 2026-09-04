@@ -8,8 +8,6 @@
         <IsPackable>false</IsPackable>
         <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
         <NoWarn>$(NoWarn);SLONPG001;SLONPOOL001</NoWarn>
-        <CommandFlowImplementation Condition="'$(CommandFlowImplementation)' == ''">Legacy</CommandFlowImplementation>
-        <DefineConstants Condition="'$(CommandFlowImplementation)' == 'Next'">$(DefineConstants);COMMAND_FLOW_NEXT</DefineConstants>
     </PropertyGroup>
 
     <ItemGroup>

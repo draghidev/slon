@@ -226,9 +226,7 @@ public class CommandDrainTests : ConnectionCreatingTest
     // wire usable (a hang shows as the "select 1" WaitAsync timing out, not a suite hang).
     [TestMethod]
     [DoNotParallelize]
-#if COMMAND_FLOW_NEXT
     [Ignore("Exercises the legacy body coroutine's open-before-park rendezvous.")]
-#endif
     public async Task ConsumerDispose_MidBatch_SyncDispose_OpenBeforePark_Stress()
     {
         var iters = StressEnv.Iterations(fallback: 8, cap: 8_000);
@@ -253,9 +251,7 @@ public class CommandDrainTests : ConnectionCreatingTest
     // CompleteEnumeration, or CompleteEnumerationWithException), completing the body cross-thread while the pump is parked - the
     // sticky terminal publication must wake it. No other live-server test reaches this interleaving.
     [TestMethod]
-#if COMMAND_FLOW_NEXT
     [Ignore("Exercises the legacy body coroutine's in-flight completion/pump handoff race.")]
-#endif
     public async Task InFlightCompletion_RacesSyncDispose_PumpNeverStrands_Stress()
     {
         // Each iteration is a full connect + force-abort cycle. Cap it because this is path coverage,
@@ -345,9 +341,7 @@ public class CommandDrainTests : ConnectionCreatingTest
     // gate await is faulted by the heartbeat-driven OnStopping and the consumer's MoveNext
     // surfaces PgClientClosedException without any delivery.
     [TestMethod]
-#if COMMAND_FLOW_NEXT
     [Ignore("Requires the legacy body coroutine to read and publish a result before any consumer advances the flow.")]
-#endif
     public async Task StoppingToken_PreFireAsync_BodyFaultsWithoutDelivery()
     {
         var protocol = await PgTestPool.NewIsolatedAsync();

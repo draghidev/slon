@@ -24,6 +24,5 @@ public class PublicCommandFlowSurfaceTests
         Assert.IsNotNull(flow.GetConstructor([
             typeof(bool), typeof(Slon.Pg.Protocol.Flows.CommandFlowOptions).MakeByRefType()
         ]));
-        Assert.IsFalse(typeof(LegacyCommandFlow).IsPublic);
     }
 }

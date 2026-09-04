@@ -38,11 +38,7 @@ public class ExclusiveAccessFlowTests : ConnectionCreatingTest
     }
 
     static async Task DrainBindingProbeAsync(BindingProbeFlow flow)
-    {
-        var e = flow.GetAsyncEnumerator();
-        while (await e.MoveNextAsync()) { }
-        await e.DisposeAsync();
-    }
+        => await flow.WaitForComplete();
 
     [TestMethod]
     public async Task Scope_RoundTrip_RunsCommandOnInnerPipeline()
