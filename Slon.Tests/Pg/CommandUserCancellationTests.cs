@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Time.Testing;
 using Slon.Pg;
 using Slon.Pg.Protocol;
 using Slon.Pg.Protocol.Flows;
@@ -567,6 +568,59 @@ public class CommandUserCancellationTests : ConnectionCreatingTest
 
         await blocker.ReleaseAsync();
         await dispose;
+        await WaitUntilAsync(() => !protocol.HasPendingCancellation);
+        await PgTestPool.RunAsync(protocol, "select 1");
+    }
+
+    [TestMethod]
+    [DataRow(false, DisplayName = "explicit cancellation")]
+    [DataRow(true, DisplayName = "consumer disposal")]
+    public async Task ServerCancel_SubsequentWindowDispatchesWithoutHeartbeat(bool dispose)
+    {
+        var time = new FakeTimeProvider();
+        await using var blocker = await PgAdvisoryLock.AcquireAsync();
+        var settleAttempt = new TaskCompletionSource<CancelRequestState>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var protocol = await PgTestPool.NewIsolatedAsync(o =>
+        {
+            o.TimeProvider = time;
+            o.HeartbeatInterval = TimeSpan.FromHours(1);
+            o.CancelRequestDelay = TimeSpan.Zero;
+            o.CancelSender = (_, _, _) => new(settleAttempt.Task);
+        });
+
+        var flow = new CommandFlow(async: true,
+            Command.Create("select 1") with { WithSync = true },
+            blocker.WaitCommand);
+        Assert.IsTrue(protocol.TryQueue(flow));
+        var enumerator = flow.GetAsyncEnumerator();
+        Assert.IsTrue(await enumerator.MoveNextAsync());
+
+        var cancellation = dispose
+            ? enumerator.DisposeAsync().AsTask()
+            : flow.CancelAsync();
+        try
+        {
+            await blocker.WaitUntilContendedAsync(protocol.FlowControl.BackendProcessId);
+            while (flow.CancellationWindow < 1)
+                await Task.Yield();
+
+            var state = ProtocolDiag.CancellationState(protocol);
+            Assert.IsTrue(state.StartsWith("dispatching=True", StringComparison.Ordinal),
+                $"The successor cancellation did not dispatch at its read frontier: {state}");
+        }
+        finally
+        {
+            settleAttempt.TrySetResult(CancelRequestState.Sent);
+            await blocker.ReleaseAsync();
+        }
+        await cancellation;
+        if (!dispose)
+        {
+            await Assert.ThrowsExactlyAsync<OperationCanceledException>(
+                async () => await enumerator.MoveNextAsync());
+            await enumerator.DisposeAsync();
+        }
         await WaitUntilAsync(() => !protocol.HasPendingCancellation);
         await PgTestPool.RunAsync(protocol, "select 1");
     }

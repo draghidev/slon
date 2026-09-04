@@ -1022,7 +1022,8 @@ readonly struct CommandExecutionCore<TOps>(TOps ops)
             if (Interlocked.CompareExchange(ref _state.Phase, PhaseDraining, phase) != phase)
                 continue;
             NotifyDrainStarted();
-            _state.ConsumerDetached = true;
+            // Decoder takeover does not imply consumer abandonment. Explicit cancellation and
+            // graceful close also drain autonomously while retaining their consumer semantics.
             ThreadPool.UnsafeQueueUserWorkItem(static state =>
                 _ = new CommandExecutionCore<TOps>(TOps.Create((PgClientFlow)state!)).DrainAsync(),
                 _ops.Flow);
@@ -1153,12 +1154,12 @@ readonly struct CommandExecutionCore<TOps>(TOps ops)
                     _state.ConsumerDetached = true;
                     if (_state.Current is { IsComplete: false }
                         || _state.CommandIndex + 1 < _state.Commands.Count)
-                        RequestCancel(default, CommandExecutionCancellationScope.RemainingFlow);
+                        RequestConsumerDrainCancellation();
                     return _state.WaitForDrainOnDispose ? DisposeDrainAsync() : FireAndForgetDrain();
                 case PhaseReading:
                     _state.ConsumerDetached = true;
                     NotifyDrainStarted();
-                    RequestCancel(default, CommandExecutionCancellationScope.RemainingFlow);
+                    RequestConsumerDrainCancellation();
                     return _state.WaitForDrainOnDispose ? DisposeCompletedAsync() : default;
                 default:
                     return !_state.WaitForDrainOnDispose || _state.ConsumerObservedCompletion
@@ -1217,7 +1218,7 @@ readonly struct CommandExecutionCore<TOps>(TOps ops)
                     _state.ConsumerDetached = true;
                     if (_state.Current is { IsComplete: false }
                         || _state.CommandIndex + 1 < _state.Commands.Count)
-                        RequestCancel(default, CommandExecutionCancellationScope.RemainingFlow);
+                        RequestConsumerDrainCancellation();
                     Drain();
                     if (_state.WaitForDrainOnDispose)
                         DisposeCompleted();
@@ -1225,7 +1226,7 @@ readonly struct CommandExecutionCore<TOps>(TOps ops)
                 case PhaseReading:
                     _state.ConsumerDetached = true;
                     NotifyDrainStarted();
-                    RequestCancel(default, CommandExecutionCancellationScope.RemainingFlow);
+                    RequestConsumerDrainCancellation();
                     if (_state.WaitForDrainOnDispose)
                         DisposeCompleted();
                     return;
@@ -1270,8 +1271,13 @@ readonly struct CommandExecutionCore<TOps>(TOps ops)
         throw new AggregateException(errors);
     }
 
-    // When true, disposal waits for the drain to reach RFQ and for framework release. Otherwise it
-    // returns while the drain continues autonomously.
+    // Give the current window a chance to finish naturally. Once disposal advances into an unread
+    // successor, dispatch at its read frontier instead of paying the grace period for every window.
+    void RequestConsumerDrainCancellation()
+        => RequestCancel(default, CommandExecutionCancellationScope.RemainingFlow,
+            BackendCancellationTiming.AfterGrace,
+            BackendCancellationTiming.AtReadFrontier);
+
     void RegisterCancellation(CancellationToken callerToken)
     {
         // Keep the second token/registration pair off ordinary flow objects. Default-token traffic
