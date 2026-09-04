@@ -8,6 +8,8 @@ namespace Slon.Pg.Protocol;
 /// </summary>
 sealed class PgFlowSourceDriver
 {
+    static readonly Action<object?> RunAction = static state => ((PgFlowSourceDriver)state!).Run();
+
     readonly PgClientFlowSource.State _source;
     readonly SourceWakeEvent _wakeEvent;
     readonly Action _signalHeldSyncFlow;
@@ -53,7 +55,7 @@ sealed class PgFlowSourceDriver
             return;
 
         if (runContinuationsAsynchronously)
-            _wakeEvent.Scheduler.SubmitDetached(static driver => driver.Run(), this);
+            _wakeEvent.Scheduler.SubmitDetached(RunAction, (object?)this);
         else
             Run();
     }
@@ -114,7 +116,7 @@ sealed class PgFlowSourceDriver
     }
 
     void ScheduleRun()
-        => _wakeEvent.Scheduler.SubmitDetached(static driver => driver.Run(), this);
+        => _wakeEvent.Scheduler.SubmitDetached(RunAction, (object?)this);
 
     void Run()
     {
@@ -149,7 +151,7 @@ sealed class PgFlowSourceDriver
             }
 
             if (transfer)
-                _wakeEvent.Scheduler.SubmitDetached(static driver => driver.Run(), this);
+                _wakeEvent.Scheduler.SubmitDetached(RunAction, (object?)this);
             return;
         }
     }
