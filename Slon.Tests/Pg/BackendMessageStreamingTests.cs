@@ -461,6 +461,43 @@ public class BackendMessageStreamingTests
     }
 
     [TestMethod]
+    public async Task EndingResultRetention_ReexposesBufferedSuccessorMessages()
+    {
+        var first = BackendMessageBytes(BackendType.DataRow, [0, 0]);
+        var terminal = BackendMessageBytes(BackendType.CommandComplete, "SELECT 1\0"u8);
+        var ready = BackendMessageBytes(BackendType.ReadyForQuery, [(byte)'I']);
+        var successor = BackendMessageBytes(BackendType.BindComplete, []);
+        var wire = new byte[first.Length + terminal.Length + ready.Length + successor.Length];
+        var offset = 0;
+        foreach (var message in (byte[][])[first, terminal, ready, successor])
+        {
+            message.CopyTo(wire, offset);
+            offset += message.Length;
+        }
+
+        var pipe = new Pipe();
+        var readPipe = new ProtocolReadPipe(pipe.Reader,
+            BackendMessageCursor.DefaultDataRowStreamingThreshold);
+        await pipe.Writer.WriteAsync(wire);
+
+        Assert.IsTrue(await readPipe.MoveNextAsync(default));
+        Assert.IsTrue(readPipe.TryMoveNext());
+        Assert.AreEqual(BackendType.DataRow, readPipe.Current.Header.Type);
+        readPipe.EnableResultRetention();
+        Assert.IsTrue(readPipe.TryMoveNext());
+        Assert.AreEqual(BackendType.CommandComplete, readPipe.Current.Header.Type);
+        Assert.IsTrue(readPipe.TryMoveNext());
+        Assert.AreEqual(BackendType.ReadyForQuery, readPipe.Current.Header.Type);
+
+        readPipe.EndResultRetention();
+        Assert.IsTrue(readPipe.TryMoveNext());
+        Assert.AreEqual(BackendType.BindComplete, readPipe.Current.Header.Type);
+
+        await pipe.Writer.CompleteAsync();
+        await readPipe.DisposeAsync();
+    }
+
+    [TestMethod]
     public async Task BackendBodyReader_ExtendsPrefixThenSlides()
     {
         var pipe = new Pipe();

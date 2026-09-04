@@ -403,20 +403,11 @@ sealed class ProtocolReadPipe(
     public void EndResultRetention()
     {
         _retainsResult = false;
-        if (!_hasActiveRead || _pendingRead is not PendingRead.None
-            || _currentMessageLength > 0
-            || !_messageContext.TryGetCursorUnread(out var unread))
-        {
-            _messageContext.ReleaseContiguousProjections();
-            return;
-        }
-
-        _messageContext.RetireCursor();
-        reader.AdvanceTo(unread, _examined);
-        _hasActiveRead = false;
-        _activeBuffer = default;
-        _currentMessageOffset = 0;
-        _pendingCursorOffset = 0;
+        // Keep the active cursor until ordinary message advancement exhausts it. Besides avoiding
+        // an examined-position rewind (not supported by every PipeReader), this lets a successor
+        // consume messages already present in the current grant. PrepareRead advances the retained
+        // prefix when it eventually needs another grant, matching the former batch reader.
+        _messageContext.ReleaseContiguousProjections();
     }
 
     public void Dispose()

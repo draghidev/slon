@@ -519,17 +519,6 @@ sealed class BackendMessageContext
         return true;
     }
 
-    public bool TryGetCursorUnread(out SequencePosition unread)
-    {
-        if (!_hasCursor)
-        {
-            unread = default;
-            return false;
-        }
-        unread = _cursor.UnreadStart;
-        return true;
-    }
-
     // Reads the next message WITHOUT publishing it as Current. The message cursor
     // really advances past the header, but the parsed (header, buffer) lands in the peek
     // slot and the follow-up TryMoveNext picks it up without re-parsing. The returned
