@@ -1,6 +1,7 @@
 using System.Data;
 using System.Data.Common;
 using System.Diagnostics;
+using System.Runtime.CompilerServices;
 using Slon.Pg;
 using Slon.Pg.Serialization;
 using Slon.Pg.Types;
@@ -22,6 +23,49 @@ interface IAdoCommand
 
 static class AdoCommandFactory
 {
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    internal static Command CreatePreparedCommandWithParameters<TCommand>(
+        in TCommand command, TrackedCommand tracked, in CommandDescriptor descriptor,
+        SlonParameters? commandParameters, bool enableErrorBarriers, CommandBehavior behavior,
+        DbParameterCollection? dbParameters, TimeSpan timeout,
+        PgSerializerOptions serializerOptions, ParameterWriter parameterWriter)
+        where TCommand : IAdoCommand
+    {
+        if (tracked.Kind is not TrackedCommandKind.Command
+            && dbParameters is not null && commandParameters is { Count: > 0 })
+        {
+            throw new InvalidOperationException(
+                "Execution parameters cannot be combined with parameters stored on the command.");
+        }
+
+        dbParameters ??= commandParameters;
+        if (dbParameters is not null and not SlonParameters)
+        {
+            throw new ArgumentException(
+                $"Execution parameters must be a {nameof(SlonParameters)} instance.", nameof(dbParameters));
+        }
+        if ((dbParameters?.Count ?? 0) != descriptor.ParameterTypes.Count)
+        {
+            throw new InvalidOperationException(
+                $"Prepared command expects {descriptor.ParameterTypes.Count} parameters, " +
+                $"received {dbParameters?.Count ?? 0}.");
+        }
+
+        var parameters = dbParameters is { Count: > 0 }
+            ? ResolveNonEmptyParameters(
+                (SlonParameters)dbParameters, serializerOptions, descriptor.ParameterTypes,
+                allowUnspecified: false, parameterWriter)
+            : default;
+        return new Command
+        {
+            Descriptor = descriptor,
+            DescribeOnly = behavior.HasFlag(CommandBehavior.SchemaOnly),
+            WithSync = enableErrorBarriers || command.AppendErrorBarrier,
+            Parameters = parameters,
+            Timeout = timeout
+        };
+    }
+
     public static (Command, TrackerResult) CreateCommand<TCommand>(in TCommand command,
         bool allowAutoPreparation, bool enableErrorBarriers, CommandBehavior behavior,
         in TrackerContext trackerContext, DbParameterCollection? dbParameters, TimeSpan timeout,
@@ -66,23 +110,9 @@ static class AdoCommandFactory
         {
             if (serializerOptions is null)
                 ThrowHelper.ThrowInvalidOperation("ADO parameter serialization requires serializer options.");
-            using var preparedTypes = preparedParameterTypes.GetEnumerator();
-            var parameterIndex = 0;
-            foreach (var kv in slonParameters!.GetStructEnumerator())
-            {
-                if (kv.Key != SlonParameters.PositionalName)
-                {
-                    throw new NotSupportedException(
-                        "Named parameters are not yet supported; they require client-side SQL parsing.");
-                }
-
-                var currentParameterIndex = parameterIndex++;
-                var preparedType = preparedTypes.MoveNext() ? preparedTypes.Current : (PgTypeId?)null;
-                slonParameters.GetOrResolveTypeInfo(
-                    currentParameterIndex, serializerOptions, preparedType, allowUnspecified: preparing);
-            }
-
-            parameters = new(slonParameters!,
+            parameters = ResolveNonEmptyParameters(
+                slonParameters!, serializerOptions, preparedParameterTypes,
+                allowUnspecified: preparing,
                 parameterWriter ?? throw new InvalidOperationException(
                     "ADO parameter serialization requires a parameter writer."));
             parameterTypes = new(parameters);
@@ -112,5 +142,29 @@ static class AdoCommandFactory
             Parameters = parameters,
             Timeout = timeout
         }, trackerResult);
+    }
+
+    static ParameterSource ResolveNonEmptyParameters(
+        SlonParameters parameters, PgSerializerOptions serializerOptions,
+        ParameterTypeList preparedParameterTypes, bool allowUnspecified,
+        ParameterWriter parameterWriter)
+    {
+        using var preparedTypes = preparedParameterTypes.GetEnumerator();
+        var parameterIndex = 0;
+        foreach (var parameter in parameters.GetStructEnumerator())
+        {
+            if (parameter.Key != SlonParameters.PositionalName)
+            {
+                throw new NotSupportedException(
+                    "Named parameters are not yet supported; they require client-side SQL parsing.");
+            }
+
+            var currentParameterIndex = parameterIndex++;
+            var preparedType = preparedTypes.MoveNext() ? preparedTypes.Current : (PgTypeId?)null;
+            parameters.GetOrResolveTypeInfo(
+                currentParameterIndex, serializerOptions, preparedType, allowUnspecified);
+        }
+
+        return new(parameters, parameterWriter);
     }
 }

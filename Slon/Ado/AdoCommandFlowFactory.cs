@@ -1,6 +1,7 @@
 using System.Buffers;
 using System.Data;
 using System.Data.Common;
+using System.Runtime.CompilerServices;
 using Slon.Pg;
 using Slon.Pg.Protocol.Flows;
 
@@ -33,6 +34,26 @@ readonly ref struct AdoCommandFlowFactory<TCommand>(
             ThrowHelper.ThrowArgumentException(nameof(parametersSpan), "The number of parameter collections must match the number of commands.");
 
         var pendingPrefix = connection?.TakePendingTransactionStatement();
+        if (commands.Length is 1 && explicitlyPrepared && !preparing && pendingPrefix is null)
+            return CreatePreparedSingle(
+                parametersSpan.IsEmpty ? null : parametersSpan[0],
+                behavior, enableErrorBarriers,
+                timeout, pgConnection, pendingTimeout);
+
+        return CreateGeneral(
+            parametersSpan, behavior, explicitlyPrepared, allowAutoPreparation, enableErrorBarriers,
+            timeout, connection, pgConnection, pendingTimeout, preparing,
+            pendingPrefix, indexParameters);
+    }
+
+    AdoCommandFlowOptions CreateGeneral(
+        ReadOnlySpan<DbParameterCollection?> parametersSpan, CommandBehavior behavior,
+        bool explicitlyPrepared, bool allowAutoPreparation, bool enableErrorBarriers, TimeSpan timeout,
+        SlonConnection? connection, PgConnection? pgConnection,
+        TimeSpan? pendingTimeout, bool preparing, string? pendingPrefix,
+        bool indexParameters)
+    {
+        var commands = _commands;
         var commandOffset = pendingPrefix is null ? 0 : 1;
         var commandCount = commands.Length + commandOffset;
         var commandArray = commandCount > 1 ? ArrayPool<Command>.Shared.Rent(commandCount) : null;
@@ -145,6 +166,96 @@ readonly ref struct AdoCommandFlowFactory<TCommand>(
                 ArrayPool<Command>.Shared.Return(commandArray, clearArray: true);
             if (pendingPrefix is not null)
                 connection!.RestorePendingTransactionStatement(pendingPrefix);
+            throw;
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    AdoCommandFlowOptions CreatePreparedSingle(
+        DbParameterCollection? parameters, CommandBehavior behavior,
+        bool enableErrorBarriers, TimeSpan timeout,
+        PgConnection? pgConnection, TimeSpan? pendingTimeout)
+    {
+        ref var adoCommand = ref _commands[0];
+        var tracked = adoCommand.Tracked
+            ?? throw new InvalidOperationException(
+                "The explicitly prepared command has no tracked command.");
+        if (!tracked.TryGetPreparedDescriptor(out var descriptor))
+            throw new InvalidOperationException(
+                "The explicitly prepared command has no prepared descriptor.");
+        var commandParameters = adoCommand.Parameters;
+        var command = parameters is null && commandParameters is null
+            && descriptor.ParameterTypes.Count is 0
+            ? new Command
+            {
+                Descriptor = descriptor,
+                DescribeOnly = behavior.HasFlag(CommandBehavior.SchemaOnly),
+                WithSync = enableErrorBarriers || adoCommand.AppendErrorBarrier,
+                Parameters = default,
+                Timeout = timeout
+            }
+            : AdoCommandFactory.CreatePreparedCommandWithParameters(
+                adoCommand, tracked, descriptor, commandParameters, enableErrorBarriers,
+                behavior, parameters, timeout,
+                dependencies.SerializerOptions, dependencies.ParameterWriter);
+
+        Action<CommandResult, object?>? resultAction = null;
+        object? resultActionState = null;
+        if (pgConnection is not null)
+        {
+            var status = pgConnection.GetTrackedStatus(tracked);
+            if (status is TrackedStatus.Tracked)
+            {
+                resultAction = AdoCommandResultObserver.AttachPrepared;
+                resultActionState = pgConnection;
+            }
+            else
+            {
+                var preparation = ResolvePreparedSingleSlow(
+                    adoCommand, command, tracked, pgConnection, status);
+                command = preparation.Command;
+                resultAction = preparation.ResultAction;
+                resultActionState = preparation.ResultActionState;
+            }
+        }
+
+        return new()
+        {
+            ResultObserver = resultAction,
+            ResultObserverState = resultActionState,
+            Commands = new(command),
+            PendingTimeout = pendingTimeout
+        };
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    static PreparationResolution ResolvePreparedSingleSlow(
+        TCommand adoCommand, Command command, TrackedCommand tracked,
+        PgConnection connection, TrackedStatus status)
+    {
+        var parameterTypes = command.Descriptor.ParameterTypes;
+        if (status is TrackedStatus.Preparing || !connection.TryBeginPreparing(tracked))
+        {
+            return new(command with
+            {
+                Descriptor = CommandDescriptor.Create(
+                    adoCommand.CommandText, parameterTypes, default)
+            }, null, null);
+        }
+
+        try
+        {
+            command = command with
+            {
+                Descriptor = CommandDescriptor.Create(
+                    adoCommand.CommandText, parameterTypes, tracked.CommandName)
+            };
+            return new(command, AdoCommandResultObserver.ObservePreparing,
+                (connection, tracked, (SlonBatchCommand?)null));
+        }
+        catch
+        {
+            connection.RemoveTracked(tracked);
             throw;
         }
     }

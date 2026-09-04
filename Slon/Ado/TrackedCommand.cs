@@ -65,7 +65,8 @@ sealed class TrackedCommand
 
         // Sample across this thread's lookups: hot commands remain recent without a clock read and
         // shared timestamp write on every execution.
-        if ((++accessSampleCounter & AccessSampleMask) is 0)
+        if (Kind is TrackedCommandKind.Auto
+            && (++accessSampleCounter & AccessSampleMask) is 0)
             Volatile.Write(ref _lastAccessedTicks, Environment.TickCount64);
         descriptor = state.Descriptor;
         return true;
