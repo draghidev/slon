@@ -214,9 +214,7 @@ partial struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
                     async: false, (IAdoCommandExecutionOwner)_fieldRef.Instance,
                     parameters, behavior, dependencies,
                     connection: null, pendingTimeout, preparing, _commands.Count,
-                    _explicitlyPrepared && _fieldRef.Instance is SlonCommand
-                        ? null
-                        : (IAdoCommandExecutionOwner)_fieldRef.Instance),
+                    ownsLifetime: !(_explicitlyPrepared && _fieldRef.Instance is SlonCommand)),
                 pendingTimeout);
         }
 
@@ -224,7 +222,7 @@ partial struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
         return connection.Enqueue(new AdoCommandExecutionFlow(
             async: false, (IAdoCommandExecutionOwner)_fieldRef.Instance,
             parameters, behavior, dependencies, connection, PendingTimeout, preparing,
-            _commands.Count, (IAdoCommandExecutionOwner)_fieldRef.Instance));
+            _commands.Count, ownsLifetime: true));
     }
 
     ValueTask<AdoCommandExecutionFlow> EnqueueAsync(DbParameterCollection? parameters,
@@ -240,9 +238,7 @@ partial struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
                     async: true, (IAdoCommandExecutionOwner)_fieldRef.Instance,
                     parameters, behavior, dependencies,
                     connection: null, pendingTimeout, preparing, _commands.Count,
-                    _explicitlyPrepared && _fieldRef.Instance is SlonCommand
-                        ? null
-                        : (IAdoCommandExecutionOwner)_fieldRef.Instance),
+                    ownsLifetime: !(_explicitlyPrepared && _fieldRef.Instance is SlonCommand)),
                 pendingTimeout, cancellationToken);
         }
 
@@ -250,7 +246,7 @@ partial struct AdoBatchCore<TCommand> where TCommand : IAdoCommand
         return connection.EnqueueAsync<AdoCommandExecutionFlow>(new AdoCommandExecutionFlow(
             async: true, (IAdoCommandExecutionOwner)_fieldRef.Instance,
             parameters, behavior, dependencies, connection, PendingTimeout, preparing,
-            _commands.Count, (IAdoCommandExecutionOwner)_fieldRef.Instance), cancellationToken);
+            _commands.Count, ownsLifetime: true), cancellationToken);
     }
 
     [DoesNotReturn]

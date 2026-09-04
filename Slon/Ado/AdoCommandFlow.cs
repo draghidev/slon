@@ -116,7 +116,7 @@ sealed class AdoCommandExecutionFlow : PgClientFlow, IValueTaskSource<bool>, IVa
     readonly SlonConnection? _connection;
     readonly bool _preparing;
     readonly int _commandCount;
-    IAdoCommandExecutionOwner? _lifetimeOwner;
+    int _lifetimePending;
     Action<CommandResult, object?>? _resultObserver;
     object? _resultObserverState;
     CommandExecutionState _state;
@@ -126,7 +126,7 @@ sealed class AdoCommandExecutionFlow : PgClientFlow, IValueTaskSource<bool>, IVa
         DbParameterCollection? parameters, CommandBehavior behavior,
         SlonDataSource.PgDbDependencies dependencies, SlonConnection? connection,
         TimeSpan? pendingTimeout, bool preparing, int commandCount,
-        IAdoCommandExecutionOwner? lifetimeOwner)
+        bool ownsLifetime)
         : base(supportsDeferredFlush: true)
     {
         _bindingOwner = bindingOwner;
@@ -136,7 +136,7 @@ sealed class AdoCommandExecutionFlow : PgClientFlow, IValueTaskSource<bool>, IVa
         _connection = connection;
         _preparing = preparing;
         _commandCount = commandCount;
-        _lifetimeOwner = lifetimeOwner;
+        _lifetimePending = ownsLifetime ? 1 : 0;
         _state.CommandIndex = -1;
         _state.EnableActivationTimeout = true;
         _state.WaitForDrainOnDispose = true;
@@ -145,7 +145,8 @@ sealed class AdoCommandExecutionFlow : PgClientFlow, IValueTaskSource<bool>, IVa
         if (!async)
             _state.HandoffEvent = new(false);
         SetObserver(AdoCommandExecutionObserver.Instance, null);
-        lifetimeOwner?.OnFlowStarted(this);
+        if (ownsLifetime)
+            bindingOwner.OnFlowStarted(this);
     }
 
     internal override bool DefersSyncHandoff => true;
@@ -192,7 +193,10 @@ sealed class AdoCommandExecutionFlow : PgClientFlow, IValueTaskSource<bool>, IVa
         => _resultObserver?.Invoke(result, _resultObserverState);
 
     internal void CompleteLifetime(Exception? exception)
-        => Interlocked.Exchange(ref _lifetimeOwner, null)?.OnFlowCompleting(this, exception);
+    {
+        if (Interlocked.Exchange(ref _lifetimePending, 0) is not 0)
+            _bindingOwner.OnFlowCompleting(this, exception);
+    }
 
     internal override void Bind(PgClientFlowBindingContext? context)
     {
