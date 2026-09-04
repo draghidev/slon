@@ -79,7 +79,6 @@ internal struct CommandExecutionState
     // Every pre-consumed successor can suspend in FirstAsync simultaneously. Retain that frame with
     // its reusable flow instead of competing for the builder's one-thread/one-core cache slots.
     internal ValueTaskSourcePromise<bool>? FirstPromise;
-    internal bool RetainFirstPromise;
     internal CommandExecutionColdState? ColdState;
     internal FlowHandoffEvent? HandoffEvent;
     internal bool SyncHandoffClaimed;
@@ -630,9 +629,8 @@ readonly struct CommandFlowCore<TOps>(TOps ops)
             _ = ready.Result;
             return FirstAfterReadyAsync();
         }
-        if (!_state.RetainFirstPromise)
+        if (_state.FirstPromise is not { } promise)
             return AwaitReadyPooledAsync(ready);
-        var promise = _state.FirstPromise ??= new();
         using (PromiseAsyncValueTaskMethodBuilder<bool>.BeginCallScope(promise))
             return AwaitReadyRetainedAsync(ready);
     }
@@ -1603,7 +1601,7 @@ readonly struct CommandFlowCore<TOps>(TOps ops)
         _state.FlowToken = default;
         _state.FlowRegistration = default;
         _state.WindowToken = default;
-        _state.RetainFirstPromise = true;
+        _state.FirstPromise ??= new();
         _state.ColdState = null;
         _state.SyncHandoffClaimed = false;
         _state.HandoffEvent?.ResetInteraction();
