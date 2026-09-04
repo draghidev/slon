@@ -15,8 +15,8 @@ public class BackendMessagePublicationBenchmark
     [Benchmark]
     public int PublishBufferedMessages()
     {
-        _context.RetireCurrentBatch();
-        _context.SetBatch(new BackendMessageBatch(new ReadOnlySequence<byte>(_messages)));
+        _context.RetireCursor();
+        _context.SetCursor(new BackendMessageCursor(new ReadOnlySequence<byte>(_messages)));
         var count = 0;
         while (_context.TryMoveNext())
             count++;
