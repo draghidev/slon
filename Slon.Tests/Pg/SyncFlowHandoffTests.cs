@@ -1,3 +1,4 @@
+using Draghi.Pipelining;
 using Slon.Pg;
 using Slon.Pg.Protocol;
 using Slon.Pg.Protocol.Flows;
@@ -34,6 +35,27 @@ public class SyncFlowHandoffTests
         internal FlowCallerInteractionCore<ValueTuple> Core;
     }
 
+    sealed class TrackingScheduler : PipelineScheduler
+    {
+        [ThreadStatic]
+        static bool _isExecuting;
+
+        internal static bool IsExecuting => _isExecuting;
+
+        public override void SubmitDetached(
+            Action<object?> action, object? state, bool preferLocal = true)
+            => PipelineScheduler.ThreadPool.SubmitDetached(static state =>
+            {
+                var work = (Work)state!;
+                var prior = _isExecuting;
+                _isExecuting = true;
+                try { work.Action(work.State); }
+                finally { _isExecuting = prior; }
+            }, new Work(action, state), preferLocal);
+
+        sealed record Work(Action<object?> Action, object? State);
+    }
+
     static ref FlowCallerInteractionCore<ValueTuple> GetWakeCore(WakeHolder holder) => ref holder.Core;
 
     [ConnectionCreatingTestMethod]
@@ -68,6 +90,49 @@ public class SyncFlowHandoffTests
         syncThread.Join();
         if (failure is not null)
             Assert.Fail($"concurrent sync/async raised {failure}");
+    }
+
+    [ConnectionCreatingTestMethod]
+    public async Task DeferredActivation_DoesNotResumeConsumerOnExecutorStrand()
+    {
+        var scheduler = new TrackingScheduler();
+        await using var blocker = await PgAdvisoryLock.AcquireAsync();
+        await using var protocol = await PgTestPool.NewIsolatedAsync(o =>
+        {
+            o.ExecutionScheduler = scheduler;
+            o.ActivationScheduler = scheduler;
+        });
+
+        var first = protocol.Queue(new CommandFlow(async: true, blocker.WaitCommand));
+        var second = protocol.Queue(new CommandFlow(async: true, Command.Create("select 1")));
+        var firstDrain = Drain(first);
+        var secondDrain = DrainAndObserveScheduler(second);
+
+        await blocker.WaitUntilContendedAsync(protocol.FlowControl.BackendProcessId);
+        await blocker.ReleaseAsync();
+
+        await firstDrain;
+        Assert.IsFalse(await secondDrain,
+            "Deferred activation resumed consumer code on the pipeline executor strand.");
+
+        static async Task Drain(CommandFlow flow)
+        {
+            var enumerator = flow.GetAsyncEnumerator();
+            while (await enumerator.MoveNextAsync())
+                await enumerator.Current.DisposeAsync();
+            await enumerator.DisposeAsync();
+        }
+
+        static async Task<bool> DrainAndObserveScheduler(CommandFlow flow)
+        {
+            var enumerator = flow.GetAsyncEnumerator();
+            Assert.IsTrue(await enumerator.MoveNextAsync());
+            var resumedOnExecutor = TrackingScheduler.IsExecuting;
+            await enumerator.Current.DisposeAsync();
+            Assert.IsFalse(await enumerator.MoveNextAsync());
+            await enumerator.DisposeAsync();
+            return resumedOnExecutor;
+        }
     }
 
     [ConnectionCreatingTestMethod]

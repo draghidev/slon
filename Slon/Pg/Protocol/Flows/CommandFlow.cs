@@ -328,11 +328,11 @@ readonly struct CommandExecutionCore<TOps>(TOps ops)
         // consumer ever arrives.
         var activation = context.GetDecoderAsync().ConfigureAwait(false);
         if (activation.IsCompleted)
-            OnActivationSettled(onExecutorStrand: true);
+            OnActivationSettled();
         else
             activation.UnsafeOnCompleted(static state =>
                 new CommandExecutionCore<TOps>(TOps.Create((PgClientFlow)state!))
-                    .OnActivationSettled(onExecutorStrand: false), _ops.Flow);
+                    .OnActivationSettled(), _ops.Flow);
         return new(new FlowTasks(writeTask, new ValueTask((IValueTaskSource)_ops.Flow, _state.PipelineTaskSource.Version)));
     }
 
@@ -346,10 +346,9 @@ readonly struct CommandExecutionCore<TOps>(TOps ops)
         return writeTask.IsCompleted ? writeTask : encoder.RunResumableTask(writeTask);
     }
 
-    // Runs on the executor strand when activation already settled, else on the activation dispatch.
-    // The executor strand never runs consumer code. An activation dispatch is a detached work item
-    // whose only remaining work is this wake, so the consumer may continue on it directly.
-    void OnActivationSettled(bool onExecutorStrand)
+    // Activation completion can run inline from pipeline advancement even when it was pending during
+    // ExecuteAuto. Never let ready publication resume consumer code on that internal executor strand.
+    void OnActivationSettled()
     {
         try
         {
@@ -366,7 +365,7 @@ readonly struct CommandExecutionCore<TOps>(TOps ops)
 
         if (IsCancelRequested)
             RequestBackendCancellation();
-        if (!CompleteReady(null, runContinuationsAsynchronously: onExecutorStrand))
+        if (!CompleteReady(null, runContinuationsAsynchronously: true))
         {
             // Teardown released the consumer while this flow waited for its turn. Nothing reads the
             // response, the closing wire owns it.
