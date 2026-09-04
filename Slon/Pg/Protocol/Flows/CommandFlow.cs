@@ -255,6 +255,8 @@ readonly struct CommandFlowCore<TOps>(TOps ops)
 
     readonly TOps _ops = ops;
     ref CommandExecutionState _state => ref _ops.GetField();
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    void SetCurrent(CommandResult result) => _state.Current = result;
     internal bool IsResultReady => Volatile.Read(ref _state.Phase) is PhaseResultReady;
     bool IsSinglePublishedCommand
         => _state.Commands.Count is 1
@@ -731,17 +733,15 @@ readonly struct CommandFlowCore<TOps>(TOps ops)
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
     async ValueTask<CommandResult?> ReadNextPublishedResultAsync()
     {
-        CommandResult? result = _state.Current;
         while (_state.CommandIndex < _state.Commands.Count)
         {
-            result = await ReadResultAsync().ConfigureAwait(false);
-            _state.Current = result;
+            SetCurrent(await ReadResultAsync().ConfigureAwait(false));
             _state.CurrentPublished = false;
             if (!_state.Commands.ItemRef(_state.CommandIndex).SuppressEnumeration)
-                return result;
+                return _state.Current;
 
             var completeError = await CompleteCurrentResultAsync().ConfigureAwait(false);
-            var suppressedError = result.Error;
+            var suppressedError = _state.Current!.Error;
             if (suppressedError is null && completeError is { } completionError)
                 suppressedError = completionError.Error;
             if (suppressedError is not null)
@@ -764,7 +764,7 @@ readonly struct CommandFlowCore<TOps>(TOps ops)
             _state.CommandIndex++;
         }
 
-        if (result is null)
+        if (_state.Current is null)
             throw ThrowHelper.ThrowInvalidOperation("The flow contains no commands.");
         await CompleteBatchAsync().ConfigureAwait(false);
         _state.ConsumerObservedCompletion = true;
@@ -813,66 +813,72 @@ readonly struct CommandFlowCore<TOps>(TOps ops)
         return null;
     }
 
-    // Reads through the command's execute prelude and initializes the protocol-static result.
-    async ValueTask<CommandResult> ReadResultAsync()
+    // Dispatch before entering an async machine so each mutually-exclusive protocol shape carries
+    // only its own awaiter and scratch state.
+    ValueTask<CommandResult> ReadResultAsync()
     {
-        var context = _state.Context;
-        var decoder = context.Decoder;
         // After close, a fresh command must not consume bytes left by its predecessor.
-        if (context.IsProtocolClosed)
-            throw context.FlowTerminationException;
-        PgError? error;
-        RowDescription? requestedRowDescription;
+        if (_state.Context.IsProtocolClosed)
+            return ValueTask.FromException<CommandResult>(_state.Context.FlowTerminationException);
         ref readonly var command = ref _state.Commands.ItemRef(_state.CommandIndex);
-        var describeOnly = command.DescribeOnly;
-        var hasPreparedDescription = command.Descriptor
-            is { IsPrepared: true, PreparedRowDescription: not null };
-        decoder.UseReadTimeout(command.Timeout);
-        ParameterTypeList? preparationParameterTypes = null;
+        _state.Context.Decoder.UseReadTimeout(command.Timeout);
         if (command.DescribeForPreparation)
+            return ReadPreparationResultAsync();
+        return command.Descriptor is { IsPrepared: true, PreparedRowDescription: not null }
+            && !command.DescribeOnly
+                ? ReadPreparedResultAsync()
+                : ReadUnpreparedResultAsync();
+    }
+
+    async ValueTask<CommandResult> ReadPreparationResultAsync()
+    {
+        ref readonly var command = ref _state.Commands.ItemRef(_state.CommandIndex);
+        var preparation = await command.ReadPreparationDescriptionAsync(
+            _state.Context.Decoder,
+            _state.Context.GetProtocolStatic<CommandFlow.ReadState>().RowDescription)
+            .ConfigureAwait(false);
+        return InitializeResult(
+            _state.CommandIndex, preparation.Item1, preparation.Item3, preparation.Item2);
+    }
+
+    async ValueTask<CommandResult> ReadPreparedResultAsync()
+    {
+        // Prepared commands with a known description have the compact BindComplete ->
+        // DataRow/CommandComplete prelude. Await the decoder directly so a read wake resumes this
+        // frame rather than a nested parser coroutine.
+        if (!_state.Context.Decoder.TryMoveNext())
         {
-            var preparation = await command.ReadPreparationDescriptionAsync(
-                decoder, context.GetProtocolStatic<CommandFlow.ReadState>().RowDescription)
-                .ConfigureAwait(false);
-            error = preparation.Item1;
-            preparationParameterTypes = preparation.Item2;
-            requestedRowDescription = preparation.Item3;
+            if (!await _state.Context.Decoder.MoveNextAsync().ConfigureAwait(false))
+                _state.Context.Decoder.ThrowUnexpectedEof();
         }
-        else if (hasPreparedDescription && !describeOnly)
+        var message = _state.Context.Decoder.Current;
+        PgError? error;
+        if (message.EnsureExpectedOrError(PgTypes.BackendType.BindComplete) is { } bindError)
         {
-            // Prepared commands with a known description have the compact BindComplete ->
-            // DataRow/CommandComplete prelude. Await the decoder directly so a read wake resumes this
-            // frame rather than a nested parser coroutine.
-            if (!decoder.TryMoveNext())
-            {
-                if (!await decoder.MoveNextAsync().ConfigureAwait(false))
-                    decoder.ThrowUnexpectedEof();
-            }
-            var message = decoder.Current;
-            if (message.EnsureExpectedOrError(PgTypes.BackendType.BindComplete) is { } bindError)
-            {
-                error = bindError;
-            }
-            else
-            {
-                if (!decoder.TryMoveNext())
-                {
-                    if (!await decoder.MoveNextAsync().ConfigureAwait(false))
-                        decoder.ThrowUnexpectedEof();
-                }
-                decoder.Current.DebugEnsureExpected(PgTypes.BackendType.DataRow, PgTypes.BackendType.CommandComplete);
-                error = null;
-            }
-            requestedRowDescription = null;
+            error = bindError;
         }
         else
         {
-            (error, requestedRowDescription) = await command
-                .ReadUntilExecuteAsync(decoder, context.GetProtocolStatic<CommandFlow.ReadState>().RowDescription)
-                .ConfigureAwait(false);
+            if (!_state.Context.Decoder.TryMoveNext())
+            {
+                if (!await _state.Context.Decoder.MoveNextAsync().ConfigureAwait(false))
+                    _state.Context.Decoder.ThrowUnexpectedEof();
+            }
+            _state.Context.Decoder.Current.DebugEnsureExpected(
+                PgTypes.BackendType.DataRow, PgTypes.BackendType.CommandComplete);
+            error = null;
         }
-        return InitializeResult(
-            _state.CommandIndex, error, requestedRowDescription, preparationParameterTypes);
+        return InitializeResult(_state.CommandIndex, error, null);
+    }
+
+    async ValueTask<CommandResult> ReadUnpreparedResultAsync()
+    {
+        ref readonly var command = ref _state.Commands.ItemRef(_state.CommandIndex);
+        var result = await command.ReadUntilExecuteAsync(
+            _state.Context.Decoder,
+            _state.Context.GetProtocolStatic<CommandFlow.ReadState>().RowDescription)
+            .ConfigureAwait(false);
+        return InitializeResult(_state.CommandIndex, result.Item1, result.Item2);
     }
 
     CommandResult ReadResult(int commandIndex)
@@ -1055,8 +1061,7 @@ readonly struct CommandFlowCore<TOps>(TOps ops)
     {
         try
         {
-            var result = _state.Current;
-            if (result is null)
+            if (_state.Current is null)
             {
                 await new ValueTask<bool>((IValueTaskSource<bool>)_ops.Flow, _state.ReadySource.Version).ConfigureAwait(false);
                 if (_state.CommandIndex < 0)
@@ -1066,19 +1071,19 @@ readonly struct CommandFlowCore<TOps>(TOps ops)
                     await CompleteBatchAsync().ConfigureAwait(false);
                     return;
                 }
-                result = await ReadResultAsync().ConfigureAwait(false);
+                SetCurrent(await ReadResultAsync().ConfigureAwait(false));
             }
 
             while (true)
             {
                 var completeError = await CompleteCurrentResultAsync().ConfigureAwait(false);
-                CaptureDrainError(result, completeError);
+                CaptureDrainError(_state.Current!, completeError);
                 _state.CurrentPublished = false;
                 if (completeError is { TransactionStatus: TransactionStatus.Unknown })
                     await SkipDiscardedCommandsAsync().ConfigureAwait(false);
                 if (++_state.CommandIndex >= _state.Commands.Count)
                     break;
-                result = await ReadResultAsync().ConfigureAwait(false);
+                SetCurrent(await ReadResultAsync().ConfigureAwait(false));
             }
             await CompleteBatchAsync().ConfigureAwait(false);
         }
