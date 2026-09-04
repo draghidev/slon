@@ -328,11 +328,12 @@ readonly struct CommandExecutionCore<TOps>(TOps ops)
         // consumer ever arrives.
         var activation = context.GetDecoderAsync().ConfigureAwait(false);
         if (activation.IsCompleted)
-            OnActivationSettled();
+            OnActivationSettled(onExecutorStrand: true);
         else
             activation.UnsafeOnCompleted(static state =>
                 new CommandExecutionCore<TOps>(TOps.Create((PgClientFlow)state!))
-                    .OnActivationSettled(), _ops.Flow);
+                    .OnActivationSettled(onExecutorStrand:
+                        !((PgClientFlow)state!).ActivationWasDispatched), _ops.Flow);
         return new(new FlowTasks(writeTask, new ValueTask((IValueTaskSource)_ops.Flow, _state.PipelineTaskSource.Version)));
     }
 
@@ -346,9 +347,10 @@ readonly struct CommandExecutionCore<TOps>(TOps ops)
         return writeTask.IsCompleted ? writeTask : encoder.RunResumableTask(writeTask);
     }
 
-    // Activation completion can run inline from pipeline advancement even when it was pending during
-    // ExecuteAuto. Never let ready publication resume consumer code on that internal executor strand.
-    void OnActivationSettled()
+    // A detached activation callback may publish ready inline on that scheduler turn. ExecuteAuto
+    // can also observe an already-completed activation directly on the executor, while a pending
+    // zero-edge activation completes inline there; both executor cases need the scheduling firewall.
+    void OnActivationSettled(bool onExecutorStrand)
     {
         try
         {
@@ -365,7 +367,8 @@ readonly struct CommandExecutionCore<TOps>(TOps ops)
 
         if (IsCancelRequested)
             RequestBackendCancellation();
-        if (!CompleteReady(null, runContinuationsAsynchronously: true))
+        var dispatchReady = _ops.IsAsyncAtDispatch && onExecutorStrand;
+        if (!CompleteReady(null, runContinuationsAsynchronously: dispatchReady))
         {
             // Teardown released the consumer while this flow waited for its turn. Nothing reads the
             // response, the closing wire owns it.

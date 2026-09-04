@@ -132,7 +132,10 @@ public abstract class PgClientFlow : IValueTaskSource<FlowActivation>, IValueTas
     /// Initialize overwrote the first's item before its Execute ran (one pending activation
     /// per flow tenure makes the field safe).
     internal void PrepareActivationDispatch(PgClientProtocol.Control control)
-        => _pendingActivationControl = control;
+    {
+        _activationWasDispatched = true;
+        _pendingActivationControl = control;
+    }
 
     void IThreadPoolWorkItem.Execute()
     {
@@ -160,6 +163,8 @@ public abstract class PgClientFlow : IValueTaskSource<FlowActivation>, IValueTas
     int _cancellationWindow;
     internal int CancellationWindow => Volatile.Read(ref _cancellationWindow);
     bool _lastMessageInducesRfq;
+    bool _activationWasDispatched;
+    internal bool ActivationWasDispatched => _activationWasDispatched;
     // We store the IsAsync value at bind time so the protocol can keep track of pipeline stalls correctly.
     bool _isAsyncAtDispatch;
     // Tri-state int (0 = unset, 1 = true, 2 = false) instead of bool? so reads / writes can be
@@ -449,6 +454,7 @@ public abstract class PgClientFlow : IValueTaskSource<FlowActivation>, IValueTas
         _rfqCount = 0;
         _cancellationWindow = 0;
         _lastMessageInducesRfq = false;
+        _activationWasDispatched = false;
         HandoffEvent?.ResetPlacement();
         _pendingTimeoutStarted = false;
         _enqueueOptions = FlowEnqueueOptions.None;

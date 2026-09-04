@@ -1398,9 +1398,9 @@ public sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
             // Only the body wake is deferred below.
             _control.BindDecoder(item);
 
-            // Inline-activate when the framework allows it (preferAsync=false) or the flow is sync:
-            // sync flows park on a kernel wait-handle signal, bounded cost, safe under the advancer
-            // latch. Async flows can attach arbitrary await continuations, so they go through TP.
+            // Inline-activate when the framework allows it (preferAsync=false) or the flow is sync.
+            // CommandFlow retains whether an async activation was dispatched so its consumer-facing
+            // ready publication supplies the scheduling firewall only when activation ran inline.
             if (preferAsync && item.IsAsyncAtDispatch)
             {
                 // The flow itself is the work item: an immutable (flow, control) pairing per queued
