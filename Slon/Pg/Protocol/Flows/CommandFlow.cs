@@ -373,6 +373,15 @@ readonly struct CommandExecutionCore<TOps>(TOps ops)
             CompletePipelineTask(null, runContinuationsAsynchronously: true);
             return;
         }
+        // Termination propagation enumerates pipeline positions best-effort. A flow can cross from
+        // the in-flight store into the activated slot while that pass is being taken and miss it.
+        // Recheck after publishing readiness: OnStopping arbitrates PhaseInitial against a consumer's
+        // PhaseReading claim, so exactly one side owns the decoder and eventual pipeline completion.
+        if (_state.Context.StoppingToken.IsCancellationRequested)
+        {
+            OnStopping(_state.Context.FlowTerminationException);
+            return;
+        }
         // A cancel latched before activation may have released its caller already. The response
         // still has to reach RFQ, so drain it unless a consumer already owns the decoder.
         if (IsCancelRequested)
