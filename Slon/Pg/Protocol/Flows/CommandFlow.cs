@@ -257,6 +257,9 @@ readonly struct CommandExecutionCore<TOps>(TOps ops)
     readonly TOps _ops = ops;
     ref CommandExecutionState _state => ref _ops.State;
     internal bool IsResultReady => Volatile.Read(ref _state.Phase) is PhaseResultReady;
+    bool IsSinglePublishedCommand
+        => _state.Commands.Count is 1
+            && !_state.Commands.ItemRef(0).SuppressEnumeration;
 
     [RuntimeAsyncMethodGeneration(false)]
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
@@ -453,7 +456,9 @@ readonly struct CommandExecutionCore<TOps>(TOps ops)
             WaitForReadySynchronously();
             Debug.Assert(!_state.ConsumerDetached);
             RegisterCancellation(default);
-            var result = ReadNextPublishedResult();
+            var result = IsSinglePublishedCommand
+                ? ReadResult(0)
+                : ReadNextPublishedResult();
             return result is not null && PublishSynchronousResult(result);
         }
         catch (TimeoutException ex)
@@ -488,6 +493,12 @@ readonly struct CommandExecutionCore<TOps>(TOps ops)
                 SkipDiscardedCommands();
 
             _state.CommandIndex++;
+            if (IsSinglePublishedCommand)
+            {
+                CompleteBatch();
+                _state.ConsumerObservedCompletion = true;
+                return false;
+            }
             var next = ReadNextPublishedResult();
             if (next is not null)
                 return PublishSynchronousResult(next);
@@ -595,7 +606,9 @@ readonly struct CommandExecutionCore<TOps>(TOps ops)
             await new ValueTask<bool>((IValueTaskSource<bool>)_ops.Flow, _state.ReadySource.Version).ConfigureAwait(false);
             Debug.Assert(!_state.ConsumerDetached);
             RegisterCancellation(cancellationToken);
-            var result = await ReadNextPublishedResultAsync().ConfigureAwait(false);
+            var result = IsSinglePublishedCommand
+                ? await ReadResultAsync(0).ConfigureAwait(false)
+                : await ReadNextPublishedResultAsync().ConfigureAwait(false);
             if (result is null)
                 return false;
             _state.Current = result;
@@ -660,6 +673,12 @@ readonly struct CommandExecutionCore<TOps>(TOps ops)
                 await SkipDiscardedCommandsAsync().ConfigureAwait(false);
 
             _state.CommandIndex++;
+            if (IsSinglePublishedCommand)
+            {
+                await CompleteBatchAsync().ConfigureAwait(false);
+                _state.ConsumerObservedCompletion = true;
+                return false;
+            }
             var next = await ReadNextPublishedResultAsync().ConfigureAwait(false);
             if (next is not null)
             {
