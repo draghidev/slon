@@ -23,10 +23,10 @@ unmerged branch.
 ## Driver strategies
 
 Slon uses its experimental lower layer through `ConnectionPool<T>` and creates a fresh
-`ReaderDrivenCommandFlow` per request. Every wire receives the same prepared statement before it
-becomes schedulable. Streaming consumption retains UTF-8 field memory through rendering, avoiding
-per-row strings and byte arrays. Zero-byte reads are disabled to match Apex's ordinary BCL transport
-shape.
+`CommandFlow` per request. Every wire receives the same prepared statement before it becomes
+schedulable. `CommandResult.CollectAsync` is the row-buffering barrier, while result buffering retains
+UTF-8 field memory through rendering without per-row strings or byte arrays. Zero-byte reads are
+disabled to match Apex's ordinary BCL transport shape.
 
 `TEMPLATING=raw` writes the same encoded HTML directly into the response buffer. It isolates the
 driver and pool cost from RazorSlices overhead without changing query or row-consumption behavior.

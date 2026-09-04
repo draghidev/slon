@@ -22,9 +22,9 @@ unmerged branch.
 ## Driver strategies
 
 Slon uses its experimental lower layer through `ConnectionPool<T>` and creates a fresh
-`ReaderDrivenCommandFlow` per request. Every wire receives the same prepared statement before it
-becomes schedulable. Results are consumed through nested streaming enumeration, and zero-byte reads
-are disabled to match Apex's ordinary BCL transport shape.
+`CommandFlow` per request. Every wire receives the same prepared statement before it becomes
+schedulable. Results are consumed through `CommandResult.CollectAsync`, and zero-byte reads are
+disabled to match Apex's ordinary BCL transport shape.
 
 Npgsql uses a slim data source and a command bound to each leased connection. Both drivers
 materialize messages as strings, append and ordinally sort the same model, and render the same

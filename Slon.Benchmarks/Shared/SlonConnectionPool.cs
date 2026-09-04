@@ -14,10 +14,10 @@ internal sealed class SlonConnectionPool : IAsyncDisposable
 {
     const string Query = "SELECT id, message FROM fortune";
     readonly ConnectionPool<ProtocolConnection> _pool;
-    readonly ReaderDrivenCommandOptions _options;
+    readonly CommandFlowOptions _options;
 
     SlonConnectionPool(ConnectionPool<ProtocolConnection> pool, Command command)
-        => (_pool, _options) = (pool, new ReaderDrivenCommandOptions(command));
+        => (_pool, _options) = (pool, new() { Commands = new(command) });
 
     internal static async ValueTask<SlonConnectionPool> CreateAsync(
         string connectionString,
@@ -63,7 +63,7 @@ internal sealed class SlonConnectionPool : IAsyncDisposable
         Func<int, string, T> create,
         CancellationToken cancellationToken)
     {
-        var flow = new ReaderDrivenCommandFlow(_options);
+        var flow = new CommandFlow(async: true, _options);
         await _pool.GetAsync(
             static (candidate, item) => candidate.Connection.Protocol.TryQueue(
                 item,
@@ -76,10 +76,23 @@ internal sealed class SlonConnectionPool : IAsyncDisposable
             cancellationToken).ConfigureAwait(false);
 
         var values = new List<T>();
-        await foreach (var result in flow.GetAsyncEnumerator(cancellationToken))
-        await foreach (var row in result)
-            values.Add(create(row.GetValue<int>(0), row.GetValue<string>(1)));
-        return values;
+        var results = flow.GetAsyncEnumerator(cancellationToken);
+        try
+        {
+            while (await results.MoveNextAsync().ConfigureAwait(false))
+            {
+                await results.Current.CollectAsync(
+                    (Values: values, Create: create),
+                    static (state, row) => state.Values.Add(
+                        state.Create(row.GetInt32(0), row.GetValue<string>(1))),
+                    cancellationToken).ConfigureAwait(false);
+            }
+            return values;
+        }
+        finally
+        {
+            await results.DisposeAsync().ConfigureAwait(false);
+        }
     }
 
     public async ValueTask ConsumeRetainedAsync<T, TState>(
@@ -88,7 +101,7 @@ internal sealed class SlonConnectionPool : IAsyncDisposable
         Func<TState, List<T>, ValueTask> consume,
         CancellationToken cancellationToken)
     {
-        var flow = new ReaderDrivenCommandFlow(_options);
+        var flow = new CommandFlow(async: true, _options);
         await _pool.GetAsync(
             static (candidate, item) => candidate.Connection.Protocol.TryQueue(
                 item,
@@ -106,13 +119,13 @@ internal sealed class SlonConnectionPool : IAsyncDisposable
         {
             if (await results.MoveNextAsync().ConfigureAwait(false))
             {
-                var rows = results.Current.GetAsyncEnumerator();
-                while (await rows.MoveNextAsync().ConfigureAwait(false))
-                {
-                    var reader = rows.Current.GetReader();
-                    values.Add(create(reader.Read<int>(), reader.ReadMemory()));
-                }
-                await rows.DisposeAsync().ConfigureAwait(false);
+                results.Current.EnableResultBuffering();
+                await results.Current.CollectAsync(
+                    (Values: values, Create: create),
+                    static (collection, row) => collection.Values.Add(
+                        collection.Create(
+                            row.GetInt32(0), row.BorrowFieldMemory(1))),
+                    cancellationToken).ConfigureAwait(false);
             }
             await consume(state, values).ConfigureAwait(false);
         }
