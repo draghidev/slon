@@ -1,4 +1,6 @@
 using System.Globalization;
+using System.IO.Pipelines;
+using System.Text.Encodings.Web;
 using Npgsql;
 using Slon.Fortunes;
 
@@ -7,11 +9,14 @@ namespace Slon.Fortunes.Minimal;
 internal abstract class FortuneDatabase : IAsyncDisposable
 {
     protected const string Query = "SELECT id, message FROM fortune";
-    private const string AdditionalFortune = "Additional fortune added at request time.";
+    private static readonly ReadOnlyMemory<byte> AdditionalFortune =
+        "Additional fortune added at request time."u8.ToArray();
 
     public abstract ValueTask DisposeAsync();
 
-    public abstract ValueTask<List<Fortune>> LoadAsync(
+    public abstract ValueTask RenderAsync(
+        PipeWriter writer,
+        HtmlEncoder htmlEncoder,
         CancellationToken cancellationToken);
 
     public static ValueTask<FortuneDatabase> CreateAsync(IConfiguration configuration)
@@ -38,6 +43,15 @@ internal abstract class FortuneDatabase : IAsyncDisposable
         fortunes.Add(new Fortune(0, AdditionalFortune));
         fortunes.Sort();
         return fortunes;
+    }
+
+    protected static async ValueTask RenderFortunesAsync(
+        List<Fortune> fortunes,
+        PipeWriter writer,
+        HtmlEncoder htmlEncoder)
+    {
+        using var template = Templates.Fortunes.Create(Complete(fortunes));
+        await template.RenderAsync(writer, htmlEncoder);
     }
 
     private static string RequiredDatabase(string? value)
@@ -86,12 +100,16 @@ internal sealed class SlonFortuneDatabase(SlonConnectionPool pool) : FortuneData
         => new SlonFortuneDatabase(await SlonConnectionPool.CreateAsync(
             connectionString, connectionCount).ConfigureAwait(false));
 
-    public override async ValueTask<List<Fortune>> LoadAsync(CancellationToken cancellationToken)
-    {
-        var fortunes = await pool.LoadAsync(
-            static (id, message) => new Fortune(id, message), cancellationToken).ConfigureAwait(false);
-        return Complete(fortunes);
-    }
+    public override ValueTask RenderAsync(
+        PipeWriter writer,
+        HtmlEncoder htmlEncoder,
+        CancellationToken cancellationToken)
+        => pool.ConsumeRetainedAsync(
+            static (id, message) => new Fortune(id, message),
+            (Writer: writer, HtmlEncoder: htmlEncoder),
+            static (output, fortunes) => RenderFortunesAsync(
+                fortunes, output.Writer, output.HtmlEncoder),
+            cancellationToken);
 
     public override ValueTask DisposeAsync() => pool.DisposeAsync();
 }
@@ -109,7 +127,9 @@ internal sealed class NpgsqlFortuneDatabase : FortuneDatabase
         _dataSource = new NpgsqlSlimDataSourceBuilder(builder.ConnectionString).Build();
     }
 
-    public override async ValueTask<List<Fortune>> LoadAsync(
+    public override async ValueTask RenderAsync(
+        PipeWriter writer,
+        HtmlEncoder htmlEncoder,
         CancellationToken cancellationToken)
     {
         await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken);
@@ -118,10 +138,11 @@ internal sealed class NpgsqlFortuneDatabase : FortuneDatabase
         List<Fortune> fortunes = [];
         while (await reader.ReadAsync(cancellationToken))
         {
-            fortunes.Add(new Fortune(reader.GetInt32(0), reader.GetString(1)));
+            fortunes.Add(new Fortune(
+                reader.GetInt32(0), reader.GetFieldValue<byte[]>(1)));
         }
 
-        return Complete(fortunes);
+        await RenderFortunesAsync(fortunes, writer, htmlEncoder);
     }
 
     public override ValueTask DisposeAsync() => _dataSource.DisposeAsync();

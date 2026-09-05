@@ -1,7 +1,6 @@
 using System.Text.Encodings.Web;
 using System.Text.Unicode;
 using Slon.Fortunes.Minimal;
-using Slon.Fortunes.Minimal.Templates;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -14,11 +13,10 @@ await using var app = builder.Build();
 
 app.MapGet(
     "/fortunes",
-    async (HtmlEncoder htmlEncoder, CancellationToken cancellationToken) =>
+    async (HttpResponse response, HtmlEncoder htmlEncoder, CancellationToken cancellationToken) =>
     {
-        var template = Fortunes.Create(await database.LoadAsync(cancellationToken));
-        template.HtmlEncoder = htmlEncoder;
-        return template;
+        response.ContentType = "text/html; charset=utf-8";
+        await database.RenderAsync(response.BodyWriter, htmlEncoder, cancellationToken);
     });
 
 app.Lifetime.ApplicationStarted.Register(static () => Console.WriteLine("Application started."));

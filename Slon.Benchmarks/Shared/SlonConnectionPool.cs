@@ -73,43 +73,6 @@ internal sealed class SlonConnectionPool : IAsyncDisposable
         return new(pool, command, GetFlowPoolCapacity());
     }
 
-    public async ValueTask<List<T>> LoadAsync<T>(
-        Func<int, string, T> create,
-        CancellationToken cancellationToken)
-    {
-        var flow = RentFlow();
-        await _pool.GetAsync(
-            static (candidate, item) => candidate.Connection.Protocol.TryQueue(
-                item,
-                candidate.IsIdleCandidate
-                    ? FlowEnqueueOptions.None
-                    : FlowEnqueueOptions.RequireExistingPipeline,
-                candidate.CancellationToken),
-            flow,
-            Timeout.InfiniteTimeSpan,
-            cancellationToken).ConfigureAwait(false);
-
-        var values = new List<T>();
-        var results = flow.GetAsyncEnumerator(cancellationToken);
-        try
-        {
-            while (await results.MoveNextAsync().ConfigureAwait(false))
-            {
-                await results.Current.CollectAsync(
-                    (Values: values, Create: create),
-                    static (state, row) => state.Values.Add(
-                        state.Create(row.GetInt32(0), row.GetValue<string>(1))),
-                    cancellationToken).ConfigureAwait(false);
-            }
-            return values;
-        }
-        finally
-        {
-            await results.DisposeAsync().ConfigureAwait(false);
-            _flowPool?.Return(flow);
-        }
-    }
-
     public async ValueTask ConsumeRetainedAsync<T, TState>(
         Func<int, ReadOnlyMemory<byte>, T> create,
         TState state,
