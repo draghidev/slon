@@ -9,7 +9,9 @@ namespace Slon.Pipelines;
 
 abstract class StreamPipeWriter : PipeWriter, IOutputWriter
 {
+#if !NET11_0_OR_GREATER
     readonly ValueTaskSourcePromise<FlushResult> _flushAsyncCorePromise = new();
+#endif
     readonly IStreamOwner? _streamOwner;
     bool _isFlushActive;
 
@@ -308,18 +310,24 @@ abstract class StreamPipeWriter : PipeWriter, IOutputWriter
 
     protected virtual ValueTask<FlushResult> FlushAsyncCore(bool writeToStream, ReadOnlyMemory<byte> data, CancellationToken cancellationToken)
     {
+#if !NET11_0_OR_GREATER
         PromiseAsyncValueTaskMethodBuilder<FlushResult>.Promise = _flushAsyncCorePromise;
         try
         {
+#endif
             return FlushAsyncCore(PendingFlushTokenSource, writeToStream, data, cancellationToken);
+#if !NET11_0_OR_GREATER
         }
         finally
         {
             PromiseAsyncValueTaskMethodBuilder<FlushResult>.Promise = null;
         }
+#endif
 
+#if !NET11_0_OR_GREATER
         [RuntimeAsyncMethodGeneration(false)]
         [AsyncMethodBuilder(typeof(PromiseAsyncValueTaskMethodBuilder<>))]
+#endif
         async ValueTask<FlushResult> FlushAsyncCore(AutoResetCancellationTokenSource? tokenSource, bool writeToStream, ReadOnlyMemory<byte> data, CancellationToken cancellationToken)
         {
             // Cancellation token was already checked before getting here.

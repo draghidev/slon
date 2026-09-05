@@ -12,7 +12,9 @@ interface IStreamOwner : IDisposable, IAsyncDisposable { }
 
 abstract class StreamPipeReader : PipeReader
 {
+#if !NET11_0_OR_GREATER
     readonly ValueTaskSourcePromise<ReadResult> _readAsyncCorePromise = new();
+#endif
     bool _directReadAwaitingData;
     readonly IStreamOwner? _streamOwner;
     int _isReadActive;
@@ -379,18 +381,24 @@ abstract class StreamPipeReader : PipeReader
 
     protected ValueTask<ReadResult> ReadAsyncCore(int minimumSize, CancellationToken cancellationToken)
     {
+#if !NET11_0_OR_GREATER
         PromiseAsyncValueTaskMethodBuilder<ReadResult>.Promise = _readAsyncCorePromise;
         try
         {
+#endif
             return ReadAsyncCore(minimumSize, PendingReadTokenSource, cancellationToken);
+#if !NET11_0_OR_GREATER
         }
         finally
         {
             PromiseAsyncValueTaskMethodBuilder<ReadResult>.Promise = null;
         }
+#endif
 
+#if !NET11_0_OR_GREATER
         [RuntimeAsyncMethodGeneration(false)]
         [AsyncMethodBuilder(typeof(PromiseAsyncValueTaskMethodBuilder<>))]
+#endif
         async ValueTask<ReadResult> ReadAsyncCore(int minimumSize,
             AutoResetCancellationTokenSource? tokenSource, CancellationToken cancellationToken)
         {
