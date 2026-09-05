@@ -14,15 +14,17 @@ Set the following configuration values as environment variables or equivalent .N
 | `DRIVER` | `slon` or `npgsql` |
 | `CONNECTION_STRING` | PostgreSQL connection string |
 | `DATABASE_CONNECTIONS` | Positive fixed pool size |
+| `SLON_FLOW_POOL_CAPACITY` | Retained `CommandFlow` count; omitted or `0` disables flow pooling |
 
 Invalid, unsupported, or missing selections fail application startup with an explicit error.
-The Crank config defaults `branchOrCommit` to `main`; override it when benchmarking an
-unmerged branch.
+The Crank config currently composes `sebros/slon-benchmarks` with Draghi's
+`experiment/observation-frontier`; override either revision after those experiments land.
 
 ## Driver strategies
 
-Slon uses its experimental lower layer through `ConnectionPool<T>` and creates a fresh
-`CommandFlow` per request. Every wire receives the same prepared statement before it becomes
+Slon uses its experimental lower layer through `ConnectionPool<T>`. Setting
+`SLON_FLOW_POOL_CAPACITY` reuses `CommandFlow` instances after framework retirement; leaving it
+unset creates a fresh flow per request. Every wire receives the same prepared statement before it becomes
 schedulable. Results are consumed through `CommandResult.CollectAsync`, and zero-byte reads are
 disabled to match Apex's ordinary BCL transport shape.
 
@@ -30,5 +32,6 @@ Npgsql uses a slim data source and a command bound to each leased connection. Bo
 materialize messages as strings, append and ordinally sort the same model, and render the same
 RazorSlices string template for a fair comparison.
 
-The Crank configuration uses two fewer Slon connections than database cores and 256 Npgsql
-connections; Npgsql needs the additional in-flight operations to hide network and query latency.
+The Crank configuration retains up to 1024 Slon flows, uses two fewer Slon connections than
+database cores, and uses 256 Npgsql connections; Npgsql needs the additional in-flight operations
+to hide network and query latency. Set `slonFlowPoolCapacity=0` for the unpooled comparison.

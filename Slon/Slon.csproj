@@ -7,6 +7,7 @@
         <GenerateDocumentationFile>true</GenerateDocumentationFile>
         <LangVersion>preview</LangVersion>
         <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+        <DraghiRoot Condition="'$(DraghiRoot)' == ''">$(MSBuildThisFileDirectory)../../Draghi</DraghiRoot>
         <TargetsForTfmSpecificBuildOutput>$(TargetsForTfmSpecificBuildOutput);IncludeProjectReferenceDlls</TargetsForTfmSpecificBuildOutput>
         <TargetsForTfmSpecificContentInPackage>$(TargetsForTfmSpecificContentInPackage);IncludeReferenceAssemblies</TargetsForTfmSpecificContentInPackage>
         <NoWarn>$(NoWarn);NU5131;DRAGHI001;SLONPG001;SLONPOOL001</NoWarn>
@@ -23,7 +24,7 @@
     <ItemGroup>
         <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.0"/>
         <PackageReference Include="Microsoft.CodeAnalysis.PublicApiAnalyzers" Version="3.3.4" PrivateAssets="all" />
-        <ProjectReference Include="../../draghi-observation-frontier/Draghi.Pipelining/Draghi.Pipelining.csproj"/>
+        <ProjectReference Include="$(DraghiRoot)/Draghi.Pipelining/Draghi.Pipelining.csproj"/>
     </ItemGroup>
 
     <Target Name="IncludeProjectReferenceDlls" DependsOnTargets="BuildOnlySettings;ResolveReferences">

@@ -1,5 +1,7 @@
 using System.Diagnostics;
+using System.Globalization;
 using System.Net;
+using Microsoft.Extensions.ObjectPool;
 using Npgsql;
 using Slon.Pg;
 using Slon.Pg.Protocol;
@@ -15,9 +17,21 @@ internal sealed class SlonConnectionPool : IAsyncDisposable
     const string Query = "SELECT id, message FROM fortune";
     readonly ConnectionPool<ProtocolConnection> _pool;
     readonly CommandFlowOptions _options;
+    readonly ObjectPool<CommandFlow>? _flowPool;
 
-    SlonConnectionPool(ConnectionPool<ProtocolConnection> pool, Command command)
-        => (_pool, _options) = (pool, new() { Commands = new(command) });
+    SlonConnectionPool(
+        ConnectionPool<ProtocolConnection> pool,
+        Command command,
+        int flowPoolCapacity)
+    {
+        _pool = pool;
+        _options = new() { Commands = new(command) };
+        if (flowPoolCapacity > 0)
+        {
+            _flowPool = new DefaultObjectPool<CommandFlow>(
+                new CommandFlowPoolPolicy(), flowPoolCapacity);
+        }
+    }
 
     internal static async ValueTask<SlonConnectionPool> CreateAsync(
         string connectionString,
@@ -56,14 +70,14 @@ internal sealed class SlonConnectionPool : IAsyncDisposable
                 MaxConnections = connectionCount,
                 ConnectionIdleLifetime = Timeout.InfiniteTimeSpan,
             });
-        return new(pool, command);
+        return new(pool, command, GetFlowPoolCapacity());
     }
 
     public async ValueTask<List<T>> LoadAsync<T>(
         Func<int, string, T> create,
         CancellationToken cancellationToken)
     {
-        var flow = new CommandFlow(async: true, _options);
+        var flow = RentFlow();
         await _pool.GetAsync(
             static (candidate, item) => candidate.Connection.Protocol.TryQueue(
                 item,
@@ -92,6 +106,7 @@ internal sealed class SlonConnectionPool : IAsyncDisposable
         finally
         {
             await results.DisposeAsync().ConfigureAwait(false);
+            _flowPool?.Return(flow);
         }
     }
 
@@ -101,7 +116,7 @@ internal sealed class SlonConnectionPool : IAsyncDisposable
         Func<TState, List<T>, ValueTask> consume,
         CancellationToken cancellationToken)
     {
-        var flow = new CommandFlow(async: true, _options);
+        var flow = RentFlow();
         await _pool.GetAsync(
             static (candidate, item) => candidate.Connection.Protocol.TryQueue(
                 item,
@@ -132,10 +147,45 @@ internal sealed class SlonConnectionPool : IAsyncDisposable
         finally
         {
             await results.DisposeAsync().ConfigureAwait(false);
+            _flowPool?.Return(flow);
         }
     }
 
     public ValueTask DisposeAsync() => _pool.DisposeAsync();
+
+    CommandFlow RentFlow()
+    {
+        var flow = _flowPool?.Get();
+        return flow is null
+            ? new CommandFlow(async: true, _options)
+            : flow.Initialize(async: true, _options);
+    }
+
+    static int GetFlowPoolCapacity()
+    {
+        const string name = "SLON_FLOW_POOL_CAPACITY";
+        var value = Environment.GetEnvironmentVariable(name);
+        if (string.IsNullOrWhiteSpace(value))
+            return 0;
+        return int.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out var capacity)
+            && capacity >= 0
+            ? capacity
+            : throw new InvalidOperationException($"{name} must be a non-negative integer.");
+    }
+
+    sealed class CommandFlowPoolPolicy : PooledObjectPolicy<CommandFlow>
+    {
+        public override CommandFlow Create()
+            => new(async: true, ReadOnlySpan<Command>.Empty);
+
+        public override bool Return(CommandFlow flow)
+        {
+            // DisposeAsync crosses the framework's retirement boundary before a flow reaches here.
+            // Reset therefore cannot overlap the old tenure's protocol or heartbeat observation.
+            flow.Reset();
+            return true;
+        }
+    }
 
     static async ValueTask<Command> PrepareAsync(PgClientProtocol protocol)
     {

@@ -5,8 +5,9 @@ imports:
 variables:
   serverPort: 5000
   npgsqlConnections: 256
-  # Override this value to benchmark an unmerged Slon branch or commit.
-  branchOrCommit: main
+  slonFlowPoolCapacity: 1024
+  branchOrCommit: sebros/slon-benchmarks
+  draghiBranchOrCommit: experiment/observation-frontier
 
 jobs:
   platform-postgresql-slon:
@@ -16,7 +17,7 @@ jobs:
         branchOrCommit: "{{branchOrCommit}}"
       Draghi:
         repository: https://github.com/draghidev/pipelining.git
-        branchOrCommit: main
+        branchOrCommit: "{{draghiBranchOrCommit}}"
     project: Slon/Slon.Benchmarks/Slon.Fortunes.Platform/Slon.Fortunes.Platform.csproj
     framework: net10.0
     patchReferences: true
@@ -29,6 +30,7 @@ jobs:
       DRIVER: slon
       CONNECTION_STRING: "Host={{databaseServer}};Database=hello_world;Username=benchmarkdbuser;Password=benchmarkdbpass"
       DATABASE_CONNECTIONS: "{{ cores | minus: 2 }}"
+      SLON_FLOW_POOL_CAPACITY: "{{slonFlowPoolCapacity}}"
 
   platform-postgresql-npgsql:
     sources:
@@ -37,7 +39,7 @@ jobs:
         branchOrCommit: "{{branchOrCommit}}"
       Draghi:
         repository: https://github.com/draghidev/pipelining.git
-        branchOrCommit: main
+        branchOrCommit: "{{draghiBranchOrCommit}}"
     project: Slon/Slon.Benchmarks/Slon.Fortunes.Platform/Slon.Fortunes.Platform.csproj
     framework: net10.0
     patchReferences: true
