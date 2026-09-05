@@ -75,8 +75,7 @@ abstract class StreamPipeReader : PipeReader
         ThrowIfCompleted();
         var bufferedBytes = Segments.BufferedBytes;
         var examinedBytes = Segments.AdvanceTo(consumed, examined);
-        if (examinedBytes == bufferedBytes)
-            ExaminedEverything = true;
+        ExaminedEverything = examinedBytes == bufferedBytes;
     }
 
     /// <inheritdoc />

@@ -20,6 +20,30 @@ public class StreamPipeReaderTests
     }
 
     [TestMethod]
+    public async Task AdvanceTo_CanUnexamineBufferedData()
+    {
+        var reader = new DefaultStreamPipeReader(
+            new MemoryStream("Hello World"u8.ToArray(), writable: false),
+            new StreamPipeReaderOptions(bufferSize: 1024, useZeroByteReads: false),
+            supportCancelPending: false);
+        var first = await reader.ReadAsync();
+        reader.AdvanceTo(first.Buffer.GetPosition(6), first.Buffer.End);
+
+        // Examining the complete first grant forces the stream EOF probe.
+        var eof = await reader.ReadAsync();
+        CollectionAssert.AreEqual("World"u8.ToArray(), eof.Buffer.ToArray());
+        Assert.IsTrue(eof.IsCompleted);
+
+        // Moving examined back to consumed must republish the existing suffix without another
+        // stream read, matching the .NET 10 PipeReader un-examine contract.
+        reader.AdvanceTo(eof.Buffer.Start, eof.Buffer.Start);
+        Assert.IsTrue(reader.TryRead(out var unexamined));
+        CollectionAssert.AreEqual("World"u8.ToArray(), unexamined.Buffer.ToArray());
+        reader.AdvanceTo(unexamined.Buffer.End);
+        await reader.CompleteAsync();
+    }
+
+    [TestMethod]
     public async Task CopyToAsync_Stream_ConsumesSuccessfullyCopiedBufferedData()
     {
         var bytes = Enumerable.Range(0, 64).Select(static i => (byte)i).ToArray();
