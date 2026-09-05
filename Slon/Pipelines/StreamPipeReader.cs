@@ -385,7 +385,7 @@ abstract class StreamPipeReader : PipeReader
         try
         {
 #endif
-            return ReadAsyncCore(minimumSize, PendingReadTokenSource, cancellationToken);
+            return StartReadAsync(minimumSize, PendingReadTokenSource, cancellationToken);
 #if !NET11_0_OR_GREATER
         }
         finally
@@ -394,27 +394,52 @@ abstract class StreamPipeReader : PipeReader
         }
 #endif
 
-#if !NET11_0_OR_GREATER
-        [RuntimeAsyncMethodGeneration(false)]
-        [AsyncMethodBuilder(typeof(PromiseAsyncValueTaskMethodBuilder<>))]
-#endif
-        async ValueTask<ReadResult> ReadAsyncCore(int minimumSize,
+        ValueTask<ReadResult> StartReadAsync(int minimumSize,
             AutoResetCancellationTokenSource? tokenSource, CancellationToken cancellationToken)
         {
-            // Cancellation token was already checked before getting here.
             if (!TryStartRead())
                 ThrowAlreadyReading();
 
             CancellationTokenRegistration reg = default;
-            CancellationToken token;
-            if (tokenSource is { } src)
+            var registered = false;
+            try
             {
-                if (cancellationToken.CanBeCanceled)
-                    reg = src.UnsafeRegister(cancellationToken);
-                token = src.Token;
+                CancellationToken token;
+                if (tokenSource is { } src)
+                {
+                    if (cancellationToken.CanBeCanceled)
+                    {
+                        registered = true;
+                        reg = src.UnsafeRegister(cancellationToken);
+                    }
+                    token = src.Token;
+                }
+                else
+                {
+                    token = cancellationToken;
+                }
+
+                var read = ReadLoopAsync(
+                    minimumSize, token, cancellationToken, endStartedRead: !registered);
+                return registered ? CompleteRegisteredReadAsync(read, reg) : read;
             }
-            else
-                token = cancellationToken;
+            catch
+            {
+                if (registered)
+                    reg.Dispose();
+                EndStartedRead();
+                throw;
+            }
+        }
+
+#if !NET11_0_OR_GREATER
+        [RuntimeAsyncMethodGeneration(false)]
+        [AsyncMethodBuilder(typeof(PromiseAsyncValueTaskMethodBuilder<>))]
+#endif
+        async ValueTask<ReadResult> ReadLoopAsync(
+            int minimumSize, CancellationToken token, CancellationToken cancellationToken,
+            bool endStartedRead)
+        {
             try
             {
                 if (Segments.BufferedBytes is 0 && UseZeroByteReads)
@@ -449,9 +474,27 @@ abstract class StreamPipeReader : PipeReader
             }
             finally
             {
+                if (endStartedRead)
+                    EndStartedRead();
+            }
+        }
+
+#if !NET11_0_OR_GREATER
+        [RuntimeAsyncMethodGeneration(false)]
+        [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
+#endif
+        async ValueTask<ReadResult> CompleteRegisteredReadAsync(
+            ValueTask<ReadResult> read, CancellationTokenRegistration registration)
+        {
+            try
+            {
+                return await read.ConfigureAwait(false);
+            }
+            finally
+            {
                 try
                 {
-                    await reg.DisposeAsync().ConfigureAwait(false);
+                    await registration.DisposeAsync().ConfigureAwait(false);
                 }
                 finally
                 {
