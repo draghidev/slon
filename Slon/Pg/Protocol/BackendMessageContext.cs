@@ -243,6 +243,17 @@ sealed class BackendMessageContext
         _currentMessageOffset = 0;
     }
 
+    internal bool TryGetCursorConsumedLength(out long consumedLength)
+    {
+        if (!_hasCursor)
+        {
+            consumedLength = 0;
+            return false;
+        }
+        consumedLength = _cursor.ConsumedLength;
+        return true;
+    }
+
     public ReadOnlyMemory<byte> GetContiguousMemory(
         short token, ReadOnlyMemory<byte> source)
     {

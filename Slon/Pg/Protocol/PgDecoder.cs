@@ -144,6 +144,9 @@ public sealed class PgDecoder: IEnumerator<BackendMessage>, IAsyncEnumerator<Bac
         _pipe.EndResultRetention();
     }
 
+    internal void ReleaseReadBufferAtIdle()
+        => _pipe.ReleaseReadBufferAtIdle();
+
     void ValidateResultBufferingOwner()
     {
         var owner = _resultBufferingOwner;

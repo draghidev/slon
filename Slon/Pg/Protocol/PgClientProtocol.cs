@@ -1881,10 +1881,15 @@ public sealed partial class PgClientProtocol : IDisposable, IAsyncDisposable
 
         internal void OnReleasing(PgClientFlow flow)
         {
+            // Draghi clears ActivatedFlow at the exact zero edge but retains the old activation turn
+            // through this callback. Null is therefore both the idle witness and an exclusive
+            // pre-release window in which no successor reader can activate.
+            var idle = ActivatedFlow is null;
             Decoder.EndResultBuffering(flow);
+            if (idle)
+                Decoder.ReleaseReadBufferAtIdle();
             protocol._serverParameterState.CommitFlow();
             ClearCancellationActivation(flow);
-            var idle = ActivatedFlow is null;
             protocol.OnFlowReleased(flow, poolFacing && idle);
             // Inner exclusive-scope subflows are not pool load units; only the outer pipeline reports
             // admission-to-retirement lifetimes to its host.

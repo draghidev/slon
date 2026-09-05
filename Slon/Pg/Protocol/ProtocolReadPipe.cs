@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Diagnostics;
 using System.IO.Pipelines;
 using Slon.Pipelines;
 
@@ -444,6 +445,33 @@ sealed class ProtocolReadPipe(
         // consume messages already present in the current grant. PrepareRead advances the retained
         // prefix when it eventually needs another grant, matching the former batch reader.
         _messageContext.ReleaseContiguousProjections();
+    }
+
+    // The retiring zero-edge owner calls this before its activation turn is released. End the
+    // current PipeReader grant at the parsed successor boundary so an idle connection cannot retain
+    // completed result storage. Any buffered suffix is deliberately un-examined and will be
+    // reacquired by the next ordinary read.
+    public void ReleaseReadBufferAtIdle()
+    {
+        Debug.Assert(!_retainsResult);
+        if (!_hasActiveRead || _pendingRead is not PendingRead.None
+            || _currentMessageLength > 0
+            || !_messageContext.TryGetCursorConsumedLength(out var cursorConsumedLength))
+            return;
+
+        var consumedOffset = checked(_pendingCursorOffset + cursorConsumedLength);
+        var consumed = _activeBuffer.GetPosition(consumedOffset);
+        _messageContext.RetireCursor();
+        reader.AdvanceTo(consumed, consumed);
+        _activeBuffer = default;
+        _examined = default;
+        _retainedStart = default;
+        _retainedOffset = 0;
+        _currentMessageOffset = 0;
+        _currentMessageLength = -1;
+        _pendingCursorOffset = 0;
+        _minimumReadSize = 0;
+        _hasActiveRead = false;
     }
 
     public void Dispose()

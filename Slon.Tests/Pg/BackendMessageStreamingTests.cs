@@ -581,6 +581,32 @@ public class BackendMessageStreamingTests
     }
 
     [TestMethod]
+    public async Task IdleRelease_UnexaminesAndReacquiresBufferedSuffix()
+    {
+        var completed = BackendMessageBytes(BackendType.ReadyForQuery, [(byte)'I']);
+        var suffix = BackendMessageBytes(BackendType.NotificationResponse, [1, 2, 3]);
+        var wire = new byte[completed.Length + suffix.Length];
+        completed.CopyTo(wire, 0);
+        suffix.CopyTo(wire, completed.Length);
+        var pipe = new Pipe();
+        var readPipe = new ProtocolReadPipe(pipe.Reader,
+            BackendMessageCursor.DefaultDataRowStreamingThreshold);
+        await pipe.Writer.WriteAsync(wire);
+
+        Assert.IsTrue(await readPipe.MoveNextAsync(default));
+        Assert.IsTrue(readPipe.TryMoveNext());
+        Assert.AreEqual(BackendType.ReadyForQuery, readPipe.CurrentType);
+
+        readPipe.ReleaseReadBufferAtIdle();
+
+        Assert.IsTrue(await readPipe.MoveNextAsync(default));
+        Assert.IsTrue(readPipe.TryMoveNext());
+        Assert.AreEqual(BackendType.NotificationResponse, readPipe.CurrentType);
+        await pipe.Writer.CompleteAsync();
+        await readPipe.DisposeAsync();
+    }
+
+    [TestMethod]
     public async Task BackendBodyReader_ExtendsPrefixThenSlides()
     {
         var pipe = new Pipe();
