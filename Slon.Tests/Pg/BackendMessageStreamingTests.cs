@@ -44,10 +44,12 @@ public class BackendMessageStreamingTests
     {
         ReadResult _activeRead;
         bool _rejectAdvanceAtStart;
+        long? _expectedAdvanceOffset;
 
         public Action? BeforeAdvance { get; set; }
 
         public void RejectAdvanceAtActiveStart() => _rejectAdvanceAtStart = true;
+        public void ExpectAdvanceAtActiveOffset(long offset) => _expectedAdvanceOffset = offset;
 
         public override ValueTask<ReadResult> ReadAsync(CancellationToken cancellationToken = default)
         {
@@ -74,6 +76,12 @@ public class BackendMessageStreamingTests
             if (_rejectAdvanceAtStart && consumed.Equals(_activeRead.Buffer.Start))
                 Assert.Fail("The supplied read was retired before its buffer was inspected.");
             _rejectAdvanceAtStart = false;
+            if (_expectedAdvanceOffset is { } expectedOffset)
+            {
+                Assert.AreEqual(_activeRead.Buffer.GetPosition(expectedOffset), consumed,
+                    "The read pipe retained bytes before the active result tenure.");
+                _expectedAdvanceOffset = null;
+            }
             inner.AdvanceTo(consumed, examined);
         }
 
@@ -190,6 +198,46 @@ public class BackendMessageStreamingTests
         Assert.AreEqual(BackendType.ReadyForQuery, header.Type);
         CollectionAssert.AreEqual(second, message.ToArray());
         Assert.IsFalse(cursor.TryReadNextInPlace(out _, out _, out _));
+    }
+
+    [TestMethod]
+    public void BackendMessageCursor_CollapsesRemainingFinalSegmentToArrayBacking()
+    {
+        var first = BackendMessageBytes(BackendType.CommandComplete, 6);
+        var second = BackendMessageBytes(BackendType.ReadyForQuery, 6);
+        var cursor = new BackendMessageCursor(Segmented(first, second));
+
+        Assert.IsTrue(cursor.TryReadNextInPlace(out _, out _, out _));
+        Assert.IsTrue(cursor.TryReadNextInPlace(out _, out var remaining, out _));
+
+        Assert.IsInstanceOfType<byte[]>(remaining.Start.GetObject());
+        Assert.AreSame(second, remaining.Start.GetObject());
+        CollectionAssert.AreEqual(second, remaining.ToArray());
+    }
+
+    [TestMethod]
+    public void BackendMessageCursor_CollapsesFinalSegmentAfterStraddlingMessage()
+    {
+        var straddling = BackendMessageBytes(
+            BackendType.DataRow, new byte[] { 1, 2, 3, 4, 5, 6 });
+        var remainingMessage = BackendMessageBytes(BackendType.ReadyForQuery, 6);
+        const int firstSegmentLength = 7;
+        var finalSegment = new byte[straddling.Length - firstSegmentLength
+            + remainingMessage.Length + 6];
+        straddling.AsSpan(firstSegmentLength).CopyTo(finalSegment.AsSpan(3));
+        remainingMessage.CopyTo(finalSegment.AsSpan(
+            3 + straddling.Length - firstSegmentLength));
+        var finalMemory = finalSegment.AsMemory(3,
+            straddling.Length - firstSegmentLength + remainingMessage.Length);
+        var cursor = new BackendMessageCursor(Segmented(
+            straddling.AsMemory(0, firstSegmentLength), finalMemory));
+
+        Assert.IsTrue(cursor.TryReadNextInPlace(out _, out var first, out _));
+        Assert.IsFalse(first.IsSingleSegment);
+        Assert.IsTrue(cursor.TryReadNextInPlace(out _, out var remaining, out _));
+
+        Assert.AreSame(finalSegment, remaining.Start.GetObject());
+        CollectionAssert.AreEqual(remainingMessage, remaining.ToArray());
     }
 
     [TestMethod]
@@ -493,6 +541,41 @@ public class BackendMessageStreamingTests
         Assert.IsTrue(readPipe.TryMoveNext());
         Assert.AreEqual(BackendType.BindComplete, readPipe.Current.Header.Type);
 
+        await pipe.Writer.CompleteAsync();
+        await readPipe.DisposeAsync();
+    }
+
+    [TestMethod]
+    public async Task BeginningNewResultRetention_DropsPriorResultPrefixAtNextRead()
+    {
+        var prior = BackendMessageBytes(BackendType.DataRow, [0, 1]);
+        var retained = BackendMessageBytes(BackendType.DataRow, [2, 3]);
+        var terminal = BackendMessageBytes(BackendType.CommandComplete, "SELECT 1\0"u8);
+        var firstGrant = new byte[prior.Length + retained.Length];
+        prior.CopyTo(firstGrant, 0);
+        retained.CopyTo(firstGrant, prior.Length);
+
+        var pipe = new Pipe();
+        var reader = new RejectRetiredSuppliedReadReader(pipe.Reader);
+        var readPipe = new ProtocolReadPipe(reader,
+            BackendMessageCursor.DefaultDataRowStreamingThreshold);
+        await pipe.Writer.WriteAsync(firstGrant);
+
+        Assert.IsTrue(await readPipe.MoveNextAsync(default));
+        Assert.IsTrue(readPipe.TryMoveNext());
+        readPipe.EnableResultRetention();
+        readPipe.EndResultRetention();
+        Assert.IsTrue(readPipe.TryMoveNext());
+        readPipe.EnableResultRetention();
+        Assert.IsFalse(readPipe.TryMoveNext());
+
+        reader.ExpectAdvanceAtActiveOffset(prior.Length);
+        await pipe.Writer.WriteAsync(terminal);
+        Assert.IsTrue(await readPipe.MoveNextAsync(default));
+        Assert.IsTrue(readPipe.TryMoveNext());
+        Assert.AreEqual(BackendType.CommandComplete, readPipe.CurrentType);
+
+        readPipe.EndResultRetention();
         await pipe.Writer.CompleteAsync();
         await readPipe.DisposeAsync();
     }

@@ -234,6 +234,15 @@ sealed class BackendMessageContext
         return _currentMessageOffset;
     }
 
+    internal long CaptureCurrentMessageOffset()
+        => GetCurrentMessageOffset(_version);
+
+    internal void RebaseCurrentMessageOffset()
+    {
+        Debug.Assert((_messageState & MessageOffsetCaptured) != 0);
+        _currentMessageOffset = 0;
+    }
+
     public ReadOnlyMemory<byte> GetContiguousMemory(
         short token, ReadOnlyMemory<byte> source)
     {

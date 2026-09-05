@@ -15,6 +15,9 @@ sealed class ProtocolReadPipe(
     ReadOnlySequence<byte> _activeBuffer;
     SequencePosition _examined;
     SequencePosition _retainedStart;
+    // Offset of _retainedStart within _activeBuffer. Reset to zero whenever a new PipeReader grant
+    // begins at that position; non-zero only while advancing the retention origin within one grant.
+    long _retainedOffset;
     long _currentMessageOffset;
     long _currentMessageLength = -1;
     long _pendingCursorOffset;
@@ -72,9 +75,10 @@ sealed class ProtocolReadPipe(
                 "The current backend-message cursor has not been exhausted.");
 
         var unreadOffset = checked(_pendingCursorOffset + cursorConsumedLength);
+        var retainedOffset = retainsResult ? _retainedOffset : 0;
         var unread = _activeBuffer.GetPosition(unreadOffset);
         _pendingCursorOffset = retainsResult
-            ? unreadOffset
+            ? checked(unreadOffset - retainedOffset)
             : 0;
         _messageContext.RetireCursor(
             retainProjections: retainsResult);
@@ -82,6 +86,7 @@ sealed class ProtocolReadPipe(
             retainsResult ? _retainedStart : unread, _examined);
         _hasActiveRead = false;
         _activeBuffer = default;
+        _retainedOffset = 0;
         _currentMessageLength = -1;
         _currentMessageOffset = 0;
         _minimumReadSize = int.CreateSaturating(requiredLength);
@@ -96,7 +101,7 @@ sealed class ProtocolReadPipe(
         if (retainsResult)
         {
             _pendingCursorOffset = checked(
-                _currentMessageOffset + _currentMessageLength);
+                _currentMessageOffset + _currentMessageLength - _retainedOffset);
             var examined = current.Length >= _currentMessageLength
                 ? current.GetPosition(_currentMessageLength)
                 : _examined;
@@ -122,6 +127,7 @@ sealed class ProtocolReadPipe(
 
         _hasActiveRead = false;
         _activeBuffer = default;
+        _retainedOffset = 0;
         _currentMessageLength = -1;
         _currentMessageOffset = 0;
         _pendingRead = PendingRead.Messages;
@@ -157,6 +163,7 @@ sealed class ProtocolReadPipe(
         _activeBuffer = result.Buffer;
         _examined = result.Buffer.End;
         _retainedStart = result.Buffer.Start;
+        _retainedOffset = 0;
         _hasActiveRead = true;
         if (_pendingSkipLength > 0)
         {
@@ -299,6 +306,7 @@ sealed class ProtocolReadPipe(
             && (consumedLength <= 0 || consumedLength >= _currentMessageLength))
             throw new ArgumentOutOfRangeException(nameof(consumedLength));
 
+        var retainedOffset = _retainsResult ? _retainedOffset : 0;
         reader.AdvanceTo(
             mode is PendingRead.Slide && !_retainsResult
                 ? consumed
@@ -308,7 +316,8 @@ sealed class ProtocolReadPipe(
         {
             if (_retainsResult)
             {
-                _currentMessageOffset = _activeBuffer.Slice(0, consumed).Length;
+                _currentMessageOffset = checked(
+                    _activeBuffer.Slice(0, consumed).Length - retainedOffset);
             }
             else
             {
@@ -317,6 +326,12 @@ sealed class ProtocolReadPipe(
             }
             _currentMessageLength -= consumedLength;
         }
+        else if (_retainsResult)
+        {
+            _currentMessageOffset = checked(
+                _currentMessageOffset - retainedOffset);
+        }
+        _retainedOffset = 0;
         _hasActiveRead = false;
         _activeBuffer = default;
         _pendingRead = mode;
@@ -396,7 +411,28 @@ sealed class ProtocolReadPipe(
         if (!_hasActiveRead || _pendingRead is not PendingRead.None)
             ThrowHelper.ThrowInvalidOperation(
                 "Result retention requires an active backend message.");
-        _ = _messageContext.Current;
+        if (_retainsResult)
+        {
+            _ = _messageContext.Current;
+            return;
+        }
+        // A prior result may have completed entirely within this PipeReader grant. Its borrowed
+        // values were released by EndResultRetention, so the next tenure can move the retained
+        // origin to its own first message. Rebase offsets when the eventual read starts there.
+        var retainedOffset = checked(_pendingCursorOffset
+            + _messageContext.CaptureCurrentMessageOffset());
+        if (_currentMessageLength > 0)
+        {
+            // Before the next grant these describe the cursor base and the message end relative to
+            // that base. Dropping preceding messages makes the retained message its own base, so
+            // preserve only its actual length and carry its current absolute offset until AdvanceTo.
+            _currentMessageLength = checked(_currentMessageLength
+                - (retainedOffset - _currentMessageOffset));
+            _currentMessageOffset = retainedOffset;
+            _messageContext.RebaseCurrentMessageOffset();
+        }
+        _retainedStart = _activeBuffer.GetPosition(retainedOffset);
+        _retainedOffset = retainedOffset;
         _retainsResult = true;
     }
 

@@ -6,6 +6,51 @@ namespace Slon.Tests.Pipelines;
 [TestClass]
 public class SegmentChainBuilderTests
 {
+    const int ReaderBufferSize = 65536;
+    const int MinimumReadSize = 512;
+
+    [TestMethod]
+    public void ReaderReserve_WithConsumedPrefix_ConsolidatesRemainingBytes()
+    {
+        using var builder = new SegmentChainBuilder(
+            MemoryPool<byte>.Shared, ReaderBufferSize, MinimumReadSize,
+            retainBufferOnEmpty: true);
+        var memory = builder.Reserve(ReaderBufferSize, enforceHint: true);
+        memory.Span[^1] = 42;
+        builder.Grow(ReaderBufferSize);
+        var initial = builder.GetReadOnlySequence();
+        var initialHead = builder.HeadInfo.Head;
+
+        builder.AdvanceTo(initial.GetPosition(ReaderBufferSize - 1024));
+        builder.Reserve(MinimumReadSize, enforceHint: true);
+
+        var consolidated = builder.GetReadOnlySequence();
+        Assert.IsTrue(consolidated.IsSingleSegment);
+        Assert.AreNotSame(initialHead, builder.HeadInfo.Head);
+        Assert.AreEqual(0, builder.HeadInfo.Index);
+        Assert.AreEqual(1024, consolidated.Length);
+        Assert.AreEqual(42, consolidated.FirstSpan[^1]);
+    }
+
+    [TestMethod]
+    public void ReaderReserve_AtUnadvancedHead_CreatesSecondSegment()
+    {
+        using var builder = new SegmentChainBuilder(
+            MemoryPool<byte>.Shared, ReaderBufferSize, MinimumReadSize,
+            retainBufferOnEmpty: true);
+        builder.Reserve(ReaderBufferSize, enforceHint: true).Span[^1] = 42;
+        builder.Grow(ReaderBufferSize);
+        var initialHead = builder.HeadInfo.Head;
+
+        builder.Reserve(MinimumReadSize, enforceHint: true);
+
+        var chained = builder.GetReadOnlySequence();
+        Assert.IsFalse(chained.IsSingleSegment);
+        Assert.AreSame(initialHead, builder.HeadInfo.Head);
+        Assert.AreEqual(ReaderBufferSize, chained.Length);
+        Assert.AreEqual(42, chained.FirstSpan[^1]);
+    }
+
     [TestMethod]
     public void AdvanceToEmpty_RetainsSegmentAndOwnedMemory_WhenEnabled()
     {

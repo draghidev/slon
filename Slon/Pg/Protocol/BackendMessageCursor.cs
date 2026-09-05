@@ -2,6 +2,7 @@ using System.Buffers;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using Slon.Pipelines;
 using Slon.Runtime.CompilerServices;
 using static Slon.Pg.Protocol.PgTypes;
@@ -241,6 +242,7 @@ struct BackendMessageCursor(ReadOnlySequence<byte> buffer)
                 _startObject = next;
                 _startIndex = SegmentFlag;
                 _length -= offset;
+                NormalizeSingleSegmentArray();
                 return boundaryPrefix;
             }
             if ((ulong)offset < (uint)firstLength)
@@ -265,7 +267,29 @@ struct BackendMessageCursor(ReadOnlySequence<byte> buffer)
             var remaining = sequence.Slice(offset);
             var result = new FastReadOnlySequence<T>(prefix);
             this = new(remaining);
+            NormalizeSingleSegmentArray();
             return result;
+        }
+
+        // ReadOnlySequence.Slice retains segment positions after a multi-segment sequence has
+        // advanced wholly into its final segment. PipeReader-style consumers should not continue
+        // paying that historical topology: when the remaining segment exposes array memory, carry
+        // the actual array and absolute indices from this point forward.
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        void NormalizeSingleSegmentArray()
+        {
+            if (!IsSegmentBacked || !ReferenceEquals(_startObject, _endObject))
+                return;
+
+            var memory = ((ReadOnlySequenceSegment<T>)_startObject!).Memory;
+            if (!MemoryMarshal.TryGetArray(memory, out ArraySegment<T> array))
+                return;
+
+            var startIndex = StartIndex;
+            var endIndex = EndIndex;
+            _startObject = _endObject = array.Array;
+            _startIndex = array.Offset + startIndex;
+            _endIndex = array.Offset + endIndex;
         }
 
     }
