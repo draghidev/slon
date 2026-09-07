@@ -19,6 +19,7 @@ jobs:
         repository: https://github.com/draghidev/pipelining.git
         branchOrCommit: "{{draghiBranchOrCommit}}"
     project: Slon/Slon.Benchmarks/Slon.Fortunes.Minimal/Slon.Fortunes.Minimal.csproj
+    sdkVersion: 11.0.100-preview.7.26381.103
     framework: net10.0
     patchReferences: true
     readyStateText: Application started.
@@ -41,6 +42,7 @@ jobs:
         repository: https://github.com/draghidev/pipelining.git
         branchOrCommit: "{{draghiBranchOrCommit}}"
     project: Slon/Slon.Benchmarks/Slon.Fortunes.Minimal/Slon.Fortunes.Minimal.csproj
+    sdkVersion: 11.0.100-preview.7.26381.103
     framework: net10.0
     patchReferences: true
     readyStateText: Application started.
